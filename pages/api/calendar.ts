@@ -1,24 +1,77 @@
+// pages/api/calendar.ts
+
 import type { NextApiRequest, NextApiResponse } from 'next'
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  const { date = '', currencies = '' } = req.query as { date?: string, currencies?: string }
-  const rss = process.env.CALENDAR_RSS_URL
-  let items:any[] = []
-  if (rss) {
-    try {
-      const r = await fetch(rss, { cache: 'no-store' })
-      const text = await r.text()
-      const parts = text.split('<item>').slice(1)
-      for (const p of parts) {
-        const title = (p.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/) || p.match(/<title>(.*?)<\/title>/))?.[1] || ''
-        const pubDate = (p.match(/<pubDate>(.*?)<\/pubDate>/)?.[1]) || ''
-        const cur = (title.match(/\b([A-Z]{3})\b/)?.[1]) || ''
-        const time = (p.match(/\b\d{1,2}:\d{2}\b/)?.[0]) || ''
-        items.push({ time: time || pubDate, currency: cur, title })
-      }
-    } catch (e:any) { console.error(e) }
+// small, dependency-free RSS parser for FF XML
+async function fetchFF(url: string) {
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`RSS fetch failed: ${res.status}`)
+  const xml = await res.text()
+
+  // very light parse: split on <item> … </item>
+  const items = xml.split('<item>').slice(1).map(block => {
+    const get = (tag: string) => {
+      const m = block.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i'))
+      return m ? m[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim() : ''
+    }
+    return {
+      title: get('title'),            // e.g. "USD - New Home Sales"
+      description: get('description'),
+      link: get('link'),
+      pubDate: get('pubDate')
+    }
+  })
+
+  return items
+}
+
+const ALL_CCY = ['USD','EUR','GBP','JPY','AUD','CAD','CHF','NZD','CNY','MXN','ZAR','SEK','NOK']
+
+function currenciesFromTitle(title: string) {
+  const hits = []
+  for (const c of ALL_CCY) {
+    // look for “EUR - …” OR wrapped in () etc.
+    if (new RegExp(`\\b${c}\\b`).test(title)) hits.push(c)
   }
-  const curList = currencies ? currencies.split(',').map(s=>s.trim().toUpperCase()) : []
-  if (curList.length) items = items.filter(i => curList.includes(i.currency))
-  res.status(200).json({ items, note: rss ? 'Fetched' : 'Set CALENDAR_RSS_URL to enable auto-fetch' })
+  return hits
+}
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  try {
+    const dateStr = (req.query.date as string) || new Date().toISOString().slice(0,10)
+    const wanted = (req.query.currencies as string | undefined)?.split(',').map(s => s.trim().toUpperCase()) ?? []
+
+    const rssUrl = process.env.CALENDAR_RSS_URL
+    if (!rssUrl) return res.status(200).json({ items: [], note: 'No CALENDAR_RSS_URL set' })
+
+    const raw = await fetchFF(rssUrl)
+
+    // optional: keep same-week items only (simple check)
+    const weekStart = new Date(dateStr); weekStart.setDate(weekStart.getDate() - weekStart.getDay()) // Sunday
+    const weekEnd = new Date(weekStart); weekEnd.setDate(weekStart.getDate() + 7)
+
+    const items = raw
+      .map(it => {
+        const ccyInTitle = currenciesFromTitle(it.title)
+        return {
+          title: it.title,
+          date: it.pubDate,
+          link: it.link,
+          currencies: ccyInTitle
+        }
+      })
+      .filter(it => {
+        // if caller asks for currencies, require an overlap
+        const passCcy = wanted.length ? it.currencies.some(c => wanted.includes(c)) : true
+        // keep it simple on date (FF sometimes uses time; we just keep the week)
+        const t = it.date ? new Date(it.date) : null
+        const passDate = t ? (t >= weekStart && t < weekEnd) : true
+        return passCcy && passDate
+      })
+      .slice(0, 40) // don’t flood the UI
+
+    return res.status(200).json({ items })
+  } catch (e: any) {
+    return res.status(200).json({ items: [], error: e.message ?? 'calendar error' })
+  }
 }
