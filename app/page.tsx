@@ -1,7 +1,7 @@
 'use client'
 import { useEffect, useMemo, useState } from 'react'
-import TradingViewTriple from '@/components/TradingViewTriple'
-import { INSTRUMENTS } from '@/lib/symbols'
+import TradingViewTriple from '../components/TradingViewTriple';
+import { INSTRUMENTS } from '../lib/symbols';
 
 type CalendarItem = { time: string, currency: string, impact?: string, title: string, actual?: string, forecast?: string, previous?: string }
 
