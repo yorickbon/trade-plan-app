@@ -12,8 +12,8 @@
     "next": "14.2.4",
     "react": "18.2.0",
     "react-dom": "18.2.0",
-    "openai": "^4.59.0",
-    "rss-parser": "^3.13.0"
+    "axios": "^1.7.7",
+    "xml2js": "^0.6.2"
   },
   "devDependencies": {
     "typescript": "5.4.2",
