@@ -1,149 +1,68 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import React from "react";
 
 type CalendarItem = {
-  title: string;
+  date: string;
+  time: string;
   country: string;
-  impact?: "low" | "medium" | "high";
-  time?: string;
-  actual?: string | number | null;
-  forecast?: string | number | null;
-  previous?: string | number | null;
-};
-
-type ApiResponse = {
-  date_from: string;
-  date_to: string;
-  countries: string[];
-  count: number;
-  items: CalendarItem[];
+  currency: string;
+  impact: string;
+  title: string;
+  actual?: string;
+  forecast?: string;
+  previous?: string;
 };
 
 export default function CalendarPanel({
-  date,
-  currencies = "EUR,USD,GBP",
+  items,
+  loading,
 }: {
-  date: string; // YYYY-MM-DD
-  currencies?: string; // CSV, e.g. "EUR,USD,GBP"
+  items: CalendarItem[];
+  loading: boolean;
 }) {
-  const [data, setData] = useState<ApiResponse | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-
-  // Map FX currencies to likely countries (very rough, good enough for guest mode)
-  const countries = useMemo(() => {
-    const map: Record<string, string[]> = {
-      EUR: ["Euro Area", "Germany", "France", "Italy", "Spain"],
-      USD: ["United States"],
-      GBP: ["United Kingdom"],
-      JPY: ["Japan"],
-      AUD: ["Australia"],
-      CAD: ["Canada"],
-      NZD: ["New Zealand"],
-      CHF: ["Switzerland"],
-    };
-    const list = currencies
-      .split(",")
-      .map((c) => c.trim().toUpperCase())
-      .flatMap((c) => map[c] ?? []);
-    // de-dupe while keeping order
-    return [...new Set(list)];
-  }, [currencies]);
-
-  useEffect(() => {
-    let cancelled = false;
-    async function run() {
-      setLoading(true);
-      setErr(null);
-      setData(null);
-      try {
-        const params = new URLSearchParams();
-        params.set("date", date);
-        if (countries.length) params.set("countries", countries.join(","));
-        const res = await fetch(`/api/calendar?${params.toString()}`, {
-          cache: "no-store",
-        });
-        const json = await res.json();
-        if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`);
-        if (!cancelled) setData(json as ApiResponse);
-      } catch (e: any) {
-        if (!cancelled) setErr(e?.message || "Failed to load calendar.");
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-    run();
-    return () => {
-      cancelled = true;
-    };
-  }, [date, countries.join("|")]);
-
   return (
-    <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
-      <div className="mb-2 flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-zinc-200">
-          Calendar Snapshot (auto)
-        </h3>
-        <span className="text-xs text-zinc-500">
-          {date} · {countries.length ? countries.join(", ") : "All"}
-        </span>
+    <div className="p-4 border rounded bg-neutral-900 border-neutral-800">
+      <div className="flex items-center justify-between mb-2">
+        <h2 className="text-lg font-bold">Calendar Snapshot</h2>
+        {loading && <span className="text-sm text-gray-400">Loading…</span>}
       </div>
 
-      {loading && (
-        <div className="text-sm text-zinc-400">Loading economic calendar…</div>
-      )}
-
-      {err && (
-        <div className="text-sm text-red-400">
-          {err}
-          <div className="text-xs text-zinc-500 mt-1">
-            Tip: guest access often returns no items for future dates. Your app
-            will still work; upgrade TE creds later for full data.
-          </div>
+      {items.length === 0 ? (
+        <p className="text-sm text-gray-400">
+          No items found (server filters by selected currencies and date).
+        </p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-left text-gray-400">
+              <tr>
+                <th className="py-1 pr-3">Time</th>
+                <th className="py-1 pr-3">Country</th>
+                <th className="py-1 pr-3">Currency</th>
+                <th className="py-1 pr-3">Impact</th>
+                <th className="py-1 pr-3">Event</th>
+                <th className="py-1 pr-3">Actual</th>
+                <th className="py-1 pr-3">Forecast</th>
+                <th className="py-1 pr-3">Previous</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((it, idx) => (
+                <tr key={idx} className="border-t border-neutral-800">
+                  <td className="py-1 pr-3">{it.time || "—"}</td>
+                  <td className="py-1 pr-3">{it.country}</td>
+                  <td className="py-1 pr-3">{it.currency}</td>
+                  <td className="py-1 pr-3">{it.impact}</td>
+                  <td className="py-1 pr-3">{it.title}</td>
+                  <td className="py-1 pr-3">{it.actual ?? "—"}</td>
+                  <td className="py-1 pr-3">{it.forecast ?? "—"}</td>
+                  <td className="py-1 pr-3">{it.previous ?? "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
-      )}
-
-      {!loading && !err && data && data.items.length === 0 && (
-        <div className="text-sm text-zinc-400">
-          No high-impact events found for this date (guest mode).
-        </div>
-      )}
-
-      {!loading && !err && data && data.items.length > 0 && (
-        <ul className="space-y-2">
-          {data.items.map((it, i) => (
-            <li
-              key={i}
-              className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-3"
-            >
-              <div className="flex items-center justify-between gap-3">
-                <div className="text-sm text-zinc-200">{it.title}</div>
-                <div className="text-xs text-zinc-500">
-                  {it.country}
-                  {it.time ? ` · ${it.time}` : ""}
-                  {it.impact ? ` · ${it.impact.toUpperCase()}` : ""}
-                </div>
-              </div>
-              {(it.actual ?? it.forecast ?? it.previous) != null && (
-                <div className="mt-1 grid grid-cols-3 gap-2 text-xs text-zinc-400">
-                  <div>
-                    <span className="text-zinc-500">Actual: </span>
-                    {it.actual ?? "—"}
-                  </div>
-                  <div>
-                    <span className="text-zinc-500">Forecast: </span>
-                    {it.forecast ?? "—"}
-                  </div>
-                  <div>
-                    <span className="text-zinc-500">Previous: </span>
-                    {it.previous ?? "—"}
-                  </div>
-                </div>
-              )}
-            </li>
-          ))}
-        </ul>
       )}
     </div>
   );
