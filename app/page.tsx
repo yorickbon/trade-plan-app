@@ -11,7 +11,7 @@ type Instrument = { code: string; currencies?: string[] };
 type CalendarItem = {
   date: string; // ISO timestamp preferred
   time?: string;
-  currency?: string;
+  country?: string;   // 👈 add this (CalendarPanel expects it!)
   impact?: "Low" | "Medium" | "High";
   title?: string;
 };
