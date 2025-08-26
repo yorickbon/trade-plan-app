@@ -1,103 +1,154 @@
-'use client'
-import { useEffect, useMemo, useState } from 'react'
-import TradingViewTriple from '../components/TradingViewTriple';
-import { INSTRUMENTS } from '../lib/symbols';
+"use client";
 
-type CalendarItem = { time: string, currency: string, impact?: string, title: string, actual?: string, forecast?: string, previous?: string }
+import React, { useEffect, useState } from "react";
+import TradingViewTriple from "../components/TradingViewTriple";
+import CalendarPanel from "../components/CalendarPanel";
+import { INSTRUMENTS } from "../lib/symbols";
+
+// If you don't have types in lib/symbols yet, this light type keeps TS happy
+type Instrument = {
+  code: string;             // e.g. "EURUSD"
+  label: string;            // e.g. "Euro / U.S. Dollar"
+  currencies: string[];     // e.g. ["EUR","USD"]
+};
+
+type PlanResponse = {
+  plan?: { text: string; conviction?: number };
+  reply?: string;                // for debug/simple mode
+  model?: string;                // echo back model
+};
 
 export default function Page() {
-  const [instrument, setInstrument] = useState(INSTRUMENTS[0])
-  const [dateStr, setDateStr] = useState(() => new Date().toISOString().slice(0,10))
-  const [calendar, setCalendar] = useState<CalendarItem[]>([])
-  const [loadingCal, setLoadingCal] = useState(false)
-  const [plan, setPlan] = useState('')
-  const [aiLoading, setAiLoading] = useState(false)
-  const [conviction, setConviction] = useState<number|null>(null)
+  const [instrument, setInstrument] = useState<Instrument>(INSTRUMENTS[0] as Instrument);
+  const [date, setDate] = useState<string>(new Date().toISOString().slice(0, 10));
+  const [planText, setPlanText] = useState<string>("");
+  const [conviction, setConviction] = useState<number | null>(null);
+  const [allLoading, setAllLoading] = useState<boolean>(false);
 
-  async function fetchCalendar() {
-    setLoadingCal(true)
-    try {
-      const res = await fetch(`/api/calendar?date=${dateStr}&currencies=${instrument.currencies.join(',')}`)
-      const json = await res.json()
-      setCalendar(json.items || [])
-    } catch (e) {
-      console.error(e)
-      setCalendar([])
-    } finally {
-      setLoadingCal(false)
-    }
-  }
-
-  useEffect(() => { fetchCalendar() }, [instrument, dateStr])
-
+  // Generate trade plan via API
   async function generatePlan() {
-    setAiLoading(true)
+    setAllLoading(true);
     try {
-      const res = await fetch('/api/plan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ instrument: instrument.code, date: dateStr, calendar })
-      })
-      const json = await res.json()
-      setPlan(json.plan?.text || '')
-      setConviction(json.plan?.conviction ?? null)
+      const res = await fetch("/api/plan", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          instrument: instrument.code,
+          date,
+          // You can attach calendar items later if you want the LLM to “see” them.
+          // calendar: <array of items>,
+        }),
+      });
+
+      const json: PlanResponse = await res.json();
+
+      // Prefer structured plan text when available; fall back to “reply”
+      const text =
+        json?.plan?.text ??
+        json?.reply ??
+        "No Trade – insufficient or unclear data.";
+      setPlanText(text);
+
+      setConviction(
+        typeof json?.plan?.conviction === "number" ? json.plan!.conviction : null
+      );
+    } catch (err) {
+      console.error(err);
+      setPlanText("Server error while generating plan.");
+      setConviction(null);
     } finally {
-      setAiLoading(false)
+      setAllLoading(false);
     }
   }
 
   function resetSession() {
-    setPlan('')
-    setConviction(null)
-    setCalendar([])
-    fetchCalendar()
+    setPlanText("");
+    setConviction(null);
   }
 
-  const calText = useMemo(() => calendar.map(i => `${i.time} ${i.currency} ${i.title}${i.impact ? ' ('+i.impact+')' : ''}${i.actual ? ' | A:'+i.actual : ''}${i.forecast ? ' F:'+i.forecast : ''}${i.previous ? ' P:'+i.previous : ''}`).join('\n'), [calendar])
-
   return (
-    <div className="container">
-      <h1>Trade Plan Assistant</h1>
-      <div className="card" style={{marginTop:12}}>
-        <div className="row" style={{gridTemplateColumns:'1fr 1fr 1fr'}}>
-          <div>
-            <div className="label">Instrument</div>
-            <select value={instrument.code} onChange={e => setInstrument(INSTRUMENTS.find(x=>x.code===e.target.value) || INSTRUMENTS[0])}>
-              {INSTRUMENTS.map(i => <option key={i.code} value={i.code}>{i.display}</option>)}
-            </select>
-          </div>
-          <div>
-            <div className="label">Date</div>
-            <input className="input" type="date" value={dateStr} onChange={e=>setDateStr(e.target.value)} />
-          </div>
-          <div>
-            <div className="label">Actions</div>
-            <div style={{display:'flex',gap:8}}>
-              <button className="button" onClick={generatePlan} disabled={aiLoading}>{aiLoading?'Generating…':'Generate Plan'}</button>
-              <button onClick={resetSession}>End Session</button>
-            </div>
-          </div>
+    <main className="mx-auto max-w-7xl p-4 space-y-6">
+      {/* Top controls */}
+      <section className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+        <div>
+          <label className="block text-sm mb-1">Instrument</label>
+          <select
+            className="w-full rounded border px-3 py-2 bg-black/20"
+            value={instrument.code}
+            onChange={(e) => {
+              const next = INSTRUMENTS.find(
+                (it: any) => it.code === e.target.value
+              ) as Instrument;
+              if (next) {
+                setInstrument(next);
+                resetSession();
+              }
+            }}
+          >
+            {INSTRUMENTS.map((it: any) => (
+              <option key={it.code} value={it.code}>
+                {it.label}
+              </option>
+            ))}
+          </select>
         </div>
-      </div>
 
-      <div style={{marginTop:12}}><TradingViewTriple symbol={instrument.tv} /></div>
-
-      <div className="card" style={{marginTop:12}}>
-        <div className="label">Calendar Snapshot (auto)</div>
-        {loadingCal ? <div className="small">Loading calendar…</div> : (
-          <pre>{calText || 'No items found (set CALENDAR_RSS_URL or paste key events manually).'}</pre>
-        )}
-        <div className="small">Tip: Server pulls from CALENDAR_RSS_URL env (RSS). We filter by: {instrument.currencies.join(', ')}.</div>
-      </div>
-
-      <div className="card" style={{marginTop:12}}>
-        <div className="label">Generated Trade Card</div>
-        <div style={{display:'flex',gap:8, alignItems:'center'}}>
-          <span className="badge">Conviction: {conviction ?? '—'}%</span>
-          <a href={`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(instrument.tv)}`} target="_blank">Open in TradingView</a>
+        <div>
+          <label className="block text-sm mb-1">Date</label>
+          <input
+            type="date"
+            className="w-full rounded border px-3 py-2 bg-black/20"
+            value={date}
+            onChange={(e) => {
+              setDate(e.target.value);
+              resetSession();
+            }}
+          />
         </div>
-        <pre style={{marginTop:8}}>{plan || 'Click Generate Plan to create an Entry/SL/TP1/TP2 + reasoning.'}</pre>
-      </div>
-    </div>
-  )
+
+        <div className="flex gap-2">
+          <button
+            className="flex-1 rounded bg-white/10 hover:bg-white/20 px-4 py-2"
+            onClick={generatePlan}
+            disabled={allLoading}
+          >
+            {allLoading ? "Generating…" : "Generate Plan"}
+          </button>
+          <button
+            className="rounded bg-white/5 hover:bg-white/15 px-4 py-2"
+            onClick={resetSession}
+          >
+            Reset
+          </button>
+        </div>
+      </section>
+
+      {/* Charts */}
+      <section>
+        <TradingViewTriple symbol={instrument.code} />
+      </section>
+
+      {/* Calendar snapshot (fetched inside the component) */}
+      <section>
+        <CalendarPanel
+          date={date}
+          currencies={instrument.currencies.join(",")}
+        />
+      </section>
+
+      {/* Generated Plan */}
+      <section className="rounded border p-4 space-y-2">
+        <div className="text-sm opacity-70">
+          Generated Trade Card
+          {typeof conviction === "number" ? (
+            <span className="ml-2">• Conviction: {conviction}%</span>
+          ) : null}
+        </div>
+
+        <pre className="whitespace-pre-wrap text-sm leading-6">
+          {planText || "Click Generate Plan to create an Entry/SL/TP1/TP2 + reasoning."}
+        </pre>
+      </section>
+    </main>
+  );
 }
