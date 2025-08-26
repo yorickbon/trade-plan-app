@@ -1,7 +1,7 @@
 // lib/prices.ts
 
 export type Candle = {
-  t: number; // epoch ms
+  t: number; // unix ms
   o: number;
   h: number;
   l: number;
@@ -9,89 +9,88 @@ export type Candle = {
   v?: number;
 };
 
-// Twelve Data REST base
 const TD_BASE = "https://api.twelvedata.com/time_series";
 
 /**
- * Map app instruments to Twelve Data symbols.
- * Add/adjust as you expand.
+ * Instruments in your UI -> Twelve Data symbols
+ * NAS100 is not available on the free tier, so we proxy it to QQQ (NASDAQ)
  */
 const SYMBOL_MAP: Record<string, string> = {
   EURUSD: "EUR/USD",
   GBPJPY: "GBP/JPY",
   XAUUSD: "XAU/USD",
-  NAS100: "NDX", // Nasdaq 100 index on Twelve Data
+  BTCUSD: "BTC/USD",
+  NAS100: "QQQ", // <- proxy for NAS100 on free plan
 };
 
-function tfToInterval(tf: "4h" | "1h" | "15m"): string {
+/** Optional exchange hints (needed for some equities/ETFs) */
+const EXCHANGE_MAP: Record<string, string> = {
+  QQQ: "NASDAQ",
+};
+
+function toTdInterval(tf: "15m" | "1h" | "4h"): string {
   if (tf === "15m") return "15min";
   if (tf === "1h") return "1h";
   return "4h";
 }
 
 /**
- * Fetch OHLC candles from Twelve Data, newest…oldest in API response.
- * We return oldest→newest (ascending time).
+ * Fetch candles from Twelve Data.
+ * @param instrument e.g. 'EURUSD', 'GBPJPY', 'XAUUSD', 'NAS100'
+ * @param tf '15m' | '1h' | '4h'
+ * @param bars number of bars to fetch (max 5000 on TD)
  */
 export default async function getCandles(
   instrument: string,
-  tf: "4h" | "1h" | "15m",
-  limit = 200
+  tf: "15m" | "1h" | "4h",
+  bars: number
 ): Promise<Candle[]> {
-  const apikey = process.env.TWELVEDATA_API_KEY;
-  if (!apikey) {
-    throw new Error("Missing TWELVEDATA_API_KEY env var");
-  }
+  const apiKey = process.env.TWELVEDATA_API_KEY;
+  if (!apiKey) throw new Error("Missing TWELVEDATA_API_KEY env var.");
 
   const symbol = SYMBOL_MAP[instrument] ?? instrument;
-  const interval = tfToInterval(tf);
+  const exchange = EXCHANGE_MAP[symbol];
+  const interval = toTdInterval(tf);
 
   const url =
-    `${TD_BASE}?` +
-    new URLSearchParams({
-      symbol,
-      interval,
-      outputsize: String(limit),
-      format: "JSON",
-      apikey,
-    }).toString();
+    `${TD_BASE}?symbol=${encodeURIComponent(symbol)}` +
+    (exchange ? `&exchange=${encodeURIComponent(exchange)}` : "") +
+    `&interval=${encodeURIComponent(interval)}` +
+    `&outputsize=${encodeURIComponent(String(bars))}` +
+    `&order=ASC&apikey=${encodeURIComponent(apiKey)}`;
 
-  const r = await fetch(url, { cache: "no-store" });
-  if (!r.ok) {
-    throw new Error(`Twelve Data HTTP ${r.status}`);
+  const res = await fetch(url, { headers: { Accept: "application/json" } });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`TwelveData HTTP ${res.status}: ${text || res.statusText}`);
   }
 
-  const json: any = await r.json();
+  const json: any = await res.json();
 
-  // Handle Twelve Data error shape
+  // Twelve Data error payload shape
   if (json?.status === "error") {
-    const msg = json?.message || "Twelve Data error";
+    const msg: string =
+      json?.message ||
+      json?.note ||
+      `TwelveData error for ${symbol} (${interval})`;
     throw new Error(msg);
   }
 
-  const rows: any[] = json?.values;
-  if (!Array.isArray(rows) || rows.length === 0) {
+  const values = json?.values;
+  if (!Array.isArray(values) || values.length === 0) {
     return [];
   }
 
-  // Map to Candle, oldest → newest
-  const candles = rows
-    .slice()
-    .reverse()
-    .map((v: any) => {
-      // Twelve Data datetime like "2025-08-26 19:15:00"
-      // Append Z to treat as UTC.
-      const t = Date.parse(v.datetime.replace(" ", "T") + "Z");
-      return {
-        t,
-        o: Number(v.open),
-        h: Number(v.high),
-        l: Number(v.low),
-        c: Number(v.close),
-        v: v.volume != null ? Number(v.volume) : undefined,
-      } as Candle;
-    })
-    .filter((c: Candle) => Number.isFinite(c.t) && Number.isFinite(c.c));
+  // Map to our Candle type (ascending order is already requested via &order=ASC)
+  const out: Candle[] = values.map((v: any) => ({
+    t: new Date(v.datetime).getTime(),
+    o: Number(v.open),
+    h: Number(v.high),
+    l: Number(v.low),
+    c: Number(v.close),
+    v: v.volume != null ? Number(v.volume) : undefined,
+  }));
 
-  return candles;
+  return out;
 }
