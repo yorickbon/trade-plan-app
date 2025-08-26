@@ -1,13 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import TradingViewTriple from "@/components/TradingViewTriple";
-import { INSTRUMENTS } from "@/lib/symbols";
-import CalendarPanel from "@/components/CalendarPanel";
+import TradingViewTriple from "../components/TradingViewTriple";
+import { INSTRUMENTS } from "../lib/symbols";
+import CalendarPanel from "../components/CalendarPanel";
 
 type Instrument = {
-  code: string;          // e.g. "EURUSD"
-  currencies: string[];  // e.g. ["EUR","USD"]
+  code: string;
+  currencies: string[];
 };
 
 type CalendarItem = {
@@ -23,7 +23,6 @@ type CalendarItem = {
 };
 
 export default function Page() {
-  // --- State ---
   const [instrument, setInstrument] = useState<Instrument>(INSTRUMENTS[0] as Instrument);
   const [dateStr, setDateStr] = useState<string>(new Date().toISOString().slice(0, 10));
 
@@ -34,7 +33,6 @@ export default function Page() {
   const [aiLoading, setAiLoading] = useState<boolean>(false);
   const [conviction, setConviction] = useState<number | null>(null);
 
-  // --- Calendar fetch ---
   async function fetchCalendar() {
     setLoadingCal(true);
     try {
@@ -53,9 +51,8 @@ export default function Page() {
 
   useEffect(() => {
     fetchCalendar();
-  }, [instrument, dateStr]); // refetch when symbol or date changes
+  }, [instrument, dateStr]);
 
-  // --- Generate plan ---
   async function generatePlan() {
     try {
       setAiLoading(true);
@@ -68,9 +65,7 @@ export default function Page() {
           calendar,
         }),
       });
-
       const json = await res.json();
-      // Accept either the structured { plan: { text, conviction } } or the earlier { reply }
       setPlanText(json?.plan?.text ?? json?.reply ?? "No response.");
       setConviction(json?.plan?.conviction ?? null);
     } catch (e) {
@@ -82,7 +77,6 @@ export default function Page() {
     }
   }
 
-  // --- Reset session ---
   function resetSession() {
     setPlanText("");
     setConviction(null);
@@ -90,12 +84,9 @@ export default function Page() {
     fetchCalendar();
   }
 
-  // --- Render ---
   return (
     <main className="p-4 space-y-6">
-      {/* Controls */}
       <div className="flex flex-wrap gap-4 items-end">
-        {/* Instrument select */}
         <div className="flex flex-col">
           <label className="text-sm text-gray-400">Instrument</label>
           <select
@@ -114,7 +105,6 @@ export default function Page() {
           </select>
         </div>
 
-        {/* Date input */}
         <div className="flex flex-col">
           <label className="text-sm text-gray-400">Date</label>
           <input
@@ -125,7 +115,6 @@ export default function Page() {
           />
         </div>
 
-        {/* Actions */}
         <div className="flex gap-3">
           <button
             onClick={generatePlan}
@@ -135,7 +124,7 @@ export default function Page() {
             {aiLoading ? "Generating..." : "Generate Plan"}
           </button>
 
-          <button
+        <button
             onClick={resetSession}
             className="rounded bg-neutral-800 hover:bg-neutral-700 px-3 py-2"
           >
@@ -144,22 +133,17 @@ export default function Page() {
         </div>
       </div>
 
-      {/* Charts */}
       <TradingViewTriple symbol={instrument.code} />
 
-      {/* Calendar */}
       <CalendarPanel items={calendar} loading={loadingCal} />
 
-      {/* Generated card */}
       <div className="p-4 border rounded bg-neutral-900 border-neutral-800">
         <h2 className="text-lg font-bold mb-2">Generated Trade Card</h2>
-
         {conviction !== null && (
           <div className="text-sm mb-2">
             Conviction: <span className="font-semibold">{conviction}%</span>
           </div>
         )}
-
         <pre className="whitespace-pre-wrap text-sm">{planText || ""}</pre>
       </div>
     </main>
