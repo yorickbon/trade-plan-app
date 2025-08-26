@@ -1,30 +1,47 @@
 // lib/prices.ts
-export type Candle = { t: number; o: number; h: number; l: number; c: number; v?: number };
 
+export type Candle = {
+  t: number; // epoch ms
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v?: number;
+};
+
+// Twelve Data REST base
 const TD_BASE = "https://api.twelvedata.com/time_series";
 
-// Map app instruments to Twelve Data symbols
+/**
+ * Map app instruments to Twelve Data symbols.
+ * Add/adjust as you expand.
+ */
 const SYMBOL_MAP: Record<string, string> = {
   EURUSD: "EUR/USD",
   GBPJPY: "GBP/JPY",
   XAUUSD: "XAU/USD",
-  BTCUSD: "BTC/USD",
-  NAS100: "NDX", // or "Nasdaq 100" depending on your plan/symbol list
+  NAS100: "NDX", // Nasdaq 100 index on Twelve Data
 };
 
-function tfToInterval(tf: "15m" | "1h" | "4h") {
+function tfToInterval(tf: "4h" | "1h" | "15m"): string {
   if (tf === "15m") return "15min";
   if (tf === "1h") return "1h";
   return "4h";
 }
 
-export async function getCandles(
+/**
+ * Fetch OHLC candles from Twelve Data, newest…oldest in API response.
+ * We return oldest→newest (ascending time).
+ */
+export default async function getCandles(
   instrument: string,
-  tf: "15m" | "1h" | "4h",
-  bars: number
+  tf: "4h" | "1h" | "15m",
+  limit = 200
 ): Promise<Candle[]> {
   const apikey = process.env.TWELVEDATA_API_KEY;
-  if (!apikey) throw new Error("Missing TWELVEDATA_API_KEY env");
+  if (!apikey) {
+    throw new Error("Missing TWELVEDATA_API_KEY env var");
+  }
 
   const symbol = SYMBOL_MAP[instrument] ?? instrument;
   const interval = tfToInterval(tf);
@@ -34,46 +51,47 @@ export async function getCandles(
     new URLSearchParams({
       symbol,
       interval,
-      outputsize: String(bars),
-      apikey,
-      order: "ASC",     // oldest→newest
+      outputsize: String(limit),
       format: "JSON",
-    });
+      apikey,
+    }).toString();
 
-  let res: Response;
-  try {
-    res = await fetch(url);
-  } catch (err: any) {
-    throw new Error(`fetch failed: ${err?.message || String(err)}`);
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) {
+    throw new Error(`Twelve Data HTTP ${r.status}`);
   }
 
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`TwelveData HTTP ${res.status}: ${txt.slice(0, 300)}`);
-  }
+  const json: any = await r.json();
 
-  let json: any;
-  try {
-    json = await res.json();
-  } catch (err: any) {
-    throw new Error(`twelvedata json parse error: ${err?.message || String(err)}`);
-  }
-
-  // TwelveData error payload?
+  // Handle Twelve Data error shape
   if (json?.status === "error") {
-    throw new Error(`twelvedata error: ${json?.message || "unknown"}`);
+    const msg = json?.message || "Twelve Data error";
+    throw new Error(msg);
   }
 
-  if (!json?.values || !Array.isArray(json.values)) {
-    throw new Error(`twelvedata unexpected payload: ${JSON.stringify(json).slice(0, 300)}`);
+  const rows: any[] = json?.values;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return [];
   }
 
-  // Convert to our candle format
-  return json.values.map((v: any) => ({
-    t: Math.floor(new Date(v.datetime).getTime() / 1000),
-    o: Number(v.open),
-    h: Number(v.high),
-    l: Number(v.low),
-    c: Number(v.close),
-  }));
+  // Map to Candle, oldest → newest
+  const candles = rows
+    .slice()
+    .reverse()
+    .map((v: any) => {
+      // Twelve Data datetime like "2025-08-26 19:15:00"
+      // Append Z to treat as UTC.
+      const t = Date.parse(v.datetime.replace(" ", "T") + "Z");
+      return {
+        t,
+        o: Number(v.open),
+        h: Number(v.high),
+        l: Number(v.low),
+        c: Number(v.close),
+        v: v.volume != null ? Number(v.volume) : undefined,
+      } as Candle;
+    })
+    .filter((c: Candle) => Number.isFinite(c.t) && Number.isFinite(c.c));
+
+  return candles;
 }
