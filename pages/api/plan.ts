@@ -1,56 +1,78 @@
 // pages/api/plan.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
+import { getCandles } from "@/lib/prices"; // <-- keep this path
 
-// ✅ Fixed relative import (no tsconfig alias)
-import { getCandles } from "../../lib/prices";
-
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY!,
-});
+// Helper to safely read envs
+const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
+const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  let stage = "start";
   try {
-    const { instrument, date } = req.body as { instrument: string; date: string };
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "Method Not Allowed" });
+    }
 
-    // 1. Fetch live candles
+    const { instrument, date, debug } = (req.body || {}) as {
+      instrument?: string; date?: string; debug?: boolean;
+    };
+    if (!instrument) return res.status(400).json({ error: "Missing instrument" });
+
+    stage = "fetch-candles";
     const [c4h, c1h, c15] = await Promise.all([
       getCandles(instrument, "4h", 200),
       getCandles(instrument, "1h", 200),
       getCandles(instrument, "15m", 200),
     ]);
 
-    const price = c15.at(-1)?.c ?? 0;
+    const last = c15.at(-1);
+    if (!last) {
+      return res.status(200).json({ stage, note: "No candles returned", instrument, c15len: c15.length });
+    }
 
-    // 2. Build trade context for GPT
+    const price = last.c;
+
+    // If debug flag is true, stop here to confirm TwelveData works end-to-end
+    if (debug) {
+      return res.status(200).json({
+        stage,
+        ok: true,
+        instrument,
+        price,
+        lens: { h4: c4h.length, h1: c1h.length, m15: c15.length },
+        sample: { last15m: last }
+      });
+    }
+
+    // ---------- OpenAI step ----------
+    stage = "openai-init";
+    if (!OPENAI_KEY) {
+      return res.status(200).json({ stage, error: "Missing OPENAI_API_KEY", note: "Set it in Vercel env & redeploy." });
+    }
+    const client = new OpenAI({ apiKey: OPENAI_KEY });
+
+    const system = `
+You are a trading assistant. Use the live data provided.
+- Anchor levels around current price within ±2%.
+- SL beyond a recent swing; TP at logical structure.
+- If unclear, output "No Trade".
+Return: Type, Direction, Entry, Stop, TP1, TP2, Conviction %, brief rationale.
+    `;
+
     const user = {
-      instrument,
-      date,
+      instrument, date,
       current_price: price,
       candles: {
-        "4h": c4h.slice(-20),   // last 20 4H candles
-        "1h": c1h.slice(-20),   // last 20 1H candles
-        "15m": c15.slice(-20),  // last 20 15m candles
+        "4h": c4h.slice(-20),
+        "1h": c1h.slice(-20),
+        "15m": c15.slice(-20),
       },
     };
 
-    // 3. System prompt (rules)
-    const system = `
-You are a trading assistant. 
-You MUST base every level on the live data provided.
-Rules:
-- Use the current price exactly as an anchor.
-- All levels (Entry/SL/TP) must stay within ±2% of current price.
-- Stop Loss must be placed beyond a recent swing or logical structure level.
-- Take Profits must align with structure/liquidity (e.g., swing high/low).
-- If data is unclear, output "No Trade".
-Return a clear trade card with:
-Type, Direction, Entry, Stop, TP1, TP2, Conviction %, and 1–2 sentence rationale.
-    `;
-
-    // 4. Call GPT
+    stage = "openai-call";
     const rsp = await client.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      model: MODEL,
       messages: [
         { role: "system", content: system },
         { role: "user", content: JSON.stringify(user) },
@@ -58,27 +80,26 @@ Type, Direction, Entry, Stop, TP1, TP2, Conviction %, and 1–2 sentence rationa
       temperature: 0.2,
     });
 
+    stage = "openai-parse";
     const text = rsp.choices[0]?.message?.content ?? "No response";
 
-    // 5. Sanity filter: reject absurd levels
+    // sanity check: keep levels near price
     const nums = [...text.matchAll(/(\d+\.\d+)/g)].map(m => Number(m[1]));
-    const limit = price * 0.02; // ±2%
+    const limit = price * 0.02;
     const bad = nums.some(n => Math.abs(n - price) > limit);
-
     if (bad) {
       return res.status(200).json({
+        stage,
         text: `No Trade – generated levels were unrealistic vs live price (${price}).`,
         conviction: 0,
       });
     }
 
-    // 6. Return result
-    res.status(200).json({
-      text,
-      conviction: 70, // default, can later scale with logic
-    });
+    return res.status(200).json({ stage: "done", text, conviction: 70, price });
 
   } catch (e: any) {
-    res.status(500).json({ error: e.message || "server error" });
+    // Surface the real error so we can fix fast
+    const msg = e?.message || String(e);
+    return res.status(500).json({ error: msg, stage });
   }
 }
