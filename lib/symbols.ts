@@ -1,8 +1,14 @@
-export type Instrument = { code: string, display: string, tv: string, currencies: string[] }
+// lib/symbols.ts
+
+export type Instrument = {
+  code: string;          // e.g. "EURUSD"
+  currencies: string[];  // e.g. ["EUR","USD"]
+  label?: string;        // optional UI label, e.g. "EUR/USD"
+};
 
 export const INSTRUMENTS: Instrument[] = [
-  { code: 'EURUSD', display: 'EURUSD', tv: 'FX:EURUSD', currencies: ['EUR','USD'] },
-  { code: 'GBPJPY', display: 'GBPJPY', tv: 'FX:GBPJPY', currencies: ['GBP','JPY'] },
-  { code: 'XAUUSD', display: 'XAUUSD (Gold)', tv: 'FX_IDC:XAUUSD', currencies: ['USD'] },
-  { code: 'NAS100', display: 'NAS100 (Nasdaq 100)', tv: 'NASDAQ:NDX', currencies: ['USD'] },
-]
+  { code: "EURUSD", currencies: ["EUR", "USD"], label: "EUR/USD" },
+  { code: "GBPJPY", currencies: ["GBP", "JPY"], label: "GBP/JPY" },
+  { code: "XAUUSD", currencies: ["USD"], label: "Gold (XAUUSD)" },
+  { code: "NDX", currencies: ["USD"], label: "Nasdaq 100 (NDX)" }, // your NAS100 fallback
+];
