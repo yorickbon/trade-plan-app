@@ -2,16 +2,12 @@
 
 import { useEffect, useState } from "react";
 import TradingViewTriple from "../components/TradingViewTriple";
-import { INSTRUMENTS } from "../lib/symbols";
 import CalendarPanel from "../components/CalendarPanel";
-
-type Instrument = {
-  code: string;            // e.g. "EURUSD"
-  currencies: string[];    // e.g. ["EUR","USD"]
-};
+import { INSTRUMENTS, type Instrument } from "../lib/symbols";
 
 type CalendarItem = {
   date: string;
+  time: string;
   country: string;
   currency: string;
   impact: string;
@@ -23,18 +19,24 @@ type CalendarItem = {
 
 export default function Page() {
   const [instrument, setInstrument] = useState<Instrument>(INSTRUMENTS[0]);
-  const [datestr, setDatestr] = useState<string>(new Date().toISOString().slice(0, 10));
+  const [dateStr, setDateStr] = useState<string>(
+    new Date().toISOString().slice(0, 10)
+  );
+
   const [calendar, setCalendar] = useState<CalendarItem[]>([]);
   const [loadingCal, setLoadingCal] = useState(false);
-  const [planText, setPlanText] = useState<string>("");
-  const [aiLoading, setAILoading] = useState(false);
+
+  const [planText, setPlanText] = useState("");
+  const [loading, setLoading] = useState(false);
   const [conviction, setConviction] = useState<number | null>(null);
 
   async function fetchCalendar() {
     setLoadingCal(true);
     try {
       const res = await fetch(
-        `/api/calendar?date=${datestr}&currencies=${instrument.currencies.join(",")}`
+        `/api/calendar?date=${dateStr}&currencies=${instrument.currencies.join(
+          ","
+        )}`
       );
       const json = await res.json();
       setCalendar(json.items || []);
@@ -48,27 +50,29 @@ export default function Page() {
 
   useEffect(() => {
     fetchCalendar();
-  }, [instrument, datestr]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [instrument, dateStr]);
 
   async function generatePlan() {
-    setAILoading(true);
+    setLoading(true);
     try {
       const res = await fetch("/api/plan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           instrument: instrument.code,
-          date: datestr,
+          date: dateStr,
           calendar,
         }),
       });
+
       const json = await res.json();
-      setPlanText(json.plan.text || "");
-      setConviction(json.plan.conviction ?? null);
+      setPlanText(json.plan?.text || "");
+      setConviction(json.plan?.conviction ?? null);
     } catch (e) {
       console.error(e);
     } finally {
-      setAILoading(false);
+      setLoading(false);
     }
   }
 
@@ -80,60 +84,69 @@ export default function Page() {
   }
 
   return (
-    <div className="p-4 space-y-4">
-      <div className="flex space-x-2">
-        <select
-          className="border p-2"
-          value={instrument.code}
-          onChange={(e) =>
-            setInstrument(INSTRUMENTS.find((it) => it.code === e.target.value)!)
-          }
-        >
-          {INSTRUMENTS.map((it) => (
-            <option key={it.code} value={it.code}>
-              {it.code}
-            </option>
-          ))}
-        </select>
+    <main className="mx-auto max-w-6xl p-4 space-y-4">
+      {/* Controls */}
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="flex flex-col">
+          <label className="text-sm text-gray-400">Instrument</label>
+          <select
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+            value={instrument.code}
+            onChange={(e) => {
+              const next = INSTRUMENTS.find((x) => x.code === e.target.value)!;
+              setInstrument(next);
+            }}
+          >
+            {INSTRUMENTS.map((i) => (
+              <option key={i.code} value={i.code}>
+                {i.label ?? i.code}
+              </option>
+            ))}
+          </select>
+        </div>
 
-        <input
-          type="date"
-          className="border p-2"
-          value={datestr}
-          onChange={(e) => setDatestr(e.target.value)}
-        />
+        <div className="flex flex-col">
+          <label className="text-sm text-gray-400">Date</label>
+          <input
+            type="date"
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1"
+            value={dateStr}
+            onChange={(e) => setDateStr(e.target.value)}
+          />
+        </div>
 
         <button
           onClick={generatePlan}
-          className="bg-blue-600 text-white px-4 py-2 rounded"
-          disabled={aiLoading}
+          disabled={loading}
+          className="rounded bg-blue-600 hover:bg-blue-500 px-3 py-2 disabled:opacity-50"
         >
-          {aiLoading ? "Generating…" : "Generate Plan"}
+          {loading ? "Generating…" : "Generate Plan"}
         </button>
 
         <button
           onClick={resetSession}
-          className="bg-gray-500 text-white px-4 py-2 rounded"
+          className="rounded bg-neutral-800 hover:bg-neutral-700 px-3 py-2"
         >
           Reset
         </button>
       </div>
 
+      {/* Charts */}
       <TradingViewTriple symbol={instrument.code} />
 
+      {/* Calendar */}
       <CalendarPanel items={calendar} loading={loadingCal} />
 
-      <div className="p-4 border rounded bg-white">
+      {/* Generated card */}
+      <div className="p-4 border rounded bg-neutral-900 border-neutral-800">
         <h2 className="text-lg font-bold mb-2">Generated Trade Card</h2>
-        {planText ? (
-          <pre className="whitespace-pre-wrap">{planText}</pre>
-        ) : (
-          <p className="text-gray-500">Click Generate Plan to create one.</p>
-        )}
         {conviction !== null && (
-          <p className="mt-2">Conviction: {conviction}%</p>
+          <div className="text-sm mb-2">
+            Conviction: <span className="font-semibold">{conviction}%</span>
+          </div>
         )}
+        <pre className="whitespace-pre-wrap text-sm">{planText || "—"}</pre>
       </div>
-    </div>
+    </main>
   );
 }
