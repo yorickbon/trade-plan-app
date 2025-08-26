@@ -1,161 +1,95 @@
 // pages/api/plan.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
-import getCandles from "../../lib/prices";
+import getCandles, { Candle } from "../../lib/prices";
 
-type Candle = { datetime: string; open: number; high: number; low: number; close: number };
+type CalItem = {
+  date: string;
+  currency: string;
+  impact: string;
+  title: string;
+  country?: string;
+};
+type NewsItem = { title: string; url: string; source: string; publishedAt: string };
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// --- helpers ---
-function parseCurrencies(code: string): string[] {
-  const m = code.match(/^([A-Z]{3})([A-Z]{3})$/);
-  if (!m) return [];
-  return [m[1], m[2]];
-}
-
-function anyHighImpactSoon(calendar: any[], minutes = 90): boolean {
-  const now = Date.now();
-  const horizon = now + minutes * 60 * 1000;
-  return (calendar || []).some((ev: any) => {
-    if (!ev?.time || !ev?.impact) return false;
-    const t = new Date(ev.time).getTime();
-    return ev.impact?.toLowerCase() === "high" && t >= now && t <= horizon;
-  });
-}
-
-function fmtHeadlinesForPrompt(items: { title: string; source: string; published_at: string }[]) {
-  if (!items?.length) return "None in the last window.";
-  return items
-    .map(
-      (h) =>
-        `• ${h.title} — ${h.source} (${new Date(h.published_at).toISOString().slice(0, 16).replace("T", " ")})`
-    )
-    .join("\n");
-}
-
-async function getHeadlines(query: string): Promise<{ title: string; source: string; url: string; published_at: string }[]> {
-  const provider = (process.env.NEWS_API_PROVIDER || "").toLowerCase();
-  const apiKey = process.env.NEWS_API_KEY || "";
-  const lang = process.env.HEADLINES_LANG || "en";
-  const hours = parseInt(process.env.HEADLINES_SINCE_HOURS || "48", 10);
-  const limit = parseInt(process.env.HEADLINES_MAX || "8", 10);
-
-  if (!provider || !apiKey) return [];
-
-  const sinceIso = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
-
-  if (provider === "newsdata") {
-    const url = new URL("https://newsdata.io/api/1/news");
-    url.searchParams.set("apikey", apiKey);
-    url.searchParams.set("q", query);
-    url.searchParams.set("language", lang);
-    url.searchParams.set("category", "business,politics,world");
-    url.searchParams.set("page", "1");
-
-    try {
-      const r = await fetch(url.toString(), { timeout: 20_000 as any });
-      if (!r.ok) return [];
-      const data = await r.json();
-      const raw = Array.isArray(data?.results) ? data.results : [];
-      return raw
-        .map((it: any) => ({
-          title: String(it?.title || "").trim(),
-          source: String(it?.source_id || it?.source || "Unknown"),
-          url: String(it?.link || it?.url || "#"),
-          published_at: new Date(it?.pubDate || it?.pub_date || Date.now()).toISOString(),
-        }))
-        .filter((h: any) => new Date(h.published_at).getTime() >= new Date(sinceIso).getTime())
-        .slice(0, limit);
-    } catch {
-      return [];
-    }
-  }
-
-  return [];
-}
-
-function lastClose(arr: Candle[] | null | undefined): number | null {
-  if (!Array.isArray(arr) || arr.length === 0) return null;
-  return Number(arr[arr.length - 1]?.close ?? null);
+function fmtC(c: Candle) {
+  // keep both formats for safety
+  const close = (c as any).close ?? (c as any).c ?? 0;
+  return { t: c.datetime ?? (c as any).t, o: c.open ?? (c as any).o, h: c.high ?? (c as any).h, l: c.low ?? (c as any).l, c: close };
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
-    const { instrument, date, calendar = [] } = req.body as {
-      instrument: string; // e.g., "EURUSD"
-      date: string;       // "YYYY-MM-DD"
-      calendar?: any[];
-    };
+    const { instrument, date, debug } = (typeof req.body === "string" ? JSON.parse(req.body) : req.body) || {};
+    if (!instrument || !date) return res.status(400).json({ error: "instrument and date are required" });
 
-    if (!instrument || !date) {
-      return res.status(400).json({ error: "instrument and date are required" });
-    }
-
-    // 1) Fetch live candles (structure context)
+    // 1) Candles (4h, 1h, 15m) — the 15m key must be "15m"
     const [h4, h1, m15] = await Promise.all([
       getCandles(instrument, "4h", 200),
       getCandles(instrument, "1h", 200),
       getCandles(instrument, "15m", 200),
     ]);
 
-    const price = lastClose(m15) ?? lastClose(h1) ?? lastClose(h4) ?? 0;
+    const c15 = Array.isArray(m15) && m15.length ? fmtC(m15[m15.length - 1]) : null;
+    const currentPrice = c15 ? c15.c : 0;
 
-    // 2) News blackout guard (90m) using provided calendar (client fetches /api/calendar)
-    if (anyHighImpactSoon(calendar, 90)) {
-      return res.status(200).json({
-        instrument,
-        date,
-        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-        reply: "No Trade.",
-        reason: "High-impact event in the next 90 minutes.",
-        plan: { text: "", conviction: null, fundamentals: { calendarSummary: "", headlines: [] } },
-      });
-    }
+    // 2) News blackout (±90 min) from Calendar panel
+    // Fetch Calendar + Headlines on server so GPT has fundamentals context
+    const calUrl = `${process.env.NEXT_PUBLIC_BASE_URL || ""}/api/calendar?date=${encodeURIComponent(
+      date
+    )}&currencies=${encodeURIComponent(instrument.slice(0, 3) + "," + instrument.slice(3))}`;
+    const newsUrl = `${process.env.NEXT_PUBLIC_BASE_URL || ""}/api/news?q=${encodeURIComponent(instrument)}`;
 
-    // 3) Headlines (last 48h)
-    const currencies = parseCurrencies(instrument);
-    const q = currencies.length ? currencies.join(" OR ") : instrument;
-    const headlines = await getHeadlines(q);
+    const [calRsp, newsRsp] = await Promise.all([fetch(calUrl), fetch(newsUrl)]);
+    const calJson = calRsp.ok ? await calRsp.json() : { items: [] as CalItem[] };
+    const newsJson = newsRsp.ok ? await newsRsp.json() : { items: [] as NewsItem[] };
 
-    // 4) Build GPT system prompt
-    const system = [
-      "You are a senior FX trader.",
-      "Craft **one** precise trade setup using ONLY the candles provided.",
-      "Hard rules:",
-      "- Use the current price as anchor; levels must be realistic and near recent structure.",
-      "- Output *one* of {Pullback, BOS/Breakout, Range Fade, Reversal}.",
-      "- Provide: Type, Direction, Entry, Stop, TP1, TP2, Conviction%, Reasoning.",
-      "- Add 'Timeframe Alignment' note (4H vs 1H vs 15m).",
-      "- Add 'Invalidation Notes' (exactly what breaks the idea).",
-      "- If information is unclear: reply 'No Trade'.",
-      "",
-      "Calendar (filtered for this instrument's currencies):",
-      Array.isArray(calendar) && calendar.length
-        ? calendar
-            .slice(0, 6)
-            .map((ev: any) => `• ${ev.time} ${ev.country} ${ev.title} (impact: ${ev.impact || "n/a"})`)
-            .join("\n")
-        : "• None found.",
-      "",
-      "Recent headlines (last window):",
-      fmtHeadlinesForPrompt(headlines),
-      "",
-      "Incorporate fundamentals ONLY if materially relevant (CB policy, CPI, jobs, geopolitics). If headlines conflict with the tech setup, lower conviction and note it."
-    ].join("\n");
+    const calendarItems: CalItem[] = Array.isArray(calJson.items) ? calJson.items : [];
+    const headlines: NewsItem[] = Array.isArray(newsJson.items) ? newsJson.items.slice(0, 6) : [];
 
-    const user = {
+    // 3) System prompt — strict format with proper Setup/Type
+    const system = `
+You are a trading assistant. Use ONLY the live data provided.
+Return a concise trade card in markdown.
+
+Rules:
+- Use the current 15m price exactly.
+- Identify **Setup** from this controlled list only:
+  ["Breakout/BOS","Pullback","Range Play","Trend Continuation","Reversal","Liquidity Grab","Fibonacci Pullback"]
+- Direction must be "Buy" or "Sell".
+- Entry must be a precise level (price). Stops beyond logical swing/structure/liquidity. TP1 conservative, TP2 stretch.
+- Add "Timeframe Alignment" comment (do H4/H1/15m agree? If not, say so and lower conviction).
+- Add "Invalidation Notes" (what change kills the idea).
+- Use Calendar and Headlines for **fundamental bias** and to warn about risks. If empty, state "No calendar/headlines of note."
+- Output fields (exact keys): Instrument, Setup, Direction, Entry, Stop, TP1, TP2, Conviction %, Reasoning, Timeframe Alignment, Invalidation Notes, Headlines Considered.
+- Keep it tight—no fluff.`.trim();
+
+    // 4) Build model context
+    const context = {
       instrument,
       date,
-      currentPrice: price,
+      currentPrice,
       candles: {
-        h4: h4?.slice(-200) ?? [],
-        h1: h1?.slice(-200) ?? [],
-        m15: m15?.slice(-200) ?? [],
+        h4: h4.slice(-120).map(fmtC),
+        h1: h1.slice(-120).map(fmtC),
+        m15: m15.slice(-120).map(fmtC),
       },
+      calendar: calendarItems.map((i) => ({
+        time: i.date,
+        currency: i.currency,
+        impact: i.impact,
+        title: i.title,
+        country: i.country ?? "",
+      })),
+      headlines: headlines.map((h) => ({
+        title: h.title,
+        source: h.source,
+        time: h.publishedAt,
+      })),
     };
 
-    // 5) Call GPT
     const rsp = await client.chat.completions.create({
       model: process.env.OPENAI_MODEL || "gpt-4o-mini",
       temperature: 0.2,
@@ -164,33 +98,30 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         {
           role: "user",
           content:
-            "Return a clean trade card in plain text. Keep numbers to typical market precision (pips). If no trade, say 'No Trade'.",
+            "Produce the trade card. Use markdown with bullet-like key:value pairs. Be precise with levels.",
         },
-        { role: "user", content: JSON.stringify(user) },
+        { role: "user", content: JSON.stringify(context) },
       ],
     });
 
-    const text = rsp.choices?.[0]?.message?.content?.trim() || "No Trade.";
-    // simple conviction parse if present like "Conviction %: 75%"
-    const cvMatch = text.match(/Conviction\s*%?:\s*(\d+)%/i);
-    const conviction = cvMatch ? Number(cvMatch[1]) : null;
+    const text = rsp.choices[0]?.message?.content?.trim() || "No plan.";
+    const conviction = (() => {
+      const m = text.match(/Conviction\s*%:\s*([0-9]+)%/i);
+      return m ? Number(m[1]) : null;
+    })();
 
     return res.status(200).json({
       instrument,
       date,
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-      reply: text,
-      plan: {
-        text,
-        conviction,
-        fundamentals: {
-          calendarSummary: Array.isArray(calendar) ? `${calendar.length} item(s)` : "0",
-          headlines: headlines.slice(0, 8),
-        },
+      plan: { text, conviction },
+      used: {
+        hasCalendar: calendarItems.length,
+        headlines: headlines.length,
       },
+      debug: debug ? context : undefined,
     });
   } catch (err: any) {
     console.error(err);
-    return res.status(500).json({ error: "Server error" });
+    return res.status(500).json({ error: err?.message || "Server error" });
   }
 }
