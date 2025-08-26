@@ -1,167 +1,196 @@
-// /pages/api/plan.ts
+// pages/api/plan.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
 import getCandles from "../../lib/prices";
 
-// Permissive candle shape to satisfy various feeds
-type Candle = {
-  c?: number;      // close (most feeds we used)
-  close?: number;  // some feeds use "close"
-  o?: number;
-  h?: number;
-  l?: number;
-  t?: string | number;
-  time?: string | number;
-};
+type Candle = { datetime: string; open: number; high: number; low: number; close: number };
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-type Instrument = {
-  code: string;                // e.g., "EURUSD"
-  currencies?: string[];       // e.g., ["EUR","USD"]
-  label?: string;
-};
+// --- helpers ---
+function parseCurrencies(code: string): string[] {
+  const m = code.match(/^([A-Z]{3})([A-Z]{3})$/);
+  if (!m) return [];
+  return [m[1], m[2]];
+}
 
-type CalendarItem = {
-  date: string;
-  time?: string;
-  country?: string;
-  currency?: string;
-  impact?: string;   // "High" | "Medium" | "Low" etc
-  title?: string;
-  actual?: string;
-  forecast?: string;
-  previous?: string;
-};
+function anyHighImpactSoon(calendar: any[], minutes = 90): boolean {
+  const now = Date.now();
+  const horizon = now + minutes * 60 * 1000;
+  return (calendar || []).some((ev: any) => {
+    if (!ev?.time || !ev?.impact) return false;
+    const t = new Date(ev.time).getTime();
+    return ev.impact?.toLowerCase() === "high" && t >= now && t <= horizon;
+  });
+}
 
-type PlanResponse = {
-  instrument: string;
-  date: string;
-  model: string;
-  plan: { text: string; conviction?: number | null };
-  calendarUsed?: { highCount: number; mediumCount: number; itemsPreview: string[] };
-  debug?: any;
-};
+function fmtHeadlinesForPrompt(items: { title: string; source: string; published_at: string }[]) {
+  if (!items?.length) return "None in the last window.";
+  return items
+    .map(
+      (h) =>
+        `• ${h.title} — ${h.source} (${new Date(h.published_at).toISOString().slice(0, 16).replace("T", " ")})`
+    )
+    .join("\n");
+}
 
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse<PlanResponse | { error: string }>
-) {
-  if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+async function getHeadlines(query: string): Promise<{ title: string; source: string; url: string; published_at: string }[]> {
+  const provider = (process.env.NEWS_API_PROVIDER || "").toLowerCase();
+  const apiKey = process.env.NEWS_API_KEY || "";
+  const lang = process.env.HEADLINES_LANG || "en";
+  const hours = parseInt(process.env.HEADLINES_SINCE_HOURS || "48", 10);
+  const limit = parseInt(process.env.HEADLINES_MAX || "8", 10);
 
+  if (!provider || !apiKey) return [];
+
+  const sinceIso = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+
+  if (provider === "newsdata") {
+    const url = new URL("https://newsdata.io/api/1/news");
+    url.searchParams.set("apikey", apiKey);
+    url.searchParams.set("q", query);
+    url.searchParams.set("language", lang);
+    url.searchParams.set("category", "business,politics,world");
+    url.searchParams.set("page", "1");
+
+    try {
+      const r = await fetch(url.toString(), { timeout: 20_000 as any });
+      if (!r.ok) return [];
+      const data = await r.json();
+      const raw = Array.isArray(data?.results) ? data.results : [];
+      return raw
+        .map((it: any) => ({
+          title: String(it?.title || "").trim(),
+          source: String(it?.source_id || it?.source || "Unknown"),
+          url: String(it?.link || it?.url || "#"),
+          published_at: new Date(it?.pubDate || it?.pub_date || Date.now()).toISOString(),
+        }))
+        .filter((h: any) => new Date(h.published_at).getTime() >= new Date(sinceIso).getTime())
+        .slice(0, limit);
+    } catch {
+      return [];
+    }
+  }
+
+  return [];
+}
+
+function lastClose(arr: Candle[] | null | undefined): number | null {
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+  return Number(arr[arr.length - 1]?.close ?? null);
+}
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
-    const {
+    const { instrument, date, calendar = [] } = req.body as {
+      instrument: string; // e.g., "EURUSD"
+      date: string;       // "YYYY-MM-DD"
+      calendar?: any[];
+    };
+
+    if (!instrument || !date) {
+      return res.status(400).json({ error: "instrument and date are required" });
+    }
+
+    // 1) Fetch live candles (structure context)
+    const [h4, h1, m15] = await Promise.all([
+      getCandles(instrument, "4h", 200),
+      getCandles(instrument, "1h", 200),
+      getCandles(instrument, "15m", 200),
+    ]);
+
+    const price = lastClose(m15) ?? lastClose(h1) ?? lastClose(h4) ?? 0;
+
+    // 2) News blackout guard (90m) using provided calendar (client fetches /api/calendar)
+    if (anyHighImpactSoon(calendar, 90)) {
+      return res.status(200).json({
+        instrument,
+        date,
+        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+        reply: "No Trade.",
+        reason: "High-impact event in the next 90 minutes.",
+        plan: { text: "", conviction: null, fundamentals: { calendarSummary: "", headlines: [] } },
+      });
+    }
+
+    // 3) Headlines (last 48h)
+    const currencies = parseCurrencies(instrument);
+    const q = currencies.length ? currencies.join(" OR ") : instrument;
+    const headlines = await getHeadlines(q);
+
+    // 4) Build GPT system prompt
+    const system = [
+      "You are a senior FX trader.",
+      "Craft **one** precise trade setup using ONLY the candles provided.",
+      "Hard rules:",
+      "- Use the current price as anchor; levels must be realistic and near recent structure.",
+      "- Output *one* of {Pullback, BOS/Breakout, Range Fade, Reversal}.",
+      "- Provide: Type, Direction, Entry, Stop, TP1, TP2, Conviction%, Reasoning.",
+      "- Add 'Timeframe Alignment' note (4H vs 1H vs 15m).",
+      "- Add 'Invalidation Notes' (exactly what breaks the idea).",
+      "- If information is unclear: reply 'No Trade'.",
+      "",
+      "Calendar (filtered for this instrument's currencies):",
+      Array.isArray(calendar) && calendar.length
+        ? calendar
+            .slice(0, 6)
+            .map((ev: any) => `• ${ev.time} ${ev.country} ${ev.title} (impact: ${ev.impact || "n/a"})`)
+            .join("\n")
+        : "• None found.",
+      "",
+      "Recent headlines (last window):",
+      fmtHeadlinesForPrompt(headlines),
+      "",
+      "Incorporate fundamentals ONLY if materially relevant (CB policy, CPI, jobs, geopolitics). If headlines conflict with the tech setup, lower conviction and note it."
+    ].join("\n");
+
+    const user = {
       instrument,
       date,
-      calendar = [] as CalendarItem[],
-      model: modelOverride,
-      debug = false,
-    } = (typeof req.body === "string" ? JSON.parse(req.body) : req.body) as {
-      instrument: Instrument | string;
-      date: string;
-      calendar?: CalendarItem[];
-      model?: string;
-      debug?: boolean;
-    };
-
-    if (!instrument || !date) return res.status(400).json({ error: "Missing instrument or date" });
-
-    const symbol = typeof instrument === "string" ? instrument : (instrument as Instrument).code;
-    if (!symbol) return res.status(400).json({ error: "Invalid instrument" });
-
-    // ---- Fetch candles (cast to permissive Candle[]) ----
-    const [h4, h1, m15] = (await Promise.all([
-      getCandles(symbol, "4h", 200),
-      getCandles(symbol, "1h", 200),
-      getCandles(symbol, "15m", 200),
-    ])) as [Candle[] | any, Candle[] | any, Candle[] | any];
-
-    const h4Arr = (Array.isArray(h4) ? h4 : []) as Candle[];
-    const h1Arr = (Array.isArray(h1) ? h1 : []) as Candle[];
-    const m15Arr = (Array.isArray(m15) ? m15 : []) as Candle[];
-
-    const last: Candle | undefined = m15Arr.length ? m15Arr[m15Arr.length - 1] : undefined;
-    const currentPrice: number = (last?.c ?? last?.close ?? 0) as number;
-
-    // ---- Calendar caution counts ----
-    const highCount = calendar.filter((it) => (it.impact || "").toLowerCase().includes("high")).length;
-    const mediumCount = calendar.filter((it) => (it.impact || "").toLowerCase().includes("medium")).length;
-
-    const itemsPreview = calendar.slice(0, 6).map((it) => {
-      const dt = (it.date || "") + (it.time ? ` ${it.time}` : "");
-      const tag = [it.country || it.currency || "", it.impact || ""].filter(Boolean).join(" • ");
-      return `${dt} — ${tag} — ${it.title || ""}`.trim();
-    });
-
-    const model = modelOverride || process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-    const system = `
-You are a trading assistant. Use ONLY the data provided below.
-
-Rules:
-- Use the provided current price exactly.
-- Output a concise trade card with: Type, Direction, Entry, Stop, TP1, TP2, Conviction %, and 1–2 sentence reasoning.
-- Include **Timeframe Alignment** (4H/1H/15M): do they align? If not, how does this affect conviction?
-- Include **Invalidation Notes**: the clear condition that kills the setup (level/structure breach).
-- Risk: Stops beyond structure; TPs aligned to recent structure/liquidity.
-- If there are High-impact events coming, lower conviction and add a one-line caution.
-- If unclear, return "No Trade." with 0% conviction.`;
-
-    const ctx = {
-      instrument: symbol,
-      date,
-      currentPrice,
+      currentPrice: price,
       candles: {
-        "4h": h4Arr.slice(-20),
-        "1h": h1Arr.slice(-20),
-        "15m": m15Arr.slice(-20),
-      },
-      calendar: {
-        counts: { high: highCount, medium: mediumCount },
-        itemsPreview,
+        h4: h4?.slice(-200) ?? [],
+        h1: h1?.slice(-200) ?? [],
+        m15: m15?.slice(-200) ?? [],
       },
     };
 
-    const user = `
-INSTRUMENT: ${symbol}
-DATE: ${date}
-PRICE: ${currentPrice}
-
-CANDLES (most recent last; truncated to 20):
-4H: ${JSON.stringify(ctx.candles["4h"])}
-1H: ${JSON.stringify(ctx.candles["1h"])}
-15M: ${JSON.stringify(ctx.candles["15m"])}
-
-ECON CALENDAR COUNTS: High=${highCount}, Medium=${mediumCount}
-ECON PREVIEW: ${itemsPreview.length ? itemsPreview.join(" | ") : "None"}
-
-Return the trade card as per rules.`;
-
+    // 5) Call GPT
     const rsp = await client.chat.completions.create({
-      model,
+      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      temperature: 0.2,
       messages: [
-        { role: "system", content: system.trim() },
-        { role: "user", content: user.trim() },
+        { role: "system", content: system },
+        {
+          role: "user",
+          content:
+            "Return a clean trade card in plain text. Keep numbers to typical market precision (pips). If no trade, say 'No Trade'.",
+        },
+        { role: "user", content: JSON.stringify(user) },
       ],
-      temperature: 0.3,
     });
 
     const text = rsp.choices?.[0]?.message?.content?.trim() || "No Trade.";
-    const convictionMatch = text.match(/Conviction[:\s]*([0-9]{1,3})\s*%/i);
-    const conviction = convictionMatch
-      ? Math.max(0, Math.min(100, parseInt(convictionMatch[1], 10)))
-      : null;
+    // simple conviction parse if present like "Conviction %: 75%"
+    const cvMatch = text.match(/Conviction\s*%?:\s*(\d+)%/i);
+    const conviction = cvMatch ? Number(cvMatch[1]) : null;
 
     return res.status(200).json({
-      instrument: symbol,
+      instrument,
       date,
-      model,
-      plan: { text, conviction },
-      calendarUsed: { highCount, mediumCount, itemsPreview },
-      ...(debug ? { debug: { price: currentPrice, lens: { h4: h4Arr.length, h1: h1Arr.length, m15: m15Arr.length } } } : {}),
+      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      reply: text,
+      plan: {
+        text,
+        conviction,
+        fundamentals: {
+          calendarSummary: Array.isArray(calendar) ? `${calendar.length} item(s)` : "0",
+          headlines: headlines.slice(0, 8),
+        },
+      },
     });
   } catch (err: any) {
     console.error(err);
-    return res.status(500).json({ error: err?.message || "Server error" });
+    return res.status(500).json({ error: "Server error" });
   }
 }
