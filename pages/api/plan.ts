@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from "next";
-import { getCandles } from "@/lib/prices";
+
 import OpenAI from "openai";
 
 const client = new OpenAI({
