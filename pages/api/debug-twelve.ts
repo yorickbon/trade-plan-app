@@ -1,6 +1,6 @@
 // pages/api/debug-twelve.ts
 import type { NextApiRequest, NextApiResponse } from "next";
-import getCandles from "../../lib/prices";  // ✅ fixed relative import
+import getCandles from "../../lib/prices";
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
