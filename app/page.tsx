@@ -1,9 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import TradingViewTriple from "./components/TradingViewTriple";
-import { INSTRUMENTS } from "./lib/symbols";
-import CalendarPanel from "./components/CalendarPanel";
+import TradingViewTriple from "../components/TradingViewTriple";
+import { INSTRUMENTS } from "../lib/symbols";
+import CalendarPanel from "../components/CalendarPanel";
 
 type Instrument = {
   code: string;            // e.g. "EURUSD"
