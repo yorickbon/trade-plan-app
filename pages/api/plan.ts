@@ -1,7 +1,7 @@
 // pages/api/plan.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
-import { getCandles } from "@/lib/prices"; // <-- keep this path
+import { getCandles } from '@/lib/prices'; // <-- keep this path
 
 // Helper to safely read envs
 const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
