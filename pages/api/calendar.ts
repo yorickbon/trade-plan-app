@@ -1,72 +1,65 @@
+// pages/api/calendar.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 
-// quick + light RSS parser for ForexFactory feed
-async function fetchFF(url: string) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`RSS fetch failed: ${res.status}`);
-  const xml = await res.text();
+// Expected env:
+// CALENDAR_RSS_URL = https://nfs.faireconomy.media/ff_calendar_thisweek.json   (or ...today.json / ...tomorrow.json)
+// TIMEZONE          (optional, e.g. "Europe/London")
 
-  // split by <item> … </item>
-  const items = xml.split("<item>").slice(1).map(block => {
-    const get = (tag: string) => {
-      const m = block.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "i"));
-      return m ? m[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim() : "";
-    };
-    return {
-      title: get("title"),          // e.g. "USD - New Home Sales"
-      description: get("description"),
-      link: get("link"),
-      pubDate: get("pubDate"),
-    };
-  });
+type FFItem = {
+  title: string;             // e.g. "German Ifo Business Climate"
+  country: string;           // e.g. "EUR", "USD", "GBP", "JPY"
+  currency?: string;         // some variants expose currency here
+  impact?: string;           // "Low" | "Medium" | "High" | "Holiday"
+  date: string;              // "2025-08-26"
+  time: string;              // "09:00"
+  timestamp?: number;        // (sometimes present)
+};
 
-  return items;
-}
-
-const ALL_CCY = ["USD","EUR","GBP","JPY","AUD","CAD","CHF","NZD","CNY","MXN","ZAR","SEK","NOK"];
-
-function currenciesFromTitle(title: string) {
-  const hits: string[] = [];
-  for (const c of ALL_CCY) {
-    if (new RegExp(`\\b${c}\\b`).test(title)) hits.push(c);
-  }
-  return hits;
+function sameDate(a: string, b: string) {
+  // both in YYYY-MM-DD
+  return a === b;
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
-    const dateStr = (req.query.date as string) || new Date().toISOString().slice(0,10);
-    const wanted = (req.query.currencies as string | undefined)?.split(",").map(s => s.trim().toUpperCase()) ?? [];
+    const { date, currencies = "" } = req.query as { date?: string; currencies?: string };
+    if (!date) {
+      return res.status(400).json({ error: "Missing ?date=YYYY-MM-DD" });
+    }
 
-    const rssUrl = process.env.CALENDAR_RSS_URL;
-    if (!rssUrl) return res.status(200).json({ items: [], note: "No CALENDAR_RSS_URL set" });
+    // currencies=EUR,USD -> ["EUR","USD"]
+    const want = currencies
+      .split(",")
+      .map(s => s.trim().toUpperCase())
+      .filter(Boolean);
 
-    const raw = await fetchFF(rssUrl);
+    const url = process.env.CALENDAR_RSS_URL ||
+      "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
 
-    // filter this week’s events
-    const weekStart = new Date(dateStr); weekStart.setDate(weekStart.getDate() - weekStart.getDay());
-    const weekEnd = new Date(weekStart); weekEnd.setDate(weekStart.getDate() + 7);
+    const r = await fetch(url, { cache: "no-store" });
+    if (!r.ok) throw new Error(`Calendar HTTP ${r.status}`);
+    const json: FFItem[] = await r.json();
 
-    const items = raw
+    // Normalize & filter
+    const items = json
       .map(it => {
-        const ccyInTitle = currenciesFromTitle(it.title);
+        const cur = (it.currency || it.country || "").toUpperCase();
         return {
           title: it.title,
-          date: it.pubDate,
-          link: it.link,
-          currencies: ccyInTitle,
+          currency: cur,
+          impact: it.impact || "",
+          date: it.date,       // already YYYY-MM-DD in this feed
+          time: it.time || "",
         };
       })
-      .filter(it => {
-        const passCcy = wanted.length ? it.currencies.some(c => wanted.includes(c)) : true;
-        const t = it.date ? new Date(it.date) : null;
-        const passDate = t ? (t >= weekStart && t < weekEnd) : true;
-        return passCcy && passDate;
-      })
-      .slice(0, 40);
+      .filter(it => sameDate(it.date, date))
+      .filter(it => (want.length ? want.includes(it.currency) : true))
+      // Keep only actionable events (optional tweak)
+      .filter(it => it.impact.toLowerCase() !== "holiday")
+      .slice(0, 25);
 
-    return res.status(200).json({ items });
-  } catch (e: any) {
-    return res.status(200).json({ items: [], error: e.message ?? "calendar error" });
+    return res.status(200).json({ date, currencies: want, count: items.length, items });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || "server error" });
   }
 }
