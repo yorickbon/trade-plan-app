@@ -1,7 +1,7 @@
 // pages/api/plan.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
-import getCandles, { Candle } from "../../lib/prices"; // <-- RELATIVE PATH
+import getCandles, { Candle } from "../../lib/prices";  // <-- RELATIVE PATH
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
