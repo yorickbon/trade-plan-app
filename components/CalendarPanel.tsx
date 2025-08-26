@@ -1,69 +1,50 @@
-"use client";
-
+// components/CalendarPanel.tsx
 import React from "react";
 
-type CalendarItem = {
-  date: string;
-  time: string;
-  country: string;
-  currency: string;
-  impact: string;
+export type CalendarItem = {
+  date: string;                 // ISO or human readable
+  time?: string;
+  country?: string;             // ← panel expects this
+  impact?: "Low" | "Medium" | "High";
   title: string;
-  actual?: string;
-  forecast?: string;
-  previous?: string;
 };
 
 export default function CalendarPanel({
   items,
-  loading,
+  loading = false,
 }: {
   items: CalendarItem[];
-  loading: boolean;
+  loading?: boolean;
 }) {
-  return (
-    <div className="p-4 border rounded bg-neutral-900 border-neutral-800">
-      <div className="flex items-center justify-between mb-2">
-        <h2 className="text-lg font-bold">Calendar Snapshot</h2>
-        {loading && <span className="text-sm text-gray-400">Loading…</span>}
-      </div>
+  if (loading) {
+    return (
+      <div className="text-sm text-gray-300 italic">Loading calendar…</div>
+    );
+  }
 
-      {items.length === 0 ? (
-        <p className="text-sm text-gray-400">
-          No items found (server filters by selected currencies and date).
-        </p>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead className="text-left text-gray-400">
-              <tr>
-                <th className="py-1 pr-3">Time</th>
-                <th className="py-1 pr-3">Country</th>
-                <th className="py-1 pr-3">Currency</th>
-                <th className="py-1 pr-3">Impact</th>
-                <th className="py-1 pr-3">Event</th>
-                <th className="py-1 pr-3">Actual</th>
-                <th className="py-1 pr-3">Forecast</th>
-                <th className="py-1 pr-3">Previous</th>
-              </tr>
-            </thead>
-            <tbody>
-              {items.map((it, idx) => (
-                <tr key={idx} className="border-t border-neutral-800">
-                  <td className="py-1 pr-3">{it.time || "—"}</td>
-                  <td className="py-1 pr-3">{it.country}</td>
-                  <td className="py-1 pr-3">{it.currency}</td>
-                  <td className="py-1 pr-3">{it.impact}</td>
-                  <td className="py-1 pr-3">{it.title}</td>
-                  <td className="py-1 pr-3">{it.actual ?? "—"}</td>
-                  <td className="py-1 pr-3">{it.forecast ?? "—"}</td>
-                  <td className="py-1 pr-3">{it.previous ?? "—"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
+  if (!items || items.length === 0) {
+    return (
+      <div className="text-sm text-gray-300">
+        No items found (server filters by selected currencies and date).
+      </div>
+    );
+  }
+
+  return (
+    <ul className="space-y-2">
+      {items.map((it, idx) => (
+        <li
+          key={idx}
+          className="text-sm rounded border border-neutral-800 p-2 bg-neutral-900"
+        >
+          <div className="font-medium">{it.title}</div>
+          <div className="text-gray-400">
+            {it.date}
+            {it.time ? ` • ${it.time}` : ""} {it.country ? `• ${it.country}` : ""}
+            {it.impact ? ` • Impact: ${it.impact}` : ""}
+          </div>
+        </li>
+      ))}
+    </ul>
   );
 }
