@@ -79,3 +79,19 @@ Type, Direction, Entry, Stop, TP1, TP2, Conviction %, and 1–2 sentence rationa
     res.status(500).json({ error: e.message || "server error" });
   }
 }
+
+// ------- TEMPORARY: minimal types + stubbed candle fetcher --------
+type Candle = { t: number; o: number; h: number; l: number; c: number; v?: number };
+
+/**
+ * TODO: replace with a real data source.
+ * For now, return an empty array so the route can deploy.
+ * The handler already outputs "No Trade" when data is unclear.
+ */
+async function getCandles(
+  _symbol: string,
+  _tf: "4h" | "1h" | "15m",
+  _limit: number
+): Promise<Candle[]> {
+  return [];
+}
