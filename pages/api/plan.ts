@@ -1,7 +1,7 @@
 // pages/api/plan.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
-import getCandles, { Candle } from "../../lib/prices";  // ✅ fixed relative import
+import getCandles from "../../lib/prices";
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
