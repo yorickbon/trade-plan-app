@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import TradingViewTriple from "@/components/TradingViewTriple";
-import CalendarPanel from "@/components/CalendarPanel";
-import HeadlinesPanel from "@/components/HeadlinesPanel";
-import { INSTRUMENTS } from "@/lib/symbols";
+import TradingViewTriple from "../components/TradingViewTriple";
+import CalendarPanel from "../components/CalendarPanel";
+import HeadlinesPanel from "../components/HeadlinesPanel";
+import { INSTRUMENTS } from "../lib/symbols";
 
 // ---------- local types (aligned with API) ----------
 type Instrument = {
