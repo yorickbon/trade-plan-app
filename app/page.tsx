@@ -3,43 +3,34 @@
 import { useEffect, useState } from "react";
 import TradingViewTriple from "../components/TradingViewTriple";
 import CalendarPanel, { CalendarItem } from "../components/CalendarPanel";
-import HeadlinesPanel from "../components/HeadlinesPanel";
+import HeadlinesPanel, { HeadlineItem } from "../components/HeadlinesPanel";
 import { INSTRUMENTS } from "../lib/symbols";
 
-// ----------- Local types aligned with API ----------
-type Headline = {
-  title: string;
-  url: string;
-  source: string;
-  seen?: string; // ISO timestamp
-};
-
+// ---- API response shape ----
 type PlanResponse = {
   ok: boolean;
   plan?: { text: string; conviction?: number | null };
   reason?: string;
-  usedHeadlines: Headline[];
+  usedHeadlines: HeadlineItem[];
   usedCalendar: CalendarItem[];
 };
 
 export default function Page() {
   const [instrument, setInstrument] = useState(INSTRUMENTS[0]);
-  const [dateStr, setDateStr] = useState(new Date().toISOString().slice(0, 10));
-
+  const [dateStr, setDateStr] = useState<string>(
+    new Date().toISOString().slice(0, 10)
+  );
   const [calendar, setCalendar] = useState<CalendarItem[]>([]);
-  const [headlines, setHeadlines] = useState<Headline[]>([]);
-
+  const [headlines, setHeadlines] = useState<HeadlineItem[]>([]);
   const [loadingCal, setLoadingCal] = useState(false);
   const [loadingNews, setLoadingNews] = useState(false);
   const [loadingPlan, setLoadingPlan] = useState(false);
-
   const [planText, setPlanText] = useState("");
   const [standDown, setStandDown] = useState<string | null>(null);
-
   const [monitoring, setMonitoring] = useState<boolean | null>(null);
-  const [monitorMsg, setMonitorMsg] = useState<string>("");
+  const [monitorMsg, setMonitorMsg] = useState("");
 
-  // ----------- fetch calendar ----------
+  // ---- fetch calendar ----
   async function fetchCalendar() {
     setLoadingCal(true);
     try {
@@ -59,7 +50,7 @@ export default function Page() {
     }
   }
 
-  // ----------- fetch headlines ----------
+  // ---- fetch headlines ----
   async function fetchHeadlines() {
     setLoadingNews(true);
     try {
@@ -77,15 +68,15 @@ export default function Page() {
     }
   }
 
-  // ----------- read current monitor state ----------
+  // ---- read monitor state ----
   async function fetchMonitorState() {
     try {
       const rsp = await fetch("/api/trade-state", { cache: "no-store" });
       if (!rsp.ok) return;
       const j = await rsp.json();
-      setMonitoring(!!j.active);
+      setMonitoring(j?.active);
     } catch {
-      // ignore if not ready yet
+      // ignore
     }
   }
 
@@ -95,11 +86,12 @@ export default function Page() {
     fetchMonitorState();
   }, [instrument, dateStr]);
 
-  // ----------- generate trade plan ----------
+  // ---- generate trade plan ----
   async function generatePlan() {
     setLoadingPlan(true);
     setPlanText("");
     setStandDown(null);
+
     try {
       const rsp = await fetch("/api/plan", {
         method: "POST",
@@ -112,8 +104,8 @@ export default function Page() {
         }),
       });
       const json: PlanResponse = await rsp.json();
-      if (json.ok && json.plan) {
-        setPlanText(json.plan.text || "");
+      if (json.ok) {
+        setPlanText(json.plan?.text || "");
         setStandDown(null);
       } else {
         setPlanText("");
@@ -128,7 +120,7 @@ export default function Page() {
     }
   }
 
-  // ----------- reset session ----------
+  // ---- reset everything ----
   function resetSession() {
     setPlanText("");
     setStandDown(null);
@@ -138,12 +130,12 @@ export default function Page() {
     setMonitorMsg("");
     fetchCalendar();
     fetchHeadlines();
-    fetchMonitorState();
   }
 
-  // ----------- monitoring controls ----------
+  // ---- monitoring controls ----
   async function startMonitoring() {
     try {
+      setMonitorMsg("");
       const rsp = await fetch("/api/trade-state", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -153,9 +145,9 @@ export default function Page() {
         }),
       });
       const j = await rsp.json();
-      if (rsp.ok && j.ok !== false) {
+      if (rsp.ok && j.ok === true) {
         setMonitoring(true);
-        setMonitorMsg("Monitoring started. Alerts will be sent to Telegram if configured.");
+        setMonitorMsg("Monitoring started.");
       } else {
         setMonitorMsg("Could not start monitoring.");
       }
@@ -166,13 +158,14 @@ export default function Page() {
 
   async function stopMonitoring() {
     try {
+      setMonitorMsg("");
       const rsp = await fetch("/api/trade-state", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ active: false }),
       });
       const j = await rsp.json();
-      if (rsp.ok && j.ok !== false) {
+      if (rsp.ok && j.ok === true) {
         setMonitoring(false);
         setMonitorMsg("Monitoring stopped.");
       } else {
@@ -186,8 +179,7 @@ export default function Page() {
   return (
     <main className="max-w-7xl mx-auto space-y-6 p-6">
       {/* Controls */}
-      <div className="flex flex-wrap items-center gap-3">
-        {/* Instrument */}
+      <div className="flex items-center gap-4 flex-wrap">
         <div>
           <label className="text-sm text-gray-400">Instrument</label>
           <select
@@ -195,8 +187,10 @@ export default function Page() {
             value={instrument.code}
             onChange={(e) => {
               const found = INSTRUMENTS.find((i) => i.code === e.target.value);
-              if (found) setInstrument(found);
-              resetSession();
+              if (found) {
+                setInstrument(found);
+                resetSession(); // reset fully on instrument change
+              }
             }}
           >
             {INSTRUMENTS.map((i) => (
@@ -207,7 +201,6 @@ export default function Page() {
           </select>
         </div>
 
-        {/* Date */}
         <div>
           <label className="text-sm text-gray-400">Date</label>
           <input
@@ -218,72 +211,72 @@ export default function Page() {
           />
         </div>
 
-        {/* Action buttons */}
-        <div className="flex gap-2">
-          <button
-            onClick={generatePlan}
-            disabled={loadingPlan}
-            className="rounded bg-blue-600 hover:bg-blue-500 px-4 py-2 disabled:opacity-50"
-          >
-            {loadingPlan ? "Generating..." : "Generate Plan"}
-          </button>
-          <button
-            onClick={resetSession}
-            className="rounded bg-neutral-800 hover:bg-neutral-700 px-4 py-2"
-          >
-            Reset
-          </button>
-          <button
-            onClick={startMonitoring}
-            className="rounded bg-emerald-600 hover:bg-emerald-500 px-4 py-2"
-            title="Start Telegram / news monitoring for this instrument"
-          >
-            Start monitoring
-          </button>
-          <button
-            onClick={stopMonitoring}
-            className="rounded bg-rose-600 hover:bg-rose-500 px-4 py-2"
-            title="Stop Telegram / news monitoring"
-          >
-            Stop monitoring
-          </button>
-        </div>
+        <button
+          onClick={generatePlan}
+          disabled={loadingPlan}
+          className="rounded bg-blue-600 hover:bg-blue-500 px-4 py-2 disabled:opacity-50"
+        >
+          {loadingPlan ? "Generating..." : "Generate Plan"}
+        </button>
+
+        <button
+          onClick={resetSession}
+          className="rounded bg-neutral-800 hover:bg-neutral-700 px-4 py-2"
+        >
+          Reset
+        </button>
+
+        <button
+          onClick={startMonitoring}
+          className="rounded bg-emerald-600 hover:bg-emerald-500 px-4 py-2"
+        >
+          Start monitoring
+        </button>
+
+        <button
+          onClick={stopMonitoring}
+          className="rounded bg-rose-600 hover:bg-rose-500 px-4 py-2"
+        >
+          Stop monitoring
+        </button>
       </div>
 
-      {/* Charts */}
+      {/* Chart */}
       <TradingViewTriple symbol={instrument.code} />
 
       {/* Calendar */}
-      <div>
+      <div className="mt-6">
         <h2 className="text-xl font-semibold mb-2">Calendar Snapshot</h2>
         <CalendarPanel items={calendar} loading={loadingCal} />
       </div>
 
-      {/* Headlines (smaller text) */}
-      <div className="text-sm">
+      {/* Headlines */}
+      <div className="mt-6 text-sm">
         <h2 className="text-xl font-semibold mb-2">Macro Headlines (24–48h)</h2>
         <HeadlinesPanel items={headlines} loading={loadingNews} />
       </div>
 
       {/* Monitoring status */}
-      <div className="text-sm text-gray-300">
+      <div className="mt-2 text-sm text-gray-300">
         {monitoring === null ? (
           <span className="text-gray-500">Monitor status: unknown</span>
         ) : monitoring ? (
           <span className="text-emerald-400">Monitoring: ON</span>
         ) : (
-          <span className="text-red-400">Monitoring: OFF</span>
+          <span className="text-gray-400">Monitoring: OFF</span>
         )}
         <div className="text-xs text-gray-400 mt-1">{monitorMsg}</div>
       </div>
 
-      {/* Trade card (larger text) */}
+      {/* Generated Trade Card */}
       <div>
         <h2 className="text-lg font-bold mb-2">Generated Trade Card</h2>
         {standDown ? (
-          <div className="text-yellow-300 font-semibold">Standing down: {standDown}</div>
+          <div className="text-yellow-300">
+            <strong>Standing down:</strong> {standDown}
+          </div>
         ) : (
-          <pre className="whitespace-pre-wrap text-lg text-white">{planText || ""}</pre>
+          <pre className="whitespace-pre-wrap text-base">{planText || ""}</pre>
         )}
       </div>
     </main>
