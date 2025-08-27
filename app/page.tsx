@@ -3,11 +3,9 @@
 import { useEffect, useState } from "react";
 import TradingViewTriple from "../components/TradingViewTriple";
 import CalendarPanel, { CalendarItem } from "../components/CalendarPanel";
-// ⬇️ Fix: use the type name your component actually exports
 import HeadlinesPanel, { Headline } from "../components/HeadlinesPanel";
 import { INSTRUMENTS } from "../lib/symbols";
 
-// ---- API response shape ----
 type PlanResponse = {
   ok: boolean;
   plan?: { text: string; conviction?: number | null };
@@ -18,9 +16,7 @@ type PlanResponse = {
 
 export default function Page() {
   const [instrument, setInstrument] = useState(INSTRUMENTS[0]);
-  const [dateStr, setDateStr] = useState<string>(
-    new Date().toISOString().slice(0, 10)
-  );
+  const [dateStr, setDateStr] = useState(new Date().toISOString().slice(0, 10));
 
   const [calendar, setCalendar] = useState<CalendarItem[]>([]);
   const [headlines, setHeadlines] = useState<Headline[]>([]);
@@ -43,12 +39,10 @@ export default function Page() {
         date: dateStr,
         currencies: (instrument.currencies ?? []).join(","),
       }).toString();
-
       const rsp = await fetch(`/api/calendar?${q}`, { cache: "no-store" });
       const json = await rsp.json();
       setCalendar(Array.isArray(json.items) ? json.items : []);
-    } catch (e) {
-      console.error(e);
+    } catch {
       setCalendar([]);
     } finally {
       setLoadingCal(false);
@@ -65,15 +59,14 @@ export default function Page() {
       });
       const json = await rsp.json();
       setHeadlines(Array.isArray(json.items) ? json.items : []);
-    } catch (e) {
-      console.error(e);
+    } catch {
       setHeadlines([]);
     } finally {
       setLoadingNews(false);
     }
   }
 
-  // ---- read monitoring state ----
+  // ---- monitoring state ----
   async function fetchMonitorState() {
     try {
       const rsp = await fetch("/api/trade-state", { cache: "no-store" });
@@ -91,7 +84,7 @@ export default function Page() {
     fetchMonitorState();
   }, [instrument, dateStr]);
 
-  // ---- generate trade plan ----
+  // ---- generate plan ----
   async function generatePlan() {
     setLoadingPlan(true);
     setPlanText("");
@@ -101,15 +94,9 @@ export default function Page() {
       const rsp = await fetch("/api/plan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          instrument,
-          date: dateStr,
-          calendar,  // pass snapshot
-          headlines, // pass snapshot
-        }),
+        body: JSON.stringify({ instrument, date: dateStr, calendar, headlines }),
       });
       const json: PlanResponse = await rsp.json();
-
       if (json.ok) {
         setPlanText(json.plan?.text || "");
         setStandDown(null);
@@ -117,8 +104,7 @@ export default function Page() {
         setPlanText("");
         setStandDown(json.reason || "No trade idea returned.");
       }
-    } catch (e) {
-      console.error(e);
+    } catch {
       setPlanText("");
       setStandDown("Server error while generating plan.");
     } finally {
@@ -126,7 +112,7 @@ export default function Page() {
     }
   }
 
-  // ---- reset everything (and refetch) ----
+  // ---- full reset (and refetch) ----
   function resetSession() {
     setPlanText("");
     setStandDown(null);
@@ -182,8 +168,8 @@ export default function Page() {
   return (
     <main className="max-w-7xl mx-auto space-y-6 p-6">
       {/* Controls row */}
-      <div className="flex items-center gap-4 flex-wrap">
-        <div>
+      <div className="flex items-end gap-4 flex-wrap">
+        <div className="flex flex-col">
           <label className="text-sm text-gray-400">Instrument</label>
           <select
             className="bg-neutral-900 border border-neutral-700 rounded px-2 py-2"
@@ -192,8 +178,7 @@ export default function Page() {
               const found = INSTRUMENTS.find((i) => i.code === e.target.value);
               if (found) {
                 setInstrument(found);
-                // Full reset on instrument change
-                resetSession();
+                resetSession(); // full reset on change
               }
             }}
           >
@@ -205,7 +190,7 @@ export default function Page() {
           </select>
         </div>
 
-        <div>
+        <div className="flex flex-col">
           <label className="text-sm text-gray-400">Date</label>
           <input
             type="date"
@@ -256,7 +241,7 @@ export default function Page() {
         <CalendarPanel items={calendar} loading={loadingCal} />
       </div>
 
-      {/* Headlines (smaller text as requested) */}
+      {/* Headlines (smaller text) */}
       <div className="mt-6 text-sm">
         <h2 className="text-xl font-semibold mb-2">Macro Headlines (24–48h)</h2>
         <HeadlinesPanel items={headlines} loading={loadingNews} />
