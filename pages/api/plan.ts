@@ -34,7 +34,8 @@ type Headline = {
   title: string;
   url: string;
   source: string;
-  seen?: string; // ISO timestamp
+  seen?: string;           // ISO timestamp
+  published_at?: string;   // <-- added to match provider items
 };
 
 type PlanOut = {
@@ -182,7 +183,9 @@ export default async function handler(
 
     try {
       // support both sync(number) and async(Promise<{score:number}>) versions
-      const r: any = await Promise.resolve(scoreSentiment((recent.map(h => h.title).join(" ") || "") as any));
+      const r: any = await Promise.resolve(
+        scoreSentiment((recent.map(h => h.title).join(" ") || "") as any)
+      );
 
       const score: number =
         typeof r === "number"
