@@ -88,7 +88,6 @@ export default async function handler(
     url.searchParams.set("apikey", API_KEY);
     url.searchParams.set("q", q); // *** IMPORTANT: use q, not country ***
     url.searchParams.set("language", lang);
-    url.searchParams.set("page", "1");
 
     const rsp = await fetch(url.toString(), { cache: "no-store" });
 
