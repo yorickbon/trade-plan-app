@@ -1,15 +1,25 @@
-// pages/api/candles.ts
+// /pages/api/candles.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getCandles } from "../../lib/prices";
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  try {
-    const { code, tf = "15m", limit = "200" } = (req.method === "GET" ? req.query : req.body) as any;
-    if (!code) return res.status(400).json({ error: "missing code" });
+type TF = "15m" | "1h" | "4h";
 
-    const candles = await getCandles({ code: String(code) }, tf as any, Number(limit));
-    return res.status(200).json({ code, tf, count: candles.length, candles });
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method Not Allowed" });
+  }
+
+  try {
+    const symbol = String(req.query.symbol || req.query.code || "");
+    const tf = (String(req.query.tf || "15m") as TF);
+    const n = Number(req.query.n || 200);
+
+    if (!symbol) return res.status(400).json({ error: "Missing symbol" });
+
+    const data = await getCandles(symbol, tf, n);
+    return res.status(200).json({ symbol, tf, n, candles: data });
   } catch (err: any) {
-    return res.status(500).json({ error: err?.message ?? "failed" });
+    return res.status(500).json({ error: err?.message || "server error" });
   }
 }
