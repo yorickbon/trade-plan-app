@@ -1,9 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import TradingViewTriple from "./components/TradingViewTriple";
-import CalendarPanel from "./components/CalendarPanel";
-import HeadlinesPanel from "./components/HeadlinesPanel";
+import TradingViewTriple from "../components/TradingViewTriple";
+import CalendarPanel from "../components/CalendarPanel";
+import HeadlinesPanel from "../components/HeadlinesPanel";
 import { INSTRUMENTS } from "../lib/symbols";
 
 /* ---------------- Local types (decouple from child components) ---------------- */
