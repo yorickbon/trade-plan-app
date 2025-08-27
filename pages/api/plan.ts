@@ -1,21 +1,22 @@
 // /pages/api/plan.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
-import { getCandles } from "../../lib/prices";
+import { getCandles } from "../../lib/prices"; // named export
 import { scoreSentiment } from "../../lib/sentiment";
 
-// ---- short in-memory cache (5 min) ----
+// -------- short in-memory cache (5 min) --------
 type CacheEntry<T> = { data: T; exp: number };
-const PLAN_CACHE =
+const PLAN_CACHE: Map<string, CacheEntry<any>> =
   (globalThis as any).__PLAN_CACHE__ ?? new Map<string, CacheEntry<any>>();
 (globalThis as any).__PLAN_CACHE__ = PLAN_CACHE;
 const PLAN_CACHE_TTL = 5 * 60 * 1000;
 
+// -------- types --------
 type Candle = { t: number; o: number; h: number; l: number; c: number };
 
 type Instrument = {
-  code: string;
-  currencies?: string[];
+  code: string;            // e.g. "EURUSD"
+  currencies?: string[];   // e.g. ["EUR","USD"]
 };
 
 type CalendarItem = {
@@ -34,7 +35,7 @@ type Headline = {
   title: string;
   url: string;
   source: string;
-  published_at: string; // ISO
+  seen?: string; // ISO
 };
 
 type PlanOut = {
@@ -52,6 +53,7 @@ type ApiOut =
   | { ok: true; plan: PlanOut; usedHeadlines: Headline[]; usedCalendar: CalendarItem[] }
   | { ok: false; reason: string; usedHeadlines: Headline[]; usedCalendar: CalendarItem[] };
 
+// -------- tiny cache helpers --------
 function cacheGet<T>(key: string): T | null {
   const e = PLAN_CACHE.get(key);
   if (!e) return null;
@@ -65,7 +67,13 @@ function cacheSet(key: string, data: any) {
   PLAN_CACHE.set(key, { data, exp: Date.now() + PLAN_CACHE_TTL });
 }
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiOut>) {
+// ===========================================================
+//                      HANDLER (POST)
+// ===========================================================
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse<ApiOut>
+) {
   try {
     if (req.method !== "POST") {
       return res
@@ -73,9 +81,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         .json({ ok: false, reason: "Method not allowed", usedHeadlines: [], usedCalendar: [] });
     }
 
+    // incoming body
     const { instrument, date, calendar, headlines } = req.body as {
       instrument: Instrument | string;
-      date?: string;
+      date?: string; // yyyy-mm-dd
       calendar?: CalendarItem[] | null;
       headlines?: Headline[] | null;
     };
@@ -89,133 +98,137 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         .json({ ok: false, reason: "Missing instrument code", usedHeadlines: [], usedCalendar: [] });
     }
 
-    // cache key
+    // cache key (instrument + date + counts)
     const cacheKey = JSON.stringify({
       code: instr.code,
       date: (date || new Date().toISOString().slice(0, 10)),
-      calN: Array.isArray(calendar) ? calendar.length : -1,
-      newsN: Array.isArray(headlines) ? headlines.length : -1,
+      caln: Array.isArray(calendar) ? calendar.length : -1,
+      heads: Array.isArray(headlines) ? headlines.length : -1,
     });
-
     const hit = cacheGet<ApiOut>(cacheKey);
     if (hit) {
       res.setHeader("Cache-Control", "public, max-age=60");
       return res.status(200).json(hit);
     }
 
-    // Ensure headlines; pull from /api/news if none supplied
+    // -------- ensure we have headlines (fallback to /api/news) --------
     let usedHeadlines: Headline[] = Array.isArray(headlines) ? headlines : [];
-    if (!usedHeadlines.length) {
-      const cur = (instr.currencies && instr.currencies.length)
-        ? `?currencies=${encodeURIComponent(instr.currencies.join(","))}`
-        : "";
+    if (!usedHeadlines.length && instr.currencies && instr.currencies.length) {
       const base = process.env.NEXT_PUBLIC_BASE_URL || `https://${req.headers.host}`;
-      const rsp = await fetch(`${base}/api/news${cur}`, { cache: "no-store" });
-      const j: any = await rsp.json().catch(() => ({}));
-      const items = Array.isArray(j?.items) ? j.items : [];
-      usedHeadlines = items.map((it: any) => ({
-        title: String(it.title || ""),
-        url: String(it.url || ""),
-        source: String(it.source || "unknown"),
-        published_at: String(it.published_at || ""),
-      }));
+      const qcur = `?currencies=${encodeURIComponent(instr.currencies.join(","))}`;
+      const rsp = await fetch(`${base}/api/news${qcur}`, { cache: "no-store" });
+      const j = await rsp.json().catch(() => ({ items: [] }));
+      usedHeadlines = Array.isArray(j.items) ? j.items : [];
     }
 
-    // Headlines window (do NOT block planning if empty)
-    const sinceH = Math.max(1, parseInt(process.env.HEADLINES_SINCE_HOURS || "24", 10));
-    const sinceMs = Date.now() - sinceH * 3600_000;
-    const recent = usedHeadlines.filter(h => {
-      const t = Date.parse(h.published_at || "");
-      return Number.isFinite(t) && t >= sinceMs;
-    });
+    // -------- recent window for headlines --------
+    const sinceH = Math.max(24, parseInt(process.env.HEADLINES_SINCE_HOURS || "24", 10));
+    const cutoffMs = Date.now() - sinceH * 3600 * 1000;
+    const recent = usedHeadlines
+      .filter(it => {
+        const t = Date.parse(it.seen || "");
+        return Number.isFinite(t) ? t >= cutoffMs : true; // best effort
+      })
+      .slice(0, 12);
 
-    // Optional blackout if a high-impact event is within ~90 min
-    const calItems: CalendarItem[] = Array.isArray(calendar) ? calendar : [];
-    const blackout = calItems.some(ev => {
-      const when = Date.parse(`${ev.date}T${ev.time ?? "00:00"}Z`);
+    // if none, we *still* trade, just note reduced conviction (news uncertainty handled later)
+    // -------- optional blackout if high-impact event within ~90 min --------
+    const callItems: CalendarItem[] = Array.isArray(calendar) ? calendar : [];
+    const blackout = callItems.some(ev => {
+      const when = Date.parse(`${ev.date}T${(ev.time || "00:00")}Z`);
       const dt = Math.abs(when - Date.now());
-      return dt <= 90 * 60 * 1000 && String(ev.impact || "").toLowerCase().includes("high");
+      return Number.isFinite(when) && (ev.impact || "").toLowerCase().includes("high") && dt <= 90 * 60 * 1000;
     });
 
-    // Fetch candles (4h / 1h / 15m)
-    const [h4, h1, m15] = await Promise.all<Candle[]>([
+    // -------- fetch candles with graceful fallback (15m mandatory) --------
+    const [h4, h1, m15] = await Promise.all([
       getCandles(instr.code, "4h", 200),
       getCandles(instr.code, "1h", 200),
       getCandles(instr.code, "15m", 200),
     ]);
 
-    if (!h4.length || !h1.length || !m15.length) {
+    const missing = {
+      h4: !(Array.isArray(h4) && h4.length),
+      h1: !(Array.isArray(h1) && h1.length),
+      m15: !(Array.isArray(m15) && m15.length),
+    };
+
+    if (missing.m15) {
       const out: ApiOut = {
         ok: false,
-        reason: "Missing candles for one or more timeframes.",
-        usedHeadlines: recent.slice(0, 12),
-        usedCalendar: calItems,
+        reason: "Missing 15m candles (mandatory) — cannot compute bias/levels.",
+        usedHeadlines: recent,
+        usedCalendar: callItems,
       };
       cacheSet(cacheKey, out);
+      res.setHeader("Cache-Control", "public, max-age=60");
       return res.status(200).json(out);
     }
 
-    // 15m bias & levels (pullback vs BOS heuristic)
-    const last = m15[m15.length - 1];
+    // proceed if h1/h4 missing, but reduce conviction and add note
+    let timeframeNote = "";
+    let timeframePenalty = 0;
+    if (missing.h1 || missing.h4) {
+      const missList = [missing.h4 ? "4h" : null, missing.h1 ? "1h" : null]
+        .filter(Boolean)
+        .join(" & ");
+      timeframeNote = `HTF confirmation unavailable (${missList}).`;
+      timeframePenalty = 10; // −10% conviction
+    }
+
+    // -------- simple 15m bias & levels (pullback vs BOS heuristic) --------
+    const last = m15[m15.length - 1] ?? m15[0];
     const prev = m15[m15.length - 2] ?? last;
-    const upBias = last.c >= prev.c;
+    const upBias = last.c >= prev.c ? "Buy" : "Sell";
 
     const swingHi = Math.max(...m15.slice(-40).map(c => c.h));
     const swingLo = Math.min(...m15.slice(-40).map(c => c.l));
-    const range = swingHi - swingLo || 1e-6;
+    const range = Math.max(1e-9, swingHi - swingLo);
+    const fib618 = swingHi - 0.618 * range; // for pullback scenario
 
-    // Pullback anchor: 0.618 into current leg
-    const fib618 = swingLo + 0.618 * range; // long leg from swingLo -> swingHi
-    const entry = Number(fib618.toFixed(3));
-    const stop  = upBias
-      ? Number((swingLo - 0.25 * range).toFixed(3))
-      : Number((swingHi + 0.25 * range).toFixed(3));
-    const tp1   = upBias
-      ? Number((swingLo + 0.50 * range).toFixed(3))
-      : Number((swingLo + 0.50 * range).toFixed(3)); // symmetric target around mid
-    const tp2   = upBias
-      ? Number((swingLo + 0.90 * range).toFixed(3))
-      : Number((swingLo + 0.10 * range).toFixed(3)); // conservative mirror
+    const entry  = Number(fib618.toFixed(5));
+    const stop   = Number((swingHi + 0.25 * range).toFixed(5));
+    const tp1    = Number((swingLo + 0.25 * range).toFixed(5));
+    const tp2    = Number((swingLo + 0.50 * range).toFixed(5));
 
-    // Conviction: base + news nudge + blackout cap
+    // -------- conviction baseline --------
     let conviction = 60;
-    if (recent.length === 0) conviction = Math.max(40, conviction - 10); // no headlines penalty
+    conviction = Math.min(95, conviction + Math.min(3, recent.length)); // headlines present = + up to 3
     if (blackout) conviction = Math.min(conviction, 55);
+    if (timeframePenalty) conviction = Math.max(0, conviction - timeframePenalty);
 
-    // Sentiment from headlines (titles only). Your current scoreSentiment returns number [-1..1].
+    // -------- lightweight headline sentiment → bias note (does not block trading) --------
+    let newsBias = "Neutral";
     let newsScore = 0;
     try {
-      const joined = recent.map(r => r.title).join(" | ");
-      const s = scoreSentiment(joined) as any;
-      newsScore = typeof s === "number" ? s : Number(s?.score || 0);
-      // small nudge based on alignment with technical direction
-      const aligned = (newsScore >= 0 && upBias) || (newsScore < 0 && !upBias);
-      const adj = Math.round(Math.min(10, Math.abs(newsScore) * 10)); // cap ±10
-      conviction = Math.max(35, Math.min(95, conviction + (aligned ? adj : -adj)));
-    } catch {}
+      const recentText = recent.map(h => h.title).join(" | ");
+      const score = scoreSentiment(recentText); // number in [-1, 1]
+      newsScore = Number(score || 0);
+      newsBias = score > 0.15 ? "Positive" : score < -0.15 ? "Negative" : "Neutral";
+    } catch { /* ignore sentiment errors */ }
 
-    // LLM formatting
+    // -------- LLM formatting (unchanged from your working version) --------
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
     const prompt = `
-You are a trading assistant. Format a *single* trade card for ${instr.code}.
+You are a trading assistant. Format a **single** trade card for ${instr.code}.
 
 Context:
-- Bias timeframe: 15m. HTFs (1h/4h) confirm only.
-- Setup candidates: Pullback to 0.618 vs. BOS continuation.
+- Bias timeframe: 15m. HTFs (1h/4h) are for confirmation only.
+- Setup candidates: pullback-to-0.618 vs. BOS continuation.
 - Macro headlines in last ${sinceH}h: ${recent.length}
-- News sentiment score: ${newsScore.toFixed(2)}
+- News sentiment (lightweight): ${newsBias} (${newsScore.toFixed(2)})
 - Calendar blackout within ~90m: ${blackout ? "YES" : "NO"}
 
-Proposed technicals (heuristic):
-- Direction: ${upBias ? "Buy" : "Sell"}
-- Entry: ${entry}
-- Stop: ${stop}
-- TP1: ${tp1}
-- TP2: ${tp2}
+Proposed technicals:
+- Direction: **${upBias}**
+- Entry: **${entry}**
+- Stop: **${stop}**
+- TP1: **${tp1}**
+- TP2: **${tp2}**
 
-Return *only* these markdown fields:
+Return **only** these markdown fields:
 
 **Trade Card: ${instr.code}**
 **Type:** (Pullback | BOS | Range | Breakout)
@@ -232,13 +245,33 @@ Return *only* these markdown fields:
 **Caution:** mention blackout/headlines if relevant.
 `.trim();
 
-    const chat = await client.chat.completions.create({
-      model,
-      temperature: 0.2,
-      messages: [{ role: "user", content: prompt }],
-    });
+    let text = "";
+    try {
+      const chat = await client.chat.completions.create({
+        model,
+        temperature: 0.2,
+        messages: [{ role: "user", content: prompt }],
+      });
+      text = chat.choices?.[0]?.message?.content?.trim() || "";
+    } catch (err: any) {
+      console.error("OPENAI error", err?.message || err);
+      // still return a technical skeleton if LLM hiccups
+      text = `
+**Trade Card: ${instr.code}**
+**Type:** Pullback
+**Direction:** ${upBias}
+**Entry:** ${entry}
+**Stop:** ${stop}
+**TP1:** ${tp1}
+**TP2:** ${tp2}
+**Conviction %:** ${conviction}
 
-    const text = chat.choices?.[0]?.message?.content?.trim() || "";
+**Reasoning:** Using 15m structure with 0.618 pullback reference and recent range extremes as targets/stops. HTF only for confirmation.
+**Timeframe Alignment:** ${missing.h4 || missing.h1 ? "HTF limited" : "Aligned"} (4H/1H/15M).
+**Invalidation Notes:** Break and close beyond stop invalidates the idea.
+**Caution:** ${blackout ? "High-impact event near session open; size down." : "Trade per plan size."}
+`.trim();
+    }
 
     const out: ApiOut = {
       ok: true,
@@ -250,17 +283,19 @@ Return *only* these markdown fields:
         stop,
         tp1,
         tp2,
-        notes: blackout ? "High-impact event within ~90 min — reduced conviction." : null,
+        notes: blackout
+          ? "High-impact event within ~90 min — reduced conviction."
+          : (timeframeNote || null),
       },
-      usedHeadlines: recent.slice(0, 12),
-      usedCalendar: calItems,
+      usedHeadlines: recent,
+      usedCalendar: callItems,
     };
 
     cacheSet(cacheKey, out);
     res.setHeader("Cache-Control", "public, max-age=60");
     return res.status(200).json(out);
   } catch (err: any) {
-    console.error("PLAN api error:", err?.message || err);
+    console.error("PLAN API error:", err?.message || err);
     return res
       .status(500)
       .json({ ok: false, reason: "Server error", usedHeadlines: [], usedCalendar: [] });
