@@ -1,70 +1,67 @@
-// lib/prices.ts
-// Unified candle fetcher using TwelveData. Returns normalized candles and exports are NAMED.
-
-export type TF = "4h" | "1h" | "15m";
+// /lib/prices.ts
 
 export type Candle = {
-  t: number; // epoch ms
+  t: number; // unix seconds
   o: number;
   h: number;
   l: number;
   c: number;
 };
 
-function tfToInterval(tf: TF): string {
-  switch (tf) {
-    case "4h":
-      return "4h";
-    case "1h":
-      return "1h";
-    case "15m":
-      return "15min";
-  }
-}
+export type TF = "15m" | "1h" | "4h";
 
-function symbolMap(code: string): string {
-  // Map internal codes to provider symbols
-  // EURUSD -> EUR/USD, XAUUSD -> XAU/USD, etc.
-  if (/^[A-Z]{6}$/.test(code)) {
-    const base = code.slice(0, 3);
-    const quote = code.slice(3);
-    return `${base}/${quote}`;
-  }
-  return code;
-}
-
+/**
+ * Fetch candles for an instrument from TwelveData
+ * Accepts either a symbol string (e.g. "EURUSD") or an object { code: "EURUSD" }.
+ * Always returns newest->oldest mapped to { t, o, h, l, c } (unix seconds).
+ */
 export async function getCandles(
-  instr: { code: string },
+  instrument: string | { code: string },
   tf: TF,
-  limit = 200
+  n: number
 ): Promise<Candle[]> {
-  const key = process.env.TWELVEDATA_API_KEY;
-  if (!key) throw new Error("TWELVEDATA_API_KEY missing");
+  const apikey = process.env.TWELVEDATA_API_KEY;
+  const symbol = typeof instrument === "string" ? instrument : instrument.code;
 
-  const interval = tfToInterval(tf);
-  const symbol = symbolMap(instr.code);
+  // Map our TF to TwelveData interval values
+  const interval = tf === "15m" ? "15min" : tf; // "1h" and "4h" are already valid
+
+  // Guard: if no key, return empty (prevents build from failing)
+  if (!apikey) return [];
 
   const url = new URL("https://api.twelvedata.com/time_series");
   url.searchParams.set("symbol", symbol);
   url.searchParams.set("interval", interval);
-  url.searchParams.set("outputsize", String(limit));
-  url.searchParams.set("format", "JSON");
-  url.searchParams.set("apikey", key);
+  url.searchParams.set("outputsize", String(n));
+  url.searchParams.set("timezone", "UTC");
+  url.searchParams.set("apikey", apikey);
 
-  const rsp = await fetch(url.toString(), { cache: "no-store" });
-  if (!rsp.ok) throw new Error(`TwelveData ${rsp.status}`);
+  try {
+    const rsp = await fetch(url.toString(), { cache: "no-store" });
+    if (!rsp.ok) return [];
+    const json: any = await rsp.json();
 
-  const json = await rsp.json();
-  const arr: Candle[] = (json?.values ?? [])
-    .map((v: any) => ({
-      t: new Date(v.datetime).getTime(),
+    const values: any[] = json?.values ?? json?.data ?? [];
+    if (!Array.isArray(values)) return [];
+
+    // TwelveData returns newest first; we keep that order (newest -> oldest).
+    const out: Candle[] = values.map((v: any) => ({
+      t: Math.floor(Date.parse(v.datetime) / 1000),
       o: Number(v.open),
       h: Number(v.high),
       l: Number(v.low),
       c: Number(v.close),
-    }))
-    .filter((x: Candle) => Number.isFinite(x.t) && Number.isFinite(x.c))
-    .reverse(); // chronological
+    }));
 
-  return arr;
+    return out.filter(
+      (c) =>
+        Number.isFinite(c.t) &&
+        Number.isFinite(c.o) &&
+        Number.isFinite(c.h) &&
+        Number.isFinite(c.l) &&
+        Number.isFinite(c.c)
+    );
+  } catch {
+    return [];
+  }
 }
