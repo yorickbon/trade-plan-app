@@ -9,27 +9,23 @@ type Item = {
   description?: string;
 };
 
-// Parse currencies param (can be comma-separated string or array)
 function parseCurrencies(q: string | string[] | undefined): string[] {
   if (!q) return [];
   const raw = Array.isArray(q) ? q.join(",") : String(q);
   return raw
     .split(",")
-    .map((s) => s.trim().toUpperCase())
+    .map(s => s.trim().toUpperCase())
     .filter(Boolean);
 }
 
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse
-) {
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   const currencies = parseCurrencies(req.query.currencies);
   const hours = Math.max(1, Number(req.query.hours ?? 48));
   const max = Math.min(25, Math.max(1, Number(req.query.max ?? process.env.HEADLINES_MAX ?? 8)));
   const lang = String(process.env.HEADLINES_LANG ?? "en");
   const debug = String(req.query.debug ?? "") === "1";
 
-  const provider = String(process.env.NEWS_API_PROVIDER ?? "newsdata").toLowerCase();
+  const provider = (process.env.NEWS_API_PROVIDER ?? "newsdata").toLowerCase();
 
   // Accept either env var name
   const API_KEY =
@@ -37,111 +33,133 @@ export default async function handler(
     process.env.NEWS_API_KEY ||
     "";
 
-  // If no key, don't 500 — just return an empty list with a note
+  // If no key, don't 500 — return empty and let planner trade technicals
   if (!API_KEY) {
     return res.status(200).json({
       provider,
       items: [],
-      note:
-        "No News API key detected (NEWSDATA_API_KEY or NEWS_API_KEY). Trading will proceed on technicals.",
+      note: "No News API key detected (NEWSDATA_API_KEY or NEWS_API_KEY). Trading will proceed on technicals.",
     });
   }
 
-  try {
-    // Build a query string for newsdata.io
-    // Docs: https://newsdata.io/ (apikey, q, language, page)
+  // ------------------ currency synonyms (short & index/metal) ------------------
+  const synonyms: Record<string, string[]> = {
+    USD: ["usd", "dollar", "greenback", "us $", "us$"],
+    EUR: ["eur", "euro", "ecb", "eurozone"],
+    JPY: ["jpy", "yen", "boj", "bank of japan"],
+    GBP: ["gbp", "pound", "boe", "bank of england", "sterling"],
+    AUD: ["aud", "aussie", "rba"],
+    CAD: ["cad", "loonie", "boc", "bank of canada"],
+    NZD: ["nzd", "kiwi", "rbnz"],
+    CHF: ["chf", "franc", "snb"],
+    GOLD: ["gold", "xauusd", "bullion"],
+    NAS100: ["nasdaq", "ndx", "nas100"],
+    SPX500: ["s&p 500", "spx", "spx500"],
+    US30: ["dow jones", "djia", "us30"],
+    GER40: ["dax", "ger40"],
+  };
 
-    // simple synonym expansion so “USD/JPY” etc still find USD or JPY headlines
-    const synonyms: Record<string, string[]> = {
-      USD: ["usd", "dollar", "greenback", "u.s.", "us"],
-      EUR: ["eur", "euro", "ecb", "eurozone"],
-      JPY: ["jpy", "yen", "boj", "bank of japan"],
-      GBP: ["gbp", "pound", "boe", "bank of england", "sterling"],
-      AUD: ["aud", "aussie", "rba"],
-      CAD: ["cad", "loonie", "boc", "bank of canada"],
-      NZD: ["nzd", "kiwi", "rbnz"],
-      CHF: ["chf", "franc", "snb"],
-      GOLD: ["gold", "xauusd", "bullion"],
-      NAS100: ["nasdaq", "ndx", "nas100"],
-      SPX500: ["s&p 500", "spx", "spx500"],
-      US30: ["dow jones", "djia", "us30"],
-      GER40: ["dax", "ger40"],
-    };
+  // -------------- build terms (short when many currencies selected) ------------
+  const terms: string[] =
+    currencies.length > 1
+      ? currencies.map(c => c.toLowerCase())
+      : currencies.flatMap(c => [c.toLowerCase(), ...(synonyms[c] ?? [])]);
 
-    // Build the terms we’ll search for
-    const terms: string[] =
-      currencies.length === 0
-        ? [] // no filter -> broad market headlines later
-        : currencies.flatMap((c) => [c.toLowerCase(), ...(synonyms[c] ?? [])]);
+  // Build a q under Newsdata's 100-char limit
+  function buildQueryWithinLimit(core: string, extraTerms: string[], maxLen = 95): string {
+    // q = "<core> OR <extra1> OR <extra2> ..."
+    let q = core;
+    for (const t of extraTerms) {
+      const next = q.length === 0 ? t : `${q} OR ${t}`;
+      if (next.length > maxLen) break;
+      q = next;
+    }
+    return q;
+  }
 
-    // Boolean OR query; add macro context words to bias results
-    // (newsdata treats spaces as AND, so we join with OR)
-    const core =
-      terms.length > 0
-        ? terms.map((t) => `"${t}"`).join(" OR ")
-        : 'forex OR markets OR economy OR "central bank"';
-    const q = `${core} OR inflation OR rates OR CPI OR GDP`;
+  // We bias for macro context; extras (currency codes/synonyms) are appended as space allows
+  const macroCore = 'markets OR economy OR "central bank" OR inflation OR rates OR CPI OR GDP';
 
-    const sinceMs = Date.now() - hours * 3600 * 1000;
-
+  async function requestNews(q: string) {
     const url = new URL("https://newsdata.io/api/1/news");
     url.searchParams.set("apikey", API_KEY);
-    url.searchParams.set("q", q); // *** IMPORTANT: use q, not country ***
+    url.searchParams.set("q", q);
     url.searchParams.set("language", lang);
+    url.searchParams.set("page", "1"); // free plan pagination: we only use first page
 
     const rsp = await fetch(url.toString(), { cache: "no-store" });
+    const status = rsp.status;
+    const bodyText = await rsp.text().catch(() => "");
+    let json: any = null;
+    try { json = JSON.parse(bodyText); } catch {}
 
-    // Surface provider error codes (e.g., 422) instead of throwing
-    if (!rsp.ok) {
-      const text = await rsp.text().catch(() => "");
-      if (debug) {
-        return res
-          .status(200)
-          .json({ provider, debug: { url: url.toString(), status: rsp.status, body: text }, items: [] });
-      }
-      return res
-        .status(200)
-        .json({ provider, items: [], note: `provider status ${rsp.status}` });
+    return { ok: rsp.ok, status, url: url.toString(), bodyText, json };
+  }
+
+  // First attempt: macro + (shortened) terms
+  let q = buildQueryWithinLimit(macroCore, terms);
+  let first = await requestNews(q);
+
+  // If provider rejects with 422 (e.g., “query too long” or invalid filter),
+  // retry once with codes-only, then once with macro-only.
+  if (!first.ok && first.status === 422) {
+    // Retry 1: codes-only (no synonyms)
+    const codesOnly = currencies.map(c => c.toLowerCase());
+    const qShort = buildQueryWithinLimit(macroCore, codesOnly);
+    first = await requestNews(qShort);
+
+    if (!first.ok && first.status === 422) {
+      // Retry 2: macro-only, no currency filter
+      first = await requestNews(macroCore);
     }
+  }
 
-    const json: any = await rsp.json();
-    const raw: any[] = Array.isArray(json?.results)
-      ? json.results
-      : Array.isArray(json?.data)
-      ? json.data
-      : [];
-
-    const items: Item[] = raw
-      .map((r: any) => ({
-        title: String(r?.title ?? r?.name ?? "").trim(),
-        url: String(r?.link ?? r?.url ?? "").trim(),
-        source: String(r?.source_id ?? r?.source ?? "").trim(),
-        published_at: String(r?.pubDate ?? r?.published_at ?? r?.date ?? "").trim(),
-        description: String(r?.description ?? r?.snippet ?? "").trim(),
-      }))
-      .filter((it) => it.title && it.url)
-      .filter((it) => {
-        // client-side time filter (best-effort)
-        const t = Date.parse(it.published_at ?? "");
-        return isFinite(t) ? t >= sinceMs : true;
-      })
-      .slice(0, max);
-
+  // Provider returned a non-OK that we didn’t handle
+  if (!first.ok) {
+    const note = `provider status ${first.status}`;
     if (debug) {
       return res.status(200).json({
         provider,
-        debug: { url: url.toString(), q, currencies },
-        count: items.length,
-        items,
+        debug: { url: first.url, status: first.status, body: first.bodyText },
+        items: [],
+        note,
       });
     }
-
-    return res.status(200).json({ provider, count: items.length, items });
-  } catch (err: any) {
-    // Don’t crash the planner if the provider has a hiccup
-    if (debug) {
-      return res.status(200).json({ provider, error: err?.message ?? "fetch failed (caught)", items: [] });
-    }
-    return res.status(200).json({ provider, items: [], note: "fetch failed" });
+    return res.status(200).json({ provider, items: [], note });
   }
+
+  // Parse payload
+  const raw: any[] = Array.isArray(first.json?.results)
+    ? first.json.results
+    : Array.isArray(first.json?.data)
+    ? first.json.data
+    : [];
+
+  const sinceMs = Date.now() - hours * 3600 * 1000;
+
+  const items: Item[] = raw
+    .map((r: any): Item => ({
+      title: String(r.title ?? r.name ?? "").trim(),
+      url: String(r.link ?? r.url ?? "").trim(),
+      source: String(r.source_id ?? r.source ?? "").trim(),
+      published_at: String(r.pubDate ?? r.published_at ?? r.date ?? "").trim(),
+      description: String(r.description ?? r.snippet ?? "").trim(),
+    }))
+    .filter(it => it.title && it.url)
+    // best-effort time filter on free plan
+    .filter(it => {
+      const t = Date.parse(it.published_at ?? "");
+      return Number.isFinite(t) ? t >= sinceMs : true;
+    })
+    .slice(0, max);
+
+  if (debug) {
+    return res.status(200).json({
+      provider,
+      debug: { q, currencies, url: first.url, count: items.length },
+      items,
+    });
+  }
+
+  return res.status(200).json({ provider, count: items.length, items });
 }
