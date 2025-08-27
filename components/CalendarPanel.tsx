@@ -2,26 +2,27 @@
 import React from "react";
 
 export type CalendarItem = {
-  date: string;                 // ISO or human readable
-  time?: string;
-  country?: string;             // ← panel expects this
-  impact?: "Low" | "Medium" | "High";
+  date: string;       // 'YYYY-MM-DD'
+  time?: string;      // 'HH:mm' or ''
+  country: string;    // e.g. 'United States'
+  currency: string;   // e.g. 'USD'
+  impact?: string;    // e.g. 'High' | 'Medium' | 'Low' | ''
   title: string;
+  actual?: string;
+  forecast?: string;
+  previous?: string;
 };
 
 export default function CalendarPanel({
   items,
-  loading = false,
+  loading,
 }: {
   items: CalendarItem[];
-  loading?: boolean;
+  loading: boolean;
 }) {
   if (loading) {
-    return (
-      <div className="text-sm text-gray-300 italic">Loading calendar…</div>
-    );
+    return <div className="text-sm text-gray-400">Loading calendar…</div>;
   }
-
   if (!items || items.length === 0) {
     return (
       <div className="text-sm text-gray-300">
@@ -29,22 +30,23 @@ export default function CalendarPanel({
       </div>
     );
   }
-
   return (
-    <ul className="space-y-2">
+    <div className="space-y-2">
       {items.map((it, idx) => (
-        <li
-          key={idx}
-          className="text-sm rounded border border-neutral-800 p-2 bg-neutral-900"
+        <div
+          key={`${it.date}-${it.time}-${idx}`}
+          className="text-sm border border-neutral-800 rounded p-2"
         >
-          <div className="font-medium">{it.title}</div>
-          <div className="text-gray-400">
-            {it.date}
-            {it.time ? ` • ${it.time}` : ""} {it.country ? `• ${it.country}` : ""}
-            {it.impact ? ` • Impact: ${it.impact}` : ""}
+          <div className="font-semibold">
+            {it.date} {it.time ? `• ${it.time}` : ""} • {it.country} ({it.currency})
           </div>
-        </li>
+          <div>{it.title}</div>
+          <div className="text-xs text-gray-400">
+            Impact: {it.impact || "-"} | Actual: {it.actual || "-"} | Forecast:{" "}
+            {it.forecast || "-"} | Previous: {it.previous || "-"}
+          </div>
+        </div>
       ))}
-    </ul>
+    </div>
   );
 }
