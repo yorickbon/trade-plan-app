@@ -1,8 +1,8 @@
 // /pages/api/plan.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
-import { getCandles } from "../../lib/prices";           // named export in your repo
-import { scoreSentiment } from "../../lib/sentiment";    // returns number in [-1, 1]
+import { getCandles } from "../../lib/prices";
+import { scoreSentiment } from "../../lib/sentiment";
 
 // ---------- short in-memory cache (5 min) ----------
 type CacheEntry<T> = { data: T; exp: number };
@@ -98,7 +98,7 @@ async function pollCandlesUntilAll(
           need.delete(tf);
         }
       } catch {
-        // ignore; we'll retry until timeout
+        // ignore; retry until timeout
       }
     }
     if (!need.size) break;
@@ -157,7 +157,7 @@ export default async function handler(
       return res.status(200).json(hit);
     }
 
-    // ensure we have headlines (fallback: /api/news?curr=…)
+    // ensure headlines (fallback to /api/news if currencies are provided)
     let usedHeadlines: Headline[] = Array.isArray(headlines) ? headlines : [];
     if (!usedHeadlines.length && instr.currencies?.length) {
       try {
@@ -174,8 +174,6 @@ export default async function handler(
     // recent headlines window
     const sinceHrs = Math.max(1, parseInt(process.env.HEADLINES_SINCE_HOURS || "48", 10));
     const recent = pickRecentHeadlines(usedHeadlines, sinceHrs);
-
-    // optional “stand down on news” rule was removed per new plan; we only apply a small conviction modifier
 
     // optional blackout if a high-impact calendar event is within ~90 min
     const calItems: CalendarItem[] = Array.isArray(calendar) ? calendar : [];
@@ -218,9 +216,9 @@ export default async function handler(
     const swingLo = Math.min(...lows);
     const range = Math.max(1e-9, swingHi - swingLo);
 
-    // ------ level proposals based on bias (FIXED LOGIC) ------
+    // ------ level proposals based on bias ------
     const fib618 = swingHi - 0.618 * range;     // pullback for long
-    const buffer = 0.10 * range;                // 10% of range buffer
+    const buffer = 0.10 * range;                // buffer to keep SL beyond swing
 
     let entry: number;
     let stop: number;
@@ -242,11 +240,10 @@ export default async function handler(
 
     // ---------- conviction baseline ----------
     let conviction = 60;
-    // small boost when we actually have some recent headlines:
     conviction = Math.min(95, conviction + Math.min(3, recent.length));
     if (blackout) conviction = Math.min(conviction, 55);
 
-    // ---------- lightweight news sentiment (does NOT block trading) ----------
+    // ---------- lightweight news sentiment (await + union type safe) ----------
     let newsBias = "Neutral";
     let newsScore = 0;
     try {
@@ -255,9 +252,15 @@ export default async function handler(
           .slice(0, 12)
           .map((h) => `• ${h.title}`)
           .join("\n") || "";
-      const s = scoreSentiment(recentText); // sync, number in [-1, 1]
-      newsScore = Number(s || 0);
-      newsBias = s > 0.15 ? "Positive" : s < -0.15 ? "Negative" : "Neutral";
+
+      // In your repo this might be sync or async, number or {score:number}.
+      const s: any = await (scoreSentiment as any)(recentText);
+      const val: number =
+        typeof s === "number" ? s :
+        typeof s?.score === "number" ? s.score : 0;
+
+      newsScore = Number(val || 0);
+      newsBias = val > 0.15 ? "Positive" : val < -0.15 ? "Negative" : "Neutral";
     } catch {
       // ignore sentiment errors
     }
@@ -265,6 +268,8 @@ export default async function handler(
     // ---------- LLM formatting ----------
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+    const sinceHrs = Math.max(1, parseInt(process.env.HEADLINES_SINCE_HOURS || "48", 10));
 
     const prompt = `
 You are a trading assistant. Format a *single* trade card for ${instr.code}.
