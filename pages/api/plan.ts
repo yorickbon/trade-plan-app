@@ -2,6 +2,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
 import { getCandles } from "../../lib/prices"; // named export
+import { scoreSentiment } from "../../lib/sentiment";
 
 // ---------- short in-memory cache (5 min) ----------
 type CacheEntry<T> = { data: T; exp: number };
