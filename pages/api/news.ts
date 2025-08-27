@@ -1,4 +1,4 @@
-// /pages/api/news.ts
+// pages/api/news.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 
 type Item = {
@@ -9,19 +9,19 @@ type Item = {
   description?: string;
 };
 
-// Parse comma/array into upper-case tokens, e.g. "eur,usd" -> ["EUR","USD"]
+// parse ?currencies=USD,JPY -> ["USD","JPY"]
 function parseCurrencies(q: string | string[] | undefined): string[] {
   if (!q) return [];
   const raw = Array.isArray(q) ? q.join(",") : String(q);
   return raw.split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
 }
 
-// Helper: trim a query string to a max length, cutting at a word boundary if possible
+// soft trim long strings
 function trimToLimit(s: string, maxLen: number): string {
   if (s.length <= maxLen) return s;
   const cut = s.slice(0, maxLen);
-  const lastSpace = cut.lastIndexOf(" ");
-  return (lastSpace > 50 ? cut.slice(0, lastSpace) : cut).trim();
+  const i = cut.lastIndexOf(" ");
+  return (i > 40 ? cut.slice(0, i) : cut).trim();
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -37,141 +37,88 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     process.env.NEWS_API_KEY ||
     "";
 
-  // No key: don't 500 the app, just return empty with a note
+  // No key? keep the app alive; planner will trade technicals
   if (!API_KEY) {
     return res.status(200).json({
       provider: "newsdata",
       items: [],
-      note: "No News API key detected (NEWSDATA_API_KEY or NEWS_API_KEY). Trading will proceed on technicals.",
+      note: "No News API key (NEWSDATA_API_KEY or NEWS_API_KEY). Proceeding with technicals.",
     });
   }
 
   try {
-    // --- Synonyms: FX, metals, indices ---
-    const synonyms: Record<string, string[]> = {
-      USD: ["usd", "dollar", "greenback", "us"],
-      EUR: ["eur", "euro", "ecb", "eurozone"],
-      GBP: ["gbp", "pound", "boe", "bank of england", "sterling"],
-      JPY: ["jpy", "yen", "boj", "bank of japan"],
-      AUD: ["aud", "aussie", "rba"],
-      NZD: ["nzd", "kiwi", "rbnz"],
-      CAD: ["cad", "loonie", "boc", "bank of canada"],
-      CHF: ["chf", "franc", "snb"],
+    // Build a SHORT query to avoid Newsdata 422 errors
+    // If currencies provided -> just the codes (e.g., "USD OR JPY")
+    // Else -> tiny macro query
+    let q = currencies.length > 0
+      ? currencies.join(" OR ")
+      : `forex OR economy OR "central bank"`;
 
-      GOLD: ["gold", "xauusd", "bullion"],
-      NAS100: ["nasdaq", "ndx", "nas100"],
-      SPX500: ["s&p 500", "spx", "spx500"],
-      US30: ["dow jones", "djia", "us30"],
-      GER40: ["dax", "ger40"],
-    };
-
-    // Build candidate terms from currencies (if provided)
-    const terms: string[] =
-      currencies.length === 0
-        ? [] // no filter -> we'll search broad macro words below
-        : currencies.flatMap((c) => [c.toLowerCase(), ...(synonyms[c] ?? [])]);
-
-    // Build the core boolean-OR query part
-    const core = terms.length > 0 ? terms.map((t) => `${t}`).join(" OR ") : "";
-    // Base macro context to bias results
-    const macroTail = `forex OR markets OR economy OR "central bank" OR inflation OR rates OR CPI OR GDP`;
-
-    // First attempt: full query (may be long)
-    let q = core ? `${core} OR ${macroTail}` : macroTail;
-
-    // If too long for Newsdata (they error ~100 chars), fallback to short code query
-    // We target ~90 to be safe, then trim softly.
-    if (q.length > 90 && currencies.length > 0) {
-      const shortCodes = currencies.join(" OR ");
-      q = `${shortCodes} OR ${macroTail}`;
-    }
-    if (q.length > 120) {
-      q = trimToLimit(q, 120);
-    }
+    // cap length to be safe
+    if (q.length > 120) q = trimToLimit(q, 120);
 
     const sinceMs = Date.now() - hours * 3600 * 1000;
 
-    // Small helper to fetch with a given q
     const fetchOnce = async (query: string) => {
       const url = new URL("https://newsdata.io/api/1/news");
       url.searchParams.set("apikey", API_KEY);
-      url.searchParams.set("q", query); // IMPORTANT: use q, not country
+      url.searchParams.set("q", query);
       url.searchParams.set("language", lang);
-      url.searchParams.set("page", "1");
+      // NOTE: do NOT set "page" on the first call (free plan quirk)
 
       const rsp = await fetch(url.toString(), { cache: "no-store" });
-      const bodyText = await rsp.text().catch(() => "");
+      const txt = await rsp.text().catch(() => "");
+      let json: any;
+      try { json = JSON.parse(txt); } catch { json = {}; }
 
-      if (!rsp.ok) {
-        // Surface provider errors (e.g., 422) without throwing
-        return {
-          ok: false,
-          status: rsp.status,
-          bodyText,
-          url: url.toString(),
-          json: null as any,
-        };
-      }
-
-      let json: any = {};
-      try {
-        json = JSON.parse(bodyText);
-      } catch {
-        json = {};
-      }
-
-      return { ok: true, status: rsp.status, bodyText, url: url.toString(), json };
+      return { ok: rsp.ok, status: rsp.status, url: url.toString(), body: txt, json };
     };
 
-    // Attempt 1: use (possibly long) query
-    let r1 = await fetchOnce(q);
+    // try primary query
+    let r = await fetchOnce(q);
 
-    // If provider says 422 (query too long / unsupported), retry once with a very short query
-    if (!r1.ok && r1.status === 422) {
-      const ultraShort =
-        currencies.length > 0 ? currencies.join(" OR ") : `forex OR economy`;
-      r1 = await fetchOnce(ultraShort);
-      if (!r1.ok && debug) {
+    // if provider rejects (422), retry once with ultra-short query
+    if (!r.ok && r.status === 422) {
+      const ultra = currencies.length > 0 ? currencies[0] : "forex";
+      r = await fetchOnce(ultra);
+      if (!r.ok && debug) {
         return res.status(200).json({
           provider: "newsdata",
-          debug: { url: r1.url, status: r1.status, body: r1.bodyText },
+          debug: { url: r.url, status: r.status, body: r.body },
           items: [],
-          note: `provider status ${r1.status}`,
+          note: `provider status ${r.status}`,
         });
       }
     }
 
-    if (!r1.ok) {
-      // Other provider error
+    if (!r.ok) {
       if (debug) {
         return res.status(200).json({
           provider: "newsdata",
-          debug: { url: r1.url, status: r1.status, body: r1.bodyText },
+          debug: { url: r.url, status: r.status, body: r.body },
           items: [],
-          note: `provider status ${r1.status}`,
+          note: `provider status ${r.status}`,
         });
       }
-      return res.status(200).json({ provider: "newsdata", items: [], note: `provider status ${r1.status}` });
+      return res.status(200).json({ provider: "newsdata", items: [], note: `provider status ${r.status}` });
     }
 
-    // Map items
-    const raw: any[] = Array.isArray(r1.json?.results)
-      ? r1.json.results
-      : Array.isArray(r1.json?.data)
-      ? r1.json.data
+    const raw: any[] = Array.isArray(r.json?.results)
+      ? r.json.results
+      : Array.isArray(r.json?.data)
+      ? r.json.data
       : [];
 
     const items: Item[] = raw
-      .map((r: any): Item => ({
-        title: String(r.title ?? r?.name ?? "").trim(),
-        url: String(r.link ?? r.url ?? "").trim(),
-        source: String(r.source_id ?? r?.source ?? "").trim(),
-        published_at: String(r.pubDate ?? r.published_at ?? r?.date ?? "").trim(),
-        description: String(r.description ?? r?.snippet ?? "").trim(),
+      .map((v: any): Item => ({
+        title: String(v.title ?? v.name ?? "").trim(),
+        url: String(v.link ?? v.url ?? "").trim(),
+        source: String(v.source_id ?? v.source ?? "").trim(),
+        published_at: String(v.pubDate ?? v.published_at ?? v.date ?? "").trim(),
+        description: String(v.description ?? v.snippet ?? "").trim(),
       }))
-      .filter((it) => it.title && it.url)
-      // Client-side time filter (best-effort on free plan)
-      .filter((it) => {
+      .filter(it => it.title && it.url)
+      .filter(it => {
         const t = Date.parse(it.published_at ?? "");
         return isFinite(t) ? t >= sinceMs : true;
       })
@@ -180,7 +127,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (debug) {
       return res.status(200).json({
         provider: "newsdata",
-        debug: { url: r1.url, q },
+        debug: { url: r.url, q },
         count: items.length,
         items,
       });
@@ -188,11 +135,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     return res.status(200).json({ provider: "newsdata", count: items.length, items });
   } catch (err: any) {
-    // Never crash the planner if the provider hiccups
-    if (String(req.query.debug ?? "") === "1") {
-      return res
-        .status(200)
-        .json({ provider: "newsdata", error: err?.message ?? "fetch failed (caught)", items: [] });
+    if (debug) {
+      return res.status(200).json({ provider: "newsdata", error: err?.message ?? "fetch failed (caught)", items: [] });
     }
     return res.status(200).json({ provider: "newsdata", items: [], note: "fetch failed" });
   }
