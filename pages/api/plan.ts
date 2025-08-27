@@ -1,31 +1,26 @@
 // /pages/api/plan.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
+import { getCandles } from "../../lib/prices";
+// We tolerate either sync or async exports from your local sentiment file.
+import * as sentimentMod from "../../lib/sentiment";
 
-type Candle = { t: number; o: number; h: number; l: number; c: number };
-
-type Instrument = { code: string; currencies?: string[] };
-
+/* ----------------------- Local API Shapes ----------------------- */
+type Candle = { t:number; o:number; h:number; l:number; c:number };
+type Instrument = { code: string; currencies?: string[] }; // e.g., EURUSD
 type CalendarItem = {
-  date: string;
-  time?: string;
-  country?: string;
-  currency?: string;
-  impact?: "Low" | "Medium" | "High" | "Undefined" | string;
-  title?: string;
-  actual?: string;
-  forecast?: string;
-  previous?: string;
+  date: string; time?: string;
+  country?: string; currency?: string;
+  impact?: "Low"|"Medium"|"High"|"Undefined"|string;
+  title?: string; actual?: string; forecast?: string; previous?: string;
 };
-
 type Headline = {
   title: string;
-  url: string;
-  source: string;
-  seen?: string;          // ISO timestamp when we showed it
-  published_at?: string;  // optional from /api/news
+  url?: string;
+  source?: string;
+  seen?: string;          // ISO when we showed it
+  published_at?: string;  // ISO from /api/news (optional)
 };
-
 type PlanOut = {
   text: string;
   conviction?: number | null;
@@ -36,129 +31,106 @@ type PlanOut = {
   tp2?: number | null;
   notes?: string | null;
 };
-
 type ApiOut =
   | { ok: true; plan: PlanOut; usedHeadlines: Headline[]; usedCalendar: CalendarItem[] }
   | { ok: false; reason: string; usedHeadlines: Headline[]; usedCalendar: CalendarItem[] };
 
-// -------- short in-memory cache (5 min) ------------
+/* --------------------- Small in-memory cache -------------------- */
 type CacheEntry<T> = { data: T; exp: number };
 const PLAN_CACHE: Map<string, CacheEntry<any>> =
-  (globalThis as any).__PLAN_CACHE__ ?? new Map<string, CacheEntry<any>>();
-(globalThis as any).__PLAN_CACHE__ = PLAN_CACHE;
+  (globalThis as any)._PLAN_CACHE ?? new Map<string, CacheEntry<any>>();
+(globalThis as any)._PLAN_CACHE = PLAN_CACHE;
 const PLAN_CACHE_TTL = 5 * 60 * 1000;
 
 function cacheGet<T>(key: string): T | null {
   const le = PLAN_CACHE.get(key);
   if (!le) return null;
-  if (Date.now() > le.exp) {
-    PLAN_CACHE.delete(key);
-    return null;
-  }
+  if (Date.now() > le.exp) { PLAN_CACHE.delete(key); return null; }
   return le.data as T;
 }
-
 function cacheSet(key: string, data: any) {
   PLAN_CACHE.set(key, { data, exp: Date.now() + PLAN_CACHE_TTL });
 }
 
-// -------------- candle helpers ---------------------
-
-// Always call our own /api/candles endpoint (it’s the one you’ve verified works)
-async function fetchCandlesViaApi(
-  symbol: string,
-  interval: "15m" | "1h" | "4h",
-  limit = 200
-): Promise<Candle[]> {
-  try {
-    const base =
-      process.env.NEXT_PUBLIC_BASE_URL ||
-      `https://${process.env.VERCEL_URL || ""}`.replace(/\/+$/, "");
-
-    // Fallback if NEXT_PUBLIC_BASE_URL is missing in local dev:
-    const url =
-      base && base.startsWith("http")
-        ? `${base}/api/candles?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`
-        : `/api/candles?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
-
-    const rsp = await fetch(url, { cache: "no-store" });
-    if (!rsp.ok) return [];
-    const j = await rsp.json();
-    return Array.isArray(j.candles) ? j.candles : [];
-  } catch {
-    return [];
-  }
-}
-
-// EURUSD <-> EUR/USD
+/* --------------------- Candle fetch utilities ------------------- */
 function altSymbol(code: string): string {
+  // EURUSD <-> EUR/USD
   if (code.includes("/")) return code.replace("/", "");
-  if (code.length === 6) return `${code.slice(0, 3)}/${code.slice(3)}`;
+  if (code.length === 6) return `${code.slice(0,3)}/${code.slice(3)}`;
   return code;
 }
 
-type AllFrames = { m4: Candle[]; m1: Candle[]; m15: Candle[]; triedAlt: string | null };
-
-async function tryAll(symbol: string, limit = 200): Promise<AllFrames> {
-  const [m4, m1, m15] = await Promise.all([
-    fetchCandlesViaApi(symbol, "4h", limit),
-    fetchCandlesViaApi(symbol, "1h", limit),
-    fetchCandlesViaApi(symbol, "15m", limit),
-  ]);
-  return { m4, m1, m15, triedAlt: null };
+async function fetchOneTF(symbol: string, interval: "15m"|"1h"|"4h", limit = 200): Promise<Candle[]> {
+  try { return await getCandles(symbol, interval, limit); } catch { return []; }
 }
 
-async function getAllWithTimeout(code: string): Promise<AllFrames & { missing: string[] }> {
-  const totalMs = Math.max(8000, Number(process.env.PLAN_CANDLES_TIMEOUT_MS ?? 8000));
-  const pollMs = Math.max(200, Number(process.env.PLAN_CANDLES_POLL_MS ?? 1000));
-  const bigLimit = 200;
+async function fetchTFWithFallback(symbol: string, interval: "15m"|"1h"|"4h", limit = 200): Promise<Candle[]> {
+  const a = await fetchOneTF(symbol, interval, limit);
+  if (a.length) return a;
+  const alt = altSymbol(symbol);
+  if (alt !== symbol) {
+    const b = await fetchOneTF(alt, interval, limit);
+    if (b.length) return b;
+  }
+  return [];
+}
 
-  const start = Date.now();
-  let last: AllFrames = { m4: [], m1: [], m15: [], triedAlt: null };
-  let used = code;
-  let step = 0;
+/**
+ * Fast parallel fetch for 4h/1h/15m with short micro-retries (no long polls).
+ * Tries primary symbol, then alt symbol only for the timeframe(s) that fail.
+ * Default total retry window ~5s (20 * 250ms).
+ */
+async function getAllTimeframesQuick(code: string) {
+  const limit = 200;
+  const maxRetries = 20;
+  const delayMs = Math.max(50, Math.min(1000, Number(process.env.PLAN_CANDLES_POLL_MS ?? 250)));
+  let m4: Candle[] = [], m1: Candle[] = [], m15: Candle[] = [];
 
-  while (Date.now() - start < totalMs) {
-    step++;
+  const tryAll = async () => {
+    if (!m4.length) m4 = await fetchTFWithFallback(code, "4h", limit);
+    if (!m1.length) m1 = await fetchTFWithFallback(code, "1h", limit);
+    if (!m15.length) m15 = await fetchTFWithFallback(code, "15m", limit);
+  };
 
-    // sequence: normal -> bigLimit -> alt -> alt + bigLimit (then repeat)
-    const useBig = step % 4 === 2 || step % 4 === 0;
-    const useAlt = step % 4 === 3 || step % 4 === 0;
-
-    used = useAlt ? altSymbol(code) : code;
-
-    last = await tryAll(used, useBig ? bigLimit : 120);
-
-    if (last.m4.length && last.m1.length && last.m15.length) {
-      return { ...last, triedAlt: useAlt ? used : null, missing: [] };
-    }
-
-    await new Promise((r) => setTimeout(r, pollMs));
+  await tryAll();
+  let tries = 0;
+  while ((!(m4.length && m1.length && m15.length)) && tries < maxRetries) {
+    await new Promise(r => setTimeout(r, delayMs));
+    await tryAll();
+    tries++;
   }
 
   const missing: string[] = [];
-  if (!last.m4.length) missing.push("4h");
-  if (!last.m1.length) missing.push("1h");
-  if (!last.m15.length) missing.push("15m");
-  return { ...last, missing };
+  if (!m4.length) missing.push("4h");
+  if (!m1.length) missing.push("1h");
+  if (!m15.length) missing.push("15m");
+
+  return { m4, m1, m15, missing, tries };
 }
 
-// -------------- sentiment helper -------------------
+/* ---------------------- Sentiment helper ------------------------ */
 async function scoreHeadlines(text: string): Promise<number> {
-  // Your /lib/sentiment may be sync or async and may export default or named;
-  // call through /api/news bias is simpler later, but keep this as a no-op for now.
   try {
-    // very light lexicon placeholder (safe if lib signature varies)
-    const lc = text.toLowerCase();
-    const pos = (lc.match(/\b(up|beat|gain|rise|bull|strong)\b/g) || []).length;
-    const neg = (lc.match(/\b(down|fall|lose|bear|weak)\b/g) || []).length;
-    return Math.max(-1, Math.min(1, (pos - neg) / 10));
-  } catch {
-    return 0;
-  }
+    const maybe: any = (sentimentMod as any).default ?? (sentimentMod as any).scoreSentiment ?? sentimentMod;
+    const ret = typeof maybe === "function" ? maybe(text) : maybe;
+    const val = ret && typeof (ret.then) === "function" ? await ret : ret;
+    if (typeof val === "number") return val;                 // already a score
+    if (val && typeof val.score === "number") return val.score; // { score }
+  } catch {}
+  return 0;
 }
 
-// ------------------- handler -----------------------
+/* ----------------------- Minor math helpers --------------------- */
+const to5 = (n: number) => Number(n.toFixed(5));
+const mean = (xs: number[]) => xs.reduce((a,b)=>a+b,0) / (xs.length || 1);
+function trend(arr: Candle[]): number {
+  const a = arr.at(-1)?.c ?? 0;
+  const b = arr.at(-21)?.c ?? a;
+  if (!a || !b) return 0;
+  return a > b ? 1 : a < b ? -1 : 0;
+}
+
+/* ------------------------- API handler -------------------------- */
 export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiOut>) {
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, reason: "Method not allowed", usedHeadlines: [], usedCalendar: [] });
@@ -166,167 +138,143 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
   try {
     const { instrument, date, calendar, headlines } = req.body as {
-      instrument: Instrument | string;
-      date?: string;
+      instrument: Instrument | string; date?: string;
       calendar?: CalendarItem[] | null;
       headlines?: Headline[] | null;
     };
 
-    const instr: Instrument = typeof instrument === "string" ? { code: instrument } : instrument;
+    const instr = typeof instrument === "string" ? { code: instrument } : instrument;
     if (!instr?.code) {
       return res.status(400).json({ ok: false, reason: "Missing instrument code", usedHeadlines: [], usedCalendar: [] });
     }
 
-    // cache key
+    // cache key: instrument + date (YYYY-MM-DD) + inputs snapshot sizes
     const cacheKey = JSON.stringify({
       code: instr.code,
-      date: (date || new Date().toISOString().slice(0, 10)),
+      date: (date ?? new Date().toISOString().slice(0,10)),
       caln: Array.isArray(calendar) ? calendar.length : -1,
       news: Array.isArray(headlines) ? headlines.length : -1,
     });
     const hit = cacheGet<ApiOut>(cacheKey);
-    if (hit) {
+    if (hit && hit.ok) {
       res.setHeader("Cache-Control", "public, max-age=60");
       return res.status(200).json(hit);
     }
 
-    // ensure headlines (fallback to /api/news)
-    let usedHeadlines: Headline[] = Array.isArray(headlines) ? headlines : [];
-    if (!usedHeadlines.length && instr.currencies?.length) {
-      const base = process.env.NEXT_PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL || ""}`.replace(/\/+$/, "");
-      const curr = encodeURIComponent(instr.currencies.join(","));
-      const rsp = await fetch(`${base}/api/news?currencies=${curr}`, { cache: "no-store" });
-      const j = await rsp.json();
-      usedHeadlines = Array.isArray(j.items) ? j.items : [];
-    }
-
-    // recent headline filter (24–48h window)
-    const sinceHrs = Math.max(24, parseInt(process.env.HEADLINES_SINCE_HOURS || "24", 10));
-    const cutoff = Date.now() - sinceHrs * 3600_000;
-    const recent = usedHeadlines.filter((h) => {
+    /* --------- ensure we have recent headlines (lightweight) ----- */
+    const usedHeadlines: Headline[] = Array.isArray(headlines) ? headlines : [];
+    const sinchHrs = Math.max(1, parseInt(process.env.HEADLINES_SINCE_HOURS ?? "24", 10));
+    const cutoff = Date.now() - sinchHrs * 3600_000;
+    const recent = usedHeadlines.filter(h => {
       const t = Date.parse(h.seen ?? h.published_at ?? "");
       return Number.isFinite(t) && t >= cutoff;
     });
 
-    // optional blackout within ±90 min
+    /* ----------------- blackout within ~90 minutes --------------- */
     const calItems: CalendarItem[] = Array.isArray(calendar) ? calendar : [];
-    const blackout = (() => {
-      if (!calItems.length) return false;
+    let blackout = false;
+    if (calItems.length) {
       const now = Date.now();
       const within = 90 * 60 * 1000;
-      return calItems.some((ev) => {
-        const t = Date.parse(`${(ev as any).date ?? ""}T${(ev as any).time ?? "00:00"}:00Z`);
-        return Number.isFinite(t) && Math.abs(t - now) <= within && String(ev.impact || "").toLowerCase().includes("high");
+      blackout = calItems.some(ev => {
+        const t = Date.parse(`${(ev as any).date}T${(ev as any).time ?? "00:00"}:00Z`);
+        return Number.isFinite(t) && Math.abs(t - now) <= within && String(ev.impact ?? "").toLowerCase().includes("high");
       });
-    })();
-
-    // --- Fetch candles (REQUIRE all 4h/1h/15m, with timeout & retries)
-    const all = await getAllWithTimeout(instr.code);
-    if (all.missing.length) {
-      const secs = Math.round(Number(process.env.PLAN_CANDLES_TIMEOUT_MS ?? 8000) / 1000);
-      const triedAlt = all.triedAlt ? ` (tried alt symbol: ${all.triedAlt})` : "";
-      const reason = `Missing candles for ${all.missing.join(", ")}.${triedAlt} Timed out after ${secs}s.`;
-      const out: ApiOut = { ok: false, reason, usedHeadlines: recent.slice(0, 12), usedCalendar: calItems };
-      cacheSet(cacheKey, out);
-      res.setHeader("Cache-Control", "public, max-age=60");
-      return res.status(200).json(out);
     }
 
-    const m15 = all.m15;
-    const m1 = all.m1;
-    const m4 = all.m4;
+    /* --------------- fetch candles (fast retries) ---------------- */
+    const t0 = Date.now();
+    const { m4, m1, m15, missing, tries } = await getAllTimeframesQuick(instr.code);
 
-    // ----- baseline levels from 15m (guard against bad ordering)
-    const lastClose = Number(m15.at(-1)?.c ?? NaN);
-    const highs = m15.slice(-40).map((c) => Number(c.h));
-    const lows = m15.slice(-40).map((c) => Number(c.l));
-    const swingHi = Math.max(...highs);
-    const swingLo = Math.min(...lows);
-    const range = Math.max(1e-9, swingHi - swingLo);
-    const fib618 = swingHi - 0.618 * range;
+    if (missing.length) {
+      const secs = ((Date.now() - t0) / 1000).toFixed(1);
+      return res.status(200).json({
+        ok: false,
+        reason: `Missing candles for ${missing.join(", ")} after ${secs}s (tries=${tries}).`,
+        usedHeadlines: recent.slice(0, 12),
+        usedCalendar: calItems,
+      });
+    }
 
-    let entry = Number(fib618.toFixed(5));
-    let stop: number, tp1: number, tp2: number;
+    /* -------------------- quick bias + levels -------------------- */
+    const up4 = trend(m4) > 0;
+    const up1 = trend(m1) > 0;
+    const wantUp = trend(m15) > 0;
 
-    // simple directional guess from last 20 candles (15m)
-    const dir =
-      (m15.at(-1)?.c ?? 0) > (m15.at(-21)?.c ?? 0) ? "Buy" :
-      (m15.at(-1)?.c ?? 0) < (m15.at(-21)?.c ?? 0) ? "Sell" : "Buy";
+    const last40 = m15.slice(-40);
+    const swingHi = Math.max(...last40.map(c => c.h));
+    const swingLo = Math.min(...last40.map(c => c.l));
+    const range   = Math.max(1e-9, swingHi - swingLo);
+    const fib618  = swingLo + 0.618 * range;
 
-    if (dir === "Buy") {
-      stop = Number((swingLo - 0.25 * range).toFixed(5));
-      tp1 = Number((swingHi + 0.25 * range).toFixed(5));
-      tp2 = Number((swingHi + 0.50 * range).toFixed(5));
-      // Safety: ensure stop < entry < tps
-      if (!(stop < entry && entry < tp1 && tp1 < tp2)) {
-        // fallback around lastClose
-        entry = Number(lastClose.toFixed(5));
-        stop = Number((entry - 0.5 * range).toFixed(5));
-        tp1 = Number((entry + 0.5 * range).toFixed(5));
-        tp2 = Number((entry + 0.8 * range).toFixed(5));
-      }
+    // Default "pullback" plan on 15m, HTFs adjust conviction only.
+    let entry  = to5(fib618);
+    let stop   = to5(swingLo - 0.25 * range);
+    let tp1    = to5(swingLo + 0.25 * range);
+    let tp2    = to5(swingLo + 0.50 * range);
+    let setup  = "Pullback";
+    let side   = wantUp ? "Buy" : "Sell";
+
+    if (!wantUp) {
+      // mirror for sell
+      entry = to5(swingHi - 0.618 * range);
+      stop  = to5(swingHi + 0.25 * range);
+      tp1   = to5(swingHi - 0.25 * range);
+      tp2   = to5(swingHi - 0.50 * range);
+    }
+
+    // Safety: make sure SL is on the **risk** side and TPs on the profit side
+    if (side === "Buy") {
+      if (!(stop < entry)) { const s = stop; stop = to5(Math.min(entry - 0.001, swingLo)); }
+      if (!(tp1 > entry)) { tp1 = to5(entry + 0.25 * range); }
+      if (!(tp2 > entry)) { tp2 = to5(entry + 0.50 * range); }
     } else {
-      // Sell
-      entry = Number((swingLo + 0.382 * range).toFixed(5));
-      stop  = Number((swingHi + 0.25 * range).toFixed(5));
-      tp1   = Number((swingLo - 0.25 * range).toFixed(5));
-      tp2   = Number((swingLo - 0.50 * range).toFixed(5));
-      // Safety: ensure tps < entry < stop
-      if (!(tp2 < tp1 && tp1 < entry && entry < stop)) {
-        entry = Number(lastClose.toFixed(5));
-        stop  = Number((entry + 0.5 * range).toFixed(5));
-        tp1   = Number((entry - 0.5 * range).toFixed(5));
-        tp2   = Number((entry - 0.8 * range).toFixed(5));
-      }
+      if (!(stop > entry)) { stop = to5(Math.max(entry + 0.001, swingHi)); }
+      if (!(tp1 < entry)) { tp1 = to5(entry - 0.25 * range); }
+      if (!(tp2 < entry)) { tp2 = to5(entry - 0.50 * range); }
     }
 
-    // conviction base + HTF alignment
+    /* ---------------- conviction from HTFs + news ---------------- */
     let conviction = 60;
-    const trend = (arr: Candle[]) => {
-      const a = arr.at(-1)?.c ?? 0;
-      const b = arr.at(-21)?.c ?? a;
-      return a > b ? 1 : a < b ? -1 : 0;
-    };
-    const t1h = trend(m1);
-    const t4h = trend(m4);
-    const wantUp = dir === "Buy";
-    let tfPenalty = 0;
-    if (t1h < 0 && wantUp) tfPenalty += 10;
-    if (t4h < 0 && wantUp) tfPenalty += 10;
-    if (t1h > 0 && !wantUp) tfPenalty += 10;
-    if (t4h > 0 && !wantUp) tfPenalty += 10;
-    conviction = Math.max(0, conviction - tfPenalty);
+    // HTF alignment = gentle, not strict
+    if (up4 === wantUp) conviction += 10;
+    if (up1 === wantUp) conviction += 10;
 
-    // news bias (light)
-    const newsText = recent.map((h) => h.title).slice(0, 12).join("\n");
+    // Lightweight news score
+    let newsBias = "Neutral";
+    let newsScore = 0;
     try {
-      const s = await scoreHeadlines(newsText);
-      if (s > 0.15) conviction = Math.min(95, conviction + 5);
-      if (s < -0.15) conviction = Math.max(5, conviction - 5);
+      const recentText = recent.slice(0, 12).map(h => `• ${h.title}`).join("\n");
+      const s = await scoreHeadlines(recentText);
+      newsScore = Number(s || 0);
+      newsBias = newsScore > 0.15 ? "Positive" : newsScore < -0.15 ? "Negative" : "Neutral";
     } catch { /* ignore */ }
 
-    // blackout penalty
-    if (blackout) conviction = Math.max(0, conviction - 15);
+    if (newsBias === "Positive" && side === "Buy") conviction += 5;
+    if (newsBias === "Negative" && side === "Sell") conviction += 5;
+    if (blackout) conviction = Math.max(0, conviction - 10);
+    conviction = Math.max(0, Math.min(95, conviction));
 
-    // LLM formatting (uses your existing OPENAI env)
+    /* ----------------------- LLM formatting ---------------------- */
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-    const htf: string[] = [];
-    htf.push(`4h ${t4h > 0 ? "up" : t4h < 0 ? "down" : "flat"}`);
-    htf.push(`1h ${t1h > 0 ? "up" : t1h < 0 ? "down" : "flat"}`);
+    const htfNote: string[] = [];
+    htfNote.push(`4h ${up4 ? "up" : "down"}`);
+    htfNote.push(`1h ${up1 ? "up" : "down"}`);
 
     const prompt = `
 You are a trading assistant. Format a *single* trade card for ${instr.code}.
 
 Context:
-- Bias timeframe: 15m (1h/4h only for alignment/conviction).
-- Headlines in last ${sinceHrs}h: ${recent.length}.
-- HTF context: ${htf.join(", ")}.
-- Blackout within ±90m: ${blackout ? "YES" : "NO"}.
+- Execution timeframe: 15m. 1H/4H used for context only (not strictly required).
+- Macro headlines checked in last ${sinchHrs}h: ${recent.length}
+- News sentiment (lightweight): ${newsBias} (${newsScore.toFixed(2)})
+- HTF context: ${htfNote.join(", ")}
+- Calendar blackout within ~90m: ${blackout ? "YES" : "NO"}
 
 Proposed technicals:
-- Direction: **${dir}**
+- Direction: **${side}**
 - Entry: **${entry}**
 - Stop: **${stop}**
 - TP1: **${tp1}**
@@ -335,15 +283,15 @@ Proposed technicals:
 Return *only* these markdown fields:
 
 **Trade Card: ${instr.code}**
-**Type:** (Pullback | BOS | Range | Breakout)
-**Direction:** (Buy | Sell)
+**Type:** (${setup} | BOS | Range | Breakout)
+**Direction:** (**Buy | Sell**)
 **Entry:** <number>
 **Stop:** <number>
 **TP1:** <number>
 **TP2:** <number>
 **Conviction %:** ${conviction}
 
-**Reasoning:** one paragraph with price-action logic, include HTF note if relevant.
+**Reasoning:** one paragraph with price-action logic. Mention HTF context briefly.
 **Timeframe Alignment:** 4H/1H/15M note.
 **Invalidation Notes:** one sentence.
 **Caution:** mention blackout/headlines if relevant.
@@ -354,7 +302,6 @@ Return *only* these markdown fields:
       temperature: 0.2,
       messages: [{ role: "user", content: prompt }],
     });
-
     const text = chat.choices?.[0]?.message?.content?.trim() || "";
 
     const out: ApiOut = {
@@ -362,11 +309,8 @@ Return *only* these markdown fields:
       plan: {
         text,
         conviction,
-        setupType: dir === "Buy" ? "Pullback" : "BOS",
-        entry,
-        stop,
-        tp1,
-        tp2,
+        setupType: setup,
+        entry, stop, tp1, tp2,
         notes: blackout ? "High-impact event within ~90m – reduced conviction." : null,
       },
       usedHeadlines: recent.slice(0, 12),
@@ -376,6 +320,7 @@ Return *only* these markdown fields:
     cacheSet(cacheKey, out);
     res.setHeader("Cache-Control", "public, max-age=60");
     return res.status(200).json(out);
+
   } catch (err: any) {
     console.error("PLAN API error:", err?.message || err);
     return res.status(500).json({ ok: false, reason: "Server error", usedHeadlines: [], usedCalendar: [] });
