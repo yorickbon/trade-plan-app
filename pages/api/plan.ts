@@ -2,7 +2,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
 import { getCandles } from "../../lib/prices";
-import { scoreSentiment } from "../../lib/sentiment";
+import { scoreSentiment as scoreSentimentImported } from "../../lib/sentiment";
 
 // ---------------- short in-memory cache (5 min) ----------------
 type CacheEntry<T> = { data: T; exp: number };
@@ -66,7 +66,7 @@ function cacheSet(key: string, data: any) {
   PLAN_CACHE.set(key, { data, exp: Date.now() + PLAN_CACHE_TTL });
 }
 
-// --------- helpers to load candles with fallbacks (limit bump + alt symbol) ---------
+// --------- candle helpers ---------
 async function loadCandles(symbol: string, interval: "15m" | "1h" | "4h", limit = 200): Promise<Candle[]> {
   try { return await getCandles(symbol, interval, limit); } catch { return []; }
 }
@@ -76,26 +76,61 @@ function altSymbol(code: string): string {
   return code;
 }
 
-async function getAllTimeframes(code: string) {
-  // first attempt
-  let m4 = await loadCandles(code, "4h", 200);
-  let m1 = await loadCandles(code, "1h", 200);
-  let m15 = await loadCandles(code, "15m", 200);
+type AllFrames = { m4: Candle[]; m1: Candle[]; m15: Candle[]; triedAlt: string | null };
 
-  // second attempt: larger history window
-  if (!m4.length) m4 = await loadCandles(code, "4h", 400);
-  if (!m1.length) m1 = await loadCandles(code, "1h", 400);
-  if (!m15.length) m15 = await loadCandles(code, "15m", 400);
+async function tryOnceAll(code: string, useAlt = false, bigLimits = false): Promise<AllFrames> {
+  const symbol = useAlt ? altSymbol(code) : code;
+  const lim = bigLimits ? 400 : 200;
+  let m4: Candle[] = await loadCandles(symbol, "4h", lim);
+  let m1: Candle[] = await loadCandles(symbol, "1h", lim);
+  let m15: Candle[] = await loadCandles(symbol, "15m", lim);
+  return { m4, m1, m15, triedAlt: useAlt ? symbol : null };
+}
 
-  // third attempt: alternate symbol form
-  const alt = altSymbol(code);
-  if (alt !== code) {
-    if (!m4.length) m4 = await loadCandles(alt, "4h", 200);
-    if (!m1.length) m1 = await loadCandles(alt, "1h", 200);
-    if (!m15.length) m15 = await loadCandles(alt, "15m", 200);
+async function getAllTimeframesWithTimeout(code: string): Promise<AllFrames & { missing: string[] }> {
+  const totalMs = Math.max(0, Number(process.env.PLAN_CANDLES_TIMEOUT_MS ?? 8000));
+  const pollMs  = Math.max(200, Number(process.env.PLAN_CANDLES_POLL_MS ?? 1000));
+  const start = Date.now();
+
+  let last: AllFrames = { m4: [], m1: [], m15: [], triedAlt: null };
+
+  // We loop: normal→bigLimits→alt→alt+bigLimits (then repeat) until all present or timeout.
+  while (Date.now() - start <= totalMs) {
+    // 1) normal
+    last = await tryOnceAll(code, false, false);
+    if (last.m4.length && last.m1.length && last.m15.length) return { ...last, missing: [] };
+
+    // 2) bigger limits
+    last = await tryOnceAll(code, false, true);
+    if (last.m4.length && last.m1.length && last.m15.length) return { ...last, missing: [] };
+
+    // 3) alt symbol
+    last = await tryOnceAll(code, true, false);
+    if (last.m4.length && last.m1.length && last.m15.length) return { ...last, missing: [] };
+
+    // 4) alt + bigger limits
+    last = await tryOnceAll(code, true, true);
+    if (last.m4.length && last.m1.length && last.m15.length) return { ...last, missing: [] };
+
+    await new Promise(r => setTimeout(r, pollMs));
   }
 
-  return { m4, m1, m15, triedAlt: alt !== code ? alt : null };
+  const missing: string[] = [];
+  if (!last.m4.length) missing.push("4h");
+  if (!last.m1.length) missing.push("1h");
+  if (!last.m15.length) missing.push("15m");
+  return { ...last, missing };
+}
+
+// --------- sentiment helper (works for sync or async implementations) ---------
+async function scoreHeadlines(text: string): Promise<number> {
+  try {
+    const maybe = scoreSentimentImported(text as any) as any;
+    const resolved = typeof maybe?.then === "function" ? await maybe : maybe;
+    if (typeof resolved === "number") return resolved;
+    if (resolved && typeof resolved.score === "number") return resolved.score;
+  } catch {}
+  return 0;
 }
 
 // ------------------------------ handler ------------------------------
@@ -139,7 +174,7 @@ export default async function handler(
       return res.status(200).json(hit);
     }
 
-    // ----------- ensure we have headlines (pull from /api/news if not supplied) -----------
+    // ----------- ensure headlines (fallback to /api/news) -----------
     let usedHeadlines: Headline[] = Array.isArray(headlines) ? headlines : [];
     if (!usedHeadlines.length && instr.currencies?.length) {
       const base = process.env.NEXT_PUBLIC_BASE_URL || `https://${req.headers.host}`;
@@ -161,7 +196,7 @@ export default async function handler(
       return Number.isFinite(t) && t >= cutoff;
     });
 
-    // optional blackout if a high-impact event is within ~90 min
+    // optional blackout within ~90 min
     const calItems: CalendarItem[] = Array.isArray(calendar) ? calendar : [];
     const blackout = (() => {
       if (!calItems.length) return false;
@@ -173,16 +208,11 @@ export default async function handler(
       });
     })();
 
-    // ----------- fetch candles (require ALL: 4h / 1h / 15m) -----------
-    const { m4, m1, m15, triedAlt } = await getAllTimeframes(instr.code);
+    // ----------- fetch candles (REQUIRE ALL 4h/1h/15m, with timeout & retries) -----------
+    const all = await getAllTimeframesWithTimeout(instr.code);
 
-    const missing: string[] = [];
-    if (!m4.length) missing.push("4h");
-    if (!m1.length) missing.push("1h");
-    if (!m15.length) missing.push("15m");
-
-    if (missing.length) {
-      const detail = `Missing candles for ${missing.join(", ")}${triedAlt ? ` (tried alt symbol: ${triedAlt})` : ""}.`;
+    if (all.missing.length) {
+      const detail = `Missing candles for ${all.missing.join(", ")}${all.triedAlt ? ` (tried alt symbol: ${all.triedAlt})` : ""}. Timed out after ${(Number(process.env.PLAN_CANDLES_TIMEOUT_MS ?? 8000))/1000}s.`;
       const out: ApiOut = {
         ok: false,
         reason: detail,
@@ -193,6 +223,8 @@ export default async function handler(
       res.setHeader("Cache-Control", "public, max-age=60");
       return res.status(200).json(out);
     }
+
+    const { m4, m1, m15 } = all;
 
     // ----------- 15m bias & levels (pullback vs BOS heuristic) -----------
     const last = m15[m15.length - 1] ?? m15[0];
@@ -216,14 +248,14 @@ export default async function handler(
     conviction = Math.min(95, conviction + Math.min(3, recent.length));
     if (blackout) conviction = Math.min(conviction, 55);
 
-    // lightweight headline sentiment (does not block trading)
+    // lightweight headline sentiment (non-blocking)
     let newsBias = "Neutral";
     let newsScore = 0;
     try {
       const recentText = recent.slice(0, 12).map(h => h.title || "").join(" | ");
-      const score = scoreSentiment(recentText); // [-1..1]
-      newsScore = Number(score || 0);
-      newsBias = score > 0.15 ? "Positive" : score < -0.15 ? "Negative" : "Neutral";
+      const s = await scoreHeadlines(recentText); // [-1..1]
+      newsScore = Number(s || 0);
+      newsBias = s > 0.15 ? "Positive" : s < -0.15 ? "Negative" : "Neutral";
     } catch { /* ignore */ }
 
     // 1h / 4h alignment for conviction
