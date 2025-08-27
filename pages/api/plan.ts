@@ -1,386 +1,134 @@
 // pages/api/plan.ts
 import type { NextApiRequest, NextApiResponse } from "next";
-import OpenAI from "openai";
-import getCandles from "../../lib/prices";
+import { getCandles } from "../../lib/prices";
 
-// ---------------- Short plan cache (5 minutes) ----------------
-const PLAN_CACHE_TTL = 5 * 60 * 1000; // 5 min
-type CacheVal = { at: number; json: any };
-const G = global as unknown as { __PLAN_CACHE__?: Map<string, CacheVal> };
-if (!G.__PLAN_CACHE__) G.__PLAN_CACHE__ = new Map();
-function planGet(key: string) {
-  const hit = G.__PLAN_CACHE__!.get(key);
-  if (!hit) return null;
-  if (Date.now() - hit.at > PLAN_CACHE_TTL) {
-    G.__PLAN_CACHE__!.delete(key);
+type Candle = { t: string; o: number; h: number; l: number; c: number };
+
+const PLAN_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const G = global as any;
+G.__PLAN_CACHE__ ??= new Map<string, { t: number; data: any }>();
+
+function cacheGet(k: string) {
+  const v = G.__PLAN_CACHE__.get(k);
+  if (!v) return null;
+  if (Date.now() - v.t > PLAN_CACHE_TTL) {
+    G.__PLAN_CACHE__.delete(k);
     return null;
   }
-  return hit.json;
+  return v.data;
 }
-function planSet(key: string, json: any) {
-  G.__PLAN_CACHE__!.set(key, { at: Date.now(), json });
-}
-
-// ---------------- Types ----------------
-type Interval = "4h" | "1h" | "15m";
-type Candle = { t: string | number | Date; o: number; h: number; l: number; c: number };
-
-type CalendarItem = {
-  date: string; time?: string;
-  country?: string; currency?: string;
-  impact?: string; title: string;
-  actual?: string; forecast?: string; previous?: string;
-};
-
-type NewsItem = { title: string; url: string; source?: string; seen?: string };
-
-type Candidate = {
-  name: "Pullback" | "BOS" | "Breakout";
-  direction: "Buy" | "Sell";
-  entry: number; stop: number; tp1: number; tp2: number;
-  rationale: string[]; confluence: string[]; score: number;
-};
-
-// ---------------- Utils ----------------
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
-
-function last<T>(arr: T[]) { return arr[arr.length - 1]; }
-function asNum(n: number) { return Number.isFinite(n) ? n : 0; }
-
-function nDec(price: number): number {
-  const p = Math.abs(price);
-  if (p >= 1000) return 2;
-  if (p >= 100) return 3;
-  if (p >= 10) return 4;
-  return 5;
-}
-function fmt(price: number) { return asNum(price).toFixed(nDec(price)); }
-
-function atr(c: Candle[], period = 14) {
-  if (c.length < period + 1) return 0;
-  let sum = 0;
-  for (let i = c.length - period; i < c.length; i++) {
-    const cur = c[i], prev = c[i - 1] ?? cur;
-    const tr = Math.max(
-      cur.h - cur.l,
-      Math.abs(cur.h - prev.c),
-      Math.abs(cur.l - prev.c)
-    );
-    sum += tr;
-  }
-  return sum / period;
+function cacheSet(k: string, data: any) {
+  G.__PLAN_CACHE__.set(k, { t: Date.now(), data });
 }
 
-function findSwings(c: Candle[], lookback = 60) {
-  const hiIdxs: number[] = [];
-  const loIdxs: number[] = [];
-  const len = Math.min(c.length - 1, lookback);
-  for (let i = c.length - len; i < c.length - 1; i++) {
-    if (i <= 0 || i >= c.length - 1) continue;
-    if (c[i].h > c[i - 1].h && c[i].h > c[i + 1].h) hiIdxs.push(i);
-    if (c[i].l < c[i - 1].l && c[i].l < c[i + 1].l) loIdxs.push(i);
-  }
-  const lastHi = hiIdxs.length ? hiIdxs[hiIdxs.length - 1] : -1;
-  const lastLo = loIdxs.length ? loIdxs[loIdxs.length - 1] : -1;
-  return { lastHi, lastLo };
+function trend(c: Candle[]): "up" | "down" | "flat" {
+  if (c.length < 5) return "flat";
+  const first = c[0].c,
+    last = c[c.length - 1].c;
+  const up = last > first * 1.002;
+  const down = last < first * 0.998;
+  return up ? "up" : down ? "down" : "flat";
+}
+function swingHL(c: Candle[]) {
+  let hi = -Infinity,
+    lo = Infinity;
+  c.forEach((x) => {
+    if (x.h > hi) hi = x.h;
+    if (x.l < lo) lo = x.l;
+  });
+  return { hi, lo };
 }
 
-function fibs(high: number, low: number) {
-  const range = high - low;
-  return {
-    "0.382": low + 0.382 * range,
-    "0.5": low + 0.5 * range,
-    "0.618": low + 0.618 * range,
-    "0.705": low + 0.705 * range,
-  };
-}
-
-function hasFVGNear(c: Candle[], price: number, tol: number) {
-  for (let i = 2; i < c.length; i++) {
-    const a = c[i - 2], b = c[i - 1], d = c[i];
-    const bull = a.h < d.l && Math.abs((a.h + d.l) / 2 - price) <= tol;
-    const bear = a.l > d.h && Math.abs((a.l + d.h) / 2 - price) <= tol;
-    if (bull || bear) return true;
-  }
-  return false;
-}
-
-function nearestStructure(c: Candle[], price: number, tol: number) {
-  for (let i = 1; i < c.length - 1; i++) {
-    const isHi = c[i].h > c[i - 1].h && c[i].h > c[i + 1].h;
-    const isLo = c[i].l < c[i - 1].l && c[i].l < c[i + 1].l;
-    const lvl = isHi ? c[i].h : isLo ? c[i].l : null;
-    if (lvl !== null && Math.abs(lvl - price) <= tol) return lvl;
-  }
-  return null;
-}
-
-function compressRatio(c: Candle[], bars = 24) {
-  const seg = c.slice(-bars);
-  const hi = Math.max(...seg.map(x => x.h));
-  const lo = Math.min(...seg.map(x => x.l));
-  const rng = hi - lo;
-  const segAtr = atr(seg, Math.min(14, seg.length - 1));
-  return segAtr ? rng / segAtr : Infinity;
-}
-
-// ---------------- Handler ----------------
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
-    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+    if (req.method !== "POST") return res.status(405).end();
 
-    const {
-      instrument,                // { code: 'EURUSD', currencies?: string[] }
-      date,
-      calendar = [] as CalendarItem[],
-      headlines = [] as NewsItem[],
-      candles: clientCandles = null, // optional { h4, h1, m15 } from client
-    } = req.body || {};
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    const instrument = body?.instrument?.code || body?.instrument || "";
+    const date = body?.date;
+    const calendar = body?.calendar || { items: [] };
+    const headlines = body?.headlines || { items: [] };
 
-    if (!instrument?.code) return res.status(400).json({ error: "Missing instrument" });
+    if (!instrument) return res.status(400).json({ error: "instrument required" });
 
-    // -------- Cache key (stable across clicks) --------
-    // We intentionally do NOT include price to allow reuse within TTL.
-    // Keyed by instrument + date + counts + first headline/calendar titles (coarse snapshot).
-    const calSig = String(calendar.length) + "|" + (calendar[0]?.title ?? "");
-    const newsSig = String(headlines.length) + "|" + (headlines[0]?.title ?? "");
-    const cacheKey = JSON.stringify({ code: instrument.code, date: date || "", calSig, newsSig });
+    const cacheKey = JSON.stringify({ instrument, date });
+    const hit = cacheGet(cacheKey);
+    if (hit) return res.status(200).json(hit);
 
-    const cached = planGet(cacheKey);
-    if (cached) {
-      res.setHeader("Cache-Control", "public, max-age=60, s-maxage=60, stale-while-revalidate=60");
-      return res.status(200).json(cached);
-    }
+    const [h4, h1, m15] = await Promise.all([
+      getCandles(instrument, "4h", 200),
+      getCandles(instrument, "1h", 200),
+      getCandles(instrument, "15m", 200),
+    ]);
 
-    // -------- Candles (server fetch if not supplied) --------
-    const [h4, h1, m15]: [Candle[], Candle[], Candle[]] = clientCandles?.h4 && clientCandles?.h1 && clientCandles?.m15
-      ? [clientCandles.h4, clientCandles.h1, clientCandles.m15]
-      : await Promise.all([
-          getCandles(instrument, "4h", 200),
-          getCandles(instrument, "1h", 200),
-          getCandles(instrument, "15m", 220),
-        ]);
+    const bias15 = trend(m15);
+    const biasH1 = trend(h1);
+    const biasH4 = trend(h4);
 
-    if (!m15?.length || !h1?.length || !h4?.length) {
-      const payload = { plan: { text: "No Trade – insufficient candle data.", conviction: 0 } };
-      planSet(cacheKey, payload);
-      res.setHeader("Cache-Control", "no-store");
-      return res.status(200).json(payload);
-    }
+    // use last ~60 bars on 15m
+    const window15 = m15.slice(-60);
+    const { hi, lo } = swingHL(window15);
+    const impulseUp = bias15 === "up";
+    const range = hi - lo;
+    const fib62 = impulseUp ? hi - 0.62 * range : lo + 0.62 * range;
 
-    const p = last(m15).c;
-    const vol = atr(m15, 14) || Math.max(1e-6, Math.abs(m15[m15.length - 1].h - m15[m15.length - 1].l));
+    const entry = Number(fib62.toFixed(5));
+    const stop = Number((impulseUp ? lo : hi).toFixed(5));
+    const tp1 = Number((impulseUp ? entry + range * 0.5 : entry - range * 0.5).toFixed(5));
+    const tp2 = Number((impulseUp ? entry + range * 0.9 : entry - range * 0.9).toFixed(5));
 
-    // -------- Macro signals (calendar + headlines) --------
-    const highImpactSoon = calendar.some((e) => /high/i.test(e.impact ?? ""));
-    const headlineText = (headlines || []).map(h => `${h.title} (${h.source ?? ""})`).join("\n").toLowerCase();
-    let macroBias: "hawkish" | "dovish" | "mixed" | "none" = "none";
-    if (/hawk|rate hike|inflation hot|sticky inflation|tighten/.test(headlineText)) macroBias = "hawkish";
-    else if (/dove|rate cut|disinflation|slowdown|recession/.test(headlineText)) macroBias = "dovish";
-    else if (headlineText.length) macroBias = "mixed";
-
-    // -------- Build candidates (Pullback, BOS, Breakout) --------
-    // Pullback (Fib GP + confluence)
-    const sw15 = findSwings(m15, 80);
-    let pullback: Candidate | null = null;
-    if (sw15.lastHi !== -1 && sw15.lastLo !== -1) {
-      // Determine impulse direction by the last swing that formed
-      const longImpulse = sw15.lastHi < sw15.lastLo; // last swing is Low -> up impulse
-      const hi = Math.max(...m15.map(x => x.h));
-      const lo = Math.min(...m15.map(x => x.l));
-      const F = longImpulse ? fibs(hi, lo) : fibs(lo, hi);
-      const z1 = longImpulse ? F["0.618"] : F["0.382"];
-      const z2 = longImpulse ? F["0.705"] : F["0.618"];
-      const entry = (z1 + z2) / 2;
-
-      const tol = vol * 1.2;
-      const conf: string[] = ["Fib golden pocket"];
-      if (hasFVGNear(m15, entry, tol)) conf.push("FVG near zone");
-      const sLvl = nearestStructure(m15, entry, tol);
-      if (sLvl !== null) conf.push("Structure near zone");
-
-      const dir: "Buy" | "Sell" = longImpulse ? "Buy" : "Sell";
-      const stop = dir === "Buy" ? Math.min(lo, entry - 1.5 * vol) : Math.max(hi, entry + 1.5 * vol);
-      const tp1 = dir === "Buy" ? entry + 1.2 * (entry - stop) : entry - 1.2 * (stop - entry);
-      const tp2 = dir === "Buy" ? entry + 2.0 * (entry - stop) : entry - 2.0 * (stop - entry);
-
-      let score = 60 + conf.length * 10;
-      const dist = Math.abs(entry - p);
-      if (dist < 0.5 * vol) score += 8;
-      if (dist > 2.5 * vol) score -= 8;
-      if (highImpactSoon) score -= 12;
-
-      pullback = {
-        name: "Pullback",
-        direction: dir, entry, stop, tp1, tp2,
-        rationale: [
-          `15m impulse ${longImpulse ? "up" : "down"}; plan limit at GP (0.62–0.705).`,
-        ],
-        confluence: conf,
-        score,
-      };
-    }
-
-    // BOS + Retest
-    let bos: Candidate | null = null;
-    {
-      const recent = m15.slice(-40);
-      const swingHigh = Math.max(...recent.map(c => c.h));
-      const swingLow  = Math.min(...recent.map(c => c.l));
-      const prev = m15[m15.length - 2].c;
-
-      if (p > swingHigh && prev <= swingHigh) {
-        const entry = swingHigh;
-        const stop  = swingLow;
-        const tp1   = entry + 0.75 * (entry - stop);
-        const tp2   = entry + 1.25 * (entry - stop);
-        let score = 55;
-        // 1H confirmation
-        const r1 = h1.slice(-60);
-        const h1High = Math.max(...r1.map(c => c.h));
-        if (last(h1).c > h1High) score += 10;
-        if (highImpactSoon) score -= 10;
-        bos = {
-          name: "BOS", direction: "Buy",
-          entry, stop, tp1, tp2,
-          rationale: ["Broke prior swing high; plan retest entry."],
-          confluence: ["Structure retest", "1H confirmation (if present)"],
-          score,
-        };
-      } else if (p < swingLow && prev >= swingLow) {
-        const entry = swingLow;
-        const stop  = swingHigh;
-        const tp1   = entry - 0.75 * (swingHigh - swingLow);
-        const tp2   = entry - 1.25 * (swingHigh - swingLow);
-        let score = 55;
-        const r1 = h1.slice(-60);
-        const h1Low = Math.min(...r1.map(c => c.l));
-        if (last(h1).c < h1Low) score += 10;
-        if (highImpactSoon) score -= 10;
-        bos = {
-          name: "BOS", direction: "Sell",
-          entry, stop, tp1, tp2,
-          rationale: ["Broke prior swing low; plan retest entry."],
-          confluence: ["Structure retest", "1H confirmation (if present)"],
-          score,
-        };
+    // News blackout guard
+    const windowMin = parseInt(process.env.MONITOR_WINDOW_MIN || "90", 10);
+    const hiEvents = (calendar?.items || []).filter((x: any) =>
+      /high/i.test(x.impact || "")
+    );
+    const now = Date.now();
+    let blackout = false;
+    for (const e of hiEvents) {
+      const ts = e?.date ? Date.parse(`${e.date}T${e.time || "00:00"}Z`) : NaN;
+      if (!Number.isFinite(ts)) continue;
+      const mins = Math.abs(ts - now) / 60000;
+      if (mins <= windowMin) {
+        blackout = true;
+        break;
       }
     }
 
-    // Range Breakout (only if tight)
-    let breakout: Candidate | null = null;
-    {
-      const ratio = compressRatio(m15, 24); // smaller => tighter
-      if (ratio < 1.6) {
-        const seg = m15.slice(-24);
-        const hi = Math.max(...seg.map(x => x.h));
-        const lo = Math.min(...seg.map(x => x.l));
-        const dir: "Buy" | "Sell" = p > (hi + lo) / 2 ? "Buy" : "Sell";
-        const entry = dir === "Buy" ? hi + 0.25 * vol : lo - 0.25 * vol;
-        const stop  = dir === "Buy" ? entry - 1.2 * vol : entry + 1.2 * vol;
-        const tp1   = dir === "Buy" ? entry + 1.2 * (entry - stop) : entry - 1.2 * (stop - entry);
-        const tp2   = dir === "Buy" ? entry + 2.0 * (entry - stop) : entry - 2.0 * (stop - entry);
-        let score = 50;
-        if (highImpactSoon) score -= 10;
-        breakout = {
-          name: "Breakout", direction: dir,
-          entry, stop, tp1, tp2,
-          rationale: ["Tight range; stop-order breakout play."],
-          confluence: ["Range compression"],
-          score,
-        };
-      }
+    const alignScore =
+      (bias15 === "up" && biasH1 === "up" ? 1 : 0) +
+      (bias15 === "down" && biasH1 === "down" ? 1 : 0) +
+      (bias15 === "up" && biasH4 === "up" ? 1 : 0) +
+      (bias15 === "down" && biasH4 === "down" ? 1 : 0);
+
+    let conviction = 60 + alignScore * 10;
+    if (blackout) conviction -= 25;
+    if ((headlines?.items || []).some((h: any) =>
+      /Fed|ECB|BOE|CPI|jobs|NFP|inflation/i.test(h.title || "")
+    )) {
+      conviction -= 10;
     }
+    conviction = Math.max(5, Math.min(95, conviction));
 
-    const candidates = [pullback, bos, breakout].filter(Boolean) as Candidate[];
-    if (!candidates.length) {
-      const payload = {
-        instrument,
-        date,
-        plan: { text: "No Trade – no clean setup (pullback/BOS/breakout) found.", conviction: 0 },
-        meta: { price: p, calendarCount: calendar.length, headlinesCount: headlines.length, alternatives: [] }
-      };
-      planSet(cacheKey, payload);
-      res.setHeader("Cache-Control", "public, max-age=60, s-maxage=60, stale-while-revalidate=60");
-      return res.status(200).json(payload);
-    }
+    const planText = `**Trade Card: ${instrument}**
 
-    candidates.sort((a, b) => b.score - a.score);
-    const best = candidates[0];
+**Setup Type:** ${impulseUp ? "Pullback-to-62% (Bullish)" : "Pullback-to-62% (Bearish)"}
+**Direction:** ${impulseUp ? "Long" : "Short"}
+**Entry:** ${entry}
+**Stop:** ${stop}
+**TP1:** ${tp1}
+**TP2:** ${tp2}
+**Conviction %:** ${conviction}
 
-    let conviction = Math.max(0, Math.min(95, Math.round(best.score)));
-    if (highImpactSoon) conviction = Math.max(20, Math.min(conviction, 70));
+**Reasoning:** 15m bias is *${bias15}* with HTF alignment H1=${biasH1}, H4=${biasH4}. Using recent swing ${
+      impulseUp ? "low→high" : "high→low"
+    }, targeting a ${impulseUp ? "dip" : "rally"} to 62% retracement for entry.
+${blackout ? "**Caution:** High-impact event within the next news window — consider waiting for the release." : ""}`;
 
-    const calNote = calendar.length
-      ? `Calendar: ${calendar.length} item(s)${highImpactSoon ? " (high impact present)" : ""}.`
-      : "Calendar: none.";
-    const topNews = headlines.slice(0, 3).map(n => `${n.source ?? "News"}: ${n.title}`);
-    const newsNote = headlines.length
-      ? `Headlines scanned: ${headlines.length}. Top: ${topNews.join(" | ")}`
-      : "Headlines scanned: none.";
-
-    const lines: string[] = [];
-    lines.push(`**Trade Card: ${instrument.code}**`, "");
-    lines.push(`**Strategy:** ${best.name}`);
-    lines.push(`**Direction:** ${best.direction}`);
-    lines.push(`**Entry:** ${fmt(best.entry)}`);
-    lines.push(`**Stop:** ${fmt(best.stop)}`);
-    lines.push(`**TP1:** ${fmt(best.tp1)}`);
-    lines.push(`**TP2:** ${fmt(best.tp2)}`);
-    lines.push(`**Conviction %:** ${conviction}%`, "");
-    lines.push(`**Why this setup (auto):**`);
-    best.rationale.forEach(r => lines.push(`- ${r}`));
-    if (best.confluence.length) lines.push(`- Confluence: ${best.confluence.join(", ")}`);
-    lines.push("");
-    lines.push(`**Timeframe Alignment (auto):** 4H / 1H for bias; 15M for execution.`);
-    lines.push("");
-    lines.push(`**Invalidation Note:** Close beyond stop invalidates; no chase.`);
-    lines.push("");
-    lines.push(`**Risk Notice:** ${calNote}`);
-    lines.push(`**News Note:** ${newsNote}`);
-    if (highImpactSoon) {
-      lines.push(`**Caution:** Upcoming high-impact event — consider waiting for post-event retest.`);
-    }
-
-    // Optionally polish wording (kept off by default)
-    let finalText = lines.join("\n");
-    if (process.env.OPENAI_POLISH === "true" && process.env.OPENAI_API_KEY) {
-      try {
-        const rsp = await client.chat.completions.create({
-          model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-          temperature: 0.2,
-          messages: [
-            { role: "system", content: "Polish for clarity. Keep all numbers exactly the same. Output plain text only." },
-            { role: "user", content: finalText },
-          ],
-        });
-        finalText = rsp.choices?.[0]?.message?.content?.trim() || finalText;
-      } catch { /* ignore polish failure */ }
-    }
-
-    const alts = candidates.slice(1).map(c => ({
-      strategy: c.name, dir: c.direction,
-      entry: Number(fmt(c.entry)),
-      stop: Number(fmt(c.stop)),
-      tp1: Number(fmt(c.tp1)),
-      tp2: Number(fmt(c.tp2)),
-      score: c.score,
-    }));
-
-    const payload = {
-      instrument,
-      date,
-      plan: { strategy: best.name, conviction, text: finalText },
-      meta: { price: p, calendarCount: calendar.length, headlinesCount: headlines.length, alternatives: alts }
-    };
-
-    // --------- Save & return (cached) ---------
-    planSet(cacheKey, payload);
-    res.setHeader("Cache-Control", "public, max-age=60, s-maxage=60, stale-while-revalidate=60");
+    const payload = { plan: { text: planText, conviction }, m15, h1, h4 };
+    cacheSet(cacheKey, payload);
     return res.status(200).json(payload);
-
-  } catch (err: any) {
-    console.error("PLAN API error:", err?.message || err);
-    return res.status(500).json({ error: err?.message || "Server error" });
+  } catch (e: any) {
+    console.error("plan error:", e?.message || e);
+    return res.status(500).json({ error: e?.message || "plan failed" });
   }
 }
