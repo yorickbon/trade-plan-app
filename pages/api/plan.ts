@@ -1,21 +1,11 @@
 // pages/api/plan.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
-
-// Use the same price source as /api/candles
 import { getCandles } from "../../lib/prices";
+// IMPORTANT: your lib exports a *named* function; do NOT default-import it.
+import { scoreSentiment as scoreSentimentImported } from "../../lib/sentiment";
 
-// Be resilient to how the sentiment helper is exported (default/named, sync/async)
-import * as SentimentMod from "../../lib/sentiment";
-
-// ---------- short in-memory cache (5 min) ----------
-type CacheEntry<T> = { data: T; exp: number };
-const PLAN_CACHE: Map<string, CacheEntry<any>> =
-  (globalThis as any).__PLAN_CACHE__ ?? new Map<string, CacheEntry<any>>();
-(globalThis as any).__PLAN_CACHE__ = PLAN_CACHE;
-const PLAN_CACHE_TTL = 5 * 60 * 1000;
-
-// ---------- Types ----------
+/* ---------------- types ---------------- */
 type Candle = { t: number; o: number; h: number; l: number; c: number };
 type Instrument = { code: string; currencies?: string[] };
 type CalendarItem = {
@@ -33,8 +23,8 @@ type Headline = {
   title: string;
   url?: string;
   source?: string;
-  seen?: string;        // ISO timestamp we mark when shown
-  published_at?: string; // optional from /api/news
+  seen?: string; // ISO string we add when rendering
+  published_at?: string;
 };
 type PlanOut = {
   text: string;
@@ -46,138 +36,148 @@ type PlanOut = {
   tp2?: number | null;
   notes?: string | null;
 };
-type ApiOut =
-  | { ok: true; plan: PlanOut; usedHeadlines: Headline[]; usedCalendar: CalendarItem[] }
-  | { ok: false; reason: string; usedHeadlines: Headline[]; usedCalendar: CalendarItem[] };
+type ApiOut = {
+  ok: true;
+  plan: PlanOut;
+  usedHeadlines: Headline[];
+  usedCalendar: CalendarItem[];
+} | {
+  ok: false;
+  reason: string;
+  usedHeadlines: Headline[];
+  usedCalendar: CalendarItem[];
+};
 
-// ---------- cache helpers ----------
-function cacheGet<T>(key: string): T | null {
-  const le = PLAN_CACHE.get(key);
-  if (!le) return null;
-  if (Date.now() > le.exp) {
-    PLAN_CACHE.delete(key);
-    return null;
-  }
-  return le.data as T;
-}
-function cacheSet(key: string, data: any) {
-  PLAN_CACHE.set(key, { data, exp: Date.now() + PLAN_CACHE_TTL });
-}
+/* --------------- helpers: robust candle fetch (15m, 1h, 4h) --------------- */
 
-// ---------- candle helpers ----------
-async function loadCandles(symbol: string, interval: "15m" | "1h" | "4h", limit = 200): Promise<Candle[]> {
-  // 1) try library directly
+const TIMEOUT_MS = Math.max(10000, Number(process.env.PLAN_CANDLES_TIMEOUT_MS ?? 8000));
+const POLL_MS    = Math.max(150,   Number(process.env.PLAN_CANDLES_POLL_MS ?? 500));
+
+const INTERVALS: Array<"15m" | "1h" | "4h"> = ["15m", "1h", "4h"];
+const LIMIT_NORMAL = 200;
+const LIMIT_BIG    = 400;
+
+async function loadCandles(symbol: string, interval: "15m" | "1h" | "4h", limit: number): Promise<Candle[]> {
   try {
-    const arr: any = await getCandles(symbol, interval, limit);
-    if (Array.isArray(arr) && arr.length) return arr as Candle[];
-  } catch (_) {
-    // ignore and fall through
+    return await getCandles(symbol, interval, limit);
+  } catch {
+    return [];
   }
-
-  // 2) fall back to your HTTP route (/api/candles) — this mirrors the manual test you do in the browser
-  try {
-    const base = process.env.NEXT_PUBLIC_BASE_URL || "";
-    const url = `${base}/api/candles?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
-    const rsp = await fetch(url, { cache: "no-store" });
-    const j = await rsp.json();
-    if (Array.isArray(j?.candles) && j.candles.length) return j.candles as Candle[];
-  } catch (_) {
-    // ignore
-  }
-
-  return [];
 }
-
-function altSymbol(code: string): string {
-  if (!code) return code;
-  if (code.includes("/")) return code.replace("/", "");
-  if (code.length <= 6) return `${code.slice(0, 3)}/${code.slice(3)}`;
-  return code;
+function altSymbols(code: string): string[] {
+  // Try a few safe alternates
+  const list = new Set<string>();
+  list.add(code);
+  // EURUSD <-> EUR/USD
+  if (code.includes("/")) list.add(code.replace("/", ""));
+  else if (code.length === 6) list.add(`${code.slice(0,3)}/${code.slice(3)}`);
+  // Yahoo-style
+  list.add(`${code}=X`);
+  return [...list];
 }
+type AllFrames = { m15: Candle[]; h1: Candle[]; h4: Candle[]; triedAlt?: string };
 
-type AllFrames = { m4: Candle[]; m1: Candle[]; m15: Candle[]; triedAlt: string | null };
-
-async function tryOnce(
-  code: string,
-  useAlt = false,
-  bigLimits = false
-): Promise<AllFrames> {
-  const symbol = useAlt ? altSymbol(code) : code;
-  const lim = bigLimits ? 400 : 200;
-
-  const m4 = await loadCandles(symbol, "4h", lim);
-  const m1 = await loadCandles(symbol, "1h", lim);
-  const m15 = await loadCandles(symbol, "15m", lim);
-
-  return { m4, m1, m15, triedAlt: useAlt ? symbol : null };
-}
-
-async function getAllTimeframesWithTimeout(code: string): Promise<AllFrames & { missing: string[] }> {
-  const totalMs = Math.max(0, Number(process.env.PLAN_CANDLES_TIMEOUT_MS ?? 60000));
-  const pollMs = Math.max(200, Number(process.env.PLAN_CANDLES_POLL_MS ?? 500));
+async function fetchAllFramesWithRetry(code: string): Promise<{ frames: AllFrames; missing: string[]; timedOut: boolean }> {
   const start = Date.now();
+  const alts = altSymbols(code);
+  let altIdx = 0;
+  let limit = LIMIT_NORMAL;
 
-  let last: AllFrames = { m4: [], m1: [], m15: [], triedAlt: null };
-  let lastAltWas: string | null = null; // persist any alt we actually tried
+  let frames: AllFrames = { m15: [], h1: [], h4: [], triedAlt: undefined };
 
-  while (Date.now() - start < totalMs) {
-    // 1) normal
-    last = await tryOnce(code, false, false);
-    if (last.m4.length && last.m1.length && last.m15.length) return { ...last, missing: [] };
+  while (Date.now() - start < TIMEOUT_MS) {
+    const symbol = alts[altIdx];
+    frames.triedAlt = symbol !== code ? symbol : undefined;
 
-    // 2) bigger limits
-    last = await tryOnce(code, false, true);
-    if (last.m4.length && last.m1.length && last.m15.length) return { ...last, missing: [] };
+    const [m15, h1, h4] = await Promise.all([
+      frames.m15.length ? Promise.resolve(frames.m15) : loadCandles(symbol, "15m", limit),
+      frames.h1.length  ? Promise.resolve(frames.h1)  : loadCandles(symbol, "1h",  limit),
+      frames.h4.length  ? Promise.resolve(frames.h4)  : loadCandles(symbol, "4h",  limit),
+    ]);
 
-    // 3) alt symbol
-    last = await tryOnce(code, true, false);
-    if (last.triedAlt) lastAltWas = last.triedAlt;
-    if (last.m4.length && last.m1.length && last.m15.length) return { ...last, missing: [] };
+    if (!frames.m15.length) frames.m15 = m15;
+    if (!frames.h1.length)  frames.h1  = h1;
+    if (!frames.h4.length)  frames.h4  = h4;
 
-    // 4) alt + bigger limits
-    last = await tryOnce(code, true, true);
-    if (last.triedAlt) lastAltWas = last.triedAlt;
-    if (last.m4.length && last.m1.length && last.m15.length) return { ...last, missing: [] };
+    const missing: string[] = [];
+    if (!frames.h4.length) missing.push("4h");
+    if (!frames.h1.length) missing.push("1h");
+    if (!frames.m15.length) missing.push("15m");
 
-    await new Promise(r => setTimeout(r, pollMs));
+    if (missing.length === 0) return { frames, missing: [], timedOut: false };
+
+    // rotate alt symbol every few attempts; escalate limit once
+    await new Promise(r => setTimeout(r, POLL_MS));
+    if (Date.now() - start > TIMEOUT_MS * 0.33 && limit === LIMIT_NORMAL) {
+      limit = LIMIT_BIG;
+    }
+    if (Date.now() - start > TIMEOUT_MS * 0.66) {
+      altIdx = (altIdx + 1) % alts.length;
+      // on alt change, drop any empties to re-fetch
+      if (!frames.m15.length) frames.m15 = [];
+      if (!frames.h1.length)  frames.h1  = [];
+      if (!frames.h4.length)  frames.h4  = [];
+    }
   }
 
   const missing: string[] = [];
-  if (!last.m4.length) missing.push("4h");
-  if (!last.m1.length) missing.push("1h");
-  if (!last.m15.length) missing.push("15m");
+  if (!frames.h4.length) missing.push("4h");
+  if (!frames.h1.length) missing.push("1h");
+  if (!frames.m15.length) missing.push("15m");
 
-  // Show the last alt we actually attempted (if any)
-  return { ...last, triedAlt: lastAltWas, missing };
+  return { frames, missing, timedOut: true };
 }
 
-// ---------- sentiment helper (works for sync or async) ----------
+/* -------- sentiment wrapper (works if lib returns number or Promise) ------- */
+
 async function scoreHeadlines(text: string): Promise<number> {
   try {
-    const modAny: any = SentimentMod as any;
-    const fn =
-      modAny.default ||
-      modAny.scoreSentiment ||
-      modAny.score ||
-      modAny.analyze ||
-      null;
-
-    if (!fn) return 0;
-
-    const maybe = fn(text);
-    if (typeof maybe === "number") return maybe;
-    if (maybe && typeof maybe.then === "function") {
-      const resolved = await maybe;
-      if (typeof resolved === "number") return resolved;
-      if (resolved && typeof resolved.score === "number") return resolved.score;
-    }
-  } catch {
-    // ignore
-  }
+    const maybe: any = (scoreSentimentImported as any)(text);
+    const resolved = (typeof maybe?.then === "function") ? await maybe : maybe;
+    if (typeof resolved === "number" && Number.isFinite(resolved)) return resolved;
+  } catch {}
   return 0;
 }
 
-// ---------- handler ----------
+/* ------------------- simple 15m heuristic for levels/bias ------------------ */
+
+function lastClose(arr: Candle[], idxFromEnd = 1): number | null {
+  const k = arr.length - idxFromEnd;
+  return k >= 0 && arr[k] ? arr[k].c : null;
+}
+function computeLevels(m15: Candle[]): { bias: "Buy" | "Sell"; entry: number; stop: number; tp1: number; tp2: number } {
+  // range from last ~40 bars
+  const tail = m15.slice(-40);
+  const highs = tail.map(c => c.h);
+  const lows  = tail.map(c => c.l);
+  const swingHi = Math.max(...highs);
+  const swingLo = Math.min(...lows);
+  const range = Math.max(1e-9, swingHi - swingLo);
+  const fib618 = swingHi - 0.618 * range; // “pullback to 0.618” entry for BUY
+
+  const last = lastClose(m15) ?? ((tail.length && tail[tail.length-1].c) || 0);
+  const prev = lastClose(m15, 2) ?? last;
+  const upBias = last > prev ? "Buy" : "Sell";
+
+  if (upBias === "Buy") {
+    const entry = Number(fib618.toFixed(5));
+    const stop  = Number((swingLo - 0.25 * range).toFixed(5)); // ALWAYS < entry
+    const tp1   = Number((swingLo + 0.50 * range).toFixed(5));
+    const tp2   = Number((swingLo + 0.90 * range).toFixed(5));
+    return { bias: "Buy", entry, stop, tp1, tp2 };
+  } else {
+    // mirror for SELL
+    const fib618Sell = swingLo + 0.618 * range;
+    const entry = Number(fib618Sell.toFixed(5));
+    const stop  = Number((swingHi + 0.25 * range).toFixed(5)); // ALWAYS > entry
+    const tp1   = Number((swingHi - 0.50 * range).toFixed(5));
+    const tp2   = Number((swingHi - 0.90 * range).toFixed(5));
+    return { bias: "Sell", entry, stop, tp1, tp2 };
+  }
+}
+
+/* ----------------------------- API handler --------------------------------- */
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiOut>) {
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, reason: "Method not allowed", usedHeadlines: [], usedCalendar: [] });
@@ -191,159 +191,102 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       headlines?: Headline[] | null;
     };
 
-    const instr: Instrument =
-      typeof instrument === "string" ? { code: instrument } : instrument;
-
+    const instr: Instrument = typeof instrument === "string" ? { code: instrument } : instrument;
     if (!instr?.code) {
       return res.status(400).json({ ok: false, reason: "Missing instrument code", usedHeadlines: [], usedCalendar: [] });
     }
 
-    // Avoid caches in proxies/CDN for plan calls
-    res.setHeader("Cache-Control", "no-store");
+    /* --- recent headlines & sentiment (24–48h by ENV) --- */
+    const sinceHrs = Math.max(1, parseInt(process.env.HEADLINES_SINCE_HOURS ?? "24", 10));
+    const cutoffT = Date.now() - sinceHrs * 3600_000;
+    const usedHeadlines = (Array.isArray(headlines) ? headlines : [])
+      .filter(h => {
+        const t = Date.parse(h.seen ?? h.published_at ?? "");
+        return Number.isFinite(t) && t >= cutoffT;
+      })
+      .slice(0, Math.max(1, parseInt(process.env.HEADLINES_MAX ?? "8", 10)));
+    const recentText = usedHeadlines.map(h => `- ${h.title}`).join("\n");
+    const sentimentVal = await scoreHeadlines(recentText);
+    const newsScore = Number(sentimentVal || 0);
+    const newsBias = newsScore > 0.15 ? "Positive" : newsScore < -0.15 ? "Negative" : "Neutral";
 
-    // -------- ensure headlines (fallback to /api/news) --------
-    let usedHeadlines: Headline[] = Array.isArray(headlines) ? headlines : [];
-    if (!usedHeadlines.length && Array.isArray(instr.currencies) && instr.currencies.length) {
-      try {
-        const base = process.env.NEXT_PUBLIC_BASE_URL || "";
-        const qs = encodeURIComponent(instr.currencies.join(","));
-        const rsp = await fetch(`${base}/api/news?currencies=${qs}`, { cache: "no-store" });
-        const j = await rsp.json();
-        usedHeadlines = Array.isArray(j?.items) ? j.items : [];
-      } catch {
-        usedHeadlines = [];
-      }
+    /* --- optional calendar blackout within ±90m for High impact --- */
+    const usedCalendar: CalendarItem[] = Array.isArray(calendar) ? calendar : [];
+    const blackout = (() => {
+      if (!usedCalendar.length) return false;
+      const now = Date.now();
+      const win = 90 * 60 * 1000;
+      return usedCalendar.some(ev => {
+        const ts = Date.parse(`${(ev as any).date ?? ""}T${(ev as any).time ?? "00:00"}:00Z`);
+        const high = (ev.impact ?? "").toLowerCase().includes("high");
+        return Number.isFinite(ts) && Math.abs(ts - now) <= win && high;
+      });
+    })();
+
+    /* --- fetch all candles with retry --- */
+    const { frames, missing, timedOut } = await fetchAllFramesWithRetry(instr.code);
+    if (missing.length) {
+      const triedTxt = frames.triedAlt ? ` tried alt symbol: ${frames.triedAlt}` : "";
+      const secs = Math.round(TIMEOUT_MS / 1000);
+      return res.status(200).json({
+        ok: false,
+        reason: `Missing candles for ${missing.join(", ")}.${triedTxt}. Timed out after ${secs}s.`,
+        usedHeadlines,
+        usedCalendar,
+      });
     }
 
-    // -------- recent headline filter (24–48h window) --------
-    const sinceHrs = Math.max(1, parseInt(process.env.HEADLINES_SINCE_HOURS || "48", 10));
-    const cutoff = Date.now() - sinceHrs * 3600_000;
-    const recent = usedHeadlines.filter((h) => {
-      const t = Date.parse(h.seen ?? h.published_at ?? "");
-      return Number.isFinite(t) && t >= cutoff;
-    });
+    /* --- compute 15m levels and HTF alignment for conviction --- */
+    const { m15, h1, h4 } = frames;
+    const levels = computeLevels(m15);
 
-    // -------- optional blackout within ~90 min --------
-    const calItems: CalendarItem[] = Array.isArray(calendar) ? calendar : [];
-    let blackout = false;
-    if (calItems.length) {
-      try {
-        const now = Date.now();
-        const within = 90 * 60 * 1000;
-        blackout = calItems.some((ev) => {
-          const ts = Date.parse(`${(ev as any).date ?? ""}T${(ev as any).time ?? "00:00"}:00Z`);
-          if (!Number.isFinite(ts)) return false;
-          const imp = (ev.impact ?? "").toLowerCase();
-          return Math.abs(ts - now) <= within && (imp.includes("high") || imp.includes("undefined"));
-        });
-      } catch {
-        blackout = false;
-      }
-    }
-
-    // -------- fetch candles (REQUIRE all 4h/1h/15m, with timeout & retries) --------
-    const all = await getAllTimeframesWithTimeout(instr.code);
-    if (all.missing.length) {
-      const tried = all.triedAlt ?? "n/a";
-      const msg = `Standing down: Missing candles for ${all.missing.join(", ")} (tried alt symbol: ${tried}). Timed out after ${Math.round((Number(process.env.PLAN_CANDLES_TIMEOUT_MS ?? 60000))/1000)}s.`;
-      return res.status(200).json({ ok: false, reason: msg, usedHeadlines: recent.slice(0, 12), usedCalendar: calItems });
-    }
-
-    const m15 = all.m15;
-
-    // -------- simple 15m bias & levels (pullback vs BOS heuristic) --------
-    const last = m15[m15.length - 1] ?? m15[0];
-    const prev = m15[m15.length - 2] ?? last;
-    const upBias = last.c >= prev.c ? "Buy" : "Sell";
-
-    const swingHi = Math.max(...m15.slice(-40).map(c => c.h));
-    const swingLo = Math.min(...m15.slice(-40).map(c => c.l));
-    const range = Math.max(1e-9, swingHi - swingLo);
-
-    // For BUY: entry near 61.8% pullback above swingLo; stop below swingLo; targets above entry.
-    // For SELL: mirrored.
-    let entry: number, stop: number, tp1: number, tp2: number;
-
-    if (upBias === "Buy") {
-      entry = swingLo + 0.618 * range;
-      stop  = swingLo - 0.25 * range;
-      tp1   = entry + 0.25 * range;
-      tp2   = entry + 0.50 * range;
-      // safety: enforce stop < entry
-      if (!(stop < entry)) stop = entry - 0.25 * range;
-    } else {
-      entry = swingHi - 0.618 * range;
-      stop  = swingHi + 0.25 * range;
-      tp1   = entry - 0.25 * range;
-      tp2   = entry - 0.50 * range;
-      // safety: enforce stop > entry
-      if (!(stop > entry)) stop = entry + 0.25 * range;
-    }
-
-    // -------- conviction baseline --------
-    let conviction = 60;
-
-    // headlines present can nudge (we cap)
-    conviction = Math.min(95, conviction + Math.min(3, recent.length));
-    if (blackout) conviction = Math.min(conviction, 55);
-
-    // -------- lightweight headline sentiment → bias note (does not block trading) --------
-    let newsBias = "Neutral";
-    let newsScore = 0;
-    try {
-      const recentText = recent.slice(0, 12).map(h => `• ${h.title}`).join("\n");
-      const val = await scoreHeadlines(recentText);  // number in [-1, 1] (or 0 if unavailable)
-      newsScore = Number(val || 0);
-      newsBias = val > 0.15 ? "Positive" : val < -0.15 ? "Negative" : "Neutral";
-    } catch {
-      // ignore sentiment errors
-    }
-
-    // -------- 1h / 4h alignment for conviction --------
+    // HTF trend check (soft, not blocking)
     const trend = (arr: Candle[]) => {
-      const a = arr[arr.length - 1]?.c ?? 0;
+      const a = arr[arr.length - 1]?.c ?? null;
       const b = arr[Math.max(0, arr.length - 21)]?.c ?? a;
-      if (!a || !b) return 0;
+      if (a == null || b == null) return 0;
       return a > b ? 1 : a < b ? -1 : 0;
     };
-    const t1h = trend(all.m1);
-    const t4h = trend(all.m4);
+    const t1h = trend(h1);
+    const t4h = trend(h4);
+    let conviction = 60; // base; can go higher/lower
+    if (levels.bias === "Buy") {
+      if (t1h >= 0) conviction += 10;
+      if (t4h >= 0) conviction += 10;
+    } else {
+      if (t1h <= 0) conviction += 10;
+      if (t4h <= 0) conviction += 10;
+    }
+    // news & blackout adjustments
+    if (newsBias === "Positive" && levels.bias === "Buy") conviction += 5;
+    if (newsBias === "Negative" && levels.bias === "Sell") conviction += 5;
+    if (blackout) conviction = Math.max(0, conviction - 15);
+    conviction = Math.max(5, Math.min(conviction, 95));
 
-    const wantUp = upBias === "Buy";
-    const opposes1h = (t1h && ((wantUp ? t1h < 0 : t1h > 0)));
-    const opposes4h = (t4h && ((wantUp ? t4h < 0 : t4h > 0)));
-
-    // time-frame conviction penalty (not a blocker)
-    let timeFramePenalty = 0;
-    if (opposes1h && opposes4h) timeFramePenalty += 10;
-    else if (opposes1h || opposes4h) timeFramePenalty += 5;
-    conviction = Math.max(0, conviction - timeFramePenalty);
-
-    // -------- LLM formatting (unchanged spirit of your version) --------
+    /* --- LLM formatting (same model as before) --- */
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-    const htfNoteParts: string[] = [];
-    if (t1h !== 0) htfNoteParts.push(`1h ${t1h > 0 ? "up" : "down"}`);
-    if (t4h !== 0) htfNoteParts.push(`4h ${t4h > 0 ? "up" : "down"}`);
+    const htfNote: string[] = [];
+    htfNote.push(`1h ${t1h > 0 ? "up" : t1h < 0 ? "down" : "flat"}`);
+    htfNote.push(`4h ${t4h > 0 ? "up" : t4h < 0 ? "down" : "flat"}`);
 
     const prompt = `
 You are a trading assistant. Format a *single* trade card for ${instr.code}.
 
 Context:
-- Bias timeframe: 15m. HTFs (1h/4h) are for confirmation & conviction adjustments.
-- Setup candidates: pullback-to-0.618 vs. BOS continuation.
-- Macro headlines in last ${sinceHrs}h: ${recent.length}
+- Bias timeframe: 15m execution; 1H/4H used for context (soft alignment).
+- Macro headlines in last ${sinceHrs}h: ${usedHeadlines.length}
 - News sentiment (lightweight): ${newsBias} (${newsScore.toFixed(2)})
-- HTF context: ${htfNoteParts.join(", ") || "n/a"}
-- Calendar blackout within ~90m: ${blackout ? "YES" : "NO"}
+- HTF context: ${htfNote.join(", ")}
+- Calendar blackout within ±90m: ${blackout ? "YES" : "NO"}
 
 Proposed technicals:
-- Direction: **${upBias}**
-- Entry: **${entry.toFixed(5)}**
-- Stop: **${stop.toFixed(5)}**
-- TP1: **${tp1.toFixed(5)}**
-- TP2: **${tp2.toFixed(5)}**
+- Direction: **${levels.bias}**
+- Entry: **${levels.entry}**
+- Stop: **${levels.stop}**
+- TP1: **${levels.tp1}**
+- TP2: **${levels.tp2}**
 
 Return *only* these markdown fields:
 **Trade Card: ${instr.code}**
@@ -369,37 +312,23 @@ Return *only* these markdown fields:
 
     const text = chat.choices?.[0]?.message?.content?.trim() || "";
 
-    const out: ApiOut = {
+    return res.status(200).json({
       ok: true,
       plan: {
         text,
         conviction,
-        setupType: upBias ? "Pullback" : "BOS",
-        entry: Number(entry.toFixed(5)),
-        stop: Number(stop.toFixed(5)),
-        tp1: Number(tp1.toFixed(5)),
-        tp2: Number(tp2.toFixed(5)),
-        notes: blackout ? "High-impact event within ~90 min — reduced conviction." : null,
+        setupType: levels.bias === "Buy" ? "Pullback" : "BOS",
+        entry: levels.entry,
+        stop: levels.stop,
+        tp1: levels.tp1,
+        tp2: levels.tp2,
+        notes: blackout ? "High-impact event within ±90m — reduced conviction." : null,
       },
-      usedHeadlines: recent.slice(0, 12),
-      usedCalendar: calItems,
-    };
-
-    // light cache on success
-    const cacheKey = JSON.stringify({
-      code: instr.code,
-      date: (date ?? new Date().toISOString().slice(0, 10)),
-      cal: calItems.length,
-      news: usedHeadlines.length,
+      usedHeadlines,
+      usedCalendar,
     });
-    cacheSet(cacheKey, out);
-    res.setHeader("Cache-Control", "public, max-age=60");
-
-    return res.status(200).json(out);
   } catch (err: any) {
-    console.error("PLAN API error:", err?.message || err);
-    return res
-      .status(500)
-      .json({ ok: false, reason: "Server error", usedHeadlines: [], usedCalendar: [] });
+    console.error("PLAN API error ->", err?.message || err);
+    return res.status(500).json({ ok: false, reason: "Server error", usedHeadlines: [], usedCalendar: [] });
   }
 }
