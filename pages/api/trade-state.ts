@@ -4,7 +4,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 type TradeState = {
   active: boolean;
   instrument?: { code: string; currencies?: string[] };
-  levels?: { entry: number; sl: number; tp1: number; tp2?: number };
+  levels?: { entry: number; sl: number; tp1: number; tp2: number };
 };
 
 // simple in-memory store (resets on cold start)
@@ -18,8 +18,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method === "POST") {
     try {
       // Next.js body parser may already parse JSON. Support both cases.
-      const body: any =
-        typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+      const body: any = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
 
       if (body?.active === false) {
         TRADE_STATE = { active: false };
