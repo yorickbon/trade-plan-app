@@ -1,20 +1,15 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import CalendarPaste from "@/components/CalendarPaste";
-import CalendarPanel from "@/components/CalendarPanel";
-import HeadlinesPanel from "@/components/HeadlinesPanel";
-import TradingViewTriple from "@/components/TradingViewTriple";
 
-// ---------- Types that match your APIs ----------
-type Headline = {
-  title: string;
-  url: string;
-  published_at?: string;
-  sentiment?: { score: number; label: "positive" | "negative" | "neutral" };
-  source?: string;
-  symbols?: string[];
-};
+// ⬇️ use RELATIVE paths (no tsconfig alias required)
+import CalendarPaste from "../components/CalendarPaste";
+import CalendarPanel from "../components/CalendarPanel";
+import HeadlinesPanel from "../components/HeadlinesPanel";
+import TradingViewTriple from "../components/TradingViewTriple";
+
+// ----------------- helpers -----------------
+const todayISO = () => new Date().toISOString().slice(0, 10);
 
 type CalendarBias = {
   perCurrency: Record<
@@ -24,102 +19,97 @@ type CalendarBias = {
   instrument?: { pair: string; score: number; label: string };
 };
 
-type CalendarResp =
-  | {
-      ok: true;
-      provider: string;
-      date: string;
-      count: number;
-      items: any[];
-      bias: CalendarBias;
-    }
-  | { ok: false; reason: string };
+type CalendarRespOK = {
+  ok: true;
+  provider?: string;
+  date?: string;
+  count: number;
+  items: any[];
+  bias: CalendarBias;
+};
+type CalendarResp = CalendarRespOK | { ok: false; reason: string };
 
 type NewsResp =
-  | { ok: true; items: Headline[]; count: number; provider?: string }
+  | { ok: true; items: any[]; count?: number; provider?: string }
   | { ok: false; reason: string };
 
-// ---------- Helpers ----------
-const todayISO = () => new Date().toISOString().slice(0, 10);
-
-// Extract currencies from calendar bias
 function currenciesFromBias(bias?: CalendarBias): string[] {
   return bias ? Object.keys(bias.perCurrency || {}) : [];
 }
 
-// ---------- Page ----------
+// ----------------- page -----------------
 export default function Page() {
-  // Core state
+  // controls
   const [instrument, setInstrument] = useState<string>("EURUSD");
   const [dateStr, setDateStr] = useState<string>(todayISO());
 
-  // Calendar state
+  // calendar + news state
   const [calendar, setCalendar] = useState<CalendarResp | null>(null);
   const [needManualCalendar, setNeedManualCalendar] = useState<boolean>(false);
   const [loadingCal, setLoadingCal] = useState<boolean>(false);
 
-  // Headlines state
-  const [headlines, setHeadlines] = useState<Headline[]>([]);
+  const [headlines, setHeadlines] = useState<any[]>([]);
   const [loadingNews, setLoadingNews] = useState<boolean>(false);
 
-  // Plan state
+  // plan state
   const [planText, setPlanText] = useState<string>("");
   const [generating, setGenerating] = useState<boolean>(false);
   const [monitoring, setMonitoring] = useState<boolean>(false);
 
-  // ---------- Load Calendar (auto) ----------
+  // ------- load calendar (auto) -------
   const loadCalendar = useCallback(async () => {
     setLoadingCal(true);
     setNeedManualCalendar(false);
     try {
-      const url = `/api/calendar?date=${dateStr}&instrument=${instrument}&windowHours=48`;
-      const r = await fetch(url, { cache: "no-store" });
+      const u = `/api/calendar?date=${dateStr}&instrument=${instrument}&windowHours=48`;
+      const r = await fetch(u, { cache: "no-store" });
       const j: CalendarResp = await r.json();
 
-      setCalendar(j);
-
-      if (!j?.ok) {
-        // no provider data -> enable paste fallback
+      if (j?.ok) {
+        setCalendar(j);
+        // load headlines for currencies present
+        const ccy = currenciesFromBias(j.bias);
+        if (ccy.length) {
+          setLoadingNews(true);
+          try {
+            const nr = await fetch(`/api/news?symbols=${ccy.join(",")}`, {
+              cache: "no-store",
+            });
+            const nj: NewsResp = await nr.json();
+            if (nj?.ok) setHeadlines(nj.items || []);
+            else setHeadlines([]);
+          } catch {
+            setHeadlines([]);
+          } finally {
+            setLoadingNews(false);
+          }
+        } else {
+          setHeadlines([]);
+        }
+      } else {
+        // provider empty -> manual paste fallback
+        setCalendar(null);
         setNeedManualCalendar(true);
-        setHeadlines([]); // will be loaded after manual submit
-        return;
+        setHeadlines([]);
       }
-
-      // calendar ok → load news for currencies present
-      const ccy = currenciesFromBias(j.bias);
-      if (ccy.length) await loadNews(ccy);
-    } catch (e) {
+    } catch {
+      setCalendar(null);
       setNeedManualCalendar(true);
+      setHeadlines([]);
     } finally {
       setLoadingCal(false);
     }
   }, [dateStr, instrument]);
 
-  // ---------- Load News ----------
-  const loadNews = useCallback(
-    async (symbols: string[]) => {
-      if (!symbols.length) return;
-      setLoadingNews(true);
-      try {
-        const u = `/api/news?symbols=${symbols.join(",")}`;
-        const r = await fetch(u, { cache: "no-store" });
-        const j: NewsResp = await r.json();
-        if (j?.ok) setHeadlines(j.items || []);
-        else setHeadlines([]);
-      } catch {
-        setHeadlines([]);
-      } finally {
-        setLoadingNews(false);
-      }
-    },
-    []
-  );
+  useEffect(() => {
+    loadCalendar();
+  }, [loadCalendar]);
 
-  // ---------- Manual calendar (paste) completed ----------
+  // ------- manual calendar (paste) completed -------
   const onCalendarManual = useCallback(
     async (resp: any) => {
-      // resp has same shape from /api/calendar-manual.ts
-      const j: CalendarResp = {
+      // resp structure comes from /api/calendar-manual.ts
+      const ok: CalendarRespOK = {
         ok: true,
         provider: "manual",
         date: dateStr,
@@ -127,55 +117,63 @@ export default function Page() {
         items: resp?.items || [],
         bias: resp?.bias || { perCurrency: {} },
       };
-      setCalendar(j);
+      setCalendar(ok);
       setNeedManualCalendar(false);
 
-      // fetch news based on currencies present
-      const ccy = currenciesFromBias(j.bias);
-      if (ccy.length) await loadNews(ccy);
+      // headlines from currencies detected
+      const ccy = currenciesFromBias(ok.bias);
+      if (ccy.length) {
+        setLoadingNews(true);
+        try {
+          const nr = await fetch(`/api/news?symbols=${ccy.join(",")}`, {
+            cache: "no-store",
+          });
+          const nj: NewsResp = await nr.json();
+          if (nj?.ok) setHeadlines(nj.items || []);
+          else setHeadlines([]);
+        } catch {
+          setHeadlines([]);
+        } finally {
+          setLoadingNews(false);
+        }
+      } else {
+        setHeadlines([]);
+      }
     },
-    [dateStr, loadNews]
+    [dateStr]
   );
 
-  // ---------- Generate Plan ----------
+  // ------- generate plan (server combines TA + FA) -------
   const generatePlan = useCallback(async () => {
     setGenerating(true);
     setPlanText("");
     try {
-      const body = {
-        instrument,
-        date: dateStr,
-        // pass headlines + calendar to server for combined conviction
-        headlines,
-        calendar,
-      };
       const r = await fetch("/api/plan", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          instrument,
+          date: dateStr,
+          calendar,
+          headlines,
+        }),
       });
       const j = await r.json();
-      if (j?.ok) setPlanText(j?.plan || j?.card || JSON.stringify(j));
+      if (j?.ok) setPlanText(j?.plan || j?.card || JSON.stringify(j, null, 2));
       else setPlanText(j?.reason || "Server error while generating plan.");
     } catch (e: any) {
       setPlanText(e?.message || "Error generating plan.");
     } finally {
       setGenerating(false);
     }
-  }, [instrument, dateStr, headlines, calendar]);
+  }, [instrument, dateStr, calendar, headlines]);
 
-  // ---------- Effects: initial loads ----------
-  useEffect(() => {
-    loadCalendar();
-  }, [loadCalendar]);
-
-  // ---------- Derived ----------
   const calendarCurrencies = useMemo(
     () => currenciesFromBias((calendar as any)?.bias),
     [calendar]
   );
 
-  // ---------- UI ----------
+  // ----------------- UI -----------------
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 space-y-4">
       {/* Controls */}
@@ -253,18 +251,21 @@ export default function Page() {
       {/* Charts */}
       <TradingViewTriple symbol={instrument} />
 
-      {/* Calendar + Headlines row */}
+      {/* Calendar + Headlines */}
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-        {/* Left: Calendar (auto) or Paste fallback */}
+        {/* Calendar panel (auto or paste fallback) */}
         <div className="rounded-lg border border-neutral-800 p-4">
           <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
 
-          {loadingCal && <div className="text-sm opacity-75">Loading calendar…</div>}
+          {loadingCal && (
+            <div className="text-sm opacity-75">Loading calendar…</div>
+          )}
 
           {!loadingCal && needManualCalendar && (
             <div className="space-y-3">
               <div className="text-sm opacity-75">
-                No items found from providers. Paste a calendar table below to continue:
+                No items found from providers. Paste a calendar table below to
+                continue:
               </div>
               <CalendarPaste
                 instrument={instrument}
@@ -274,7 +275,7 @@ export default function Page() {
           )}
 
           {!needManualCalendar && calendar?.ok && (
-            <CalendarPanel items={(calendar as any).items || []} />
+            <CalendarPanel items={(calendar as CalendarRespOK).items || []} />
           )}
 
           {!needManualCalendar && !calendar?.ok && !loadingCal && (
@@ -282,12 +283,10 @@ export default function Page() {
           )}
         </div>
 
-        {/* Right: Headlines */}
+        {/* Headlines */}
         <div className="rounded-lg border border-neutral-800 p-4">
-          <h2 className="text-lg font-semibold mb-2">
-            Macro Headlines (24–48h)
-          </h2>
-          <HeadlinesPanel items={headlines as any} />
+          <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
+          <HeadlinesPanel items={headlines} />
           <div className="text-xs mt-2 opacity-60">
             {loadingNews
               ? "Loading headlines…"
@@ -311,9 +310,9 @@ export default function Page() {
           <div className="text-sm opacity-80">Generating…</div>
         ) : (
           <div className="text-sm opacity-70">
-            Click <b>Generate Plan</b> to build a setup using 15m execution, 1h+4h
-            context, fundamentals (calendar bias + headlines), and our strategy
-            logic.
+            Click <b>Generate Plan</b> to build a setup using 15m execution,
+            1h+4h context, fundamentals (calendar bias + headlines), and
+            strategy logic.
           </div>
         )}
       </div>
