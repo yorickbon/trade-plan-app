@@ -2,12 +2,7 @@
 
 import React, { useEffect } from "react";
 
-type Props = {
-  symbol: string; // e.g. "EURUSD", "XAUUSD", "SPX500"
-};
-
-// Map your app symbols to TradingView symbols.
-// Adjust as you prefer (FXCM/OANDA/CME etc.)
+/** Map your app symbols to TradingView symbols */
 function tvSymbol(sym: string) {
   const s = sym.toUpperCase();
   // Indices
@@ -15,26 +10,26 @@ function tvSymbol(sym: string) {
   if (s === "NAS100") return "NASDAQ:NDX";
   if (s === "US30") return "TVC:DJI";
   if (s === "GER40") return "XETR:DAX";
-  // Crypto (common default)
+  // Crypto
   if (s === "BTCUSD") return "CRYPTO:BTCUSD";
   if (s === "ETHUSD") return "CRYPTO:ETHUSD";
   // Metals
   if (s === "XAUUSD") return "OANDA:XAUUSD";
-  // FX default to OANDA; change to FXCM if you prefer
+  // FX (OANDA default)
   return `OANDA:${s}`;
 }
 
-function injectTradingView(): Promise<void> {
-  return new Promise((resolve, reject) => {
+/** Load TV script once, without crashing render */
+function loadTvScript(): Promise<void> {
+  return new Promise((resolve) => {
     if (typeof window === "undefined") return resolve();
-    // If already present, resolve
+    // already there?
     if ((window as any).TradingView) return resolve();
+
     const id = "tv-script";
-    if (document.getElementById(id)) {
-      (document.getElementById(id) as HTMLScriptElement).addEventListener(
-        "load",
-        () => resolve()
-      );
+    const existing = document.getElementById(id) as HTMLScriptElement | null;
+    if (existing) {
+      existing.addEventListener("load", () => resolve(), { once: true });
       return;
     }
     const s = document.createElement("script");
@@ -42,87 +37,60 @@ function injectTradingView(): Promise<void> {
     s.src = "https://s3.tradingview.com/tv.js";
     s.async = true;
     s.onload = () => resolve();
-    s.onerror = () => reject(new Error("Failed to load TradingView script"));
+    s.onerror = () => resolve(); // never throw -> never crash
     document.head.appendChild(s);
   });
 }
 
-export default function TradingViewTriple({ symbol }: Props) {
+export default function TradingViewTriple({ symbol }: { symbol: string }) {
   useEffect(() => {
     let mounted = true;
 
-    const load = async () => {
+    const run = async () => {
       if (typeof window === "undefined") return;
-      try {
-        await injectTradingView();
-        if (!mounted) return;
+      await loadTvScript();
+      if (!mounted) return;
 
-        const tv = (window as any).TradingView;
-        const s = tvSymbol(symbol);
+      const TV = (window as any).TradingView;
+      if (!TV) return; // script blocked? just skip silently
 
-        // Clean previous widgets if any
-        ["tv-4h", "tv-1h", "tv-15m"].forEach((id) => {
-          const el = document.getElementById(id);
-          if (el) el.innerHTML = ""; // remove old widget
-        });
+      const tvSym = tvSymbol(symbol);
 
-        // create three widgets (4h, 1h, 15m). Use "advanced-chart" widget.
-        new tv.widget({
-          container_id: "tv-4h",
-          symbol: s,
-          interval: "240",
-          timezone: "Etc/UTC",
-          theme: "dark",
-          style: "1",
-          locale: "en",
-          hide_side_toolbar: false,
-          allow_symbol_change: false,
-          autosize: true,
-        });
+      // clear any previous widgets
+      ["tv-4h", "tv-1h", "tv-15m"].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = "";
+      });
 
-        new tv.widget({
-          container_id: "tv-1h",
-          symbol: s,
-          interval: "60",
-          timezone: "Etc/UTC",
-          theme: "dark",
-          style: "1",
-          locale: "en",
-          hide_side_toolbar: false,
-          allow_symbol_change: false,
-          autosize: true,
-        });
+      const base = {
+        symbol: tvSym,
+        timezone: "Etc/UTC",
+        theme: "dark",
+        style: "1",
+        locale: "en",
+        hide_side_toolbar: false,
+        allow_symbol_change: false,
+        autosize: true,
+      };
 
-        new tv.widget({
-          container_id: "tv-15m",
-          symbol: s,
-          interval: "15",
-          timezone: "Etc/UTC",
-          theme: "dark",
-          style: "1",
-          locale: "en",
-          hide_side_toolbar: false,
-          allow_symbol_change: false,
-          autosize: true,
-        });
-      } catch (e) {
-        // Keep UI alive even if TradingView fails to load
-        // (no throw -> no client-side fatal)
-        console.warn("TradingView load error:", e);
-      }
+      new TV.widget({ ...base, container_id: "tv-4h", interval: "240" });
+      new TV.widget({ ...base, container_id: "tv-1h", interval: "60" });
+      new TV.widget({ ...base, container_id: "tv-15m", interval: "15" });
     };
 
-    load();
+    run();
     return () => {
       mounted = false;
     };
   }, [symbol]);
 
+  // Always side-by-side (3 columns). If you want wrap on tiny screens,
+  // replace `flex` with `grid grid-cols-1 md:grid-cols-3`.
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-3 gap-3">
-      <div id="tv-4h" className="h-[340px] min-h-[280px] rounded border border-neutral-800" />
-      <div id="tv-1h" className="h-[340px] min-h-[280px] rounded border border-neutral-800" />
-      <div id="tv-15m" className="h-[340px] min-h-[280px] rounded border border-neutral-800" />
+    <div className="flex gap-3">
+      <div id="tv-4h" className="flex-1 min-w-0 h-[400px] rounded border border-neutral-800" />
+      <div id="tv-1h" className="flex-1 min-w-0 h-[400px] rounded border border-neutral-800" />
+      <div id="tv-15m" className="flex-1 min-w-0 h-[400px] rounded border border-neutral-800" />
     </div>
   );
 }
