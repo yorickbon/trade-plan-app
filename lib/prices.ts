@@ -41,7 +41,11 @@ export async function getCandles(
     if (fh.length) return remember(cacheKey, fh);
   }
 
-  // 4) Synthetic from nearest TF (best-effort so we never hard stand-down)
+  // 4) Yahoo Finance (FREE fallback, all instruments)
+  const yf = await yahooFetch(symbol, tf, n, perCall);
+  if (yf.length) return remember(cacheKey, yf);
+
+  // 5) Synthetic from nearest TF (best-effort so we never hard stand-down)
   const synth = await syntheticFromNearest(symbol, tf, n, perCall);
   if (synth.length) return remember(cacheKey, synth);
 
@@ -56,8 +60,7 @@ function remember(key: string, data: Candle[]): Candle[] {
   return data;
 }
 
-const ok = (c: Candle) =>
-  [c.t, c.o, c.h, c.l, c.c].every(Number.isFinite);
+const ok = (c: Candle) => [c.t, c.o, c.h, c.l, c.c].every(Number.isFinite);
 
 async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return (await Promise.race([
@@ -81,8 +84,12 @@ function isForex(s: string) {
   return /^[A-Z]{6}$/.test(s);
 }
 
-function mapTf(tf: TF, provider: "td" | "polygon" | "finnhub"): string {
+function mapTf(tf: TF, provider: "td" | "polygon" | "finnhub" | "yf"): string {
   if (provider === "td") return tf === "15m" ? "15min" : tf; // TD naming
+  if (provider === "yf") {
+    // Yahoo: 15m / 60m; no 4h — we’ll build 4h from 60m
+    return tf === "15m" ? "15m" : "60m";
+  }
   // polygon/finnhub use minutes
   return tf === "15m" ? "15" : tf === "1h" ? "60" : "240";
 }
@@ -94,7 +101,7 @@ const TD_ALIASES: Record<string, string[]> = {
   // Indices
   SPX500: ["SPX", "SP500", "US500", "S&P500", "SPX500"],
   NAS100: ["NDX", "NASDAQ100", "NAS100"],
-  US30: ["DJI", "DOW", "US30"],
+  US30:  ["DJI", "DOW", "US30"],
   GER40: ["DAX", "DE40", "GER40"],
 
   // Metals/Crypto (both slash and noslash forms)
@@ -190,8 +197,7 @@ async function polygonFetch(symbol: string, tf: TF, n: number, ms: number): Prom
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Finnhub (FOREX only)
-
+/** Finnhub (FOREX only) */
 async function finnhubFetch(symbol: string, tf: TF, n: number, ms: number): Promise<Candle[]> {
   const key = process.env.FINNHUB_API_KEY || "";
   if (!key) return [];
@@ -229,11 +235,86 @@ async function finnhubFetch(symbol: string, tf: TF, n: number, ms: number): Prom
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Yahoo Finance (FREE fallback)
+
+function yahooSymbol(symbol: string): string | null {
+  // normalized like "EUR/USD", "SPX500", "XAU/USD", "BTC/USD"
+  // FX → EURUSD=X, USDJPY=X, XAUUSD=X (metals often work too)
+  if (isForex(symbol)) {
+    const code = symbol.replace("/", "");
+    return `${code}=X`;
+  }
+
+  // Metals (XAU/USD etc) → XAUUSD=X
+  if (symbol.startsWith("XAU/") || symbol === "XAUUSD" || symbol === "XAU/USD") return "XAUUSD=X";
+
+  // Crypto → BTC-USD, ETH-USD
+  if (symbol.startsWith("BTC/") || symbol === "BTCUSD" || symbol === "BTC/USD") return "BTC-USD";
+  if (symbol.startsWith("ETH/") || symbol === "ETHUSD" || symbol === "ETH/USD") return "ETH-USD";
+
+  // Indices mappings
+  if (symbol === "SPX500") return "^GSPC";    // S&P 500
+  if (symbol === "NAS100") return "^NDX";     // NASDAQ 100
+  if (symbol === "US30")  return "^DJI";      // Dow Jones
+  if (symbol === "GER40") return "^GDAXI";    // DAX
+
+  return null;
+}
+
+async function yahooFetch(symbol: string, tf: TF, n: number, ms: number): Promise<Candle[]> {
+  const y = yahooSymbol(symbol);
+  if (!y) return [];
+  const interval = mapTf(tf, "yf"); // 15m or 60m
+  // Choose a generous range to cover n bars. YF caps intraday ranges but 30–60d generally OK for 15m/60m.
+  const range = tf === "15m" ? "30d" : "60d";
+
+  const url = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(y)}`);
+  url.searchParams.set("interval", interval);
+  url.searchParams.set("range", range);
+  // Some regions require events=history to include OHLC consistently
+  url.searchParams.set("events", "history");
+
+  try {
+    const rsp = await withTimeout(fetch(url.toString(), { cache: "no-store" }), ms);
+    if (!rsp.ok) return [];
+    const j: any = await rsp.json();
+    const r = j?.chart?.result?.[0];
+    const ts: number[] = Array.isArray(r?.timestamp) ? r.timestamp : [];
+    const q = r?.indicators?.quote?.[0] || {};
+    const opens: number[] = q?.open || [];
+    const highs: number[] = q?.high || [];
+    const lows: number[] = q?.low || [];
+    const closes: number[] = q?.close || [];
+
+    let bars: Candle[] = [];
+    for (let i = ts.length - 1; i >= 0; i--) {
+      const t = Number(ts[i]);
+      const o = Number(opens[i]);
+      const h = Number(highs[i]);
+      const l = Number(lows[i]);
+      const c = Number(closes[i]);
+      if (Number.isFinite(t) && Number.isFinite(o) && Number.isFinite(h) && Number.isFinite(l) && Number.isFinite(c)) {
+        bars.push({ t, o, h, l, c });
+      }
+      if (bars.length >= (tf === "4h" ? n * 4 : n)) break;
+    }
+
+    // If 4h requested, aggregate 60m → 4h
+    if (tf === "4h") {
+      bars = aggregate(bars, 4);
+    }
+
+    return bars.slice(0, n);
+  } catch {
+    return [];
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 /** Synthetic fallbacks so we never “hard stand down”.
  *  We “explode” higher TF into lower TF bars (step model),
  *  or “aggregate” lower TF into higher TF OHLC.
  */
-
 function explode(bars: Candle[], ratio: number, stepSec: number): Candle[] {
   const out: Candle[] = [];
   for (const b of bars) {
@@ -243,7 +324,6 @@ function explode(bars: Candle[], ratio: number, stepSec: number): Candle[] {
   }
   return out;
 }
-
 function aggregate(bars: Candle[], ratio: number): Candle[] {
   const out: Candle[] = [];
   for (let i = 0; i < bars.length; i += ratio) {
@@ -258,9 +338,7 @@ function aggregate(bars: Candle[], ratio: number): Candle[] {
   }
   return out;
 }
-
 async function syntheticFromNearest(symbol: string, tf: TF, n: number, ms: number): Promise<Candle[]> {
-  // Try derive requested TF from closest available TD TFs
   if (tf === "15m") {
     const h1 = await tdTryAliases(symbol, "1h", Math.ceil(n / 4), ms);
     if (h1.length) return explode(h1, 4, 15 * 60).slice(0, n);
@@ -274,6 +352,7 @@ async function syntheticFromNearest(symbol: string, tf: TF, n: number, ms: numbe
     if (m15.length) return aggregate(m15, 4).slice(0, n);
   }
   if (tf === "4h") {
+    // In most cases we’ll already have built this from Yahoo 60m if earlier steps failed.
     const h1 = await tdTryAliases(symbol, "1h", n * 4, ms);
     if (h1.length) return aggregate(h1, 4).slice(0, n);
   }
