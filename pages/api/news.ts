@@ -1,123 +1,139 @@
-// /pages/api/news.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 
-type Item = {
+/**
+ * NEWS API
+ * - Accepts BOTH ?currencies= and ?symbols= (comma-separated)
+ * - Optional: ?hours= (default from HEADLINES_SINCE_HOURS or 48)
+ * - Optional: ?max= (default from HEADLINES_MAX or 12)
+ * - Optional: ?lang= (default from HEADLINES_LANG or "en")
+ * - Optional: ?debug=1 to include provider URL + raw counters
+ *
+ * ENV:
+ *   NEWS_API_PROVIDER = "newsdata"
+ *   NEWSDATA_API_KEY
+ *   HEADLINES_MAX
+ *   HEADLINES_LANG
+ *   HEADLINES_SINCE_HOURS
+ */
+type NewsItem = {
   title: string;
   url: string;
-  source: string;
   published_at: string; // ISO
-  description?: string;
+  source?: string;
+  country?: string | string[];
+  language?: string;
+  symbols?: string[];
+  sentiment?: { score: number; label: "positive" | "negative" | "neutral" };
 };
 
-// --- helpers ---------------------------------------------------
-const parseCurrencies = (q: string | string[] | undefined): string[] => {
+type NewsResponse =
+  | { ok: true; provider: string; count: number; items: NewsItem[]; query: any; debug?: any }
+  | { ok: false; reason: string; provider?: string; query?: any; debug?: any };
+
+const positiveWords = ["beats", "surge", "soar", "rally", "growth", "optimism", "strong", "bull", "gain"];
+const negativeWords = ["miss", "fall", "drop", "slump", "recession", "fear", "weak", "bear", "loss"];
+
+function simpleSentiment(text: string) {
+  const t = text.toLowerCase();
+  let score = 0;
+  for (const w of positiveWords) if (t.includes(w)) score += 1;
+  for (const w of negativeWords) if (t.includes(w)) score -= 1;
+  const label = score > 0 ? "positive" : score < 0 ? "negative" : "neutral";
+  return { score, label as const };
+}
+
+function parseList(q: string | string[] | undefined): string[] {
   if (!q) return [];
   const raw = Array.isArray(q) ? q.join(",") : String(q);
-  return raw.split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
-};
-
-// Coerce various provider date formats to ISO so Date.parse works
-function normalizeToISO(s: string): string {
-  const t = (s || "").trim();
-  if (!t) return "";
-  if (/^\d{4}-\d{2}-\d{2}T/.test(t)) return t; // already ISO
-  if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(t)) return t.replace(" ", "T") + "Z"; // "YYYY-MM-DD HH:mm"
-  if (/^\d{10}(\d{3})?$/.test(t)) { // epoch secs/ms
-    const ms = t.length === 13 ? Number(t) : Number(t) * 1000;
-    return new Date(ms).toISOString();
-  }
-  const ms = Date.parse(t);
-  return Number.isFinite(ms) ? new Date(ms).toISOString() : "";
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
-// --------------------------------------------------------------
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  const currencies = parseCurrencies(req.query.currencies);
-  const hours = Math.max(1, Number(req.query.hours ?? 48));
-  const max = Math.min(25, Math.max(1, Number(req.query.max ?? (process.env.HEADLINES_MAX ?? 8))));
-  const lang = String(process.env.HEADLINES_LANG ?? "en");
-  const debug = String(req.query.debug ?? "") === "1";
+function hoursAgoISO(hours: number) {
+  const d = new Date(Date.now() - hours * 3600 * 1000);
+  return d.toISOString();
+}
 
-  const API_KEY = process.env.NEWSDATA_API_KEY || process.env.NEWS_API_KEY || "";
-  if (!API_KEY) {
-    return res.status(200).json({
-      provider: "newsdata",
-      items: [],
-      note: "No News API key (NEWSDATA_API_KEY or NEWS_API_KEY). Proceeding with technicals.",
-    });
-  }
+export default async function handler(req: NextApiRequest, res: NextApiResponse<NewsResponse>) {
+  if (req.method !== "GET") return res.status(405).json({ ok: false, reason: "Method not allowed" });
+
+  const provider = String(process.env.NEWS_API_PROVIDER || "newsdata");
+
+  // Accept both ?currencies= and ?symbols=
+  const list = parseList((req.query as any).currencies ?? (req.query as any).symbols);
+  const lang = String(req.query.lang || process.env.HEADLINES_LANG || "en");
+  const hours = Math.max(1, Number(req.query.hours || process.env.HEADLINES_SINCE_HOURS || 48));
+  const max = Math.min(25, Math.max(1, Number(req.query.max || process.env.HEADLINES_MAX || 12)));
+  const debugWanted = String(req.query.debug || "") === "1";
+
+  const queryMeta = { list, lang, hours, max };
 
   try {
-    const synonyms: Record<string, string[]> = {
-      USD: ["usd","dollar","greenback","u.s.","us"],
-      EUR: ["eur","euro","ecb","eurozone"],
-      JPY: ["jpy","yen","boj","bank of japan"],
-      GBP: ["gbp","pound","boe","bank of england","sterling"],
-      AUD: ["aud","aussie","rba"],
-      CAD: ["cad","loonie","boc","bank of canada"],
-      NZD: ["nzd","kiwi","rbnz"],
-      CHF: ["chf","franc","snb"],
-      XAUUSD: ["gold","xauusd","bullion","precious metals"],
-    };
-
-    const terms =
-      currencies.length === 0
-        ? []
-        : currencies.flatMap(c => {
-            const key = c.includes("/") ? c.replace("/", "") : c;
-            return [c.toLowerCase(), ...(synonyms[key] ?? [] )];
-          });
-
-    const core =
-      terms.length > 0
-        ? terms.map(t => `"${t}"`).join(" OR ")
-        : 'forex OR markets OR economy OR "central bank"';
-
-    const q = `${core} OR inflation OR rates OR CPI OR GDP`;
-    const sinceMs = Date.now() - hours * 3600_000;
-
-    const url = new URL("https://newsdata.io/api/1/news");
-    url.searchParams.set("apikey", API_KEY);
-    url.searchParams.set("q", q);
-    url.searchParams.set("language", lang);
-
-    const rsp = await fetch(url.toString(), { cache: "no-store" });
-    const bodyText = await rsp.text().catch(() => "");
-    if (!rsp.ok) {
-      const payload: any = { provider: "newsdata", items: [], note: `provider status ${rsp.status}` };
-      if (debug) payload.debug = { status: rsp.status, url: url.toString(), body: bodyText };
-      return res.status(200).json(payload);
+    if (provider !== "newsdata") {
+      return res.status(200).json({ ok: false, reason: "Unsupported NEWS_API_PROVIDER", provider, query: queryMeta });
     }
 
-    let json: any = {};
-    try { json = JSON.parse(bodyText); } catch {}
-    const raw: any[] = Array.isArray(json?.results)
-      ? json.results
-      : Array.isArray(json?.data)
-      ? json.data
-      : [];
+    const apiKey = process.env.NEWSDATA_API_KEY;
+    if (!apiKey) return res.status(200).json({ ok: false, reason: "NEWSDATA_API_KEY missing", provider, query: queryMeta });
 
-    const items: Item[] = raw
-      .map((r: any): Item => ({
-        title: String(r?.title ?? r?.name ?? "").trim(),
-        url: String(r?.link ?? r?.url ?? "").trim(),
-        source: String(r?.source_id ?? r?.source ?? "").trim(),
-        published_at: normalizeToISO(String(r?.pubDate ?? r?.published_at ?? r?.date ?? "")),
-        description: String(r?.description ?? r?.snippet ?? "").trim(),
-      }))
-      .filter(it => it.title && it.url)
-      .filter(it => {
-        const t = Date.parse(it.published_at || "");
-        return Number.isFinite(t) ? t >= sinceMs : true;
-      })
-      .slice(0, max);
+    // Build a loose OR query like: (EUR OR USD) with some finance keywords to reduce noise
+    const tokens = list.length ? list : ["USD"];
+    const q = "(" + tokens.map((s) => s.replace(/[^\w/+-]/g, "")).join(" OR ") + ") AND (forex OR currency OR index OR stocks OR gold OR oil OR crypto OR market)";
 
-    const payload: any = { provider: "newsdata", count: items.length, items };
-    if (debug) payload.debug = { url: url.toString(), q, currencies };
-    return res.status(200).json(payload);
+    const fromIso = hoursAgoISO(hours);
+
+    // Newsdata docs: https://newsdata.io/docs (v1)
+    // We’ll use the v1 endpoint with qInTitle fallback; language & from_date supported.
+    const url = new URL("https://newsdata.io/api/1/news");
+    url.searchParams.set("apikey", apiKey);
+    url.searchParams.set("q", q);
+    url.searchParams.set("language", lang);
+    url.searchParams.set("from_date", fromIso.slice(0, 10)); // v1 supports date (yyyy-mm-dd)
+    url.searchParams.set("page", "1");
+
+    const providerUrl = url.toString();
+
+    const resp = await fetch(providerUrl, { cache: "no-store" });
+    if (!resp.ok) {
+      return res.status(200).json({ ok: false, reason: `newsdata http ${resp.status}`, provider, query: queryMeta, debug: debugWanted ? { providerUrl } : undefined });
+    }
+
+    const data: any = await resp.json();
+    const results: any[] = Array.isArray(data?.results) ? data.results : [];
+
+    const items: NewsItem[] = results
+      .slice(0, max)
+      .map((r) => {
+        const title: string = r?.title || r?.description || "";
+        const sentiment = simpleSentiment(title);
+        return {
+          title,
+          url: r?.link || r?.source_url || "",
+          published_at: r?.pubDate ? new Date(r.pubDate).toISOString() : new Date().toISOString(),
+          source: r?.source_id || r?.creator || r?.source || undefined,
+          country: r?.country,
+          language: r?.language || lang,
+          symbols: tokens,
+          sentiment,
+        };
+      });
+
+    return res.status(200).json({
+      ok: true,
+      provider,
+      count: items.length,
+      items,
+      query: queryMeta,
+      debug: debugWanted ? { providerUrl, total_from_provider: results.length } : undefined,
+    });
   } catch (err: any) {
-    const payload: any = { provider: "newsdata", items: [], note: "fetch failed" };
-    if (debug) payload.error = err?.message || "fetch failed (caught)";
-    return res.status(200).json(payload);
+    return res.status(200).json({
+      ok: false,
+      reason: err?.message || "Unknown error",
+      provider,
+      query: queryMeta,
+    });
   }
 }
