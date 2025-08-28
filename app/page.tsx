@@ -1,341 +1,322 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import TradingViewTriple from "../components/TradingViewTriple";
-import CalendarPanel from "../components/CalendarPanel";
-import HeadlinesPanel from "../components/HeadlinesPanel";
-import { INSTRUMENTS } from "../lib/symbols";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import CalendarPaste from "@/components/CalendarPaste";
+import CalendarPanel from "@/components/CalendarPanel";
+import HeadlinesPanel from "@/components/HeadlinesPanel";
+import TradingViewTriple from "@/components/TradingViewTriple";
 
-// ---------------- Local types (aligned with API, but lenient for UI) ------------
-type Instrument = {
-  code: string;           // e.g. "EURUSD"
-  currencies?: string[];  // e.g. ["EUR","USD"]
-};
-
-// NOTE: we keep these very permissive to avoid compile breaks if the panel types differ.
-// The panels only read fields they need; extra fields are ignored.
-type CalendarItem = {
-  date?: string;
-  time?: string;
-  country?: string;
-  currency?: string;
-  impact?: string;
-  title?: string;
-  actual?: string;
-  forecast?: string;
-  previous?: string;
-};
-
-type HeadlineItem = {
+// ---------- Types that match your APIs ----------
+type Headline = {
   title: string;
-  url?: string;
-  source?: string;
-  seen?: string;        // ISO timestamp when shown (optional)
+  url: string;
   published_at?: string;
+  sentiment?: { score: number; label: "positive" | "negative" | "neutral" };
+  source?: string;
+  symbols?: string[];
 };
 
-// API response for /api/plan
-type PlanResponse = {
-  ok: boolean;
-  plan?: { text: string; conviction?: number | null };
-  reason?: string;
-  usedHeadlines?: HeadlineItem[];
-  usedCalendar?: CalendarItem[];
+type CalendarBias = {
+  perCurrency: Record<
+    string,
+    { score: number; label: string; count: number; evidence: any[] }
+  >;
+  instrument?: { pair: string; score: number; label: string };
 };
 
+type CalendarResp =
+  | {
+      ok: true;
+      provider: string;
+      date: string;
+      count: number;
+      items: any[];
+      bias: CalendarBias;
+    }
+  | { ok: false; reason: string };
+
+type NewsResp =
+  | { ok: true; items: Headline[]; count: number; provider?: string }
+  | { ok: false; reason: string };
+
+// ---------- Helpers ----------
+const todayISO = () => new Date().toISOString().slice(0, 10);
+
+// Extract currencies from calendar bias
+function currenciesFromBias(bias?: CalendarBias): string[] {
+  return bias ? Object.keys(bias.perCurrency || {}) : [];
+}
+
+// ---------- Page ----------
 export default function Page() {
-  // ------------ state ------------
-  const [instrument, setInstrument] = useState<Instrument>(INSTRUMENTS[0]);
-  const [dateStr, setDateStr] = useState<string>(new Date().toISOString().slice(0, 10));
+  // Core state
+  const [instrument, setInstrument] = useState<string>("EURUSD");
+  const [dateStr, setDateStr] = useState<string>(todayISO());
 
-  const [calendar, setCalendar] = useState<CalendarItem[]>([]);
-  const [headlines, setHeadlines] = useState<HeadlineItem[]>([]);
+  // Calendar state
+  const [calendar, setCalendar] = useState<CalendarResp | null>(null);
+  const [needManualCalendar, setNeedManualCalendar] = useState<boolean>(false);
+  const [loadingCal, setLoadingCal] = useState<boolean>(false);
 
-  const [loadingCal, setLoadingCal] = useState(false);
-  const [loadingNews, setLoadingNews] = useState(false);
-  const [loadingPlan, setLoadingPlan] = useState(false);
+  // Headlines state
+  const [headlines, setHeadlines] = useState<Headline[]>([]);
+  const [loadingNews, setLoadingNews] = useState<boolean>(false);
 
+  // Plan state
   const [planText, setPlanText] = useState<string>("");
-  const [standDown, setStandDown] = useState<string | null>(null);
+  const [generating, setGenerating] = useState<boolean>(false);
+  const [monitoring, setMonitoring] = useState<boolean>(false);
 
-  // monitor state messaging
-  const [monitoring, setMonitoring] = useState<boolean | null>(null);
-  const [monitorMsg, setMonitorMsg] = useState<string>("");
-
-  // forces a full “fresh mount” of children (charts, etc) when we reset or change instrument
-  const [sessionKey, setSessionKey] = useState<number>(() => Date.now());
-
-  // helper: “fresh page” reset
-  function hardReset(nextInstrument?: Instrument) {
-    setPlanText("");
-    setStandDown(null);
-    setCalendar([]);
-    setHeadlines([]);
-    setLoadingCal(false);
-    setLoadingNews(false);
-    setLoadingPlan(false);
-    setMonitoring(null);
-    setMonitorMsg("");
-    if (nextInstrument) setInstrument(nextInstrument);
-    // bump sessionKey so children unmount/remount (clears any cached fetch / local state)
-    setSessionKey(Date.now());
-  }
-
-  // ------------- fetch calendar -------------
-  async function fetchCalendar() {
+  // ---------- Load Calendar (auto) ----------
+  const loadCalendar = useCallback(async () => {
     setLoadingCal(true);
+    setNeedManualCalendar(false);
     try {
-      const q = new URLSearchParams({
-        date: dateStr,
-        currencies: (instrument.currencies ?? []).join(","),
-      }).toString();
+      const url = `/api/calendar?date=${dateStr}&instrument=${instrument}&windowHours=48`;
+      const r = await fetch(url, { cache: "no-store" });
+      const j: CalendarResp = await r.json();
 
-      const rsp = await fetch(`/api/calendar?${q}`, { cache: "no-store" });
-      const json = await rsp.json();
-      setCalendar(Array.isArray(json.items) ? json.items : []);
+      setCalendar(j);
+
+      if (!j?.ok) {
+        // no provider data -> enable paste fallback
+        setNeedManualCalendar(true);
+        setHeadlines([]); // will be loaded after manual submit
+        return;
+      }
+
+      // calendar ok → load news for currencies present
+      const ccy = currenciesFromBias(j.bias);
+      if (ccy.length) await loadNews(ccy);
     } catch (e) {
-      console.error(e);
-      setCalendar([]);
+      setNeedManualCalendar(true);
     } finally {
       setLoadingCal(false);
     }
-  }
+  }, [dateStr, instrument]);
 
-  // ------------- fetch headlines -------------
-  async function fetchHeadlines() {
-    setLoadingNews(true);
-    try {
-      const curr = (instrument.currencies ?? []).join(",");
-      const rsp = await fetch(`/api/news?currencies=${encodeURIComponent(curr)}`, {
-        cache: "no-store",
-      });
-      const json = await rsp.json();
-      setHeadlines(Array.isArray(json.items) ? json.items : []);
-    } catch (e) {
-      console.error(e);
-      setHeadlines([]);
-    } finally {
-      setLoadingNews(false);
-    }
-  }
-
-  // ------------- read current monitor state (if endpoint exists) -------------
-  async function fetchMonitorState() {
-    try {
-      const rsp = await fetch("/api/trade-state", { cache: "no-store" });
-      if (!rsp.ok) return;
-      const j = await rsp.json();
-      setMonitoring(!!j?.active);
-    } catch {
-      /* endpoint may not exist yet; ignore */
-    }
-  }
-
-  // initial load OR when instrument/date changes -> refetch everything
-  useEffect(() => {
-    fetchCalendar();
-    fetchHeadlines();
-    fetchMonitorState();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [instrument.code, dateStr, sessionKey]);
-
-  // ------------- generate plan -------------
-  async function generatePlan() {
-    setLoadingPlan(true);
-    setPlanText("");
-    setStandDown(null);
-    try {
-      const rsp = await fetch("/api/plan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          instrument,
-          date: dateStr,
-          calendar,   // pass snapshot already fetched
-          headlines,  // pass snapshot already fetched
-        }),
-      });
-
-      const json: PlanResponse = await rsp.json();
-      if (json.ok) {
-        setPlanText(json.plan?.text || "");
-        setStandDown(null);
-      } else {
-        setPlanText("");
-        setStandDown(json.reason || "No trade idea returned.");
+  // ---------- Load News ----------
+  const loadNews = useCallback(
+    async (symbols: string[]) => {
+      if (!symbols.length) return;
+      setLoadingNews(true);
+      try {
+        const u = `/api/news?symbols=${symbols.join(",")}`;
+        const r = await fetch(u, { cache: "no-store" });
+        const j: NewsResp = await r.json();
+        if (j?.ok) setHeadlines(j.items || []);
+        else setHeadlines([]);
+      } catch {
+        setHeadlines([]);
+      } finally {
+        setLoadingNews(false);
       }
-    } catch (e) {
-      console.error(e);
-      setPlanText("");
-      setStandDown("Server error while generating plan.");
-    } finally {
-      setLoadingPlan(false);
-    }
-  }
-
-  // ------------- start / stop monitoring -------------
-  async function startMonitoring() {
-    try {
-      setMonitorMsg("");
-      const rsp = await fetch("/api/trade-state", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          active: true,
-          instrument,
-          // later we can include parsed entry/sl/tp from planText
-        }),
-      });
-      const j = await rsp.json();
-      if (rsp.ok && j?.ok === true) {
-        setMonitoring(true);
-        setMonitorMsg("Monitoring started. Alerts will be sent to Telegram (if configured).");
-      } else {
-        setMonitoring(false);
-        setMonitorMsg(j?.error || "Could not start monitoring.");
-      }
-    } catch (e: any) {
-      setMonitoring(false);
-      setMonitorMsg("Could not start monitoring.");
-    }
-  }
-
-  async function stopMonitoring() {
-    try {
-      setMonitorMsg("");
-      const rsp = await fetch("/api/trade-state", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ active: false }),
-      });
-      const j = await rsp.json();
-      if (rsp.ok && j?.ok === true) {
-        setMonitoring(false);
-        setMonitorMsg("Monitoring stopped.");
-      } else {
-        setMonitorMsg(j?.error || "Could not stop monitoring.");
-      }
-    } catch (e: any) {
-      setMonitorMsg("Could not stop monitoring.");
-    }
-  }
-
-  // ------------- render -------------
-  const instrumentOptions = useMemo(
-    () =>
-      INSTRUMENTS.map((i) => (
-        <option key={i.code} value={i.code}>
-          {i.code}
-        </option>
-      )),
+    },
     []
   );
 
+  // ---------- Manual calendar (paste) completed ----------
+  const onCalendarManual = useCallback(
+    async (resp: any) => {
+      // resp has same shape from /api/calendar-manual.ts
+      const j: CalendarResp = {
+        ok: true,
+        provider: "manual",
+        date: dateStr,
+        count: resp?.count || 0,
+        items: resp?.items || [],
+        bias: resp?.bias || { perCurrency: {} },
+      };
+      setCalendar(j);
+      setNeedManualCalendar(false);
+
+      // fetch news based on currencies present
+      const ccy = currenciesFromBias(j.bias);
+      if (ccy.length) await loadNews(ccy);
+    },
+    [dateStr, loadNews]
+  );
+
+  // ---------- Generate Plan ----------
+  const generatePlan = useCallback(async () => {
+    setGenerating(true);
+    setPlanText("");
+    try {
+      const body = {
+        instrument,
+        date: dateStr,
+        // pass headlines + calendar to server for combined conviction
+        headlines,
+        calendar,
+      };
+      const r = await fetch("/api/plan", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (j?.ok) setPlanText(j?.plan || j?.card || JSON.stringify(j));
+      else setPlanText(j?.reason || "Server error while generating plan.");
+    } catch (e: any) {
+      setPlanText(e?.message || "Error generating plan.");
+    } finally {
+      setGenerating(false);
+    }
+  }, [instrument, dateStr, headlines, calendar]);
+
+  // ---------- Effects: initial loads ----------
+  useEffect(() => {
+    loadCalendar();
+  }, [loadCalendar]);
+
+  // ---------- Derived ----------
+  const calendarCurrencies = useMemo(
+    () => currenciesFromBias((calendar as any)?.bias),
+    [calendar]
+  );
+
+  // ---------- UI ----------
   return (
-    <main className="max-w-7xl mx-auto space-y-6 px-3 pb-10">
+    <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 space-y-4">
       {/* Controls */}
-      <div className="flex items-center gap-3 flex-wrap">
+      <div className="flex flex-wrap gap-3 items-center">
+        <div className="flex items-center gap-2">
+          <span className="text-sm opacity-80">Instrument</span>
+          <select
+            value={instrument}
+            onChange={(e) => setInstrument(e.target.value.toUpperCase())}
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
+          >
+            {/* Forex */}
+            <option>AUDUSD</option>
+            <option>EURUSD</option>
+            <option>GBPUSD</option>
+            <option>USDJPY</option>
+            <option>USDCAD</option>
+            <option>EURGBP</option>
+            <option>EURJPY</option>
+            <option>GBPJPY</option>
+            <option>EURAUD</option>
+            <option>NZDUSD</option>
+            {/* Indices */}
+            <option>SPX500</option>
+            <option>NAS100</option>
+            <option>US30</option>
+            <option>GER40</option>
+            {/* Metals/Crypto */}
+            <option>XAUUSD</option>
+            <option>BTCUSD</option>
+            <option>ETHUSD</option>
+          </select>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <span className="text-sm opacity-80">Date</span>
+          <input
+            type="date"
+            value={dateStr}
+            onChange={(e) => setDateStr(e.target.value)}
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
+          />
+        </div>
+
+        <button
+          onClick={loadCalendar}
+          className="px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
+          disabled={loadingCal}
+        >
+          Refresh Calendar
+        </button>
+
         <button
           onClick={generatePlan}
-          disabled={loadingPlan}
-          className="rounded bg-blue-600 hover:bg-blue-500 px-4 py-2 disabled:opacity-50"
+          className="px-3 py-1 text-sm rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
+          disabled={generating}
         >
-          {loadingPlan ? "Generating..." : "Generate Plan"}
+          {generating ? "Generating…" : "Generate Plan"}
         </button>
 
         <button
-          onClick={() => hardReset()}
-          className="rounded bg-neutral-800 hover:bg-neutral-700 px-4 py-2"
-          title="Full reset (like a fresh open)"
-        >
-          Reset
-        </button>
-
-        <button
-          onClick={startMonitoring}
-          className="rounded bg-emerald-600 hover:bg-emerald-500 px-4 py-2"
-          title="Start Telegram / news monitoring for this instrument"
+          onClick={() => setMonitoring(true)}
+          className="px-3 py-1 text-sm rounded bg-sky-700 hover:bg-sky-600"
         >
           Start monitoring
         </button>
-
         <button
-          onClick={stopMonitoring}
-          className="rounded bg-rose-600 hover:bg-rose-500 px-4 py-2"
-          title="Stop Telegram / news monitoring"
+          onClick={() => setMonitoring(false)}
+          className="px-3 py-1 text-sm rounded bg-rose-700 hover:bg-rose-600"
         >
           Stop monitoring
         </button>
       </div>
 
-      {/* Instrument + Date */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div className="flex flex-col">
-          <label className="text-sm text-gray-400">Instrument</label>
-          <select
-            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-2"
-            value={instrument.code}
-            onChange={(e) => {
-              const found = INSTRUMENTS.find((i) => i.code === e.target.value);
-              // hard reset on instrument change (fresh session)
-              hardReset(found || instrument);
-            }}
-          >
-            {instrumentOptions}
-          </select>
-        </div>
-
-        <div className="flex flex-col">
-          <label className="text-sm text-gray-400">Date</label>
-          <input
-            type="date"
-            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-2"
-            value={dateStr}
-            onChange={(e) => setDateStr(e.target.value)}
-          />
-        </div>
-      </div>
-
       {/* Charts */}
-      <TradingViewTriple key={sessionKey} symbol={instrument.code} />
+      <TradingViewTriple symbol={instrument} />
 
-      {/* Calendar */}
-      <div className="mt-6">
-        <h2 className="text-xl font-semibold mb-2">Calendar Snapshot</h2>
-        {/* Calendar items component – unchanged */}
-        <CalendarPanel items={calendar as any} loading={loadingCal} />
-      </div>
+      {/* Calendar + Headlines row */}
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+        {/* Left: Calendar (auto) or Paste fallback */}
+        <div className="rounded-lg border border-neutral-800 p-4">
+          <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
 
-      {/* Headlines (smaller text requested) */}
-      <div className="mt-6 text-sm">
-        <h2 className="text-xl font-semibold mb-2">Macro Headlines (24–48h)</h2>
-        {/* Smaller typographic scale handled inside the panel via parent font-size */}
-        <HeadlinesPanel items={headlines as any} loading={loadingNews} />
-      </div>
+          {loadingCal && <div className="text-sm opacity-75">Loading calendar…</div>}
 
-      {/* Monitoring status */}
-      <div className="mt-2 text-sm text-gray-300">
-        {monitoring === null ? (
-          <span className="text-gray-500">Monitor status: unknown</span>
-        ) : monitoring ? (
-          <span className="text-emerald-400">Monitoring: ON</span>
-        ) : (
-          <span className="text-gray-400">Monitoring: OFF</span>
-        )}
-        {monitorMsg ? <div className="text-xs text-gray-400 mt-1">{monitorMsg}</div> : null}
+          {!loadingCal && needManualCalendar && (
+            <div className="space-y-3">
+              <div className="text-sm opacity-75">
+                No items found from providers. Paste a calendar table below to continue:
+              </div>
+              <CalendarPaste
+                instrument={instrument}
+                onComplete={onCalendarManual}
+              />
+            </div>
+          )}
+
+          {!needManualCalendar && calendar?.ok && (
+            <CalendarPanel items={(calendar as any).items || []} />
+          )}
+
+          {!needManualCalendar && !calendar?.ok && !loadingCal && (
+            <div className="text-sm opacity-75">No items found.</div>
+          )}
+        </div>
+
+        {/* Right: Headlines */}
+        <div className="rounded-lg border border-neutral-800 p-4">
+          <h2 className="text-lg font-semibold mb-2">
+            Macro Headlines (24–48h)
+          </h2>
+          <HeadlinesPanel items={headlines as any} />
+          <div className="text-xs mt-2 opacity-60">
+            {loadingNews
+              ? "Loading headlines…"
+              : headlines.length
+              ? `${headlines.length} headlines found`
+              : calendarCurrencies.length
+              ? "No notable headlines."
+              : "Select an instrument or load calendar to fetch related headlines."}
+          </div>
+        </div>
       </div>
 
       {/* Generated Trade Card */}
-      <div className="mt-6 border rounded border-neutral-800 bg-neutral-900 p-3">
-        <h2 className="text-lg font-bold mb-2">Generated Trade Card</h2>
-        {standDown ? (
-          <div className="text-yellow-300">
-            <strong>Standing down:</strong> {standDown}
-          </div>
+      <div className="rounded-lg border border-neutral-800 p-4">
+        <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
+        {planText ? (
+          <pre className="whitespace-pre-wrap text-sm leading-5 opacity-95">
+            {planText}
+          </pre>
+        ) : generating ? (
+          <div className="text-sm opacity-80">Generating…</div>
         ) : (
-          <pre className="whitespace-pre-wrap text-base">{planText || ""}</pre>
+          <div className="text-sm opacity-70">
+            Click <b>Generate Plan</b> to build a setup using 15m execution, 1h+4h
+            context, fundamentals (calendar bias + headlines), and our strategy
+            logic.
+          </div>
         )}
       </div>
-    </main>
+    </div>
   );
 }
