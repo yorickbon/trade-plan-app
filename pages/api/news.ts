@@ -9,13 +9,12 @@ type Item = {
   description?: string;
 };
 
-// ---- helpers -------------------------------------------------
-
-function parseCurrencies(q: string | string[] | undefined): string[] {
+// --- helpers ---------------------------------------------------
+const parseCurrencies = (q: string | string[] | undefined): string[] => {
   if (!q) return [];
   const raw = Array.isArray(q) ? q.join(",") : String(q);
   return raw.split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
-}
+};
 
 // Coerce various provider date formats to ISO so Date.parse works
 function normalizeToISO(s: string): string {
@@ -30,7 +29,6 @@ function normalizeToISO(s: string): string {
   const ms = Date.parse(t);
   return Number.isFinite(ms) ? new Date(ms).toISOString() : "";
 }
-
 // --------------------------------------------------------------
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -40,9 +38,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const lang = String(process.env.HEADLINES_LANG ?? "en");
   const debug = String(req.query.debug ?? "") === "1";
 
-  // Accept either env var name for safety
   const API_KEY = process.env.NEWSDATA_API_KEY || process.env.NEWS_API_KEY || "";
-
   if (!API_KEY) {
     return res.status(200).json({
       provider: "newsdata",
@@ -52,7 +48,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   try {
-    // Build a SHORT boolean-OR query
     const synonyms: Record<string, string[]> = {
       USD: ["usd","dollar","greenback","u.s.","us"],
       EUR: ["eur","euro","ecb","eurozone"],
@@ -62,17 +57,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       CAD: ["cad","loonie","boc","bank of canada"],
       NZD: ["nzd","kiwi","rbnz"],
       CHF: ["chf","franc","snb"],
-      GOLD:["gold","xauusd","bullion"],
-      NAS100:["nasdaq","ndx","nas100"],
-      SPX500:["s&p 500","spx","spx500"],
-      US30:["dow jones","djia","us30"],
-      GER40:["dax","ger40"],
+      XAUUSD: ["gold","xauusd","bullion","precious metals"],
     };
 
     const terms =
       currencies.length === 0
         ? []
-        : currencies.flatMap(c => [c.toLowerCase(), ...(synonyms[c] ?? [])]);
+        : currencies.flatMap(c => {
+            const key = c.includes("/") ? c.replace("/", "") : c;
+            return [c.toLowerCase(), ...(synonyms[key] ?? [] )];
+          });
 
     const core =
       terms.length > 0
@@ -80,7 +74,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         : 'forex OR markets OR economy OR "central bank"';
 
     const q = `${core} OR inflation OR rates OR CPI OR GDP`;
-
     const sinceMs = Date.now() - hours * 3600_000;
 
     const url = new URL("https://newsdata.io/api/1/news");
@@ -91,20 +84,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const rsp = await fetch(url.toString(), { cache: "no-store" });
     const bodyText = await rsp.text().catch(() => "");
     if (!rsp.ok) {
-      if (debug) {
-        return res.status(200).json({
-          provider: "newsdata",
-          debug: { status: rsp.status, url: url.toString(), body: bodyText },
-          items: [],
-          note: `provider status ${rsp.status}`,
-        });
-      }
-      return res.status(200).json({ provider: "newsdata", items: [], note: `provider status ${rsp.status}` });
+      const payload: any = { provider: "newsdata", items: [], note: `provider status ${rsp.status}` };
+      if (debug) payload.debug = { status: rsp.status, url: url.toString(), body: bodyText };
+      return res.status(200).json(payload);
     }
 
     let json: any = {};
     try { json = JSON.parse(bodyText); } catch {}
-
     const raw: any[] = Array.isArray(json?.results)
       ? json.results
       : Array.isArray(json?.data)
@@ -126,24 +112,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       })
       .slice(0, max);
 
-    if (debug) {
-      return res.status(200).json({
-        provider: "newsdata",
-        debug: { url: url.toString(), q, currencies },
-        count: items.length,
-        items,
-      });
-    }
-
-    return res.status(200).json({ provider: "newsdata", count: items.length, items });
+    const payload: any = { provider: "newsdata", count: items.length, items };
+    if (debug) payload.debug = { url: url.toString(), q, currencies };
+    return res.status(200).json(payload);
   } catch (err: any) {
-    if (debug) {
-      return res.status(200).json({
-        provider: "newsdata",
-        error: err?.message || "fetch failed (caught)",
-        items: [],
-      });
-    }
-    return res.status(200).json({ provider: "newsdata", items: [], note: "fetch failed" });
+    const payload: any = { provider: "newsdata", items: [], note: "fetch failed" };
+    if (debug) payload.error = err?.message || "fetch failed (caught)";
+    return res.status(200).json(payload);
   }
 }
