@@ -1,31 +1,31 @@
-// lib/symbols.ts
+export const INSTRUMENTS = [
+  // ─── Forex
+  { code: "AUDUSD", label: "AUDUSD", currencies: ["AUD", "USD"] },
+  { code: "EURGBP", label: "EURGBP", currencies: ["EUR", "GBP"] },
+  { code: "EURJPY", label: "EURJPY", currencies: ["EUR", "JPY"] },
+  { code: "EURAUD", label: "EURAUD", currencies: ["EUR", "AUD"] },
+  { code: "EURUSD", label: "EURUSD", currencies: ["EUR", "USD"] },
+  { code: "GBPJPY", label: "GBPJPY", currencies: ["GBP", "JPY"] },
+  { code: "GBPUSD", label: "GBPUSD", currencies: ["GBP", "USD"] },
+  { code: "NZDUSD", label: "NZDUSD", currencies: ["NZD", "USD"] },
+  { code: "USDCAD", label: "USDCAD", currencies: ["USD", "CAD"] },
+  { code: "USDJPY", label: "USDJPY", currencies: ["USD", "JPY"] },
 
-export type Instrument = {
-  code: string;        // e.g. "EURUSD"
-  currencies: string[]; // e.g. ["EUR","USD"]
-  label?: string;       // optional UI label, e.g. "EUR/USD"
-};
+  // ─── Indices
+  { code: "GER40", label: "GER40 (DAX)", currencies: ["Germany", "Euro Area"] },
+  { code: "NAS100", label: "NAS100 (NASDAQ 100)", currencies: ["United States"] },
+  { code: "US30", label: "US30 (Dow Jones)", currencies: ["United States"] },
+  { code: "SPX500", label: "SPX500 (S&P 500)", currencies: ["United States"] },
 
-export const INSTRUMENTS: Instrument[] = [
-  // --- Majors / crosses ---
-  { code: "EURUSD", currencies: ["EUR","USD"], label: "EUR/USD" },
-  { code: "GBPUSD", currencies: ["GBP","USD"], label: "GBP/USD" },
-  { code: "USDJPY", currencies: ["USD","JPY"], label: "USD/JPY" },
-  { code: "USDCAD", currencies: ["USD","CAD"], label: "USD/CAD" },
-  { code: "AUDUSD", currencies: ["AUD","USD"], label: "AUD/USD" },
-  { code: "NZDUSD", currencies: ["NZD","USD"], label: "NZD/USD" },
-  { code: "EURGBP", currencies: ["EUR","GBP"], label: "EUR/GBP" },
-  { code: "EURJPY", currencies: ["EUR","JPY"], label: "EUR/JPY" },
-  { code: "EURAUD", currencies: ["EUR","AUD"], label: "EUR/AUD" },
+  // ─── Metals / Crypto
+  { code: "XAUUSD", label: "Gold", currencies: ["United States", "Global"] },
+  { code: "BTCUSD", label: "Bitcoin", currencies: ["United States", "Global"] },
+  { code: "ETHUSD", label: "Ethereum", currencies: ["United States", "Global"] },
+] as const;
 
-  // --- Metals / Crypto ---
-  { code: "XAUUSD", currencies: ["USD"], label: "Gold (XAUUSD)" },
-  { code: "BTCUSD", currencies: ["USD"], label: "Bitcoin (BTCUSD)" },
-  { code: "ETHUSD", currencies: ["USD"], label: "Ethereum (ETHUSD)" },
+export type Instrument = (typeof INSTRUMENTS)[number];
 
-  // --- Indices (need vendor mapping in /api/candles) ---
-  { code: "NAS100", currencies: ["USD"], label: "Nasdaq 100 (NAS100)" },
-  { code: "SPX500", currencies: ["USD"], label: "S&P 500 (SPX500)" },
-  { code: "US30",  currencies: ["USD"], label: "Dow 30 (US30)" },
-  { code: "GER40", currencies: ["EUR"], label: "Germany 40 (GER40)" },
-];
+export function findInstrument(code: string): Instrument | undefined {
+  const k = (code || "").toUpperCase();
+  return INSTRUMENTS.find((i) => i.code === k);
+}
