@@ -1,371 +1,382 @@
-// /pages/api/plan.ts
+// pages/api/plan.ts
 import type { NextApiRequest, NextApiResponse } from "next";
-import OpenAI from "openai";
-import { getCandles } from "../../lib/prices";
-// keep as named import to avoid default-export errors
-import { scoreSentiment as scoreSentimentImported } from "../../lib/sentiment";
+import { getCandles, type TF, type Candle } from "../../lib/prices";
 
-/* =========================
-   Types
-   ========================= */
-type Candle = { t: number; o: number; h: number; l: number; c: number };
+type TradeType = "Breakout (BOS)" | "Pullback (Limit)" | "Range Fade" | "No Trade";
+type Direction = "BUY" | "SELL" | "NONE";
 
-type Instrument = {
-  code: string;
-  currencies?: string[];
-};
-
-type CalendarItem = {
+type PlanPayload = {
+  instrument: string | { code: string };
   date?: string;
-  time?: string;
-  country?: string;
-  currency?: string;
-  impact?: string; // "High" | "Medium" | ...
-  title?: string;
-  actual?: string;
-  forecast?: string;
-  previous?: string;
+  headlines?: Array<{ title?: string; url?: string; source?: string; seen?: string }>;
+  calendar?: Array<{
+    impact?: string; // "High" | "Medium" | ...
+    title?: string;
+    country?: string;
+    currency?: string;
+    datetime?: string; // ISO
+  }>;
 };
 
-type Headline = {
-  title: string;
-  url?: string;
-  source?: string;
-  seen?: string;         // ISO
-  published_at?: string; // ISO
+type PlanResponse = {
+  ok: boolean;
+  reason?: string;
+  counts?: Record<TF, number>;
+  missing?: TF[];
+  used?: { instrument: string; price: number; provider?: string };
+  plan?: {
+    type: TradeType;
+    direction: Direction;
+    entry: number | null;
+    stop: number | null;
+    tp1: number | null;
+    tp2: number | null;
+    conviction: number; // 0..100
+    note: string;       // short rationale
+    card: string;       // multiline human-readable
+  };
+  // optional echoes for UI
+  usedHeadlines?: PlanPayload["headlines"];
+  usedCalendar?: PlanPayload["calendar"];
 };
 
-type PlanOut = {
-  text: string;
-  conviction: number | null;
-  setupType: string | null;
-  entry: number | null;
-  stop: number | null;
-  tp1: number | null;
-  tp2: number | null;
-  notes?: string | null;
-};
+// ---------- helpers ----------
+const TF_LIST: TF[] = ["15m", "1h", "4h"];
+const LIMIT_15M = 240; // fetch depth
+const FIBS = [0.382, 0.5, 0.618, 0.705];
 
-type ApiOut =
-  | { ok: true; plan: PlanOut; usedHeadlines: Headline[]; usedCalendar: CalendarItem[] }
-  | { ok: false; reason: string; usedHeadlines: Headline[]; usedCalendar: CalendarItem[] };
-
-/* =========================
-   Config
-   ========================= */
-const PER_CALL_TIMEOUT_MS = Math.max(3000, Number(process.env.PLAN_PER_CALL_TIMEOUT_MS ?? 8000));
-const TOTAL_BUDGET_MS     = Math.max(6000, Number(process.env.PLAN_TOTAL_BUDGET_MS ?? 12000));
-const HEADLINES_SINCE_HOURS = Math.max(1, Number(process.env.HEADLINES_SINCE_HOURS ?? 48));
-const LIMIT = 200;
-
-/* =========================
-   Helpers
-   ========================= */
-function withTimeout<T>(p: Promise<T>, ms: number, tag = "op"): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const to = setTimeout(() => reject(new Error(`timeout:${tag}:${ms}`)), ms);
-    p.then(v => { clearTimeout(to); resolve(v); })
-     .catch(e => { clearTimeout(to); reject(e); });
-  });
+function latest(c: Candle[] | undefined): Candle | undefined {
+  return c && c.length ? c[0] : undefined; // newest->oldest per lib/prices.ts
 }
 
-function altSymbol(code: string): string | null {
-  if (!code) return null;
-  const c = code.toUpperCase().trim();
-  // EURUSD -> EUR/USD
-  if (/^[A-Z]{6}$/.test(c)) return `${c.slice(0,3)}/${c.slice(3)}`;
-  // EUR/USD -> EURUSD
-  if (/^[A-Z]{3}\/[A-Z]{3}$/.test(c)) return c.replace("/", "");
-  return null;
+function mid(a: number, b: number) {
+  return (a + b) / 2;
 }
 
-async function fetchAllTF(code: string, limit = LIMIT) {
-  const calls = [
-    withTimeout(getCandles(code, "15m", limit), PER_CALL_TIMEOUT_MS, `candles-15m`).catch(() => [] as Candle[]),
-    withTimeout(getCandles(code, "1h",  limit), PER_CALL_TIMEOUT_MS, `candles-1h`).catch(() => [] as Candle[]),
-    withTimeout(getCandles(code, "4h",  limit), PER_CALL_TIMEOUT_MS, `candles-4h`).catch(() => [] as Candle[]),
-  ];
-  const [m15, h1, h4] = await Promise.all(calls);
-  return { m15, h1, h4 };
+// find recent swing highs/lows over window N (on newest->oldest arrays)
+function recentSwingHigh(arr: Candle[], lookback = 20): number | null {
+  if (!arr.length) return null;
+  let hi = -Infinity;
+  for (let i = 0; i < Math.min(lookback, arr.length); i++) hi = Math.max(hi, arr[i].h);
+  return Number.isFinite(hi) ? hi : null;
+}
+function recentSwingLow(arr: Candle[], lookback = 20): number | null {
+  if (!arr.length) return null;
+  let lo = Infinity;
+  for (let i = 0; i < Math.min(lookback, arr.length); i++) lo = Math.min(lo, arr[i].l);
+  return Number.isFinite(lo) ? lo : null;
 }
 
-function missingTFs(m15: Candle[], h1: Candle[], h4: Candle[]) {
-  const miss: string[] = [];
-  if (!m15?.length) miss.push("15m");
-  if (!h1?.length)  miss.push("1h");
-  if (!h4?.length)  miss.push("4h");
-  return miss;
+// very light BOS detector: compares last closes against closes N bars back
+function biasFromCloses(arr: Candle[], step: number): number {
+  if (arr.length <= step) return 0;
+  return arr[0].c > arr[step].c ? 1 : arr[0].c < arr[step].c ? -1 : 0;
 }
 
-function baseUrl(req: NextApiRequest) {
-  const host = (req.headers["x-forwarded-host"] as string) || (req.headers.host as string);
-  const proto = (req.headers["x-forwarded-proto"] as string) || "https";
-  return `${proto}://${host}`;
-}
-
-async function safeSentiment(text: string): Promise<number> {
-  try {
-    const maybe = (scoreSentimentImported as any)(text);
-    const resolved = typeof maybe?.then === "function" ? await maybe : maybe;
-    if (typeof resolved === "number") return resolved;
-    if (resolved && typeof resolved.score === "number") return resolved.score;
-  } catch {}
-  return 0;
-}
-
-/* =========================
-   Handler
-   ========================= */
-export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiOut | any>) {
-  // Probe GET → quick browser check: counts & missing (no LLM)
-  if (req.method === "GET" && String(req.query.probe ?? "0") === "1") {
-    const inputSymbol = String(req.query.symbol || "EURUSD").toUpperCase();
-    const started = Date.now();
-
-    // first attempt
-    let symUsed = inputSymbol;
-    let { m15, h1, h4 } = await fetchAllTF(symUsed, LIMIT);
-    let miss = missingTFs(m15, h1, h4);
-
-    // one alt attempt if missing and time remains
-    if (miss.length && Date.now() - started < TOTAL_BUDGET_MS) {
-      const alt = altSymbol(symUsed);
-      if (alt && alt !== symUsed) {
-        symUsed = alt;
-        ({ m15, h1, h4 } = await fetchAllTF(symUsed, LIMIT));
-        miss = missingTFs(m15, h1, h4);
-      }
-    }
-
-    return res.status(200).json({
-      ok: miss.length === 0,
-      symbolUsed: symUsed,
-      counts: { m15: m15.length, h1: h1.length, h4: h4.length },
-      missing: miss,
-    });
+// compute “recent volatility” (average true range over N) for sensible stops/targets
+function atrLike(arr: Candle[], n = 14): number {
+  if (arr.length < 2) return 0;
+  const m = Math.min(n, arr.length - 1);
+  let sum = 0;
+  for (let i = 0; i < m; i++) {
+    const hi = arr[i].h;
+    const lo = arr[i].l;
+    const pc = arr[i + 1].c; // previous close (since newest->oldest)
+    const tr = Math.max(hi - lo, Math.abs(hi - pc), Math.abs(lo - pc));
+    sum += tr;
   }
+  return sum / m;
+}
 
+// simple headline sentiment (very lightweight)
+function headlineBias(headlines: PlanPayload["headlines"]): number {
+  if (!Array.isArray(headlines) || !headlines.length) return 0;
+  const pos = /(cooling inflation|soft landing|rate cut|dovish|risk-on|beats|surprise.*lower)/i;
+  const neg = /(hot inflation|hawkish|rate hike|risk-off|misses|surprise.*higher|geopolitical|sanction|conflict)/i;
+  let score = 0;
+  for (const h of headlines) {
+    const t = (h?.title || "").toString();
+    if (!t) continue;
+    if (pos.test(t)) score += 1;
+    if (neg.test(t)) score -= 1;
+  }
+  // clamp to [-2, 2]
+  return Math.max(-2, Math.min(2, score));
+}
+
+// warn if a High impact calendar is within X minutes
+function highImpactSoon(calendar: PlanPayload["calendar"], minutesAhead = 90): boolean {
+  if (!Array.isArray(calendar)) return false;
+  const now = Date.now();
+  for (const e of calendar) {
+    if (!e?.datetime) continue;
+    if (!/high/i.test(e?.impact || "")) continue;
+    const t = Date.parse(e.datetime);
+    if (!Number.isFinite(t)) continue;
+    const diffMin = (t - now) / 60000;
+    if (diffMin >= -10 && diffMin <= minutesAhead) return true; // within window or just released
+  }
+  return false;
+}
+
+// ensure SL/TP ordering is correct vs entry/direction
+function enforceOrdering(direction: Direction, entry: number, stop: number, tp1: number, tp2: number) {
+  if (direction === "BUY") {
+    // SL must be < entry, TPs > entry
+    if (stop >= entry) stop = entry - Math.abs(entry - stop) - (Math.abs(entry) * 0.0001);
+    if (tp1 <= entry) tp1 = entry + Math.abs(tp1 - entry) + (Math.abs(entry) * 0.0001);
+    if (tp2 <= tp1) tp2 = tp1 + Math.abs(tp2 - tp1) + (Math.abs(entry) * 0.0001);
+  } else if (direction === "SELL") {
+    if (stop <= entry) stop = entry + Math.abs(entry - stop) + (Math.abs(entry) * 0.0001);
+    if (tp1 >= entry) tp1 = entry - Math.abs(tp1 - entry) - (Math.abs(entry) * 0.0001);
+    if (tp2 >= tp1) tp2 = tp1 - Math.abs(tp2 - tp1) - (Math.abs(entry) * 0.0001);
+  }
+  return { stop, tp1, tp2 };
+}
+
+// build the final trade card text
+function buildCardText(
+  instrument: string,
+  type: TradeType,
+  direction: Direction,
+  entry: number | null,
+  stop: number | null,
+  tp1: number | null,
+  tp2: number | null,
+  conviction: number,
+  rationale: string,
+  notes: string[],
+  counts: Record<TF, number>,
+  missing: TF[],
+): string {
+  const lines: string[] = [];
+  lines.push(`Instrument: ${instrument}`);
+  lines.push(`TF data available → 15m:${counts["15m"]}  1h:${counts["1h"]}  4h:${counts["4h"]}${missing.length ? `  (missing: ${missing.join(", ")})` : ""}`);
+  lines.push(`Type: ${type}    Direction: ${direction}`);
+  lines.push(`Entry: ${entry ?? "-"}    SL: ${stop ?? "-"}    TP1: ${tp1 ?? "-"}    TP2: ${tp2 ?? "-"}`);
+  lines.push(`Conviction: ${Math.round(conviction)}%`);
+  lines.push(`Why: ${rationale}`);
+  if (notes.length) {
+    lines.push(`Notes: ${notes.join(" | ")}`);
+  }
+  return lines.join("\n");
+}
+
+// ---------- main handler ----------
+export default async function handler(req: NextApiRequest, res: NextApiResponse<PlanResponse>) {
   if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, reason: "Method not allowed", usedHeadlines: [], usedCalendar: [] });
+    return res.status(405).json({ ok: false, reason: "Method not allowed" });
   }
 
-  try {
-    const { instrument, date, calendar, headlines } = req.body as {
-      instrument: Instrument | string;
-      date?: string;
-      calendar?: CalendarItem[] | null;
-      headlines?: Headline[] | null;
-    };
+  // parse input
+  const body = (req.body || {}) as PlanPayload;
+  const instrument = (typeof body.instrument === "string" ? body.instrument : body.instrument?.code || "EURUSD").toUpperCase();
+  const headlines = Array.isArray(body.headlines) ? body.headlines : [];
+  const calendar = Array.isArray(body.calendar) ? body.calendar : [];
 
-    const instr: Instrument = typeof instrument === "string" ? { code: instrument } : instrument;
-    if (!instr?.code) {
-      return res.status(400).json({ ok: false, reason: "Missing instrument code", usedHeadlines: [], usedCalendar: [] });
-    }
+  // fetch candles in parallel (lib/prices.ts already handles provider failover)
+  const [m15, h1, h4] = await Promise.all<TF[]>(TF_LIST.map(async (tf) => tf) // types trick
+    .then(async () => [
+      await getCandles(instrument, "15m", LIMIT_15M),
+      await getCandles(instrument, "1h", LIMIT_15M),
+      await getCandles(instrument, "4h", LIMIT_15M),
+    ]));
 
-    /* ---- Headlines (use provided or pull fallback) ---- */
-    let usedHeadlines: Headline[] = Array.isArray(headlines) ? headlines : [];
-    if (!usedHeadlines.length && instr.currencies?.length) {
-      try {
-        const rsp = await fetch(
-          `${baseUrl(req)}/api/news?currencies=${encodeURIComponent(instr.currencies.join(","))}`,
-          { cache: "no-store" }
-        );
-        const j = await rsp.json();
-        usedHeadlines = Array.isArray(j.items) ? j.items : [];
-      } catch {}
-    }
-    const cutoff = Date.now() - HEADLINES_SINCE_HOURS * 3600_000;
-    const recentNews = usedHeadlines.filter(h => {
-      const t = Date.parse(h.seen ?? h.published_at ?? "");
-      return Number.isFinite(t) && t >= cutoff;
-    }).slice(0, 12);
+  const counts: Record<TF, number> = {
+    "15m": m15.length,
+    "1h": h1.length,
+    "4h": h4.length,
+  };
+  const missing = TF_LIST.filter((tf) => counts[tf] === 0);
 
-    /* ---- Calendar ---- */
-    const calItems: CalendarItem[] = Array.isArray(calendar) ? calendar : [];
-    const blackout = (() => {
-      if (!calItems.length) return false;
-      const now = Date.now();
-      const windowMs = 90 * 60 * 1000;
-      return calItems.some(ev => {
-        const t = Date.parse(`${ev.date ?? ""}T${ev.time ?? "00:00"}:00Z`);
-        const high = String(ev.impact || "").toLowerCase().includes("high");
-        return Number.isFinite(t) && high && Math.abs(t - now) <= windowMs;
-      });
-    })();
-
-    /* ---- Candles (one shot + alt retry, no polling) ---- */
-    const started = Date.now();
-    let symUsed = instr.code.toUpperCase();
-    let { m15, h1, h4 } = await fetchAllTF(symUsed, LIMIT);
-    let miss = missingTFs(m15, h1, h4);
-
-    if (miss.length && Date.now() - started < TOTAL_BUDGET_MS) {
-      const alt = altSymbol(symUsed);
-      if (alt && alt !== symUsed) {
-        symUsed = alt;
-        ({ m15, h1, h4 } = await fetchAllTF(symUsed, LIMIT));
-        miss = missingTFs(m15, h1, h4);
-      }
-    }
-
-    if (miss.length) {
-      return res.status(200).json({
-        ok: false,
-        reason: `Missing candles for ${miss.join(", ")} (symbol used: ${symUsed}).`,
-        usedHeadlines: recentNews,
-        usedCalendar: calItems,
-      });
-    }
-
-    /* ---- Rule-based levels from 15m to avoid SL/TP inversion ---- */
-    const last = m15[m15.length - 1]!;
-    const prev = m15[m15.length - 2] ?? last;
-    const close = Number(last.c);
-    const directionUp = close >= Number(prev.c); // simple PA bias; LLM will refine
-
-    // recent range from last N bars
-    const N = 96;
-    const recent = m15.slice(-N);
-    const hi = Math.max(...recent.map(c => c.h));
-    const lo = Math.min(...recent.map(c => c.l));
-    const range = Math.max(hi - lo, 0.0005); // minimal buffer
-
-    // build conservative levels (buy or sell)
-    let entry = close;
-    let stop  = directionUp ? close - range * 0.5 : close + range * 0.5;
-    let tp1   = directionUp ? close + range * 0.5 : close - range * 0.5;
-    let tp2   = directionUp ? close + range * 1.0 : close - range * 1.0;
-
-    // ensure logical ordering
-    if (directionUp) {
-      // stop must be below entry, tps above
-      if (!(stop < entry)) stop = entry - Math.abs(range) * 0.4;
-      if (!(tp1 > entry)) tp1 = entry + Math.abs(range) * 0.4;
-      if (!(tp2 > tp1))   tp2 = tp1 + Math.abs(range) * 0.4;
-    } else {
-      // stop must be above entry, tps below
-      if (!(stop > entry)) stop = entry + Math.abs(range) * 0.4;
-      if (!(tp1 < entry)) tp1 = entry - Math.abs(range) * 0.4;
-      if (!(tp2 < tp1))   tp2 = tp1 - Math.abs(range) * 0.4;
-    }
-
-    /* ---- Lightweight sentiment ---- */
-    const newsText = recentNews.map(h => `• ${h.title}`).join("\n");
-    const sScore = newsText ? await safeSentiment(newsText) : 0;
-    const newsBias = sScore > 0.15 ? "Positive" : sScore < -0.15 ? "Negative" : "Neutral";
-
-    /* ---- Higher TF trend alignment (soft) ---- */
-    const trend = (arr: Candle[]) => {
-      const a = Number(arr[arr.length - 1]?.c ?? 0);
-      const b = Number(arr[Math.max(0, arr.length - 21)]?.c ?? a);
-      return a > b ? 1 : a < b ? -1 : 0;
-    };
-    const t1h = trend(h1);
-    const t4h = trend(h4);
-    const wantUp = directionUp;
-
-    let conviction = 72;
-    if ((wantUp && t1h < 0) || (!wantUp && t1h > 0)) conviction -= 6;
-    if ((wantUp && t4h < 0) || (!wantUp && t4h > 0)) conviction -= 8;
-    if (newsBias === "Positive" && wantUp) conviction += 4;
-    if (newsBias === "Negative" && !wantUp) conviction += 4;
-    if (blackout) conviction -= 10;
-    conviction = Math.max(0, Math.min(95, conviction));
-
-    /* ---- LLM: format the card (levels are ours; LLM does the wording) ---- */
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
-    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-    const htfNoteParts: string[] = [];
-    if (t1h !== 0) htfNoteParts.push(`1H ${t1h > 0 ? "up" : "down"}`);
-    if (t4h !== 0) htfNoteParts.push(`4H ${t4h > 0 ? "up" : "down"}`);
-
-    const sys =
-`You are a professional trader. You must keep the EXACT numeric levels provided. Do not change them.
-Keep the response tight and structured for a trade card.`;
-
-    const user =
-`Instrument: ${symUsed}
-Bias TF: 15m. HTFs 1h/4h for context.
-
-Setup diagnosis:
-- Consider BOS/continuation vs pullback-to-0.5/0.618 retrace.
-- Consider liquidity at prior swing highs/lows on 15m.
-- Mention if we are inside a prior 15m range.
-
-Macro (last ${HEADLINES_SINCE_HOURS}h): ${recentNews.length} headlines, bias ${newsBias} (${sScore.toFixed(2)})
-Calendar blackout (±90m): ${blackout ? "YES" : "NO"}
-HTF note: ${htfNoteParts.join(", ") || "n/a"}
-
-LEVELS (DO NOT ALTER):
-Direction: ${wantUp ? "Buy" : "Sell"}
-Entry: ${entry}
-Stop: ${stop}
-TP1: ${tp1}
-TP2: ${tp2}
-Conviction: ${conviction}
-
-Return exactly:
-**Trade Card:** ${symUsed}
-**Type:** (Pullback | BOS | Range | Breakout)
-**Direction:** (Buy | Sell)
-**Entry:** ${entry}
-**Stop:** ${stop}
-**TP1:** ${tp1}
-**TP2:** ${tp2}
-**Conviction:** ${conviction}
-
-**Reasoning:** one compact paragraph of price-action logic referencing 15m + HTF context.
-**Timeframe Alignment:** short note on 4H/1H/15M.
-**Invalidation Notes:** 1 sentence (what breaks the idea).
-**Caution:** note if blackout/headlines suggest caution.
-`;
-
-    const chat = await client.chat.completions.create({
-      model,
-      temperature: 0.2,
-      messages: [
-        { role: "system", content: sys },
-        { role: "user", content: user },
-      ],
+  // Absolute last resort: if even 15m is missing, we cannot trade
+  if (counts["15m"] === 0) {
+    return res.status(200).json({
+      ok: false,
+      reason: `No 15m candles available for ${instrument}.`,
+      counts,
+      missing,
+      used: { instrument, price: NaN },
+      usedHeadlines: headlines,
+      usedCalendar: calendar,
     });
-
-    const text = chat.choices?.[0]?.message?.content?.trim() || 
-`**Trade Card:** ${symUsed}
-**Type:** Pullback
-**Direction:** ${wantUp ? "Buy" : "Sell"}
-**Entry:** ${entry}
-**Stop:** ${stop}
-**TP1:** ${tp1}
-**TP2:** ${tp2}
-**Conviction:** ${conviction}
-
-**Reasoning:** Price-action bias from 15m with soft 1h/4h context and recent macro bias ${newsBias}.
-**Timeframe Alignment:** 4H ${t4h>0?"up":"down"}/ 1H ${t1h>0?"up":"down"}/ 15M ${wantUp?"up":"down"}.
-**Invalidation Notes:** Breach beyond stop invalidates idea.
-**Caution:** ${blackout ? "High-impact event within ~90m; reduce size." : "Standard risk."}
-`;
-
-    const out: ApiOut = {
-      ok: true,
-      plan: {
-        text,
-        conviction,
-        setupType: "PA + HTF + Macro",
-        entry,
-        stop,
-        tp1,
-        tp2,
-        notes: blackout ? "High-impact event within ~90 min – reduced conviction." : null,
-      },
-      usedHeadlines: recentNews,
-      usedCalendar: calItems,
-    };
-
-    return res.status(200).json(out);
-
-  } catch (err: any) {
-    console.error("PLAN API error", err);
-    return res.status(500).json({ ok: false, reason: "Server error", usedHeadlines: [], usedCalendar: [] });
   }
+
+  // Current price = latest 15m close
+  const last15 = latest(m15)!;
+  const current = last15.c;
+
+  // ---- BASIC STRUCTURE READ ----
+  // Bias (HTF + 15m)
+  const b4h = counts["4h"] ? biasFromCloses(h4, 8) * 2 : 0;  // weight more
+  const b1h = counts["1h"] ? biasFromCloses(h1, 12) * 1.2 : 0;
+  const b15 = biasFromCloses(m15, 20) * 0.8;
+
+  let techBias = b4h + b1h + b15; // positive → bullish, negative → bearish
+
+  // Swings on 15m to propose concrete levels
+  const swingHi = recentSwingHigh(m15, 30);
+  const swingLo = recentSwingLow(m15, 30);
+
+  // ATR-like for sizing SL/TP bands
+  const vol = Math.max(1e-9, atrLike(m15, 14)); // avoid zero
+
+  // ---- HEADLINE / CALENDAR ADJUSTMENTS ----
+  const hb = headlineBias(headlines); // -2..+2
+  techBias += hb * 0.6; // blend a bit; not overpowering
+
+  const highSoon = highImpactSoon(calendar, 90);
+  const notes: string[] = [];
+  if (highSoon) notes.push("High-impact calendar within ~90m → cut size / widen SL");
+
+  // ---- TRADE CANDIDATE SELECTION ----
+  let type: TradeType = "No Trade";
+  let dir: Direction = "NONE";
+  let entry: number | null = null;
+  let stop: number | null = null;
+  let tp1: number | null = null;
+  let tp2: number | null = null;
+  let rationale = "";
+
+  // 1) Breakout (BOS) if strong single-side bias and clear nearby swing
+  if (techBias >= 2 && swingHi && current < swingHi) {
+    type = "Breakout (BOS)";
+    dir = "BUY";
+    entry = swingHi + vol * 0.1;          // stop-entry just above liquidity
+    stop  = Math.min(current, swingLo ?? current - vol) - vol * 0.6; // below recent structure
+    tp1   = entry + vol * 1.2;
+    tp2   = entry + vol * 2.0;
+    rationale = "Bullish bias (HTF+15m) with nearby swing-high liquidity. Break-and-go setup.";
+  } else if (techBias <= -2 && swingLo && current > swingLo) {
+    type = "Breakout (BOS)";
+    dir = "SELL";
+    entry = swingLo - vol * 0.1;
+    stop  = Math.max(current, swingHi ?? current + vol) + vol * 0.6;
+    tp1   = entry - vol * 1.2;
+    tp2   = entry - vol * 2.0;
+    rationale = "Bearish bias (HTF+15m) with nearby swing-low liquidity. Break-and-go setup.";
+  }
+
+  // 2) Pullback (Limit) with Fib confluence inside last 15m impulse (if no BOS chosen)
+  if (dir === "NONE" && swingHi && swingLo) {
+    // define the most recent leg (approx: from last pivot to current)
+    const bullLeg = current > mid(swingHi, swingLo);
+    const legHigh = bullLeg ? swingHi : current;
+    const legLow  = bullLeg ? current : swingLo;
+
+    // Fib levels from that leg
+    const fibs = FIBS.map(f => legLow + (legHigh - legLow) * (bullLeg ? (1 - f) : f));
+    // choose the cluster closest to current but not crossed yet
+    const candidate = fibs.sort((a,b)=>Math.abs(a-current)-Math.abs(b-current))[0];
+
+    if (techBias >= 0.5 && bullLeg) {
+      type = "Pullback (Limit)";
+      dir = "BUY";
+      entry = candidate;                       // buy limit at the fib zone
+      stop  = entry - Math.max(vol * 0.8, (entry - (swingLo ?? entry - vol))*0.6);
+      tp1   = entry + vol * 1.2;
+      tp2   = entry + vol * 2.2;
+      rationale = "Pullback buy into fib/structure confluence with bullish composite bias.";
+    } else if (techBias <= -0.5 && !bullLeg) {
+      type = "Pullback (Limit)";
+      dir = "SELL";
+      entry = candidate;
+      stop  = entry + Math.max(vol * 0.8, ((swingHi ?? entry + vol) - entry)*0.6);
+      tp1   = entry - vol * 1.2;
+      tp2   = entry - vol * 2.2;
+      rationale = "Pullback sell into fib/structure confluence with bearish composite bias.";
+    }
+  }
+
+  // 3) Range fade (if bias is weak and we have clear range)
+  if (dir === "NONE" && swingHi && swingLo && Math.abs(techBias) < 0.8) {
+    type = "Range Fade";
+    // pick side by micro momentum (last few closes)
+    const shortTerm = biasFromCloses(m15, 6);
+    if (shortTerm >= 0) {
+      dir = "SELL";
+      entry = swingHi - vol * 0.2;
+      stop  = swingHi + vol * 0.6;
+      tp1   = mid(current, swingLo);
+      tp2   = swingLo - vol * 0.3;
+    } else {
+      dir = "BUY";
+      entry = swingLo + vol * 0.2;
+      stop  = swingLo - vol * 0.6;
+      tp1   = mid(current, swingHi);
+      tp2   = swingHi + vol * 0.3;
+    }
+    rationale = "Balanced bias with defined 15m range — fading the edges back to the mean/liquidity.";
+  }
+
+  // If still NONE → no trade, but we’ll return a clear card (not empty)
+  if (dir === "NONE") {
+    const card = buildCardText(
+      instrument,
+      "No Trade",
+      "NONE",
+      null, null, null, null,
+      0,
+      "No clean structure with acceptable R:R based on current volatility.",
+      notes.concat(missing.length ? [`Missing TFs: ${missing.join(", ")}`] : []),
+      counts,
+      missing,
+    );
+    return res.status(200).json({
+      ok: true,
+      counts, missing,
+      used: { instrument, price: current },
+      plan: {
+        type: "No Trade",
+        direction: "NONE",
+        entry: null, stop: null, tp1: null, tp2: null,
+        conviction: 0,
+        note: "Stand aside until structure clarifies or HTF confirms.",
+        card,
+      },
+      usedHeadlines: headlines,
+      usedCalendar: calendar,
+    });
+  }
+
+  // Enforce correct ordering for SL/TP vs entry/direction
+  const ord = enforceOrdering(dir, entry!, stop!, tp1!, tp2!);
+  stop = ord.stop; tp1 = ord.tp1; tp2 = ord.tp2;
+
+  // Conviction: start from TF coverage + bias strength, adjust for headlines/calendar
+  const tfCoverage = ( (counts["15m"]>0?1:0) + (counts["1h"]>0?1:0) + (counts["4h"]>0?1:0) ) / 3;
+  let conviction = 50 * tfCoverage + Math.min(40, Math.abs(techBias) * 15);
+  conviction += hb * 5; // headlines nudge
+  if (highSoon) conviction = Math.max(5, conviction - 15);
+  conviction = Math.max(1, Math.min(95, conviction));
+
+  // Notes
+  if (hb > 0) notes.push("Headlines lean risk-on/dovish");
+  if (hb < 0) notes.push("Headlines lean risk-off/hawkish");
+  if (missing.length) notes.push(`Generated without: ${missing.join(", ")}`);
+
+  // Build card
+  const card = buildCardText(
+    instrument, type, dir, entry!, stop!, tp1!, tp2!, conviction,
+    rationale, notes, counts, missing
+  );
+
+  return res.status(200).json({
+    ok: true,
+    counts, missing,
+    used: { instrument, price: current },
+    plan: {
+      type,
+      direction: dir,
+      entry,
+      stop,
+      tp1,
+      tp2,
+      conviction: Math.round(conviction),
+      note: rationale,
+      card,
+    },
+    usedHeadlines: headlines,
+    usedCalendar: calendar,
+  });
 }
