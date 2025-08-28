@@ -1,4 +1,4 @@
-// /lib/prices.ts
+// lib/prices.ts
 
 export type Candle = {
   t: number; // unix seconds
@@ -11,57 +11,94 @@ export type Candle = {
 export type TF = "15m" | "1h" | "4h";
 
 /**
- * Fetch candles for an instrument from TwelveData
- * Accepts either a symbol string (e.g. "EURUSD") or an object { code: "EURUSD" }.
- * Always returns newest->oldest mapped to { t, o, h, l, c } (unix seconds).
+ * getCandles
+ * Same signature as before, but now it calls our multi-provider
+ * server endpoint at /api/candles (which has the provider failovers).
+ *
+ * Always returns newest -> oldest as { t,o,h,l,c } in unix seconds.
  */
 export async function getCandles(
   instrument: string | { code: string },
   tf: TF,
   n: number
 ): Promise<Candle[]> {
-  const apikey = process.env.TWELVEDATA_API_KEY;
   const symbol = typeof instrument === "string" ? instrument : instrument.code;
 
-  // Map our TF to TwelveData interval values
-  const interval = tf === "15m" ? "15min" : tf; // "1h" and "4h" are already valid
+  // Build the base URL correctly for both server and browser
+  const explicit = process.env.NEXT_PUBLIC_BASE_URL?.trim();
+  const root =
+    explicit ||
+    (typeof window === "undefined"
+      ? // Server side: use Vercel URL if present
+        (process.env.VERCEL_URL
+          ? `https://${process.env.VERCEL_URL}`
+          : "http://localhost:3000")
+      : // Browser: relative
+        "");
 
-  // Guard: if no key, return empty (prevents build from failing)
-  if (!apikey) return [];
+  const url =
+    `${root}/api/candles` +
+    `?symbol=${encodeURIComponent(symbol)}` +
+    `&interval=${encodeURIComponent(tf)}` +
+    `&limit=${encodeURIComponent(String(n))}`;
 
-  const url = new URL("https://api.twelvedata.com/time_series");
-  url.searchParams.set("symbol", symbol);
-  url.searchParams.set("interval", interval);
-  url.searchParams.set("outputsize", String(n));
-  url.searchParams.set("timezone", "UTC");
-  url.searchParams.set("apikey", apikey);
+  // Per-call timeout (milliseconds)
+  const perCallMs =
+    Number(process.env.PLAN_PER_CALL_TIMEOUT_MS ?? "") || 8000;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), perCallMs);
 
   try {
-    const rsp = await fetch(url.toString(), { cache: "no-store" });
+    const rsp = await fetch(url, {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
     if (!rsp.ok) return [];
-    const json: any = await rsp.json();
 
-    const values: any[] = json?.values ?? json?.data ?? [];
-    if (!Array.isArray(values)) return [];
+    const j = await rsp.json();
 
-    // TwelveData returns newest first; we keep that order (newest -> oldest).
-    const out: Candle[] = values.map((v: any) => ({
-      t: Math.floor(Date.parse(v.datetime) / 1000),
-      o: Number(v.open),
-      h: Number(v.high),
-      l: Number(v.low),
-      c: Number(v.close),
-    }));
-
-    return out.filter(
-      (c) =>
-        Number.isFinite(c.t) &&
-        Number.isFinite(c.o) &&
-        Number.isFinite(c.h) &&
-        Number.isFinite(c.l) &&
-        Number.isFinite(c.c)
-    );
+    // Expecting { candles: Candle[] } from our /api/candles
+    const arr: any[] = Array.isArray(j?.candles) ? j.candles : [];
+    return normalizeCandles(arr);
   } catch {
+    clearTimeout(timer);
     return [];
   }
+}
+
+/**
+ * Normalize and sanity-check the array, keeping newest -> oldest,
+ * t in seconds, and finite OHLC values.
+ */
+function normalizeCandles(input: any[]): Candle[] {
+  const out: Candle[] = [];
+  for (const v of input) {
+    const tRaw = v?.t ?? v?.time ?? v?.timestamp ?? v?.datetime;
+    const t =
+      typeof tRaw === "number"
+        ? // assume provider seconds; if it looks like ms, convert
+          (tRaw > 1e12 ? Math.floor(tRaw / 1000) : tRaw)
+        : typeof tRaw === "string"
+        ? Math.floor(Date.parse(tRaw) / 1000)
+        : NaN;
+
+    const o = Number(v?.o ?? v?.open);
+    const h = Number(v?.h ?? v?.high);
+    const l = Number(v?.l ?? v?.low);
+    const c = Number(v?.c ?? v?.close);
+
+    if (
+      Number.isFinite(t) &&
+      Number.isFinite(o) &&
+      Number.isFinite(h) &&
+      Number.isFinite(l) &&
+      Number.isFinite(c)
+    ) {
+      out.push({ t, o, h, l, c });
+    }
+  }
+  return out;
 }
