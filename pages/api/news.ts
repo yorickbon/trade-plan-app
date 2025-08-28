@@ -15,6 +15,8 @@ import type { NextApiRequest, NextApiResponse } from "next";
  *   HEADLINES_LANG
  *   HEADLINES_SINCE_HOURS
  */
+type SentimentLabel = "positive" | "negative" | "neutral";
+
 type NewsItem = {
   title: string;
   url: string;
@@ -23,7 +25,7 @@ type NewsItem = {
   country?: string | string[];
   language?: string;
   symbols?: string[];
-  sentiment?: { score: number; label: "positive" | "negative" | "neutral" };
+  sentiment?: { score: number; label: SentimentLabel };
 };
 
 type NewsResponse =
@@ -33,13 +35,13 @@ type NewsResponse =
 const positiveWords = ["beats", "surge", "soar", "rally", "growth", "optimism", "strong", "bull", "gain"];
 const negativeWords = ["miss", "fall", "drop", "slump", "recession", "fear", "weak", "bear", "loss"];
 
-function simpleSentiment(text: string) {
+function simpleSentiment(text: string): { score: number; label: SentimentLabel } {
   const t = text.toLowerCase();
   let score = 0;
   for (const w of positiveWords) if (t.includes(w)) score += 1;
   for (const w of negativeWords) if (t.includes(w)) score -= 1;
-  const label = score > 0 ? "positive" : score < 0 ? "negative" : "neutral";
-  return { score, label as const };
+  const label: SentimentLabel = score > 0 ? "positive" : score < 0 ? "negative" : "neutral";
+  return { score, label };
 }
 
 function parseList(q: string | string[] | undefined): string[] {
@@ -76,49 +78,57 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
 
     const apiKey = process.env.NEWSDATA_API_KEY;
-    if (!apiKey) return res.status(200).json({ ok: false, reason: "NEWSDATA_API_KEY missing", provider, query: queryMeta });
+    if (!apiKey) {
+      return res.status(200).json({ ok: false, reason: "NEWSDATA_API_KEY missing", provider, query: queryMeta });
+    }
 
-    // Build a loose OR query like: (EUR OR USD) with some finance keywords to reduce noise
+    // Build a loose OR query like: (EUR OR USD) with finance keywords to reduce noise
     const tokens = list.length ? list : ["USD"];
-    const q = "(" + tokens.map((s) => s.replace(/[^\w/+-]/g, "")).join(" OR ") + ") AND (forex OR currency OR index OR stocks OR gold OR oil OR crypto OR market)";
+    const q =
+      "(" +
+      tokens.map((s) => s.replace(/[^\w/+-]/g, "")).join(" OR ") +
+      ") AND (forex OR currency OR index OR stocks OR gold OR oil OR crypto OR market)";
 
     const fromIso = hoursAgoISO(hours);
 
-    // Newsdata docs: https://newsdata.io/docs (v1)
-    // We’ll use the v1 endpoint with qInTitle fallback; language & from_date supported.
+    // Newsdata v1
     const url = new URL("https://newsdata.io/api/1/news");
     url.searchParams.set("apikey", apiKey);
     url.searchParams.set("q", q);
     url.searchParams.set("language", lang);
-    url.searchParams.set("from_date", fromIso.slice(0, 10)); // v1 supports date (yyyy-mm-dd)
+    url.searchParams.set("from_date", fromIso.slice(0, 10)); // yyyy-mm-dd
     url.searchParams.set("page", "1");
 
     const providerUrl = url.toString();
 
     const resp = await fetch(providerUrl, { cache: "no-store" });
     if (!resp.ok) {
-      return res.status(200).json({ ok: false, reason: `newsdata http ${resp.status}`, provider, query: queryMeta, debug: debugWanted ? { providerUrl } : undefined });
+      return res.status(200).json({
+        ok: false,
+        reason: `newsdata http ${resp.status}`,
+        provider,
+        query: queryMeta,
+        debug: debugWanted ? { providerUrl } : undefined,
+      });
     }
 
     const data: any = await resp.json();
     const results: any[] = Array.isArray(data?.results) ? data.results : [];
 
-    const items: NewsItem[] = results
-      .slice(0, max)
-      .map((r) => {
-        const title: string = r?.title || r?.description || "";
-        const sentiment = simpleSentiment(title);
-        return {
-          title,
-          url: r?.link || r?.source_url || "",
-          published_at: r?.pubDate ? new Date(r.pubDate).toISOString() : new Date().toISOString(),
-          source: r?.source_id || r?.creator || r?.source || undefined,
-          country: r?.country,
-          language: r?.language || lang,
-          symbols: tokens,
-          sentiment,
-        };
-      });
+    const items: NewsItem[] = results.slice(0, max).map((r) => {
+      const title: string = r?.title || r?.description || "";
+      const sentiment = simpleSentiment(title);
+      return {
+        title,
+        url: r?.link || r?.source_url || "",
+        published_at: r?.pubDate ? new Date(r.pubDate).toISOString() : new Date().toISOString(),
+        source: r?.source_id || r?.creator || r?.source || undefined,
+        country: r?.country,
+        language: r?.language || lang,
+        symbols: tokens,
+        sentiment,
+      };
+    });
 
     return res.status(200).json({
       ok: true,
