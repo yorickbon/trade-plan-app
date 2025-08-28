@@ -6,7 +6,7 @@ import dynamic from "next/dynamic";
 import CalendarPanel from "../components/CalendarPanel";
 import HeadlinesPanel from "../components/HeadlinesPanel";
 
-// ✅ client-only chart import to avoid client-side exception
+// client-only chart to avoid hydration issues
 const TradingViewTriple = dynamic(
   () => import("../components/TradingViewTriple"),
   {
@@ -19,7 +19,7 @@ const TradingViewTriple = dynamic(
   }
 );
 
-// ---------- types / helpers ----------
+// ---------- types ----------
 type CalendarBias = {
   perCurrency: Record<
     string,
@@ -43,12 +43,10 @@ const currenciesFromBias = (bias?: CalendarBias) =>
 function baseQuoteFromInstrument(instr: string): [string, string] {
   const s = (instr || "").toUpperCase().replace("/", "");
   if (s.length >= 6) return [s.slice(0, 3), s.slice(-3)];
-  // fallback for index/metals/crypto (treat like USD cross if needed)
   if (s.endsWith("USD")) return [s.replace("USD", ""), "USD"];
   return [s, "USD"];
 }
 
-// ---------- page ----------
 export default function Page() {
   // controls
   const [instrument, setInstrument] = useState<string>("EURUSD");
@@ -87,7 +85,7 @@ export default function Page() {
     }
   }, []);
 
-  // ----- load calendar from provider only (no manual fallback) -----
+  // ----- load calendar from provider (no manual paste) -----
   const loadCalendar = useCallback(async () => {
     setLoadingCal(true);
     try {
@@ -97,17 +95,14 @@ export default function Page() {
       setCalendar(j);
 
       if (j?.ok) {
-        // Load headlines using currencies from calendar bias
         const ccy = currenciesFromBias(j.bias);
         if (ccy.length) {
           await loadHeadlinesForSymbols(ccy);
         } else {
-          // If bias missing, fallback to instrument symbols
           const [base, quote] = baseQuoteFromInstrument(instrument);
           await loadHeadlinesForSymbols([base, quote]);
         }
       } else {
-        // Provider empty: fallback to instrument symbols (Google News will almost always have something)
         const [base, quote] = baseQuoteFromInstrument(instrument);
         await loadHeadlinesForSymbols([base, quote]);
       }
@@ -198,6 +193,7 @@ export default function Page() {
           />
         </div>
 
+        {/* Keep manual retry button */}
         <button
           onClick={loadCalendar}
           className="px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
@@ -228,32 +224,29 @@ export default function Page() {
         </button>
       </div>
 
-      {/* Charts */}
+      {/* Charts: always side-by-side */}
       <TradingViewTriple symbol={instrument} />
 
-      {/* Calendar + Headlines */}
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-        {/* Calendar */}
-        <div className="rounded-lg border border-neutral-800 p-4">
-          <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
+      {/* Middle row: Calendar alone */}
+      <div className="rounded-lg border border-neutral-800 p-4">
+        <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
 
-          {loadingCal && (
-            <div className="text-sm opacity-75">Loading calendar…</div>
-          )}
+        {loadingCal && <div className="text-sm opacity-75">Loading calendar…</div>}
 
-          {!loadingCal && calendar?.ok && Array.isArray(calendar.items) && (
-            <CalendarPanel items={calendar.items} />
-          )}
+        {!loadingCal && calendar?.ok && Array.isArray(calendar.items) && (
+          <CalendarPanel items={calendar.items} />
+        )}
 
-          {!loadingCal && (!calendar || !calendar.ok) && (
-            <div className="text-sm opacity-75">
-              No calendar items found from providers. (Once your
-              TradingEconomics key is active, this will populate automatically.)
-            </div>
-          )}
-        </div>
+        {!loadingCal && (!calendar || !calendar.ok) && (
+          <div className="text-sm opacity-75">
+            No calendar items found from providers. (Once your TradingEconomics
+            key is active, this will populate automatically.)
+          </div>
+        )}
+      </div>
 
-        {/* Headlines */}
+      {/* Bottom row: Headlines LEFT, Trade Card RIGHT */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div className="rounded-lg border border-neutral-800 p-4">
           <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
           <HeadlinesPanel items={Array.isArray(headlines) ? headlines : []} />
@@ -267,24 +260,23 @@ export default function Page() {
               : "Fetched by instrument (calendar empty)."}
           </div>
         </div>
-      </div>
 
-      {/* Generated Trade Card */}
-      <div className="rounded-lg border border-neutral-800 p-4">
-        <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
-        {planText ? (
-          <pre className="whitespace-pre-wrap text-sm leading-5 opacity-95">
-            {planText}
-          </pre>
-        ) : generating ? (
-          <div className="text-sm opacity-80">Generating…</div>
-        ) : (
-          <div className="text-sm opacity-70">
-            Click <b>Generate Plan</b> to build a setup using 15m execution,
-            1h+4h context, fundamentals (calendar bias + headlines), and our
-            strategy logic.
-          </div>
-        )}
+        <div className="rounded-lg border border-neutral-800 p-4">
+          <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
+          {planText ? (
+            <pre className="whitespace-pre-wrap text-sm leading-5 opacity-95">
+              {planText}
+            </pre>
+          ) : generating ? (
+            <div className="text-sm opacity-80">Generating…</div>
+          ) : (
+            <div className="text-sm opacity-70">
+              Click <b>Generate Plan</b> to build a setup using 15m execution,
+              1h+4h context, fundamentals (calendar bias + headlines), and our
+              strategy logic.
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
