@@ -11,24 +11,21 @@ type ScanResult = {
   note?: string;
 };
 
-type Card = {
-  status: "OK" | "STAND_DOWN";
+type PlanResponse = {
+  ok: boolean;
+  plan?: { text: string; conviction?: number | null };
   reason?: string;
-  usedSymbol: string;
-  htf: { h1Trend: "up"|"down"|"flat"; h4Trend: "up"|"down"|"flat" };
-  idea?: string;
-  detail?: string[];
+  usedHeadlines?: any[];
+  usedCalendar?: any[];
 };
 
-const TF_LIST: TF[] = ["15m", "1h", "4h"];
-const LIMIT_15M = 350; // enough for swings + ATR
-const LIMIT_H1  = 400;
-const LIMIT_H4  = 400;
+const LIMIT_15M = 350;
+const LIMIT_H1 = 400;
+const LIMIT_H4 = 400;
 
 const clamp = (v:number, a:number, b:number) => Math.max(a, Math.min(b, v));
 
 // ───────────────────────────── technical utils
-
 function ema(values: number[], period: number): number[] {
   if (!values.length || period <= 1) return values.slice();
   const out: number[] = [];
@@ -41,7 +38,6 @@ function ema(values: number[], period: number): number[] {
   }
   return out;
 }
-
 function trendFromEMA(closes: number[], period=50): "up"|"down"|"flat" {
   if (closes.length < period + 5) return "flat";
   const e = ema(closes, period);
@@ -51,34 +47,26 @@ function trendFromEMA(closes: number[], period=50): "up"|"down"|"flat" {
   if (a < b * 0.9995) return "down";
   return "flat";
 }
+const asCloses = (arr: Candle[]) => arr.map(c => c.c);
+const asHighs  = (arr: Candle[]) => arr.map(c => c.h);
+const asLows   = (arr: Candle[]) => arr.map(c => c.l);
 
-// Expect newest→oldest candles
-function asCloses(arr: Candle[]): number[] { return arr.map(c => c.c); }
-function asHighs(arr: Candle[]): number[] { return arr.map(c => c.h); }
-function asLows(arr: Candle[]): number[] { return arr.map(c => c.l); }
-
-function recentSwingHigh(highs: number[], lookback=30): number {
+function recentSwingHigh(highs: number[], lookback=60): number {
   return Math.max(...highs.slice(0, lookback));
 }
-function recentSwingLow(lows: number[], lookback=30): number {
+function recentSwingLow(lows: number[], lookback=60): number {
   return Math.min(...lows.slice(0, lookback));
 }
 
 function detectBOS(m15: Candle[], bias: "up"|"down"|"flat"): ScanResult {
   if (m15.length < 120) return { ok:false, note:"insufficient bars" };
-  const highs = asHighs(m15);
-  const lows  = asLows(m15);
-  const closes= asCloses(m15);
-  const lastClose = closes[0];
-
-  const rh = recentSwingHigh(highs, 60);
-  const rl = recentSwingLow(lows, 60);
-
-  if (lastClose > rh) {
+  const highs = asHighs(m15), lows = asLows(m15), closes = asCloses(m15);
+  const last = closes[0], rh = recentSwingHigh(highs), rl = recentSwingLow(lows);
+  if (last > rh) {
     const conf = 70 + (bias === "up" ? 15 : bias === "down" ? -15 : 0);
     return { ok:true, direction:"bull", confidence: clamp(conf, 0, 100), note:"Close > 60-bar swing high" };
   }
-  if (lastClose < rl) {
+  if (last < rl) {
     const conf = 70 + (bias === "down" ? 15 : bias === "up" ? -15 : 0);
     return { ok:true, direction:"bear", confidence: clamp(conf, 0, 100), note:"Close < 60-bar swing low" };
   }
@@ -89,23 +77,15 @@ function detectPullback(m15: Candle[], bias: "up"|"down"|"flat"): ScanResult {
   if (m15.length < 120) return { ok:false };
   const highs = asHighs(m15), lows = asLows(m15), closes = asCloses(m15);
   const last = closes[0];
-
-  // impulse anchor = max/min of the last 120 bars
   const maxH = Math.max(...highs.slice(0, 120));
   const minL = Math.min(...lows.slice(0, 120));
-
-  // 38.2–61.8 retracement back into impulse
   if (bias === "up" || bias === "flat") {
     const retr = (maxH - last) / (maxH - minL + 1e-9);
-    if (retr > 0.382 && retr < 0.618) {
-      return { ok:true, direction:"bull", confidence: 60, note:"Bullish pullback (38–62% retracement)" };
-    }
+    if (retr > 0.382 && retr < 0.618) return { ok:true, direction:"bull", confidence: 60, note:"Bullish pullback (38–62% retracement)" };
   }
   if (bias === "down" || bias === "flat") {
     const retr = (last - minL) / (maxH - minL + 1e-9);
-    if (retr > 0.382 && retr < 0.618) {
-      return { ok:true, direction:"bear", confidence: 60, note:"Bearish pullback (38–62% retracement)" };
-    }
+    if (retr > 0.382 && retr < 0.618) return { ok:true, direction:"bear", confidence: 60, note:"Bearish pullback (38–62% retracement)" };
   }
   return { ok:false };
 }
@@ -117,18 +97,28 @@ function detectRange(m15: Candle[]): ScanResult {
   const hi = Math.max(...highs);
   const lo = Math.min(...lows);
   const width = (hi - lo) / ((hi + lo) / 2);
-  if (width < 0.004) { // < ~0.4% width over 120 bars → range
+  if (width < 0.004) {
     return { ok:true, direction: m15[0].c > (hi + lo) / 2 ? "bear" : "bull", confidence: 45, note:"Compression range" };
   }
   return { ok:false };
 }
 
-// ───────────────────────────── main
+// ───────────────────────────── handler
+export default async function handler(req: NextApiRequest, res: NextApiResponse<PlanResponse>) {
+  // Read instrument from POST body first (UI sends it), then fall back to query.
+  let input = "EURUSD";
+  try {
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
+    if (body?.instrument?.code) input = String(body.instrument.code).toUpperCase();
+  } catch {}
+  if (!input && (req.query.symbol || req.query.code)) {
+    input = String(req.query.symbol || req.query.code).toUpperCase();
+  }
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse<Card | any>) {
-  const input = String(req.query.symbol || req.query.code || "EURUSD").toUpperCase();
+  const usedCalendar = Array.isArray((req.body as any)?.calendar) ? (req.body as any).calendar : [];
+  const usedHeadlines = Array.isArray((req.body as any)?.headlines) ? (req.body as any).headlines : [];
 
-  // Candle fetch with polling budget (same behavior as plan-debug)
+  // Candle fetch with polling budget (matches plan-debug semantics)
   const totalMs = Math.max(1000, Number(process.env.PLAN_CANDLES_TIMEOUT_MS ?? 120000));
   const pollMs  = Math.max(100,  Number(process.env.PLAN_CANDLES_POLL_MS    ?? 200));
   const maxTries = Math.max(1, Math.floor(totalMs / pollMs));
@@ -137,12 +127,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
   let triedAlt: string | null = null;
   let m15: Candle[] = [], h1: Candle[] = [], h4: Candle[] = [];
 
+  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+  const altSymbol = (s: string) => (s.includes("/") || s.length !== 6) ? null : `${s.slice(0,3)}/${s.slice(3)}`;
+
   for (let i = 1; i <= maxTries; i++) {
     if (!m15.length) m15 = await getCandles(code, "15m", LIMIT_15M);
     if (!h1.length)  h1  = await getCandles(code, "1h" , LIMIT_H1);
     if (!h4.length)  h4  = await getCandles(code, "4h" , LIMIT_H4);
-
     if (m15.length && h1.length && h4.length) break;
+
     if (i === 3 && !triedAlt) {
       const alt = altSymbol(code);
       if (alt) { code = alt; triedAlt = alt; }
@@ -150,7 +143,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (i < maxTries) await sleep(pollMs);
   }
 
-  // Stand down if any TF missing
   const missing = [
     !h4.length && "4h",
     !h1.length && "1h",
@@ -159,14 +151,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
   if (missing.length) {
     return res.status(200).json({
-      status: "STAND_DOWN",
+      ok: false,
       reason: `Missing candles for ${missing.join(", ")}`,
-      usedSymbol: input,
-      htf: { h1Trend: "flat", h4Trend: "flat" },
-    } satisfies Card);
+      usedHeadlines,
+      usedCalendar,
+    });
   }
 
-  // HTF bias
+  // HTF bias → pick agreement between 1h & 4h (ties -> 1h)
   const h1Trend = trendFromEMA(asCloses(h1), 50);
   const h4Trend = trendFromEMA(asCloses(h4), 50);
   const bias: "up"|"down"|"flat" =
@@ -176,12 +168,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
   const pullRes = detectPullback(m15, bias);
   const rangeRes = detectRange(m15);
 
-  // Score + choose best
-  const scored: Array<[string, ScanResult]> = [
+  const scored = [
     ["BOS", bosRes],
     ["Pullback", pullRes],
     ["Range", rangeRes],
-  ];
+  ] as const;
 
   const best = scored
     .map(([name, r]) => ({ name, r, score: (r.ok ? (r.confidence ?? 50) : 0) + (r.direction ? 5 : 0) }))
@@ -189,33 +180,26 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
   if (!best || best.score < 40) {
     return res.status(200).json({
-      status: "STAND_DOWN",
+      ok: false,
       reason: "No high-conviction setup on 15m with HTF context",
-      usedSymbol: input,
-      htf: { h1Trend, h4Trend },
-    } satisfies Card);
+      usedHeadlines,
+      usedCalendar,
+    });
   }
 
   const dirWord = best.r.direction === "bull" ? "LONG" : "SHORT";
-  const idea = `${dirWord} ${input} — ${best.name} (${best.r.note || "signal"}) with ${best.r.confidence ?? 50}% confidence`;
-  const detail: string[] = [
-    `HTF bias: 1h=${h1Trend}, 4h=${h4Trend}`,
-    `Signal: ${best.name} → ${best.r.note ?? "—"}`,
+  const lines = [
+    `Setup: ${best.name} — ${best.r.note ?? "signal"} (${best.r.confidence ?? 50}% conf)`,
+    `HTF bias → 1h: ${h1Trend}, 4h: ${h4Trend}`,
+    `Direction: ${dirWord}`,
+    `Symbol: ${input}`,
   ];
+  const text = lines.join("\n");
 
   return res.status(200).json({
-    status: "OK",
-    usedSymbol: input,
-    htf: { h1Trend, h4Trend },
-    idea,
-    detail,
-  } satisfies Card);
-}
-
-// ───────────────────────────── small helpers
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-function altSymbol(code: string) {
-  if (code.includes("/")) return null;
-  if (code.length === 6) return `${code.slice(0,3)}/${code.slice(3)}`;
-  return null;
+    ok: true,
+    plan: { text, conviction: best.r.confidence ?? 50 },
+    usedHeadlines,
+    usedCalendar,
+  });
 }
