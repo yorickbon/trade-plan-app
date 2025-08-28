@@ -1,12 +1,13 @@
+// /pages/api/news.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 
 /**
- * NEWS API
+ * NEWS API (Newsdata.io)
  * - Accepts BOTH ?currencies= and ?symbols= (comma-separated)
- * - Optional: ?hours= (default from HEADLINES_SINCE_HOURS or 48)
- * - Optional: ?max= (default from HEADLINES_MAX or 12)
- * - Optional: ?lang= (default from HEADLINES_LANG or "en")
- * - Optional: ?debug=1 to include provider URL + raw counters
+ * - Optional: ?hours= (default HEADLINES_SINCE_HOURS or 48)
+ * - Optional: ?max= (default HEADLINES_MAX or 12; hard cap 25)
+ * - Optional: ?lang= (default HEADLINES_LANG or "en")
+ * - Optional: ?debug=1 (returns provider URL and hit counts)
  *
  * ENV:
  *   NEWS_API_PROVIDER = "newsdata"
@@ -15,6 +16,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
  *   HEADLINES_LANG
  *   HEADLINES_SINCE_HOURS
  */
+
 type SentimentLabel = "positive" | "negative" | "neutral";
 
 type NewsItem = {
@@ -28,9 +30,23 @@ type NewsItem = {
   sentiment?: { score: number; label: SentimentLabel };
 };
 
-type NewsResponse =
-  | { ok: true; provider: string; count: number; items: NewsItem[]; query: any; debug?: any }
-  | { ok: false; reason: string; provider?: string; query?: any; debug?: any };
+type OkResponse = {
+  ok: true;
+  provider: string;
+  count: number;
+  items: NewsItem[];
+  query: any;
+  debug?: any;
+};
+type ErrResponse = {
+  ok: false;
+  reason: string;
+  provider?: string;
+  query?: any;
+  debug?: any;
+};
+
+type NewsResponse = OkResponse | ErrResponse;
 
 const positiveWords = ["beats", "surge", "soar", "rally", "growth", "optimism", "strong", "bull", "gain"];
 const negativeWords = ["miss", "fall", "drop", "slump", "recession", "fear", "weak", "bear", "loss"];
@@ -91,7 +107,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     const fromIso = hoursAgoISO(hours);
 
-    // Newsdata v1
+    // First attempt (scoped)
     const url = new URL("https://newsdata.io/api/1/news");
     url.searchParams.set("apikey", apiKey);
     url.searchParams.set("q", q);
@@ -113,7 +129,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
 
     const data: any = await resp.json();
+
+    // Explicit error payloads (rate limit, etc.)
+    if (data?.status === "error") {
+      return res.status(200).json({
+        ok: false,
+        reason: `newsdata error: ${data?.message ?? "unknown"}`,
+        provider,
+        query: queryMeta,
+        debug: debugWanted ? { providerUrl } : undefined,
+      });
+    }
+
     const results: any[] = Array.isArray(data?.results) ? data.results : [];
+    let providerHits = results.length;
 
     const items: NewsItem[] = results.slice(0, max).map((r) => {
       const title: string = r?.title || r?.description || "";
@@ -130,13 +159,52 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       };
     });
 
+    // Broaden-on-empty: retry once without finance keywords & from_date
+    if (items.length === 0) {
+      const url2 = new URL("https://newsdata.io/api/1/news");
+      url2.searchParams.set("apikey", apiKey);
+      url2.searchParams.set("q", "(" + tokens.map((s) => s.replace(/[^\w/+-]/g, "")).join(" OR ") + ")");
+      url2.searchParams.set("language", lang);
+      url2.searchParams.set("page", "1");
+
+      const resp2 = await fetch(url2.toString(), { cache: "no-store" });
+      if (resp2.ok) {
+        const d2: any = await resp2.json();
+        if (d2?.status === "error") {
+          // keep items empty, but report reason
+          return res.status(200).json({
+            ok: false,
+            reason: `newsdata error: ${d2?.message ?? "unknown"}`,
+            provider,
+            query: queryMeta,
+            debug: debugWanted ? { providerUrl: url2.toString() } : undefined,
+          });
+        }
+        const r2: any[] = Array.isArray(d2?.results) ? d2.results : [];
+        providerHits = r2.length;
+        for (const r of r2.slice(0, max)) {
+          const title: string = r?.title || r?.description || "";
+          items.push({
+            title,
+            url: r?.link || r?.source_url || "",
+            published_at: r?.pubDate ? new Date(r.pubDate).toISOString() : new Date().toISOString(),
+            source: r?.source_id || r?.creator || r?.source || undefined,
+            country: r?.country,
+            language: r?.language || lang,
+            symbols: tokens,
+            sentiment: simpleSentiment(title),
+          });
+        }
+      }
+    }
+
     return res.status(200).json({
       ok: true,
       provider,
       count: items.length,
       items,
       query: queryMeta,
-      debug: debugWanted ? { providerUrl, total_from_provider: results.length } : undefined,
+      debug: debugWanted ? { providerUrl, providerHits } : undefined,
     });
   } catch (err: any) {
     return res.status(200).json({
