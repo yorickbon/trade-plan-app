@@ -1,71 +1,54 @@
-"use client";
-
+// /components/HeadlinesPanel.tsx
 import React from "react";
 
-export type Headline = {
-  title?: string;
-  url?: string;
+export interface Headline {
+  title: string;
+  url: string;
   source?: string;
   published_at?: string;
-  sentiment?: { score?: number; label?: string } | string;
+  sentiment?: { score: number; label: string };
+}
+
+type Props = {
+  items: Headline[];
+  loading?: boolean;
 };
 
-function isStr(v: any): v is string {
-  return typeof v === "string";
-}
+export default function HeadlinesPanel({ items, loading }: Props) {
+  if (loading) {
+    return <div className="text-gray-400">Loading headlines…</div>;
+  }
 
-function fmtWhen(s?: string) {
-  if (!s) return "";
-  const d = new Date(s);
-  if (isNaN(d.getTime())) return "";
-  return d.toLocaleString(undefined, {
-    month: "short",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-export default function HeadlinesPanel({ items }: { items: any }) {
-  const list: Headline[] = Array.isArray(items) ? items : [];
-
-  if (!list.length) {
-    return <div className="text-sm opacity-70">No notable headlines.</div>;
+  if (!items || items.length === 0) {
+    return (
+      <div className="text-gray-400">
+        No notable headlines in the selected window.
+      </div>
+    );
   }
 
   return (
-    <ul className="space-y-1">
-      {list.slice(0, 24).map((h, i) => {
-        const title = isStr(h?.title) ? h!.title : "(untitled)";
-        const url = isStr(h?.url) ? h!.url : undefined;
-        const src = isStr((h as any)?.source) ? (h as any).source : "";
-        const when = isStr((h as any)?.published_at) ? (h as any).published_at : "";
-        let sent = "";
-        if (isStr(h?.sentiment)) sent = h!.sentiment as string;
-        else if (h?.sentiment && typeof h.sentiment === "object") {
-          sent = isStr((h.sentiment as any).label) ? (h.sentiment as any).label : "";
-        }
-
-        return (
-          <li key={`${i}-${title.slice(0, 40)}`} className="text-sm">
-            {url ? (
-              <a
-                href={url}
-                target="_blank"
-                rel="noreferrer"
-                className="text-sky-300 hover:underline"
-              >
-                {title}
-              </a>
-            ) : (
-              <span>{title}</span>
-            )}
-            <span className="opacity-60 ml-2">
-              {src && `— ${src}`} {when && `— ${fmtWhen(when)}`} {sent && `— ${sent}`}
+    <ul className="space-y-2 text-sm">
+      {items.map((h, i) => (
+        <li key={i}>
+          <a
+            href={h.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-400 hover:underline"
+          >
+            {h.title}
+          </a>
+          {h.source ? (
+            <span className="text-gray-500 ml-2">— {h.source}</span>
+          ) : null}
+          {h.sentiment ? (
+            <span className="ml-2 text-xs italic text-gray-400">
+              {h.sentiment.label}
             </span>
-          </li>
-        );
-      })}
+          ) : null}
+        </li>
+      ))}
     </ul>
   );
 }
