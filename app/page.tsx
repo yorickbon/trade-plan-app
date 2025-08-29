@@ -261,10 +261,10 @@ export default function Page() {
       {/* Charts */}
       <TradingViewTriple symbol={instrument} />
 
-      {/* 2+1 columns: LEFT (Calendar + Headlines) | RIGHT (Trade Card) */}
+      {/* 2+1 columns becomes 1+2: LEFT (Calendar + Headlines) | RIGHT (Trade Card, wider) */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
-        {/* LEFT: Calendar + Headlines stacked (span 2 columns) */}
-        <div className="xl:col-span-2 space-y-4">
+        {/* LEFT: Calendar + Headlines stacked (span 1 column) */}
+        <div className="xl:col-span-1 space-y-4">
           {/* Calendar */}
           <div className="rounded-lg border border-neutral-800 p-4">
             <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
@@ -288,8 +288,8 @@ export default function Page() {
           {/* Headlines – smaller font */}
           <div className="rounded-lg border border-neutral-800 p-4">
             <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
-            {/* Make li/text inside HeadlinesPanel smaller without touching that component */}
-            <div className="text-xs [&_li]:text-xs [&_a]:text-sky-300">
+            {/* Make everything inside HeadlinesPanel smaller */}
+            <div className="text-[11px] leading-snug [&_li]:text-[11px] [&_a]:text-sky-300">
               <HeadlinesPanel items={Array.isArray(headlines) ? headlines : []} />
             </div>
             <div className="text-[11px] mt-2 opacity-60">
@@ -304,11 +304,11 @@ export default function Page() {
           </div>
         </div>
 
-        {/* RIGHT: Trade Card – bigger font & vertical lines */}
-        <div className="rounded-lg border border-neutral-800 p-4">
-          <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
+        {/* RIGHT: Trade Card – wider (spans 2 columns), larger font */}
+        <div className="xl:col-span-2 rounded-lg border border-neutral-800 p-4">
+          <h2 className="text-xl font-semibold mb-2">Generated Trade Card</h2>
           {planText ? (
-            <pre className="whitespace-pre-wrap text-base leading-6 opacity-95">
+            <pre className="whitespace-pre-wrap text-lg leading-7 opacity-95">
               {planText}
             </pre>
           ) : generating ? (
