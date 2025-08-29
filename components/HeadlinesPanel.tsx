@@ -1,26 +1,23 @@
-// /components/HeadlinesPanel.tsx
+"use client";
+
 import React from "react";
 
 export type Headline = {
-  title: string;
-  url: string;
+  title?: string;
+  url?: string;
   source?: string;
-  // your base uses `seen`; our API may return `published_at`.
-  seen?: string;            // ISO timestamp
-  published_at?: string;    // ISO timestamp (optional)
+  published_at?: string;
+  sentiment?: { score?: number; label?: string } | string;
 };
 
-type Props = {
-  items: Headline[];
-  loading?: boolean;
-  max?: number;             // default 12; set lower in caller if you want
-};
+function isStr(v: any): v is string {
+  return typeof v === "string";
+}
 
-function fmtWhen(h: Headline): string {
-  const iso = h.seen || h.published_at;
-  if (!iso) return "today";
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return "today";
+function fmtWhen(s?: string) {
+  if (!s) return "";
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return "";
   return d.toLocaleString(undefined, {
     month: "short",
     day: "2-digit",
@@ -29,48 +26,46 @@ function fmtWhen(h: Headline): string {
   });
 }
 
-export default function HeadlinesPanel({ items, loading, max = 12 }: Props) {
-  if (loading) {
-    return <div className="text-sm text-gray-400">Loading headlines…</div>;
-  }
+export default function HeadlinesPanel({ items }: { items: any }) {
+  const list: Headline[] = Array.isArray(items) ? items : [];
 
-  const list = Array.isArray(items) ? items.slice(0, max) : [];
-
-  if (list.length === 0) {
-    return (
-      <div className="text-sm text-gray-300">
-        No notable headlines in the selected lookback window. We’ll still trade off technicals; conviction may be slightly reduced.
-      </div>
-    );
+  if (!list.length) {
+    return <div className="text-sm opacity-70">No notable headlines.</div>;
   }
 
   return (
-    <div className="space-y-2 text-sm leading-snug">
-      <div className="text-gray-400">
-        {list.length} headline{list.length > 1 ? "s" : ""} found
-      </div>
+    <ul className="space-y-1">
+      {list.slice(0, 24).map((h, i) => {
+        const title = isStr(h?.title) ? h!.title : "(untitled)";
+        const url = isStr(h?.url) ? h!.url : undefined;
+        const src = isStr((h as any)?.source) ? (h as any).source : "";
+        const when = isStr((h as any)?.published_at) ? (h as any).published_at : "";
+        let sent = "";
+        if (isStr(h?.sentiment)) sent = h!.sentiment as string;
+        else if (h?.sentiment && typeof h.sentiment === "object") {
+          sent = isStr((h.sentiment as any).label) ? (h.sentiment as any).label : "";
+        }
 
-      {list.map((h, i) => (
-        <div key={i} className="pb-2 border-b border-neutral-800">
-          <a
-            href={h.url}
-            target="_blank"
-            rel="noreferrer"
-            className="font-medium hover:underline"
-          >
-            {h.title}
-          </a>
-          <div className="text-xs text-gray-400">
-            {h.source || "News"} · {fmtWhen(h)}
-          </div>
-        </div>
-      ))}
-
-      {Array.isArray(items) && items.length > max && (
-        <div className="text-xs text-gray-400">
-          Showing {max} of {items.length}. Check News tab for more.
-        </div>
-      )}
-    </div>
+        return (
+          <li key={`${i}-${title.slice(0, 40)}`} className="text-sm">
+            {url ? (
+              <a
+                href={url}
+                target="_blank"
+                rel="noreferrer"
+                className="text-sky-300 hover:underline"
+              >
+                {title}
+              </a>
+            ) : (
+              <span>{title}</span>
+            )}
+            <span className="opacity-60 ml-2">
+              {src && `— ${src}`} {when && `— ${fmtWhen(when)}`} {sent && `— ${sent}`}
+            </span>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
