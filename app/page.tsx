@@ -6,7 +6,6 @@ import dynamic from "next/dynamic";
 import CalendarPanel from "../components/CalendarPanel";
 import HeadlinesPanel from "../components/HeadlinesPanel";
 
-// charts are client-only to avoid hydration errors
 const TradingViewTriple = dynamic(
   () => import("../components/TradingViewTriple"),
   { ssr: false }
@@ -41,6 +40,17 @@ function currenciesFromBias(bias?: CalendarBias) {
   return bias ? Object.keys(bias.perCurrency || {}) : [];
 }
 
+/** ---- NEW: utils to ensure we always render a string ---- */
+function toDisplayString(v: any): string {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  try {
+    return JSON.stringify(v, null, 2);
+  } catch {
+    return String(v);
+  }
+}
+
 export default function Page() {
   const [instrument, setInstrument] = useState("EURUSD");
   const [dateStr, setDateStr] = useState(todayISO());
@@ -51,7 +61,7 @@ export default function Page() {
   const [headlines, setHeadlines] = useState<any[]>([]);
   const [loadingNews, setLoadingNews] = useState(false);
 
-  const [planText, setPlanText] = useState("");
+  const [planText, setPlanText] = useState<string>("");
   const [generating, setGenerating] = useState(false);
 
   const calendarCurrencies = useMemo(
@@ -107,6 +117,7 @@ export default function Page() {
     loadCalendar();
   }, [loadCalendar]);
 
+  /** ---- FIXED: always stringify response before rendering ---- */
   const generatePlan = useCallback(async () => {
     setGenerating(true);
     setPlanText("");
@@ -116,11 +127,31 @@ export default function Page() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ instrument, date: dateStr, calendar, headlines }),
       });
-      const j = await r.json();
-      if (j?.ok) setPlanText(j.plan || j.card || JSON.stringify(j, null, 2));
-      else setPlanText(j?.reason || "Server error while generating plan.");
+
+      // If the server returns a plain text body (not JSON), still handle it gracefully
+      const contentType = r.headers.get("content-type") || "";
+      let j: any;
+      if (contentType.includes("application/json")) {
+        j = await r.json();
+      } else {
+        const t = await r.text();
+        setPlanText(toDisplayString(t));
+        setGenerating(false);
+        return;
+      }
+
+      if (j?.ok) {
+        // prefer string fields; otherwise stringify whatever came back
+        const text =
+          (typeof j.plan === "string" && j.plan) ||
+          (typeof j.card === "string" && j.card) ||
+          toDisplayString(j.plan ?? j.card ?? j);
+        setPlanText(text);
+      } else {
+        setPlanText(toDisplayString(j?.reason || j));
+      }
     } catch (e: any) {
-      setPlanText(e?.message || "Error generating plan.");
+      setPlanText(toDisplayString(e?.message || e));
     } finally {
       setGenerating(false);
     }
@@ -176,7 +207,7 @@ export default function Page() {
         </button>
       </div>
 
-      {/* Charts – side-by-side (inline styles in component) */}
+      {/* Charts */}
       <TradingViewTriple symbol={instrument} />
 
       {/* Calendar */}
@@ -193,7 +224,7 @@ export default function Page() {
         )}
       </div>
 
-      {/* Headlines left — Trade Card right */}
+      {/* Headlines + Trade Card */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div className="rounded-lg border border-neutral-800 p-4">
           <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
