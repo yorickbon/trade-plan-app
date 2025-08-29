@@ -29,7 +29,14 @@ type CalendarBias = {
 };
 
 type CalendarResp =
-  | { ok: true; provider?: string; date?: string; count: number; items: any[]; bias: CalendarBias }
+  | {
+      ok: true;
+      provider?: string;
+      date?: string;
+      count: number;
+      items: any[];
+      bias: CalendarBias;
+    }
   | { ok: false; reason: string };
 
 type NewsResp =
@@ -43,9 +50,19 @@ const currenciesFromBias = (bias?: CalendarBias) =>
 function baseQuoteFromInstrument(instr: string): [string, string] {
   const s = (instr || "").toUpperCase().replace("/", "");
   if (s.length >= 6) return [s.slice(0, 3), s.slice(-3)];
-  // fallback for index/metals/crypto (treat like USD cross if needed)
   if (s.endsWith("USD")) return [s.replace("USD", ""), "USD"];
   return [s, "USD"];
+}
+
+// normalize plan text so it prints line-by-line
+function normalizePlanText(v: any): string {
+  if (!v) return "";
+  if (typeof v === "string") return v.replace(/\\n/g, "\n");
+  try {
+    return JSON.stringify(v, null, 2);
+  } catch {
+    return String(v);
+  }
 }
 
 // ---------- page ----------
@@ -140,10 +157,12 @@ export default function Page() {
         }),
       });
       const j = await r.json();
-      if (j?.ok) setPlanText(j?.plan || j?.card || JSON.stringify(j, null, 2));
-      else setPlanText(j?.reason || "Server error while generating plan.");
+      if (j?.ok) {
+        const raw = j?.plan || j?.card || j?.text || j;
+        setPlanText(normalizePlanText(raw));
+      } else setPlanText(normalizePlanText(j?.reason || "Server error while generating plan."));
     } catch (e: any) {
-      setPlanText(e?.message || "Error generating plan.");
+      setPlanText(normalizePlanText(e?.message || "Error generating plan."));
     } finally {
       setGenerating(false);
     }
@@ -153,6 +172,16 @@ export default function Page() {
     () => currenciesFromBias((calendar as any)?.bias),
     [calendar]
   );
+
+  // reset = clear outputs and re-fetch calendar/news
+  const resetAll = useCallback(() => {
+    setPlanText("");
+    setHeadlines([]);
+    setCalendar(null);
+    setDateStr(todayISO());
+    // re-pull with fresh date/instrument
+    setTimeout(() => loadCalendar(), 0);
+  }, [loadCalendar]);
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 space-y-4">
@@ -198,12 +227,13 @@ export default function Page() {
           />
         </div>
 
+        {/* 🔄 Reset replaces "Refresh Calendar" */}
         <button
-          onClick={loadCalendar}
+          onClick={resetAll}
           className="px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
           disabled={loadingCal}
         >
-          Refresh Calendar
+          Reset
         </button>
 
         <button
@@ -231,60 +261,66 @@ export default function Page() {
       {/* Charts */}
       <TradingViewTriple symbol={instrument} />
 
-      {/* Calendar + Headlines */}
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-        {/* Calendar */}
+      {/* 2+1 columns: LEFT (Calendar + Headlines) | RIGHT (Trade Card) */}
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+        {/* LEFT: Calendar + Headlines stacked (span 2 columns) */}
+        <div className="xl:col-span-2 space-y-4">
+          {/* Calendar */}
+          <div className="rounded-lg border border-neutral-800 p-4">
+            <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
+
+            {loadingCal && (
+              <div className="text-sm opacity-75">Loading calendar…</div>
+            )}
+
+            {!loadingCal && calendar?.ok && Array.isArray(calendar.items) && (
+              <CalendarPanel items={calendar.items} />
+            )}
+
+            {!loadingCal && (!calendar || !calendar.ok) && (
+              <div className="text-sm opacity-75">
+                No calendar items found from providers. (Once your
+                TradingEconomics key is active, this will populate automatically.)
+              </div>
+            )}
+          </div>
+
+          {/* Headlines – smaller font */}
+          <div className="rounded-lg border border-neutral-800 p-4">
+            <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
+            {/* Make li/text inside HeadlinesPanel smaller without touching that component */}
+            <div className="text-xs [&_li]:text-xs [&_a]:text-sky-300">
+              <HeadlinesPanel items={Array.isArray(headlines) ? headlines : []} />
+            </div>
+            <div className="text-[11px] mt-2 opacity-60">
+              {loadingNews
+                ? "Loading headlines…"
+                : headlines.length
+                ? `${headlines.length} headlines found`
+                : calendarCurrencies.length
+                ? "No notable headlines."
+                : "Fetched by instrument (calendar empty)."}
+            </div>
+          </div>
+        </div>
+
+        {/* RIGHT: Trade Card – bigger font & vertical lines */}
         <div className="rounded-lg border border-neutral-800 p-4">
-          <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
-
-          {loadingCal && (
-            <div className="text-sm opacity-75">Loading calendar…</div>
-          )}
-
-          {!loadingCal && calendar?.ok && Array.isArray(calendar.items) && (
-            <CalendarPanel items={calendar.items} />
-          )}
-
-          {!loadingCal && (!calendar || !calendar.ok) && (
-            <div className="text-sm opacity-75">
-              No calendar items found from providers. (Once your
-              TradingEconomics key is active, this will populate automatically.)
+          <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
+          {planText ? (
+            <pre className="whitespace-pre-wrap text-base leading-6 opacity-95">
+              {planText}
+            </pre>
+          ) : generating ? (
+            <div className="text-sm opacity-80">Generating…</div>
+          ) : (
+            <div className="text-sm opacity-70">
+              Click <b>Generate Plan</b> to build a setup using 15m execution,
+              1h+4h context, fundamentals (calendar bias + headlines), and our
+              strategy logic.
             </div>
           )}
         </div>
-
-        {/* Headlines */}
-        <div className="rounded-lg border border-neutral-800 p-4">
-          <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
-          <HeadlinesPanel items={Array.isArray(headlines) ? headlines : []} />
-          <div className="text-xs mt-2 opacity-60">
-            {loadingNews
-              ? "Loading headlines…"
-              : headlines.length
-              ? `${headlines.length} headlines found`
-              : calendarCurrencies.length
-              ? "No notable headlines."
-              : "Fetched by instrument (calendar empty)."}
-          </div>
-        </div>
-      </div>
-
-      {/* Generated Trade Card */}
-      <div className="rounded-lg border border-neutral-800 p-4">
-        <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
-        {planText ? (
-          <pre className="whitespace-pre-wrap text-sm leading-5 opacity-95">
-            {planText}
-          </pre>
-        ) : generating ? (
-          <div className="text-sm opacity-80">Generating…</div>
-        ) : (
-          <div className="text-sm opacity-70">
-            Click <b>Generate Plan</b> to build a setup using 15m execution,
-            1h+4h context, fundamentals (calendar bias + headlines), and our
-            strategy logic.
-          </div>
-        )}
       </div>
     </div>
   );
