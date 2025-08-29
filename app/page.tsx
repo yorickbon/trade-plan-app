@@ -28,7 +28,7 @@ export default function Page() {
     setPlanText("");
   }, [instrument, dateStr]);
 
-  // ---- fetchers (kept minimal) ----
+  // ---- fetchers ----
   async function refreshCalendar() {
     try {
       const url = `/api/calendar?date=${encodeURIComponent(
@@ -61,7 +61,7 @@ export default function Page() {
     setGenerating(true);
     setPlanText("");
     try {
-      // IMPORTANT FIX: send ONLY the symbol string in both query AND body
+      // send only the instrument string (fixes empty-candles bug)
       const r = await fetch(
         `/api/plan?instrument=${encodeURIComponent(
           instrument.code
@@ -70,7 +70,7 @@ export default function Page() {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
-            instrument: instrument.code,   // <-- send string, not object (fixes empty candles)
+            instrument: instrument.code,
             date: dateStr,
             calendar: calendarItems,
             headlines,
@@ -102,7 +102,12 @@ export default function Page() {
     setPlanText("");
   }
 
-  // ---- UI ----
+  // --- NEW: auto-refresh headlines when instrument/date changes ---
+  useEffect(() => {
+    refreshHeadlines();
+  }, [instrument, dateStr]);
+  // (Calendar stays manual via button, per your preference.)
+
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 space-y-4">
       {/* Controls */}
@@ -167,7 +172,7 @@ export default function Page() {
       {/* Charts */}
       <TradingViewTriple symbol={instrument.code} />
 
-      {/* Calendar (lightweight) */}
+      {/* Calendar */}
       <div className="rounded-lg border border-neutral-800 p-4">
         <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
         {calendarItems.length ? (
@@ -187,16 +192,17 @@ export default function Page() {
         )}
       </div>
 
-      {/* Headlines (left, smaller) + Trade Card (right, bigger) */}
+      {/* Headlines (left) + Trade Card (right) */}
+      {/* NEW: force side-by-side with a permanent 12-col grid */}
       <div className="grid grid-cols-12 gap-4 items-start">
-        <div className="col-span-12 lg:col-span-7 rounded-lg border border-neutral-800 p-4">
+        <div className="col-span-7 rounded-lg border border-neutral-800 p-4">
           <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
           <div className="text-xs">
             <HeadlinesPanel items={headlines} />
           </div>
         </div>
 
-        <div className="col-span-12 lg:col-span-5 rounded-lg border border-neutral-800 p-4">
+        <div className="col-span-5 rounded-lg border border-neutral-800 p-4">
           <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
           {planText ? (
             <pre className="whitespace-pre-wrap text-base md:text-lg leading-[1.35] opacity-95 max-h-[60vh] overflow-auto">
