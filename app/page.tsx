@@ -1,328 +1,271 @@
-"use client";
+// app/page.tsx
+'use client';
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import dynamic from "next/dynamic";
+import React, { useEffect, useMemo, useState } from 'react';
 
-import CalendarPanel from "../components/CalendarPanel";
-import HeadlinesPanel from "../components/HeadlinesPanel";
+// === components (use the relative paths that compile in your repo) ===
+import TradingViewTriple from '../components/TradingViewTriple';
+import HeadlinesPanel from '../components/HeadlinesPanel';
+// If you have CalendarPanel and want to render it, you can import it too:
+// import CalendarPanel from '../components/CalendarPanel';
 
-// charts client-only (prevents hydration issues)
-const TradingViewTriple = dynamic(
-  () => import("../components/TradingViewTriple"),
-  { ssr: false }
-);
-
-type CalendarBias = {
-  perCurrency: Record<
-    string,
-    { score: number; label: string; count: number; evidence: any[] }
-  >;
-  instrument?: { pair: string; score: number; label: string };
-};
-
-type CalendarResp =
-  | { ok: true; provider?: string; date?: string; count: number; items: any[]; bias: CalendarBias }
-  | { ok: false; reason: string };
-
-type NewsResp =
-  | { ok: true; items: any[]; count?: number; provider?: string }
-  | { ok: false; reason: string };
-
-const todayISO = () => new Date().toISOString().slice(0, 10);
-
-function baseQuoteFromInstrument(instr: string): [string, string] {
-  const s = (instr || "").toUpperCase().replace("/", "");
-  if (s.length >= 6) return [s.slice(0, 3), s.slice(-3)];
-  if (s.endsWith("USD")) return [s.replace("USD", ""), "USD"];
-  return [s, "USD"];
+// ---------------- helpers ----------------
+function todayISO() {
+  const d = new Date();
+  const iso = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  return iso.toISOString().slice(0, 10);
 }
 
-function currenciesFromBias(bias?: CalendarBias) {
-  return bias ? Object.keys(bias.perCurrency || {}) : [];
+function toSymbolsForNews(code: string): string[] {
+  // EURUSD -> ["EUR","USD"]; GBPJPY -> ["GBP","JPY"]; XAUUSD -> ["XAU","USD"] ...
+  const m = code.toUpperCase().trim();
+  if (m.length >= 6) return [m.slice(0, 3), m.slice(3, 6)];
+  // fallback: guess currency-like tokens
+  return [m];
 }
 
-/** Ensure readable multi-line text for Trade Card */
-function toReadableText(v: any): string {
-  let raw: string;
-  if (v == null) return "";
-  if (typeof v === "string") raw = v;
-  else if (typeof v === "object") {
-    if (v.card && typeof v.card.text === "string") raw = v.card.text;
-    else if (typeof v.text === "string") raw = v.text;
-    else if (typeof v.plan === "string") raw = v.plan;
-    else {
-      try { raw = JSON.stringify(v, null, 2); } catch { raw = String(v); }
-    }
-  } else raw = String(v);
-  return raw.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\\t/g, "    ");
-}
-
+// ---------------- page ----------------
 export default function Page() {
-  const [instrument, setInstrument] = useState("EURUSD");
-  const [dateStr, setDateStr] = useState(todayISO());
+  // ---- state ----
+  const [instrument, setInstrument] = useState<string>('EURUSD');
+  const [dateStr, setDateStr] = useState<string>(todayISO());
 
-  const [calendar, setCalendar] = useState<CalendarResp | null>(null);
-  const [loadingCal, setLoadingCal] = useState(false);
+  const [loadingCalendar, setLoadingCalendar] = useState(false);
+  const [calendarItems, setCalendarItems] = useState<any[]>([]);
 
-  const [headlines, setHeadlines] = useState<any[]>([]);
   const [loadingNews, setLoadingNews] = useState(false);
+  const [headlines, setHeadlines] = useState<any[]>([]);
 
-  const [planText, setPlanText] = useState<string>("");
   const [generating, setGenerating] = useState(false);
+  const [planText, setPlanText] = useState<string>('');
+  const [status, setStatus] = useState<string>(''); // small UI status line
 
-  // ---- prevent stale updates (only minimal use here) ----
-  const requestIdRef = useRef(0);
-  const planAbortRef = useRef<AbortController | null>(null);
-
-  // ✅ Reset plan whenever instrument OR date changes (your request)
+  // Clear previous output whenever instrument or date changes
   useEffect(() => {
-    setPlanText("");
-    setGenerating(false);
-    if (planAbortRef.current) {
-      try { planAbortRef.current.abort(); } catch {}
-      planAbortRef.current = null;
-    }
+    setPlanText('');
+    setStatus('');
   }, [instrument, dateStr]);
 
-  const calendarCurrencies = useMemo(
-    () => currenciesFromBias((calendar as any)?.bias),
-    [calendar]
-  );
+  // auto-load headlines when instrument changes
+  useEffect(() => {
+    (async () => {
+      await refreshNews();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [instrument]);
 
-  const loadHeadlinesFor = useCallback(async (symbols: string[]) => {
-    if (!symbols.length) {
-      setHeadlines([]);
-      return;
-    }
-    setLoadingNews(true);
+  // ---------------- fetchers ----------------
+  async function refreshCalendar() {
+    setLoadingCalendar(true);
+    setStatus('Refreshing calendar...');
     try {
-      const r = await fetch(`/api/news?symbols=${symbols.join(",")}`, { cache: "no-store" });
-      const j: NewsResp = await r.json();
-      if (j?.ok) setHeadlines(j.items || []);
-      else setHeadlines([]);
-    } catch {
+      const url =
+        `/api/calendar?date=${encodeURIComponent(dateStr)}&instrument=${encodeURIComponent(
+          instrument
+        )}&windowHours=48`;
+      const r = await fetch(url);
+      const j = await r.json();
+      if (j?.ok && Array.isArray(j.items)) {
+        setCalendarItems(j.items);
+      } else {
+        setCalendarItems([]);
+      }
+    } catch (err) {
+      setCalendarItems([]);
+    } finally {
+      setLoadingCalendar(false);
+      setStatus('');
+    }
+  }
+
+  async function refreshNews() {
+    setLoadingNews(true);
+    setStatus('Fetching headlines...');
+    try {
+      const list = toSymbolsForNews(instrument);
+      const url =
+        `/api/news?symbols=${encodeURIComponent(list.join(','))}&hours=48`;
+      const r = await fetch(url);
+      const j = await r.json();
+      if (j?.ok && Array.isArray(j.items)) {
+        setHeadlines(j.items);
+      } else if (Array.isArray(j.items)) {
+        setHeadlines(j.items);
+      } else {
+        setHeadlines([]);
+      }
+    } catch (err) {
       setHeadlines([]);
     } finally {
       setLoadingNews(false);
+      setStatus('');
     }
-  }, []);
+  }
 
-  const loadCalendar = useCallback(async () => {
-    setLoadingCal(true);
-    try {
-      const r = await fetch(
-        `/api/calendar?date=${dateStr}&instrument=${instrument}&windowHours=48`,
-        { cache: "no-store" }
-      );
-      const j: CalendarResp = await r.json();
-      setCalendar(j);
-
-      if (j?.ok) {
-        const ccy = currenciesFromBias(j.bias);
-        await loadHeadlinesFor(ccy.length ? ccy : baseQuoteFromInstrument(instrument));
-      } else {
-        await loadHeadlinesFor(baseQuoteFromInstrument(instrument));
-      }
-    } catch {
-      setCalendar({ ok: false, reason: "Calendar request failed" });
-      await loadHeadlinesFor(baseQuoteFromInstrument(instrument));
-    } finally {
-      setLoadingCal(false);
-    }
-  }, [dateStr, instrument, loadHeadlinesFor]);
-
-  useEffect(() => {
-    loadCalendar();
-  }, [loadCalendar]);
-
-  const generatePlan = useCallback(async () => {
-    // Abort any older request
-    const myId = ++requestIdRef.current;
-    if (planAbortRef.current) {
-      try { planAbortRef.current.abort(); } catch {}
-    }
-    const controller = new AbortController();
-    planAbortRef.current = controller;
-
+  async function generatePlan() {
     setGenerating(true);
-    setPlanText("");
-
+    setPlanText('');
+    setStatus('Generating plan...');
     try {
-      // ✅ ALSO include instrument/date in the URL query so legacy plan routes that read query still work
-      const r = await fetch(`/api/plan?instrument=${instrument}&date=${dateStr}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ instrument, date: dateStr, calendar, headlines }),
-        signal: controller.signal,
+      // Pass instrument in both query and body (prevents stale EURUSD)
+      const r = await fetch(`/api/plan?instrument=${encodeURIComponent(instrument)}&date=${encodeURIComponent(dateStr)}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          instrument,
+          date: dateStr,
+          calendar: calendarItems,
+          headlines,
+        }),
       });
-
-      if (myId !== requestIdRef.current) return; // ignore stale
-
-      const contentType = r.headers.get("content-type") || "";
-      if (contentType.includes("application/json")) {
-        const j: any = await r.json();
-        if (myId !== requestIdRef.current) return;
-        if (j?.ok) setPlanText(toReadableText(j));
-        else setPlanText(toReadableText(j?.reason || j));
+      const j = await r.json();
+      if (j?.ok && typeof j.text === 'string') {
+        setPlanText(j.text);
+      } else if (j?.reason) {
+        setPlanText(`Standing down: ${j.reason}`);
       } else {
-        const t = await r.text();
-        if (myId !== requestIdRef.current) return;
-        setPlanText(toReadableText(t));
+        setPlanText('Standing down: Unknown server response.');
       }
-    } catch (e: any) {
-      if (controller.signal.aborted) return;
-      if (myId === requestIdRef.current) setPlanText(toReadableText(e?.message || e));
+    } catch (err: any) {
+      setPlanText(`Standing down: ${err?.message ?? 'Network error'}`);
     } finally {
-      if (myId === requestIdRef.current) setGenerating(false);
+      setGenerating(false);
+      setStatus('');
     }
-  }, [instrument, dateStr, calendar, headlines]);
+  }
 
-  // Buttons you asked for (kept)
-  const resetAll = useCallback(() => {
-    setPlanText("");
-    setCalendar(null);
-    setHeadlines([]);
-    setLoadingCal(false);
-    setLoadingNews(false);
-    console.info("Reset complete.");
-  }, []);
-
-  const callMonitor = useCallback(
-    async (action: "start" | "stop") => {
-      try {
-        const r = await fetch("/api/monitor", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ action, instrument, date: dateStr }),
-        });
-        const j = await r.json();
-        if (j?.ok) console.info(`[monitor] ${action} ok`, j);
-        else console.warn(`[monitor] ${action} responded`, j);
-      } catch (e) {
-        console.warn(`[monitor] ${action} failed`, e);
-      }
-    },
-    [instrument, dateStr]
-  );
-
+  // ---------------- UI ----------------
   return (
-    <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 space-y-4">
-      {/* Controls */}
-      <div className="flex flex-wrap gap-3 items-center">
-        <div className="flex items-center gap-2">
-          <span className="text-sm opacity-80">Instrument</span>
-          <select
+    <div className="page">
+      {/* top controls */}
+      <div className="toolbar">
+        <div className="row">
+          <label>Instrument</label>
+          <input
             value={instrument}
-            onChange={(e) => setInstrument(e.target.value.toUpperCase())}
-            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
-          >
-            {/* Forex */}
-            <option>AUDUSD</option><option>EURUSD</option><option>GBPUSD</option>
-            <option>USDJPY</option><option>USDCAD</option><option>EURGBP</option>
-            <option>EURJPY</option><option>GBPJPY</option><option>EURAUD</option>
-            <option>NZDUSD</option>
-            {/* Indices */}
-            <option>SPX500</option><option>NAS100</option><option>US30</option><option>GER40</option>
-            {/* Metals/Crypto */}
-            <option>XAUUSD</option><option>BTCUSD</option><option>ETHUSD</option>
-          </select>
+            onChange={(e) => setInstrument(e.target.value.toUpperCase().replace(/\s+/g, ''))}
+            placeholder="EURUSD / GBPJPY / XAUUSD"
+          />
         </div>
-
-        <div className="flex items-center gap-2">
-          <span className="text-sm opacity-80">Date</span>
+        <div className="row">
+          <label>Date</label>
           <input
             type="date"
             value={dateStr}
             onChange={(e) => setDateStr(e.target.value)}
-            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
           />
         </div>
-
-        <button
-          onClick={loadCalendar}
-          className="px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
-          disabled={loadingCal}
-        >
-          Refresh Calendar
-        </button>
-
-        <button
-          onClick={generatePlan}
-          className="px-3 py-1 text-sm rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
-          disabled={generating}
-        >
-          {generating ? "Generating…" : "Generate Plan"}
-        </button>
-
-        {/* Buttons restored */}
-        <button
-          onClick={resetAll}
-          className="px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
-        >
-          Reset
-        </button>
-
-        <button
-          onClick={() => callMonitor("start")}
-          className="px-3 py-1 text-sm rounded bg-sky-700 hover:bg-sky-600"
-        >
-          Start monitoring
-        </button>
-        <button
-          onClick={() => callMonitor("stop")}
-          className="px-3 py-1 text-sm rounded bg-rose-700 hover:bg-rose-600"
-        >
-          Stop monitoring
-        </button>
-      </div>
-
-      {/* Charts row (unchanged) */}
-      <TradingViewTriple symbol={instrument} />
-
-      {/* Calendar */}
-      <div className="rounded-lg border border-neutral-800 p-4">
-        <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
-        {loadingCal && <div className="text-sm opacity-75">Loading calendar…</div>}
-        {!loadingCal && calendar?.ok && Array.isArray(calendar.items) && (
-          <CalendarPanel items={calendar.items} />
-        )}
-        {!loadingCal && (!calendar || !calendar.ok) && (
-          <div className="text-sm opacity-75">
-            No calendar items found from providers. (Once your TradingEconomics key is active, this will populate automatically.)
-          </div>
-        )}
-      </div>
-
-      {/* Headlines (left) + Trade Card (right) */}
-      <div className="grid grid-cols-12 gap-4">
-        <div className="col-span-12 lg:col-span-7 rounded-lg border border-neutral-800 p-4">
-          <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
-          <HeadlinesPanel items={headlines} />
-          <div className="text-xs mt-2 opacity-60">
-            {loadingNews
-              ? "Loading headlines…"
-              : headlines.length
-              ? `${headlines.length} headlines found`
-              : "No notable headlines."}
-          </div>
+        <div className="buttons">
+          <button onClick={refreshCalendar} disabled={loadingCalendar}>
+            Refresh Calendar
+          </button>
+          <button onClick={generatePlan} disabled={generating}>
+            {generating ? 'Generating…' : 'Generate Plan'}
+          </button>
+          <button onClick={() => setStatus('Monitoring started (stub)')}>
+            Start monitoring
+          </button>
+          <button onClick={() => setStatus('Monitoring stopped')}>
+            Stop monitoring
+          </button>
         </div>
+      </div>
 
-        <div className="col-span-12 lg:col-span-5 rounded-lg border border-neutral-800 p-4">
-          <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
+      {status ? <div className="status">{status}</div> : null}
+
+      {/* charts: 3 side-by-side */}
+      <div className="charts3">
+        <TradingViewTriple symbol={instrument} />
+      </div>
+
+      {/* calendar snapshot (text note only; when TE key is live, this will fill) */}
+      <h3 className="sectionTitle">Calendar Snapshot</h3>
+      <div className="calendarNote">
+        {loadingCalendar ? (
+          <em>Loading calendar…</em>
+        ) : calendarItems.length ? (
+          <ul>
+            {calendarItems.map((e, i) => (
+              <li key={i}>
+                {e?.time ?? ''} — <strong>{e?.title ?? e?.name ?? 'Event'}</strong>{' '}
+                ({e?.currency ?? ''}) {e?.impact ? `— ${e.impact}` : ''}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <span>No calendar items found from providers. (Once your TradingEconomics key is active, this will populate automatically.)</span>
+        )}
+      </div>
+
+      {/* headlines + trade card in two columns */}
+      <div className="grid2">
+        <div className="leftCol">
+          <h3 className="sectionTitle">Macro Headlines (24–48h)</h3>
+          {/* Your base HeadlinesPanel takes only {items}. Do not pass non-existing props. */}
+          <HeadlinesPanel items={headlines} />
+        </div>
+        <div className="rightCol">
+          <h3 className="sectionTitle">Generated Trade Card</h3>
           {planText ? (
-            <pre className="whitespace-pre-wrap text-sm leading-5 opacity-95 max-h-[60vh] overflow-auto">
-              {planText}
-            </pre>
-          ) : generating ? (
-            <div className="text-sm opacity-80">Generating…</div>
+            <pre className="planBox">{planText}</pre>
           ) : (
-            <div className="text-sm opacity-70">
-              Click <b>Generate Plan</b> to build a setup using 15m execution,
-              1h+4h context, fundamentals (calendar bias + headlines), and our strategy logic.
+            <div className="planEmpty">
+              <em>
+                Click <strong>Generate Plan</strong> to build a setup using 15m execution,
+                1h+4h context, fundamentals (calendar bias + headlines), and your strategy logic.
+              </em>
             </div>
           )}
         </div>
       </div>
+
+      {/* local styles so you don’t have to touch global CSS */}
+      <style jsx>{`
+        .page { padding: 10px 14px; color: #d9e1ee; background: #0b1220; min-height: 100vh; }
+        .toolbar { display: grid; grid-template-columns: 1fr 1fr auto; gap: 12px; align-items: end; }
+        .row { display: grid; grid-template-columns: 80px 1fr; gap: 8px; align-items: center; }
+        label { color: #9bb0cA; font-size: 12px; }
+        input { background: #121a2b; border: 1px solid #2a3a5a; color: #e9f2ff; padding: 6px 8px; border-radius: 6px; }
+        .buttons { display: flex; gap: 8px; justify-content: flex-end; }
+        button { background: #182338; border: 1px solid #2a3a5a; color: #e9f2ff; padding: 8px 10px; border-radius: 6px; cursor: pointer; }
+        button:disabled { opacity: .6; cursor: default; }
+        .status { margin: 8px 0 2px; color: #9bb0ca; font-size: 12px; }
+
+        .charts3 { margin-top: 10px; }
+        /* TradingViewTriple already renders 3 frames in a row; no extra layout here */
+
+        .sectionTitle { margin: 18px 0 8px; font-size: 16px; font-weight: 600; color: #cfe3ff; }
+
+        .calendarNote { font-size: 13px; color: #b8c5dd; padding-bottom: 4px; }
+        .calendarNote ul { margin: 6px 0 0 16px; }
+
+        .grid2 { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 18px; margin-top: 10px; }
+        .leftCol { min-width: 0; }
+        .rightCol { min-width: 0; }
+
+        /* Make headlines smaller */
+        :global(.headlines-panel) { font-size: 13px; line-height: 1.35; }
+        :global(.headlines-panel a) { color: #9fd1ff; }
+
+        /* Make Trade Card bigger and stacked */
+        .planBox {
+          white-space: pre-wrap;
+          background: #0e1626;
+          border: 1px solid #2a3a5a;
+          border-radius: 10px;
+          padding: 12px 14px;
+          font-size: 14px;
+          line-height: 1.4;
+        }
+        .planEmpty {
+          background: #0e1626; border: 1px dashed #324466; border-radius: 10px;
+          padding: 14px; color: #9bb0ca; font-size: 14px;
+        }
+
+        @media (max-width: 1200px) {
+          .grid2 { grid-template-columns: 1fr; }
+        }
+      `}</style>
     </div>
   );
 }
