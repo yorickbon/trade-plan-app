@@ -9,7 +9,7 @@ type PlanResp = PlanOk | PlanFail;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-/* ---------------------------- small number utils --------------------------- */
+/* ---------------------------- numeric helpers ----------------------------- */
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const nowIso = () => new Date().toISOString();
 const toJSON = (x: any) => { try { return JSON.stringify(x); } catch { return "{}"; } };
@@ -19,7 +19,7 @@ const H = (a: Candle[]) => a.map(c => c.h);
 const L = (a: Candle[]) => a.map(c => c.l);
 const C = (a: Candle[]) => a.map(c => c.c);
 
-/* ------------------------------- ATR (14) ---------------------------------- */
+/* -------------------------------- ATR(14) --------------------------------- */
 function atr(Hh: number[], Ll: number[], Cc: number[], period = 14) {
   if (Hh.length < period + 1) return 0;
   const tr: number[] = [];
@@ -128,17 +128,20 @@ type PlanCore = {
   scenarios: string[], invalidation: string, conviction: number
 };
 
+function tickRounder(instrument: string) {
+  const tick = tickSizeFor(instrument);
+  const dec = (tick.toString().split(".")[1]?.length || 0);
+  return { tick, dec, rnd: (n: number) => Number(roundToTick(n, tick).toFixed(dec)) };
+}
+
 function buildDeterministicPlan(params: {
   instrument: string,
   m15: Candle[], h1: Candle[], h4: Candle[],
   headlines: any[], calendar: any
-}): PlanCore {
+}) {
   const { instrument, m15, h1, h4, headlines, calendar } = params;
 
-  const tick = tickSizeFor(instrument);
-  const dec = (tick.toString().split(".")[1]?.length || 0);
-  const rnd = (n: number) => Number(roundToTick(n, tick).toFixed(dec));
-
+  const { tick, rnd } = tickRounder(instrument);
   const last = C(m15).at(-1) || 0;
   const A15 = atr(H(m15), L(m15), C(m15), 14);
   const slBuf = Math.max(3*tick, 0.2*A15);
@@ -149,14 +152,12 @@ function buildDeterministicPlan(params: {
     h1: labelTrend(h1, 2),
     m15: labelTrend(m15, 2),
   };
-
   const { lastHigh, lastLow } = lastSupportResistance(m15);
 
   const sent = summarizeHeadlines(headlines);
   const calWatch: string[] = [];
   const now = Date.now();
-  const calItems = Array.isArray(calendar?.items) ? calendar.items : [];
-  for (const e of calItems) {
+  for (const e of (calendar?.items || [])) {
     const t = e?.time || e?.date;
     const imp = (e?.impact || e?.importance || "").toString().toLowerCase();
     if (!t) continue;
@@ -169,19 +170,18 @@ function buildDeterministicPlan(params: {
   }
 
   // Choose direction
-  let dir: "Long"|"Short"|"Flat" = "Flat";
+  let dir: PlanCore["direction"] = "Flat";
   if (tview.h4 === "up" && (tview.h1 === "up" || tview.m15 === "up")) dir = "Long";
   else if (tview.h4 === "down" && (tview.h1 === "down" || tview.m15 === "down")) dir = "Short";
   else if (tview.m15 === "up" && sent.bias === "bullish") dir = "Long";
   else if (tview.m15 === "down" && sent.bias === "bearish") dir = "Short";
-
-  // If range everywhere, play mean-reversion to structure
   if (dir === "Flat") {
+    // range mean-reversion toward nearest structure
     if (lastLow && last < (lastLow + ((lastHigh ?? lastLow) - lastLow) * 0.35)) dir = "Long";
     else if (lastHigh && last > (lastHigh - ((lastHigh - (lastLow ?? lastHigh)) * 0.35))) dir = "Short";
   }
 
-  // Compute entry/SL/TPs
+  // Initial numbers (pullback)
   let order: PlanCore["order_type"] = "Buy Limit";
   let entry = last, stop = last, tp1 = last, tp2 = last;
   const signals: string[] = [];
@@ -190,50 +190,82 @@ function buildDeterministicPlan(params: {
   if (dir === "Long") {
     order = "Buy Limit";
     const support = lastLow ?? (last - A15*0.8);
-    const pullbackMid = support + (last - support) * 0.5;
+    const pullbackMid = support + Math.max(0, (last - support)) * 0.5;
     entry = rnd(pullbackMid);
     stop = rnd(entry - slBuf);
     const risk = Math.abs(entry - stop);
     tp1 = rnd(Math.max(entry + minTPFromRisk(risk), (lastHigh ?? entry + 1.5*risk)));
     tp2 = rnd(Math.max(tp1 + 0.5*risk, tp1 + minTPFromRisk(risk)*0.6));
     setup = "Pullback (OB/FVG + Fib 0.5) Long";
-    short_reason = "Buy the dip toward recent 15m support; SL beyond swing with ATR buffer.";
-    signals.push("OB", "FVG", "Fib0.5");
+    short_reason = "Buy the dip toward 15m support; SL beyond swing w/ ATR buffer.";
+    signals.push("OB","FVG","Fib0.5");
   } else if (dir === "Short") {
     order = "Sell Limit";
     const resistance = lastHigh ?? (last + A15*0.8);
-    const pullbackMid = resistance - (resistance - (last)) * 0.5;
+    const pullbackMid = resistance - Math.max(0, (resistance - last)) * 0.5;
     entry = rnd(pullbackMid);
     stop = rnd(entry + slBuf);
     const risk = Math.abs(entry - stop);
     tp1 = rnd(Math.min(entry - minTPFromRisk(risk), (lastLow ?? entry - 1.5*risk)));
     tp2 = rnd(Math.min(tp1 - 0.5*risk, tp1 - minTPFromRisk(risk)*0.6));
     setup = "Pullback (OB/FVG + Fib 0.5) Short";
-    short_reason = "Sell the rally toward recent 15m resistance; SL beyond swing with ATR buffer.";
-    signals.push("OB", "FVG", "Fib0.5");
+    short_reason = "Sell the rally toward 15m resistance; SL beyond swing w/ ATR buffer.";
+    signals.push("OB","FVG","Fib0.5");
   } else {
     order = "Market";
     entry = rnd(last);
-    stop = rnd(entry - slBuf); // placeholder, small risk plan
+    stop = rnd(entry - slBuf);
     const risk = Math.abs(entry - stop);
     tp1 = rnd(entry + minTPFromRisk(risk));
     tp2 = rnd(tp1 + 0.5*risk);
-    setup = "No clear trend; conservative reference levels only.";
-    short_reason = "Structure unclear; use HTF levels and wait for confirmation.";
+    setup = "Sideways: conservative reference only.";
+    short_reason = "Wait for 15m BOS + pullback with HTF confluence.";
   }
 
-  // Safety: ensure distances
-  const risk = Math.abs(entry - stop);
-  const needTP1 = Math.max(1.0*risk, 0.3*A15);
-  if (dir === "Long") {
-    if (tp1 <= entry + needTP1) tp1 = rnd(entry + needTP1);
-    if (tp2 <= tp1 + 0.5*risk) tp2 = rnd(tp1 + 0.5*risk);
-  } else if (dir === "Short") {
-    if (tp1 >= entry - needTP1) tp1 = rnd(entry - needTP1);
-    if (tp2 >= tp1 - 0.5*risk) tp2 = rnd(tp1 - 0.5*risk);
+  // Final consistency gate (fixes 'sell limit below market' etc.)
+  const fixes: string[] = [];
+  const risk0 = Math.abs(entry - stop);
+  const needTP1 = Math.max(1.0*risk0, 0.3*A15);
+
+  if (order === "Market") {
+    if (entry !== last) { entry = rnd(last); fixes.push("market=last"); }
+  } else if (order === "Buy Limit") {
+    if (entry >= last) { entry = rnd(last - 0.25*A15); fixes.push("buyLimitBelowLast"); }
+  } else if (order === "Sell Limit") {
+    if (entry <= last) { entry = rnd(last + 0.25*A15); fixes.push("sellLimitAboveLast"); }
+  } else if (order === "Buy Stop") {
+    if (entry <= last) { entry = rnd(last + 0.05*A15); fixes.push("buyStopAboveLast"); }
+  } else if (order === "Sell Stop") {
+    if (entry >= last) { entry = rnd(last - 0.05*A15); fixes.push("sellStopBelowLast"); }
   }
 
-  // Alignment score → conviction
+  // Rebuild SL/TP after any entry correction
+  if (fixes.length) {
+    if (dir === "Long" || order.startsWith("Buy")) {
+      stop = rnd(entry - Math.max(3*tick, 0.2*A15));
+      const r = Math.abs(entry - stop);
+      tp1 = rnd(entry + Math.max(1.0*r, 0.3*A15));
+      tp2 = rnd(tp1 + 0.5*r);
+    } else if (dir === "Short" || order.startsWith("Sell")) {
+      stop = rnd(entry + Math.max(3*tick, 0.2*A15));
+      const r = Math.abs(entry - stop);
+      tp1 = rnd(entry - Math.max(1.0*r, 0.3*A15));
+      tp2 = rnd(tp1 - 0.5*r);
+    }
+  } else {
+    // even if no entry fix, enforce sensible TP spacing
+    const r = Math.abs(entry - stop);
+    const min1 = Math.max(1.0*r, 0.3*A15);
+    if (dir === "Long") {
+      if (tp1 <= entry + min1) tp1 = rnd(entry + min1);
+      if (tp2 <= tp1 + 0.5*r) tp2 = rnd(tp1 + 0.5*r);
+    } else if (dir === "Short") {
+      if (tp1 >= entry - min1) tp1 = rnd(entry - min1);
+      if (tp2 >= tp1 - 0.5*r) tp2 = rnd(tp1 - 0.5*r);
+    }
+  }
+
+  // Alignment → conviction
   let alignment: PlanCore["alignment"] = "Mixed";
   const tfAgree = (tview.h4 === tview.h1) && (tview.h1 === tview.m15) && tview.h1 !== "range";
   if (tfAgree) alignment = "Match";
@@ -243,14 +275,11 @@ function buildDeterministicPlan(params: {
   let conviction = 55;
   if (alignment === "Match") conviction += 10;
   if (alignment === "Conflict") conviction -= 15;
-  if (sent.bias === "bullish" && dir === "Long") conviction += 6;
-  if (sent.bias === "bearish" && dir === "Short") conviction += 6;
-  if (sent.bias === "bullish" && dir === "Short") conviction -= 6;
-  if (sent.bias === "bearish" && dir === "Long") conviction -= 6;
-
-  // Calendar watch dampener
+  if (sent.bias === "bullish" && (dir === "Long")) conviction += 6;
+  if (sent.bias === "bearish" && (dir === "Short")) conviction += 6;
+  if (sent.bias === "bullish" && (dir === "Short")) conviction -= 6;
+  if (sent.bias === "bearish" && (dir === "Long")) conviction -= 6;
   if ((calendar?.blackoutWithin90m || []).length) conviction = Math.max(35, conviction - 10);
-
   conviction = clamp(Math.round(conviction), 25, 92);
 
   const fundamentals = {
@@ -281,19 +310,22 @@ function buildDeterministicPlan(params: {
     : "No active setup – wait for BOS + pullback.";
 
   return {
-    direction: dir, order_type: order,
-    entry, stop, tp1, tp2,
-    setup, short_reason, signals,
-    tview, alignment, fundamentals, scenarios, invalidation,
-    conviction
+    core: {
+      direction: dir, order_type: order,
+      entry, stop, tp1, tp2,
+      setup, short_reason, signals,
+      tview, alignment, fundamentals, scenarios, invalidation,
+      conviction
+    },
+    debug: { last, atr15: A15, fixes }
   };
 }
 
-/* --------------------------- LLM reasoning (optional) ---------------------- */
+/* ------------------------- LLM (reasoning only, optional) ------------------ */
 async function llmReasoning(instrument: string, userPayload: any) {
   if (!OPENAI_API_KEY) return null;
   const system =
-    "You are a trading assistant. ONLY provide short reasoning text and bullet points. Do NOT output numbers or levels. Do NOT change direction or plan. Keep it concise (6–10 lines).";
+    "You are a trading assistant. Provide only short reasoning text (6–10 lines). Do NOT output numbers or levels. Do NOT change direction or plan.";
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
@@ -302,18 +334,17 @@ async function llmReasoning(instrument: string, userPayload: any) {
       temperature: 0.2,
       messages: [
         { role: "system", content: system },
-        { role: "user", content: `Instrument: ${instrument}. Here are the inputs (candles compressed, TF labels, sentiment, calendar):\n\`\`\`json\n${toJSON(userPayload)}\n\`\`\`\nWrite a short rationale that explains the setup, HTF context, and how headlines/calendar affect conviction. No numbers, just reasoning.` }
+        { role: "user", content: `Instrument: ${instrument}. Inputs:\n\`\`\`json\n${toJSON(userPayload)}\n\`\`\`\nWrite a concise rationale (no numbers) that explains HTF context, execution logic, and how headlines/calendar affect conviction.` }
       ]
     })
   });
   if (!resp.ok) return null;
   const data = await resp.json();
-  const content: string = data?.choices?.[0]?.message?.content || "";
-  return content.trim();
+  return (data?.choices?.[0]?.message?.content || "").trim();
 }
 
 /* ------------------------------ card formatter ----------------------------- */
-function buildCard(instrument: string, core: PlanCore, reasoning?: string) {
+function buildCard(instrument: string, core: PlanCore, reasoning?: string, debug?: any, showDebug=false) {
   const lines: string[] = [];
   lines.push("Quick Plan (Actionable)", "");
   lines.push(`• Direction: ${core.direction}`);
@@ -354,6 +385,14 @@ function buildCard(instrument: string, core: PlanCore, reasoning?: string) {
   lines.push("");
   lines.push("Notes", "");
   lines.push(`• Symbol: ${instrument}`);
+
+  if (showDebug) {
+    lines.push("");
+    lines.push("Debug (server)");
+    lines.push(`• last: ${debug?.last}`);
+    lines.push(`• atr15: ${debug?.atr15}`);
+    if (debug?.fixes?.length) lines.push(`• fixes: ${debug.fixes.join(", ")}`);
+  }
   return lines.join("\n");
 }
 
@@ -363,6 +402,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const body = typeof req.body === "string" ? parseMaybeJSON(req.body) || {} : (req.body || {});
     const instrument = String(body.instrument || body.code || req.query.instrument || req.query.code || "EURUSD")
       .toUpperCase().replace(/\s+/g, "");
+    const showDebug = String(req.query.debug || body.debug || "") === "1";
 
     // Candles
     const [m15, h1, h4] = await Promise.all([
@@ -388,34 +428,30 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     else if (c1) calendar = c1;
 
     // Deterministic plan (levels from real data only)
-    const core = buildDeterministicPlan({ instrument, m15, h1, h4, headlines, calendar });
+    const { core, debug } = buildDeterministicPlan({ instrument, m15, h1, h4, headlines, calendar });
 
-    // Optional: short reasoning from LLM (no numbers)
-    const userPayload = {
-      instrument,
-      generated_at: nowIso(),
-      current_price: C(m15).at(-1) || 0,
-      tf_summary: core.tview,
-      sentiment_summary: summarizeHeadlines(headlines),
-      candles: {
-        m15: m15.slice(-120).map(c => ({ t: c.t, o: c.o, h: c.h, l: c.l, c: c.c })),
-        h1:  h1.slice(-120).map(c => ({ t: c.t, o: c.o, h: c.h, l: c.l, c: c.c })),
-        h4:  h4.slice(-120).map(c => ({ t: c.t, o: c.o, h: c.h, l: c.l, c: c.c })),
-      },
-      calendar: calendar,
-      headlines: headlines.slice(0, 12).map((h: any) => ({ title: h?.title, source: h?.source, sentiment: h?.sentiment?.score ?? null })),
-    };
-
+    // Optional short reasoning (no numbers)
     let reasoning: string | undefined;
-    try { reasoning = await llmReasoning(instrument, userPayload) || undefined; } catch {}
+    try {
+      const payload = {
+        instrument,
+        generated_at: nowIso(),
+        current_price: C(m15).at(-1) || 0,
+        tf_summary: core.tview,
+        sentiment: summarizeHeadlines(headlines),
+        calendar,
+        headlines: headlines.slice(0, 10).map((h: any) => ({ title: h?.title, source: h?.source, sentiment: h?.sentiment?.score ?? null })),
+      };
+      reasoning = await llmReasoning(instrument, payload) || undefined;
+    } catch {}
 
-    const card = buildCard(instrument, core, reasoning);
+    const card = buildCard(instrument, core, reasoning, debug, showDebug);
 
     return res.status(200).json({
       ok: true,
       text: card,
       conviction: core.conviction,
-      meta: { core, usedLLM: !!reasoning }
+      meta: { core, debug, usedLLM: !!reasoning }
     });
   } catch (err: any) {
     console.error("plan.ts error:", err?.message || err);
