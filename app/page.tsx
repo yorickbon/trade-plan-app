@@ -6,6 +6,7 @@ import dynamic from "next/dynamic";
 import CalendarPanel from "../components/CalendarPanel";
 import HeadlinesPanel from "../components/HeadlinesPanel";
 
+// Client-only chart import
 const TradingViewTriple = dynamic(() => import("../components/TradingViewTriple"), {
   ssr: false,
   loading: () => (
@@ -15,6 +16,7 @@ const TradingViewTriple = dynamic(() => import("../components/TradingViewTriple"
   ),
 });
 
+// ---------- types / helpers ----------
 type CalendarBias = {
   perCurrency: Record<
     string,
@@ -59,20 +61,25 @@ function normalizePlanText(v: any): string {
   }
 }
 
+// ---------- page ----------
 export default function Page() {
+  // controls
   const [instrument, setInstrument] = useState<string>("EURUSD");
   const [dateStr, setDateStr] = useState<string>(todayISO());
 
+  // calendar + headlines
   const [calendar, setCalendar] = useState<CalendarResp | null>(null);
   const [loadingCal, setLoadingCal] = useState<boolean>(false);
 
   const [headlines, setHeadlines] = useState<any[]>([]);
   const [loadingNews, setLoadingNews] = useState<boolean>(false);
 
+  // plan
   const [planText, setPlanText] = useState<string>("");
   const [generating, setGenerating] = useState<boolean>(false);
   const [monitoring, setMonitoring] = useState<boolean>(false);
 
+  // load headlines for a list of symbols
   const loadHeadlinesForSymbols = useCallback(async (symbols: string[]) => {
     if (!symbols.length) {
       setHeadlines([]);
@@ -93,6 +100,7 @@ export default function Page() {
     }
   }, []);
 
+  // load calendar
   const loadCalendar = useCallback(async () => {
     setLoadingCal(true);
     try {
@@ -126,6 +134,7 @@ export default function Page() {
     loadCalendar();
   }, [loadCalendar]);
 
+  // generate plan
   const generatePlan = useCallback(async () => {
     setGenerating(true);
     setPlanText("");
