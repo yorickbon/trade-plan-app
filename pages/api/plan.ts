@@ -9,7 +9,7 @@ type PlanResp = PlanOk | PlanFail;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-/* --------------------------- small numeric utils --------------------------- */
+/* ---------------------------- small number utils --------------------------- */
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const nowIso = () => new Date().toISOString();
 const toJSON = (x: any) => { try { return JSON.stringify(x); } catch { return "{}"; } };
@@ -19,6 +19,7 @@ const H = (a: Candle[]) => a.map(c => c.h);
 const L = (a: Candle[]) => a.map(c => c.l);
 const C = (a: Candle[]) => a.map(c => c.c);
 
+/* ------------------------------- ATR (14) ---------------------------------- */
 function atr(Hh: number[], Ll: number[], Cc: number[], period = 14) {
   if (Hh.length < period + 1) return 0;
   const tr: number[] = [];
@@ -40,26 +41,26 @@ function tickSizeFor(sym: string): number {
   if (s.includes("XAG")) return 0.01;
   if (s.includes("BTC") || s.includes("ETH")) return 1;
   if (/^(US30|DJI|US100|NAS100|NDX|US500|SPX|GER40|DE40|UK100|FTSE|DAX|CAC40|EU50|HK50|JP225)/.test(s)) return 1;
-  return 0.0001; // default FX
+  return 0.0001; // FX default
 }
 const roundToTick = (n: number, t: number) => Math.round(n / t) * t;
 
-/* ------------------------------ HTTP helpers ------------------------------ */
+/* ------------------------------- HTTP utils -------------------------------- */
 function originFromReq(req: NextApiRequest) {
   const proto = (req.headers["x-forwarded-proto"] as string) || "https";
   const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
   if (host.startsWith("http")) return host;
   return `${proto}://${host}`;
 }
-async function safeGET<T = any>(url: string, opts?: RequestInit): Promise<T | null> {
+async function safeGET<T = any>(url: string): Promise<T | null> {
   try {
-    const r = await fetch(url, { ...(opts || {}), method: "GET", headers: { "content-type": "application/json", ...(opts?.headers || {}) } });
+    const r = await fetch(url, { method: "GET", headers: { "content-type": "application/json" } });
     if (!r.ok) return null;
     return (await r.json()) as T;
   } catch { return null; }
 }
 
-/* -------------------------- swing/structure utils ------------------------- */
+/* -------------------------- swing/structure helpers ------------------------ */
 function swings(series: Candle[], k = 2) {
   const out: { idx: number; type: "H" | "L"; price: number }[] = [];
   for (let i = k; i < series.length - k; i++) {
@@ -86,23 +87,20 @@ function labelTrend(series: Candle[], k = 2) {
     if (prev.type === "L" && cur.type === "L" && cur.price < prev.price) dnSeq++;
   }
   const closes = C(series).slice(-20);
-  const drift = closes[closes.length - 1] - closes[0];
+  const drift = closes.length ? (closes[closes.length-1] - closes[0]) : 0;
   if (upSeq >= 2 && drift > 0) return "up";
   if (dnSeq >= 2 && drift < 0) return "down";
   return "range";
 }
 
-/* ------------------------- payload shaping functions ---------------------- */
-function compressCandles(series: Candle[], step = 1, maxBars = 240) {
-  const take = Math.min(series.length, maxBars);
-  const sliced = series.slice(series.length - take);
-  const s = Math.max(1, step);
-  return sliced.filter((_, i) => i % s === 0).map(c => ({
-    t: new Date(c.t).toISOString(),
-    o: c.o, h: c.h, l: c.l, c: c.c,
-  }));
+function lastSupportResistance(m15: Candle[]) {
+  const sw = swings(m15, 2);
+  const lastH = [...sw].reverse().find(s => s.type === "H");
+  const lastL = [...sw].reverse().find(s => s.type === "L");
+  return { lastHigh: lastH?.price ?? null, lastLow: lastL?.price ?? null };
 }
 
+/* ------------------------- headline sentiment quick ------------------------ */
 function summarizeHeadlines(headlines: any[]) {
   const out = { pos: 0, neg: 0, neu: 0, examples: [] as string[] };
   for (const h of headlines || []) {
@@ -118,68 +116,46 @@ function summarizeHeadlines(headlines: any[]) {
   return { ...out, bias };
 }
 
-function buildLLMSystem(instrument: string, tick: number) {
-  return [
-    "You are Trade Plan Assistant.",
-    "Use ONLY the provided candles, strict timeframe structure summary, headlines, and calendar.",
-    "Do NOT fabricate numbers, events, or levels.",
-    "",
-    "HARD RULES:",
-    `- Tick size = ${tick}. Round all prices to this tick.`,
-    "- Per-timeframe trend is independent: classify 4H, 1H, 15m strictly from their own structure.",
-    "- If order_type = Market → entry MUST equal current_price (rounded).",
-    "- Buy Limit → entry <= current_price. Sell Limit → entry >= current_price.",
-    "- Buy Stop  → entry >= current_price. Sell Stop  → entry <= current_price.",
-    "- SL MUST be beyond invalidation (swing/OB/FVG edge) by safety buffer: max(3 ticks, 0.2×ATR15). Never exactly on the level.",
-    "- TP1/TP2: target structure or ≥1.0R for TP1 if structure is far; never a few ticks from entry.",
-    "- 15m = execution; 1H & 4H = context. Entry must be at a zone (OB/FVG/Fib 0.5–0.618) or a confirmed BOS breakout.",
-    "- Fundamentals: derive bias from headlines & calendar. Avoid 'neutral' unless pos≈neg or no meaningful headlines.",
-    "- If high-impact event is within ~90 min, warn explicitly and moderate conviction.",
-    "- If TFs conflict (e.g., 4H up, 1H/15m down), lower conviction and say so.",
-    "",
-    "OUTPUT: Return ONE JSON object in a single ```json fenced block:",
-    "{",
-    '  "direction": "Long|Short|Flat",',
-    '  "order_type": "Buy Limit|Sell Limit|Buy Stop|Sell Stop|Market",',
-    '  "entry": number, "stop_loss": number, "take_profit_1": number, "take_profit_2": number,',
-    '  "conviction": number,',
-    '  "setup": "string", "short_reason": "string",',
-    '  "signals": ["..."],',
-    '  "tview": { "h4": "string", "h1": "string", "m15": "string" },',
-    '  "fundamentals": { "bias": "bullish|bearish|neutral", "headline_snapshot": ["..."], "calendar_watch": ["..."] },',
-    '  "alignment": "Match|Mixed|Conflict",',
-    '  "scenarios": ["..."] ,',
-    '  "invalidation": "string",',
-    '  "card_text": "Full multiline card in sections: Quick Plan (Actionable) → Full Breakdown → Advanced Reasoning (Pro-Level Context) → News / Event Watch → Notes"',
-    "}",
-    "```",
-  ].join("\n");
-}
+/* -------------------------- deterministic plan core ------------------------ */
+type PlanCore = {
+  direction: "Long" | "Short" | "Flat",
+  order_type: "Buy Limit" | "Sell Limit" | "Buy Stop" | "Sell Stop" | "Market",
+  entry: number, stop: number, tp1: number, tp2: number,
+  setup: string, short_reason: string,
+  signals: string[], tview: { h4:string, h1:string, m15:string },
+  alignment: "Match"|"Mixed"|"Conflict",
+  fundamentals: { bias: "bullish"|"bearish"|"neutral", headline_snapshot: string[], calendar_watch: string[] },
+  scenarios: string[], invalidation: string, conviction: number
+};
 
-function buildLLMUserPayload(params: {
-  instrument: string;
-  m15: Candle[];
-  h1: Candle[];
-  h4: Candle[];
-  headlines: any[];
-  calendar: any;
-}) {
+function buildDeterministicPlan(params: {
+  instrument: string,
+  m15: Candle[], h1: Candle[], h4: Candle[],
+  headlines: any[], calendar: any
+}): PlanCore {
   const { instrument, m15, h1, h4, headlines, calendar } = params;
 
-  const Hh15 = H(m15), Ll15 = L(m15), Cc15 = C(m15);
-  const A15 = atr(Hh15, Ll15, Cc15, 14);
-  const last = Cc15.at(-1) || 0;
+  const tick = tickSizeFor(instrument);
+  const dec = (tick.toString().split(".")[1]?.length || 0);
+  const rnd = (n: number) => Number(roundToTick(n, tick).toFixed(dec));
 
-  const tf_summary = {
+  const last = C(m15).at(-1) || 0;
+  const A15 = atr(H(m15), L(m15), C(m15), 14);
+  const slBuf = Math.max(3*tick, 0.2*A15);
+  const minTPFromRisk = (risk: number) => Math.max(1.0*risk, 0.3*A15);
+
+  const tview = {
     h4: labelTrend(h4, 2),
     h1: labelTrend(h1, 2),
     m15: labelTrend(m15, 2),
   };
 
-  const sentiment = summarizeHeadlines(headlines);
+  const { lastHigh, lastLow } = lastSupportResistance(m15);
+
+  const sent = summarizeHeadlines(headlines);
+  const calWatch: string[] = [];
   const now = Date.now();
-  const blackoutWatch: string[] = [];
-  const calItems = Array.isArray(calendar?.items) ? calendar.items.slice(0, 30) : [];
+  const calItems = Array.isArray(calendar?.items) ? calendar.items : [];
   for (const e of calItems) {
     const t = e?.time || e?.date;
     const imp = (e?.impact || e?.importance || "").toString().toLowerCase();
@@ -188,169 +164,197 @@ function buildLLMUserPayload(params: {
     if (!Number.isFinite(ts)) continue;
     const mins = Math.abs(ts - now) / 60000;
     if (mins <= 90 && (imp.includes("high") || imp.includes("red") || e?.isBlackout)) {
-      blackoutWatch.push(`${e?.title || "Event"} (${e?.currency || ""}) @ ${t}`);
+      calWatch.push(`${e?.title || "Event"} (${e?.currency || ""}) @ ${t}`);
     }
   }
 
+  // Choose direction
+  let dir: "Long"|"Short"|"Flat" = "Flat";
+  if (tview.h4 === "up" && (tview.h1 === "up" || tview.m15 === "up")) dir = "Long";
+  else if (tview.h4 === "down" && (tview.h1 === "down" || tview.m15 === "down")) dir = "Short";
+  else if (tview.m15 === "up" && sent.bias === "bullish") dir = "Long";
+  else if (tview.m15 === "down" && sent.bias === "bearish") dir = "Short";
+
+  // If range everywhere, play mean-reversion to structure
+  if (dir === "Flat") {
+    if (lastLow && last < (lastLow + ((lastHigh ?? lastLow) - lastLow) * 0.35)) dir = "Long";
+    else if (lastHigh && last > (lastHigh - ((lastHigh - (lastLow ?? lastHigh)) * 0.35))) dir = "Short";
+  }
+
+  // Compute entry/SL/TPs
+  let order: PlanCore["order_type"] = "Buy Limit";
+  let entry = last, stop = last, tp1 = last, tp2 = last;
+  const signals: string[] = [];
+  let setup = "", short_reason = "";
+
+  if (dir === "Long") {
+    order = "Buy Limit";
+    const support = lastLow ?? (last - A15*0.8);
+    const pullbackMid = support + (last - support) * 0.5;
+    entry = rnd(pullbackMid);
+    stop = rnd(entry - slBuf);
+    const risk = Math.abs(entry - stop);
+    tp1 = rnd(Math.max(entry + minTPFromRisk(risk), (lastHigh ?? entry + 1.5*risk)));
+    tp2 = rnd(Math.max(tp1 + 0.5*risk, tp1 + minTPFromRisk(risk)*0.6));
+    setup = "Pullback (OB/FVG + Fib 0.5) Long";
+    short_reason = "Buy the dip toward recent 15m support; SL beyond swing with ATR buffer.";
+    signals.push("OB", "FVG", "Fib0.5");
+  } else if (dir === "Short") {
+    order = "Sell Limit";
+    const resistance = lastHigh ?? (last + A15*0.8);
+    const pullbackMid = resistance - (resistance - (last)) * 0.5;
+    entry = rnd(pullbackMid);
+    stop = rnd(entry + slBuf);
+    const risk = Math.abs(entry - stop);
+    tp1 = rnd(Math.min(entry - minTPFromRisk(risk), (lastLow ?? entry - 1.5*risk)));
+    tp2 = rnd(Math.min(tp1 - 0.5*risk, tp1 - minTPFromRisk(risk)*0.6));
+    setup = "Pullback (OB/FVG + Fib 0.5) Short";
+    short_reason = "Sell the rally toward recent 15m resistance; SL beyond swing with ATR buffer.";
+    signals.push("OB", "FVG", "Fib0.5");
+  } else {
+    order = "Market";
+    entry = rnd(last);
+    stop = rnd(entry - slBuf); // placeholder, small risk plan
+    const risk = Math.abs(entry - stop);
+    tp1 = rnd(entry + minTPFromRisk(risk));
+    tp2 = rnd(tp1 + 0.5*risk);
+    setup = "No clear trend; conservative reference levels only.";
+    short_reason = "Structure unclear; use HTF levels and wait for confirmation.";
+  }
+
+  // Safety: ensure distances
+  const risk = Math.abs(entry - stop);
+  const needTP1 = Math.max(1.0*risk, 0.3*A15);
+  if (dir === "Long") {
+    if (tp1 <= entry + needTP1) tp1 = rnd(entry + needTP1);
+    if (tp2 <= tp1 + 0.5*risk) tp2 = rnd(tp1 + 0.5*risk);
+  } else if (dir === "Short") {
+    if (tp1 >= entry - needTP1) tp1 = rnd(entry - needTP1);
+    if (tp2 >= tp1 - 0.5*risk) tp2 = rnd(tp1 - 0.5*risk);
+  }
+
+  // Alignment score → conviction
+  let alignment: PlanCore["alignment"] = "Mixed";
+  const tfAgree = (tview.h4 === tview.h1) && (tview.h1 === tview.m15) && tview.h1 !== "range";
+  if (tfAgree) alignment = "Match";
+  else if (tview.h1 === tview.m15) alignment = "Mixed";
+  else alignment = "Conflict";
+
+  let conviction = 55;
+  if (alignment === "Match") conviction += 10;
+  if (alignment === "Conflict") conviction -= 15;
+  if (sent.bias === "bullish" && dir === "Long") conviction += 6;
+  if (sent.bias === "bearish" && dir === "Short") conviction += 6;
+  if (sent.bias === "bullish" && dir === "Short") conviction -= 6;
+  if (sent.bias === "bearish" && dir === "Long") conviction -= 6;
+
+  // Calendar watch dampener
+  if ((calendar?.blackoutWithin90m || []).length) conviction = Math.max(35, conviction - 10);
+
+  conviction = clamp(Math.round(conviction), 25, 92);
+
+  const fundamentals = {
+    bias: sent.bias,
+    headline_snapshot: sent.examples,
+    calendar_watch: (calendar?.blackoutWithin90m || []) as string[],
+  };
+
+  const scenarios = dir === "Long"
+    ? [
+        "If pullback holds at 15m support, continuation to TP1 then trail toward TP2.",
+        "Break of swing low (below SL) = invalidate; wait for new 15m BOS up."
+      ]
+    : dir === "Short"
+    ? [
+        "If rally rejects at 15m resistance, continuation to TP1 then trail toward TP2.",
+        "Break above swing high (above SL) = invalidate; wait for new 15m BOS down."
+      ]
+    : [
+        "Wait for 15m BOS + pullback into OB/FVG with HTF confluence.",
+        "Avoid entries ahead of high-impact releases."
+      ];
+
+  const invalidation = dir === "Long"
+    ? "Clean 15m close below protective swing/zone."
+    : dir === "Short"
+    ? "Clean 15m close above protective swing/zone."
+    : "No active setup – wait for BOS + pullback.";
+
   return {
-    instrument,
-    generated_at: nowIso(),
-    current_price: last,
-    atr15: A15,
-    tick_size: tickSizeFor(instrument),
-    tf_summary,
-    sentiment_summary: sentiment,
-    candles: {
-      m15: compressCandles(m15, 1, 240),
-      h1:  compressCandles(h1, 1, 240),
-      h4:  compressCandles(h4, 1, 240),
-    },
-    headlines: (Array.isArray(headlines) ? headlines : []).slice(0, 24).map((h: any) => ({
-      title: String(h?.title || "").slice(0, 220),
-      source: h?.source || h?.provider || "",
-      published_at: h?.published_at || h?.pubDate || h?.date || null,
-      url: h?.url || h?.link || "",
-      sentiment: typeof h?.sentiment?.score === "number" ? h.sentiment.score : null,
-    })),
-    calendar: {
-      ok: !!calendar?.ok,
-      bias: calendar?.bias || null,
-      blackoutWithin90m: blackoutWatch,
-      items: calItems.map((e: any) => ({
-        time: e?.time || e?.date || null,
-        impact: e?.impact || e?.importance || null,
-        title: e?.title || e?.event || "",
-        currency: e?.currency || e?.country || "",
-        isBlackout: !!e?.isBlackout,
-      })),
-    },
+    direction: dir, order_type: order,
+    entry, stop, tp1, tp2,
+    setup, short_reason, signals,
+    tview, alignment, fundamentals, scenarios, invalidation,
+    conviction
   };
 }
 
-/* ------------------------------- OpenAI call ------------------------------- */
-async function callOpenAI(system: string, user: any) {
-  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+/* --------------------------- LLM reasoning (optional) ---------------------- */
+async function llmReasoning(instrument: string, userPayload: any) {
+  if (!OPENAI_API_KEY) return null;
+  const system =
+    "You are a trading assistant. ONLY provide short reasoning text and bullet points. Do NOT output numbers or levels. Do NOT change direction or plan. Keep it concise (6–10 lines).";
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "authorization": `Bearer ${OPENAI_API_KEY}`,
-    },
+    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
     body: JSON.stringify({
       model: OPENAI_MODEL,
-      temperature: 0.15,
+      temperature: 0.2,
       messages: [
         { role: "system", content: system },
-        { role: "user", content: "Here is the real market context (JSON):" },
-        { role: "user", content: "```json\n" + toJSON(user) + "\n```" },
-        { role: "user", content: "Generate the plan now. Obey all hard rules. Return a single ```json block as specified." },
-      ],
-    }),
+        { role: "user", content: `Instrument: ${instrument}. Here are the inputs (candles compressed, TF labels, sentiment, calendar):\n\`\`\`json\n${toJSON(userPayload)}\n\`\`\`\nWrite a short rationale that explains the setup, HTF context, and how headlines/calendar affect conviction. No numbers, just reasoning.` }
+      ]
+    })
   });
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    throw new Error(`OpenAI error ${resp.status}: ${text}`);
-  }
+  if (!resp.ok) return null;
   const data = await resp.json();
   const content: string = data?.choices?.[0]?.message?.content || "";
-  return content;
-}
-function extractJSONFromFenced(text: string): any | null {
-  const re = /```json\s*([\s\S]*?)```/gi;
-  let m: RegExpExecArray | null = null;
-  let last: string | null = null;
-  while ((m = re.exec(text)) !== null) last = m[1];
-  if (!last) return null;
-  return parseMaybeJSON(last.trim());
+  return content.trim();
 }
 
-/* ----------------------------- card constructors -------------------------- */
-function isPlaceholderCard(s: string | undefined | null) {
-  if (!s) return true;
-  const t = s.toLowerCase();
-  return t.includes("full multiline card in sections");
-}
-
-function buildServerCard(parsed: any, instrument: string, extras: {
-  calendar?: any, tf_summary?: any, currentPrice: number
-}) {
-  const {
-    direction = "Flat",
-    order_type = "—",
-    entry,
-    stop_loss,
-    take_profit_1,
-    take_profit_2,
-    conviction,
-    setup,
-    short_reason,
-    signals,
-    tview,
-    fundamentals,
-    alignment,
-    scenarios,
-    invalidation,
-  } = parsed || {};
-
-  const calLines: string[] =
-    Array.isArray(extras.calendar?.items) && extras.calendar.items.length
-      ? extras.calendar.items.slice(0, 6).map((e: any) =>
-          `• ${e?.impact || ""} ${e?.title || ""} (${e?.currency || ""}) @ ${e?.time || ""}`)
-      : ["• No calendar connected or no events in window."];
-
-  const tf = tview || {
-    h4: (extras.tf_summary?.h4 || "").toUpperCase(),
-    h1: (extras.tf_summary?.h1 || "").toUpperCase(),
-    m15: (extras.tf_summary?.m15 || "").toUpperCase(),
-  };
-
-  const sigs = Array.isArray(signals) && signals.length ? `• Signals Triggered: ${signals.join(" • ")}` : "• Signals Triggered: —";
-
-  const headlineSnap: string[] = Array.isArray(fundamentals?.headline_snapshot)
-    ? fundamentals.headline_snapshot.slice(0, 6)
-    : [];
-
-  const fundBlock = [
-    `• Fundamental View (Calendar + Sentiment): ${fundamentals?.bias || "neutral"} bias.`,
-    headlineSnap.length ? `• Headline Snapshot:\n${headlineSnap.map((x) => `  - ${x}`).join("\n")}` : undefined
-  ].filter(Boolean).join("\n");
-
-  const scenBlock = Array.isArray(scenarios) && scenarios.length
-    ? scenarios.map((s: string) => `  - ${s}`).join("\n")
-    : "  - —";
-
-  const parts = [
-    "Quick Plan (Actionable)",
-    "",
-    `• Direction: ${direction}`,
-    `• Order Type: ${order_type}`,
-    `• Trigger: ${order_type === "Market" ? "—" : "As specified by setup"}`,
-    `• Entry: ${entry ?? extras.currentPrice}`,
-    `• Stop Loss: ${stop_loss ?? "—"}`,
-    `• Take Profit(s): TP1 ${take_profit_1 ?? "—"} / TP2 ${take_profit_2 ?? "—"}`,
-    `• Conviction: ${typeof conviction === "number" ? `${conviction}%` : "—"}`,
-    `• Setup: ${setup || "—"}`,
-    `• Short Reasoning: ${short_reason || "—"}`,
-    "",
-    "Full Breakdown",
-    "",
-    `• Technical View (HTF + Intraday): 4H=${tf.h4 || "—"} / 1H=${tf.h1 || "—"} / 15m=${tf.m15 || "—"}`,
-    sigs,
-    fundBlock,
-    `• Tech vs Fundy Alignment: ${alignment || "Mixed"}`,
-    "• Conditional Scenarios:",
-    scenBlock,
-    `• Invalidation: ${invalidation || "—"}`,
-    "",
-    "News / Event Watch",
-    ...calLines,
-    "",
-    "Notes",
-    "",
-    `• Symbol: ${instrument}`,
-  ].join("\n");
-
-  return parts;
+/* ------------------------------ card formatter ----------------------------- */
+function buildCard(instrument: string, core: PlanCore, reasoning?: string) {
+  const lines: string[] = [];
+  lines.push("Quick Plan (Actionable)", "");
+  lines.push(`• Direction: ${core.direction}`);
+  lines.push(`• Order Type: ${core.order_type}`);
+  lines.push(`• Trigger: ${core.order_type === "Market" ? "—" : "Limit pullback / zone touch"}`);
+  lines.push(`• Entry: ${core.entry}`);
+  lines.push(`• Stop Loss: ${core.stop}`);
+  lines.push(`• Take Profit(s): TP1 ${core.tp1} / TP2 ${core.tp2}`);
+  lines.push(`• Conviction: ${core.conviction}%`);
+  lines.push(`• Setup: ${core.setup}`);
+  lines.push(`• Short Reasoning: ${core.short_reason}`);
+  lines.push("");
+  lines.push("Full Breakdown", "");
+  lines.push(`• Technical View (HTF + Intraday): 4H=${core.tview.h4} / 1H=${core.tview.h1} / 15m=${core.tview.m15}`);
+  lines.push(core.signals.length ? `• Signals Triggered: ${core.signals.join(" • ")}` : "• Signals Triggered: —");
+  lines.push(`• Fundamental View (Calendar + Sentiment): ${core.fundamentals.bias} bias.`);
+  if (core.fundamentals.headline_snapshot.length) {
+    lines.push("• Headline Snapshot:");
+    for (const h of core.fundamentals.headline_snapshot) lines.push(`  - ${h}`);
+  }
+  lines.push(`• Tech vs Fundy Alignment: ${core.alignment}`);
+  lines.push("• Conditional Scenarios:");
+  for (const s of core.scenarios) lines.push(`  - ${s}`);
+  lines.push(`• Invalidation: ${core.invalidation}`);
+  if (reasoning) {
+    lines.push("");
+    lines.push("Advanced Reasoning (Pro-Level Context)");
+    lines.push("");
+    lines.push(reasoning);
+  }
+  lines.push("");
+  lines.push("News / Event Watch");
+  if (core.fundamentals.calendar_watch.length) {
+    for (const w of core.fundamentals.calendar_watch) lines.push(`• ${w}`);
+  } else {
+    lines.push("• No high-impact events in the ±90m window or calendar unavailable.");
+  }
+  lines.push("");
+  lines.push("Notes", "");
+  lines.push(`• Symbol: ${instrument}`);
+  return lines.join("\n");
 }
 
 /* --------------------------------- handler -------------------------------- */
@@ -359,159 +363,62 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const body = typeof req.body === "string" ? parseMaybeJSON(req.body) || {} : (req.body || {});
     const instrument = String(body.instrument || body.code || req.query.instrument || req.query.code || "EURUSD")
       .toUpperCase().replace(/\s+/g, "");
-    const passHeadlines = Array.isArray(body.headlines) ? body.headlines : null;
-    const passCalendar = body.calendar ?? null;
 
+    // Candles
     const [m15, h1, h4] = await Promise.all([
       getCandles(instrument, "15m", 360),
       getCandles(instrument, "1h",  360),
       getCandles(instrument, "4h",  360),
     ]);
-    if (!Array.isArray(m15) || m15.length < 60) {
-      return res.status(200).json({ ok: false, reason: "Missing 15m candles" });
+    if (!m15?.length || !h1?.length || !h4?.length) {
+      return res.status(200).json({ ok: false, reason: "Missing candles for one or more timeframes" });
     }
 
-    let headlines = passHeadlines;
-    let calendar = passCalendar;
+    // Headlines + Calendar
     const base = originFromReq(req);
-    if (!headlines) {
-      const u1 = `${base}/api/news?instrument=${encodeURIComponent(instrument)}&hours=48`;
-      const u2 = `${base}/api/news?symbol=${encodeURIComponent(instrument)}&hours=48`;
-      headlines = (await safeGET<any>(u1)) || (await safeGET<any>(u2)) || [];
-      if (headlines && headlines.ok && Array.isArray(headlines.items)) headlines = headlines.items;
-    }
-    if (!calendar) {
-      const u1 = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&hours=48`;
-      const u2 = `${base}/api/calendar?symbol=${encodeURIComponent(instrument)}&windowHours=48`;
-      calendar = (await safeGET<any>(u1)) || (await safeGET<any>(u2)) || { ok: false, items: [] };
-    }
+    let headlines: any[] = [];
+    let calendar: any = { ok: false, items: [], blackoutWithin90m: [] };
 
-    const tick = tickSizeFor(instrument);
-    const system = buildLLMSystem(instrument, tick);
-    const userPayload = buildLLMUserPayload({ instrument, m15, h1, h4, headlines: headlines || [], calendar: calendar || {} });
+    const n1 = await safeGET<any>(`${base}/api/news?instrument=${encodeURIComponent(instrument)}&hours=48`);
+    if (n1?.ok && Array.isArray(n1.items)) headlines = n1.items;
+    else if (Array.isArray(n1)) headlines = n1;
 
-    let content = "";
-    try { content = await callOpenAI(system, userPayload); }
-    catch (e: any) { console.error("OpenAI error:", e?.message || e); }
+    const c1 = await safeGET<any>(`${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&hours=48`);
+    if (c1?.ok) calendar = c1;
+    else if (c1) calendar = c1;
 
-    const parsed = content ? extractJSONFromFenced(content) : null;
+    // Deterministic plan (levels from real data only)
+    const core = buildDeterministicPlan({ instrument, m15, h1, h4, headlines, calendar });
 
-    const last = C(m15).at(-1) || 0;
-    const A15 = atr(H(m15), L(m15), C(m15), 14);
-    const tickDec = (tick.toString().split(".")[1]?.length || 0);
-    const round = (n: any) => Number.isFinite(Number(n)) ? Number(roundToTick(Number(n), tick).toFixed(tickDec)) : n;
-    const slBuf = Math.max(3 * tick, 0.2 * A15);
-    const minTPDist = (risk: number) => Math.max(1.0 * risk, 0.3 * A15);
+    // Optional: short reasoning from LLM (no numbers)
+    const userPayload = {
+      instrument,
+      generated_at: nowIso(),
+      current_price: C(m15).at(-1) || 0,
+      tf_summary: core.tview,
+      sentiment_summary: summarizeHeadlines(headlines),
+      candles: {
+        m15: m15.slice(-120).map(c => ({ t: c.t, o: c.o, h: c.h, l: c.l, c: c.c })),
+        h1:  h1.slice(-120).map(c => ({ t: c.t, o: c.o, h: c.h, l: c.l, c: c.c })),
+        h4:  h4.slice(-120).map(c => ({ t: c.t, o: c.o, h: c.h, l: c.l, c: c.c })),
+      },
+      calendar: calendar,
+      headlines: headlines.slice(0, 12).map((h: any) => ({ title: h?.title, source: h?.source, sentiment: h?.sentiment?.score ?? null })),
+    };
 
-    let cardText = "";
-    let conviction: number | undefined;
-    let meta: any;
+    let reasoning: string | undefined;
+    try { reasoning = await llmReasoning(instrument, userPayload) || undefined; } catch {}
 
-    if (parsed && typeof parsed === "object") {
-      let { direction, order_type, entry, stop_loss, take_profit_1, take_profit_2 } = parsed;
+    const card = buildCard(instrument, core, reasoning);
 
-      entry = round(entry);
-      stop_loss = round(stop_loss);
-      take_profit_1 = round(take_profit_1);
-      take_profit_2 = round(take_profit_2);
-
-      // Entry consistency with current price & order type
-      if (order_type === "Market") entry = round(last);
-      else if (order_type === "Buy Limit" && entry > last) entry = round(last);
-      else if (order_type === "Sell Limit" && entry < last) entry = round(last);
-      else if (order_type === "Buy Stop" && entry < last) entry = round(last);
-      else if (order_type === "Sell Stop" && entry > last) entry = round(last);
-
-      // SL safety buffer beyond invalidation
-      if (typeof stop_loss === "number" && typeof entry === "number") {
-        const dist = Math.abs(entry - stop_loss);
-        if (dist < slBuf) {
-          const isLong = (direction || "").toLowerCase() === "long" || (order_type||"").startsWith("Buy");
-          stop_loss = isLong ? round(entry - slBuf) : round(entry + slBuf);
-        }
-      }
-
-      // TP1 minimum distance
-      const risk = (typeof entry === "number" && typeof stop_loss === "number") ? Math.abs(entry - stop_loss) : 0;
-      const needTP1 = minTPDist(risk);
-      if (typeof take_profit_1 === "number" && typeof entry === "number" && needTP1 > 0) {
-        const d = Math.abs(take_profit_1 - entry);
-        if (d < needTP1) {
-          const isLong = (direction || "").toLowerCase() === "long";
-          take_profit_1 = isLong ? round(entry + needTP1) : round(entry - needTP1);
-        }
-      }
-
-      parsed.entry = entry;
-      parsed.stop_loss = stop_loss;
-      parsed.take_profit_1 = take_profit_1;
-      parsed.take_profit_2 = take_profit_2;
-
-      // Conviction penalty if TFs misaligned
-      const tf = userPayload.tf_summary;
-      let misalignPenalty = 0;
-      if (tf.h4 === "up" && (tf.h1 !== "up" || tf.m15 !== "up")) misalignPenalty += 12;
-      if (tf.h4 === "down" && (tf.h1 !== "down" || tf.m15 !== "down")) misalignPenalty += 12;
-      if (tf.h1 !== tf.m15) misalignPenalty += 6;
-
-      const rawConv = typeof parsed.conviction === "number" ? parsed.conviction : 55;
-      conviction = clamp(Math.round(rawConv - misalignPenalty), 25, 95);
-
-      // prefer model card if real; otherwise server-build
-      const maybeCard: string = String(parsed.card_text || "").trim();
-      if (!isPlaceholderCard(maybeCard) && maybeCard.length > 120) {
-        cardText = maybeCard;
-      } else {
-        cardText = buildServerCard(parsed, instrument, {
-          calendar,
-          tf_summary: tf,
-          currentPrice: round(last),
-        });
-      }
-
-      meta = { ...parsed, enforced: { sl_buffer: slBuf, tf_summary: tf, current_price: round(last) } };
-    }
-
-    if (!cardText) {
-      const fallback = [
-        "Quick Plan (Actionable)",
-        "",
-        `• Direction: Flat (LLM unavailable)`,
-        `• Order Type: —`,
-        `• Trigger: —`,
-        `• Entry: ${round(last)}`,
-        `• Stop Loss: —`,
-        `• Take Profit(s): TP1 — / TP2 —`,
-        `• Conviction: 30%`,
-        `• Setup: Conservative Hold`,
-        `• Short Reasoning: LLM reasoning temporarily unavailable. Using latest price as reference only.`,
-        "",
-        "Full Breakdown",
-        "",
-        "• Technical View (HTF + Intraday): Using raw candles; no AI narrative.",
-        "• Signals Triggered: —",
-        "• Fundamental View (Calendar + Sentiment): Headlines/Calendar loaded; no AI synthesis.",
-        "• Tech vs Fundy Alignment: Mixed",
-        "• Conditional Scenarios:",
-        "  - Wait for clear 15m structure (BOS + pullback into OB/FVG) before considering entry.",
-        "• Surprise Risk: Unscheduled headlines.",
-        "• Invalidation: —",
-        "",
-        "News / Event Watch",
-        ...(Array.isArray(calendar?.items) && calendar.items.length
-          ? calendar.items.slice(0, 6).map((e: any) => `• ${e?.impact || ""} ${e?.title || ""} (${e?.currency || ""}) @ ${e?.time || ""}`)
-          : ["• No calendar connected or no events in window."]),
-        "",
-        "Notes",
-        "",
-        `• Symbol: ${instrument}`,
-      ].join("\n");
-      return res.status(200).json({ ok: true, text: fallback, conviction: 30, meta: { fallback: true } });
-    }
-
-    return res.status(200).json({ ok: true, text: cardText, conviction, meta });
+    return res.status(200).json({
+      ok: true,
+      text: card,
+      conviction: core.conviction,
+      meta: { core, usedLLM: !!reasoning }
+    });
   } catch (err: any) {
-    console.error("Plan generation error", err);
+    console.error("plan.ts error:", err?.message || err);
     return res.status(200).json({ ok: false, reason: err?.message || "Plan generation failed" });
   }
 }
