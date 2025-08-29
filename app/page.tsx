@@ -1,138 +1,271 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import dynamic from "next/dynamic";
 
-// ✅ Fixed imports: now relative paths instead of "@/..."
-import TradingViewTriple from "../components/TradingViewTriple";
-import HeadlinesPanel from "../components/HeadlinesPanel";
+// ✅ relative paths; do not import CalendarPaste at all
 import CalendarPanel from "../components/CalendarPanel";
-import { INSTRUMENTS, findInstrument, type Instrument } from "../lib/symbols";
+import HeadlinesPanel from "../components/HeadlinesPanel";
 
+// ✅ TradingView client-only to avoid hydration crash
+const TradingViewTriple = dynamic(
+  () => import("../components/TradingViewTriple"),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="rounded-lg border border-neutral-800 p-4">
+        <div className="text-sm opacity-75">Loading charts…</div>
+      </div>
+    ),
+  }
+);
+
+// ----------------- types / helpers -----------------
+type CalendarBias = {
+  perCurrency: Record<
+    string,
+    { score: number; label: string; count: number; evidence: any[] }
+  >;
+  instrument?: { pair: string; score: number; label: string };
+};
+
+type CalendarResp =
+  | { ok: true; provider?: string; date?: string; count: number; items: any[]; bias: CalendarBias }
+  | { ok: false; reason: string };
+
+type NewsResp =
+  | { ok: true; items: any[]; count?: number; provider?: string }
+  | { ok: false; reason: string };
+
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const currenciesFromBias = (bias?: CalendarBias) =>
+  bias ? Object.keys(bias.perCurrency || {}) : [];
+
+// ----------------- page -----------------
 export default function Page() {
-  const [instrument, setInstrument] = useState<Instrument>(INSTRUMENTS[0]);
-  const [date, setDate] = useState<string>(new Date().toISOString().slice(0, 10));
+  // controls
+  const [instrument, setInstrument] = useState<string>("EURUSD");
+  const [dateStr, setDateStr] = useState<string>(todayISO());
+
+  // calendar + headlines
+  const [calendar, setCalendar] = useState<CalendarResp | null>(null);
+  const [loadingCal, setLoadingCal] = useState<boolean>(false);
+
   const [headlines, setHeadlines] = useState<any[]>([]);
-  const [calendar, setCalendar] = useState<any[]>([]);
-  const [plan, setPlan] = useState<any>(null);
+  const [loadingNews, setLoadingNews] = useState<boolean>(false);
 
-  // ✅ Reset when instrument changes
+  // plan
+  const [planText, setPlanText] = useState<string>("");
+  const [generating, setGenerating] = useState<boolean>(false);
+  const [monitoring, setMonitoring] = useState<boolean>(false);
+
+  // ------- load calendar from provider only -------
+  const loadCalendar = useCallback(async () => {
+    setLoadingCal(true);
+    try {
+      const u = `/api/calendar?date=${dateStr}&instrument=${instrument}&windowHours=48`;
+      const r = await fetch(u, { cache: "no-store" });
+      const j: CalendarResp = await r.json();
+      setCalendar(j);
+
+      // headlines if we have currencies
+      if (j?.ok) {
+        const ccy = currenciesFromBias(j.bias);
+        if (ccy.length) {
+          setLoadingNews(true);
+          try {
+            const nr = await fetch(`/api/news?symbols=${ccy.join(",")}`, {
+              cache: "no-store",
+            });
+            const nj: NewsResp = await nr.json();
+            if (nj?.ok) setHeadlines(nj.items || []);
+            else setHeadlines([]);
+          } catch {
+            setHeadlines([]);
+          } finally {
+            setLoadingNews(false);
+          }
+        } else {
+          setHeadlines([]);
+        }
+      } else {
+        // provider returned nothing
+        setHeadlines([]);
+      }
+    } catch {
+      setCalendar({ ok: false, reason: "Calendar request failed" });
+      setHeadlines([]);
+    } finally {
+      setLoadingCal(false);
+    }
+  }, [dateStr, instrument]);
+
   useEffect(() => {
-    setHeadlines([]);
-    setCalendar([]);
-    setPlan(null);
-  }, [instrument]);
+    loadCalendar();
+  }, [loadCalendar]);
 
-  const refreshHeadlines = async () => {
+  // ------- generate plan -------
+  const generatePlan = useCallback(async () => {
+    setGenerating(true);
+    setPlanText("");
     try {
-      const res = await fetch(`/api/news?symbols=${instrument.currencies.join(",")}`);
-      const data = await res.json();
-      if (data.ok) setHeadlines(data.items || []);
-    } catch (err) {
-      console.error("Error fetching headlines", err);
-    }
-  };
-
-  const refreshCalendar = async () => {
-    try {
-      const res = await fetch(
-        `/api/calendar?date=${date}&currencies=${instrument.currencies.join(",")}&windowHours=48`
-      );
-      const data = await res.json();
-      if (data.ok) setCalendar(data.items || []);
-    } catch (err) {
-      console.error("Error fetching calendar", err);
-    }
-  };
-
-  const generatePlan = async () => {
-    try {
-      const res = await fetch("/api/plan", {
+      const r = await fetch("/api/plan", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({
           instrument,
-          headlines,
+          date: dateStr,
           calendar,
+          headlines,
         }),
       });
-      const data = await res.json();
-      setPlan(data);
-    } catch (err) {
-      console.error("Error generating plan", err);
+      const j = await r.json();
+      if (j?.ok) setPlanText(j?.plan || j?.card || JSON.stringify(j, null, 2));
+      else setPlanText(j?.reason || "Server error while generating plan.");
+    } catch (e: any) {
+      setPlanText(e?.message || "Error generating plan.");
+    } finally {
+      setGenerating(false);
     }
-  };
+  }, [instrument, dateStr, calendar, headlines]);
 
+  const calendarCurrencies = useMemo(
+    () => currenciesFromBias((calendar as any)?.bias),
+    [calendar]
+  );
+
+  // ----------------- UI -----------------
   return (
-    <div className="p-4 space-y-4">
-      {/* Top controls */}
-      <div className="flex space-x-2">
-        <select
-          value={instrument.code}
-          onChange={(e) => {
-            const inst = findInstrument(e.target.value);
-            if (inst) setInstrument(inst);
-          }}
-          className="bg-gray-900 text-white p-2 rounded"
-        >
-          {INSTRUMENTS.map((inst) => (
-            <option key={inst.code} value={inst.code}>
-              {inst.label}
-            </option>
-          ))}
-        </select>
+    <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 space-y-4">
+      {/* Controls */}
+      <div className="flex flex-wrap gap-3 items-center">
+        <div className="flex items-center gap-2">
+          <span className="text-sm opacity-80">Instrument</span>
+          <select
+            value={instrument}
+            onChange={(e) => setInstrument(e.target.value.toUpperCase())}
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
+          >
+            {/* Forex */}
+            <option>AUDUSD</option>
+            <option>EURUSD</option>
+            <option>GBPUSD</option>
+            <option>USDJPY</option>
+            <option>USDCAD</option>
+            <option>EURGBP</option>
+            <option>EURJPY</option>
+            <option>GBPJPY</option>
+            <option>EURAUD</option>
+            <option>NZDUSD</option>
+            {/* Indices */}
+            <option>SPX500</option>
+            <option>NAS100</option>
+            <option>US30</option>
+            <option>GER40</option>
+            {/* Metals/Crypto */}
+            <option>XAUUSD</option>
+            <option>BTCUSD</option>
+            <option>ETHUSD</option>
+          </select>
+        </div>
 
-        <input
-          type="date"
-          value={date}
-          onChange={(e) => setDate(e.target.value)}
-          className="bg-gray-900 text-white p-2 rounded"
-        />
+        <div className="flex items-center gap-2">
+          <span className="text-sm opacity-80">Date</span>
+          <input
+            type="date"
+            value={dateStr}
+            onChange={(e) => setDateStr(e.target.value)}
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
+          />
+        </div>
 
         <button
-          onClick={refreshCalendar}
-          className="bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded"
+          onClick={loadCalendar}
+          className="px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
+          disabled={loadingCal}
         >
           Refresh Calendar
         </button>
 
         <button
-          onClick={refreshHeadlines}
-          className="bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded"
+          onClick={generatePlan}
+          className="px-3 py-1 text-sm rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
+          disabled={generating}
         >
-          Refresh Headlines
+          {generating ? "Generating…" : "Generate Plan"}
         </button>
 
         <button
-          onClick={generatePlan}
-          className="bg-green-600 hover:bg-green-700 px-3 py-1 rounded"
+          onClick={() => setMonitoring(true)}
+          className="px-3 py-1 text-sm rounded bg-sky-700 hover:bg-sky-600"
         >
-          Generate Plan
+          Start monitoring
+        </button>
+        <button
+          onClick={() => setMonitoring(false)}
+          className="px-3 py-1 text-sm rounded bg-rose-700 hover:bg-rose-600"
+        >
+          Stop monitoring
         </button>
       </div>
 
-      {/* TradingView triple charts */}
-      <TradingViewTriple symbol={instrument.code} />
+      {/* Charts */}
+      <TradingViewTriple symbol={instrument} />
 
-      {/* Layout for headlines + trade card side by side */}
-      <div className="grid grid-cols-2 gap-4">
-        <div>
-          <h2 className="text-xl font-semibold mb-2">Calendar Snapshot</h2>
-          <CalendarPanel items={calendar} />
+      {/* Calendar + Headlines */}
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+        {/* Calendar panel */}
+        <div className="rounded-lg border border-neutral-800 p-4">
+          <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
 
-          <h2 className="text-xl font-semibold mb-2 mt-4">Macro Headlines (24–48h)</h2>
-          <HeadlinesPanel items={headlines} />
-        </div>
+          {loadingCal && (
+            <div className="text-sm opacity-75">Loading calendar…</div>
+          )}
 
-        <div>
-          <h2 className="text-xl font-semibold mb-2">Generated Trade Card</h2>
-          {plan ? (
-            <pre className="bg-gray-800 p-2 rounded whitespace-pre-wrap text-sm">
-              {plan.text || JSON.stringify(plan, null, 2)}
-            </pre>
-          ) : (
-            <div className="text-sm opacity-70">Click Generate Plan to build a trade idea.</div>
+          {!loadingCal && calendar?.ok && Array.isArray(calendar.items) && (
+            <CalendarPanel items={calendar.items} />
+          )}
+
+          {!loadingCal && (!calendar || !calendar.ok) && (
+            <div className="text-sm opacity-75">
+              No calendar items found from providers. (Once your TradingEconomics
+              key is active, this will populate automatically.)
+            </div>
           )}
         </div>
+
+        {/* Headlines */}
+        <div className="rounded-lg border border-neutral-800 p-4">
+          <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
+          <HeadlinesPanel items={Array.isArray(headlines) ? headlines : []} />
+          <div className="text-xs mt-2 opacity-60">
+            {loadingNews
+              ? "Loading headlines…"
+              : headlines.length
+              ? `${headlines.length} headlines found`
+              : calendarCurrencies.length
+              ? "No notable headlines."
+              : "Select an instrument or load calendar to fetch related headlines."}
+          </div>
+        </div>
+      </div>
+
+      {/* Generated Trade Card */}
+      <div className="rounded-lg border border-neutral-800 p-4">
+        <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
+        {planText ? (
+          <pre className="whitespace-pre-wrap text-sm leading-5 opacity-95">
+            {planText}
+          </pre>
+        ) : generating ? (
+          <div className="text-sm opacity-80">Generating…</div>
+        ) : (
+          <div className="text-sm opacity-70">
+            Click <b>Generate Plan</b> to build a setup using 15m execution,
+            1h+4h context, fundamentals (calendar bias + headlines), and our
+            strategy logic.
+          </div>
+        )}
       </div>
     </div>
   );
