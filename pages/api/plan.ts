@@ -7,12 +7,12 @@ type PlanOk = { ok: true; text: string; conviction: number; setup: string; signa
 type PlanFail = { ok: false; reason: string };
 type PlanResp = PlanOk | PlanFail;
 
-/** ===== Utility ===== */
+/** ===== Helpers ===== */
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
-const getOpens  = (a: Candle[]) => a.map(c => c.o);
-const getHighs  = (a: Candle[]) => a.map(c => c.h);
-const getLows   = (a: Candle[]) => a.map(c => c.l);
-const getCloses = (a: Candle[]) => a.map(c => c.c);
+const getO = (a: Candle[]) => a.map(c => c.o);
+const getH = (a: Candle[]) => a.map(c => c.h);
+const getL = (a: Candle[]) => a.map(c => c.l);
+const getC = (a: Candle[]) => a.map(c => c.c);
 
 function ema(vals: number[], p: number): number {
   if (!vals.length) return 0;
@@ -35,7 +35,7 @@ function atr(H: number[], L: number[], C: number[], period = 14): number {
   return last.reduce((s, x) => s + x, 0) / last.length;
 }
 
-/** ===== Ticks & rounding (no artificial minimums) ===== */
+/** ===== Ticks & rounding (no artificial stop min) ===== */
 function tickSizeFor(sym: string): number {
   const s = sym.toUpperCase();
   if (s.endsWith("JPY")) return 0.01;
@@ -66,60 +66,66 @@ function detectSwings(H: number[], L: number[], lb = 2): Swing[] {
   }
   return s.sort((a, b) => a.idx - b.idx);
 }
-
 function lastSwing(type: "H" | "L", swings: Swing[]): Swing | null {
   for (let i = swings.length - 1; i >= 0; i--) if (swings[i].type === type) return swings[i];
   return null;
 }
 
-type Struct = "UP" | "DOWN" | "TRANSITION" | "RANGE";
-function structureFromSwings(sw: Swing[]): Struct {
-  const s = sw.slice(-8);
+type Struct = "UP" | "DOWN" | "RANGE" | "TRANSITION";
+/** Price-action trend classifier (no EMAs in decision):
+ *  - Requires TWO consecutive HHs and HLs (or LHs/LLs) in last legs to call UP/DOWN.
+ *  - Calls RANGE only if band is tight vs ATR. Otherwise TRANSITION.
+ */
+function structureFromSwings(sw: Swing[], H: number[], L: number[], C: number[], atrVal: number): Struct {
+  const s = sw.slice(-10);
   if (s.length < 4) return "TRANSITION";
-  // require two legs confirming
   const highs = s.filter(x => x.type === "H");
   const lows  = s.filter(x => x.type === "L");
-  let HH = 0, LH = 0, HL = 0, LL = 0;
-  for (let i = 1; i < highs.length; i++) (highs[i].price > highs[i - 1].price) ? HH++ : LH++;
-  for (let i = 1; i < lows.length;  i++) (lows[i].price  > lows[i - 1].price)  ? HL++ : LL++;
-  if (HH >= 2 && HL >= 2) return "UP";
-  if (LH >= 2 && LL >= 2) return "DOWN";
-  // flat band?
-  const hi = Math.max(...s.map(x => x.price));
-  const lo = Math.min(...s.map(x => x.price));
-  const midBand = (hi - lo) / (s[s.length - 1].idx - s[0].idx + 1);
-  if (midBand < (hi - lo) * 0.002) return "RANGE";
-  return "TRANSITION";
+  const HH = highs.length >= 3 && highs[highs.length - 1].price > highs[highs.length - 2].price
+                           && highs[highs.length - 2].price > highs[highs.length - 3].price;
+  const HL = lows.length  >= 3 &&  lows[lows.length - 1].price   >  lows[lows.length - 2].price
+                           &&  lows[lows.length - 2].price   >  lows[lows.length - 3].price;
+  const LH = highs.length >= 3 && highs[highs.length - 1].price < highs[highs.length - 2].price
+                           && highs[highs.length - 2].price < highs[highs.length - 3].price;
+  const LL = lows.length  >= 3 &&  lows[lows.length - 1].price   <  lows[lows.length - 2].price
+                           &&  lows[lows.length - 2].price   <  lows[lows.length - 3].price;
+
+  if (HH && HL) return "UP";
+  if (LH && LL) return "DOWN";
+
+  const bandHi = Math.max(...s.map(x => x.price));
+  const bandLo = Math.min(...s.map(x => x.price));
+  const bandW  = bandHi - bandLo;
+  const rangeish = bandW <= atrVal * 1.1; // tight vs recent volatility
+  return rangeish ? "RANGE" : "TRANSITION";
 }
 
-/** ===== BOS / SR-flip / Liquidity Sweep / FVG / OB / Fib ===== */
+/** ===== BOS / SR-flip / Sweep / FVG / OB / Fib / Trendline ===== */
 type BOS = { side: "up" | "down"; level: number; idx: number };
+/** BOS requires a CLOSE beyond prior swing (not just wick). */
 function detectBOS(C: number[], H: number[], L: number[], sw: Swing[]): BOS | null {
   const i = C.length - 1;
   const lastH = lastSwing("H", sw);
   const lastL = lastSwing("L", sw);
-  if (lastH && C[i] > lastH.price) return { side: "up", level: lastH.price, idx: i };
-  if (lastL && C[i] < lastL.price) return { side: "down", level: lastL.price, idx: i };
+  if (lastH && C[i] > lastH.price && C[i - 1] <= lastH.price) return { side: "up", level: lastH.price, idx: i };
+  if (lastL && C[i] < lastL.price && C[i - 1] >= lastL.price) return { side: "down", level: lastL.price, idx: i };
   return null;
 }
-
 function detectSRFlip(C: number[], H: number[], L: number[], sw: Swing[]): { level: number; side: "bull" | "bear" } | null {
   const lastH = lastSwing("H", sw);
   const lastL = lastSwing("L", sw);
-  const n = C.length;
   if (lastH) {
-    const broke = C.slice(lastH.idx + 1).some(c => c > lastH.price);
-    const retest = L.slice(-30).some(x => x <= lastH.price);
+    const broke = C.some((c, i) => i > lastH.idx && c > lastH.price);
+    const retest = L.slice(-40).some(x => x <= lastH.price);
     if (broke && retest) return { level: lastH.price, side: "bull" };
   }
   if (lastL) {
-    const broke = C.slice(lastL.idx + 1).some(c => c < lastL.price);
-    const retest = H.slice(-30).some(x => x >= lastL.price);
+    const broke = C.some((c, i) => i > lastL.idx && c < lastL.price);
+    const retest = H.slice(-40).some(x => x >= lastL.price);
     if (broke && retest) return { level: lastL.price, side: "bear" };
   }
   return null;
 }
-
 function detectLiquiditySweep(O: number[], C: number[], H: number[], L: number[], sw: Swing[]): { side: "bull" | "bear"; wickLevel: number } | null {
   const lastH = lastSwing("H", sw);
   const lastL = lastSwing("L", sw);
@@ -140,7 +146,6 @@ function detectFVG(H: number[], L: number[]): FVG[] {
   }
   return out.slice(-10);
 }
-
 type OB = { idx: number; hi: number; lo: number; side: "bull" | "bear" };
 function detectOB(O: number[], H: number[], L: number[], C: number[], sw: Swing[]): OB[] {
   const out: OB[] = [];
@@ -148,21 +153,12 @@ function detectOB(O: number[], H: number[], L: number[], C: number[], sw: Swing[
   const swingL = sw.filter(s => s.type === "L").slice(-5);
   for (let i = 2; i < C.length; i++) {
     const brokeH = swingH.some(sh => C[i] > sh.price && i > sh.idx);
-    if (brokeH) {
-      for (let j = i - 1; j >= Math.max(0, i - 8); j--) {
-        if (C[j] < O[j]) { out.push({ idx: j, hi: H[j], lo: L[j], side: "bull" }); break; }
-      }
-    }
+    if (brokeH) for (let j = i - 1; j >= Math.max(0, i - 8); j--) if (C[j] < O[j]) { out.push({ idx: j, hi: H[j], lo: L[j], side: "bull" }); break; }
     const brokeL = swingL.some(sl => C[i] < sl.price && i > sl.idx);
-    if (brokeL) {
-      for (let j = i - 1; j >= Math.max(0, i - 8); j--) {
-        if (C[j] > O[j]) { out.push({ idx: j, hi: H[j], lo: L[j], side: "bear" }); break; }
-      }
-    }
+    if (brokeL) for (let j = i - 1; j >= Math.max(0, i - 8); j--) if (C[j] > O[j]) { out.push({ idx: j, hi: H[j], lo: L[j], side: "bear" }); break; }
   }
   return out.slice(-8);
 }
-
 type FibZone = { a: number; b: number; r382: number; r5: number; r618: number };
 function fibZones(lastLow: Swing | null, lastHigh: Swing | null) {
   const z: { bull?: FibZone; bear?: FibZone } = {};
@@ -175,27 +171,6 @@ function fibZones(lastLow: Swing | null, lastHigh: Swing | null) {
     z.bear = { a, b, r382: b + (a - b) * 0.618, r5: b + (a - b) * 0.5, r618: b + (a - b) * 0.382 };
   }
   return z;
-}
-
-/** ===== Trendline (simple) ===== */
-function simpleTrendlineBreak(sw: Swing[], C: number[]): { side: "up" | "down" } | null {
-  // take last two highs and two lows; if price closes through the opposite line, count it
-  const highs = sw.filter(s => s.type === "H");
-  const lows  = sw.filter(s => s.type === "L");
-  const n = C.length - 1;
-  if (highs.length >= 2) {
-    const h1 = highs[highs.length - 2], h2 = highs[highs.length - 1];
-    const slope = (h2.price - h1.price) / (h2.idx - h1.idx);
-    const expected = h2.price + slope * (n - h2.idx);
-    if (C[n] > expected) return { side: "up" };
-  }
-  if (lows.length >= 2) {
-    const l1 = lows[lows.length - 2], l2 = lows[lows.length - 1];
-    const slope = (l2.price - l1.price) / (l2.idx - l1.idx);
-    const expected = l2.price + slope * (n - l2.idx);
-    if (C[n] < expected) return { side: "down" };
-  }
-  return null;
 }
 
 /** ===== Headlines (calendar optional) ===== */
@@ -247,7 +222,7 @@ function card({
 
 /** ===== API ===== */
 export default async function handler(req: NextApiRequest, res: NextApiResponse<PlanResp>) {
-  // ---- Input ----
+  // Inputs
   let instrument = "EURUSD";
   let headlines: any[] = [];
   let calendar: any = null;
@@ -261,59 +236,57 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     instrument = String(req.query.instrument || "EURUSD").toUpperCase();
   }
 
-  // ---- Candles (real) ----
+  // Real candles
   const [m15, h1, h4] = await Promise.all([
-    getCandles(instrument, "15m", 400),
-    getCandles(instrument, "1h",  600),
-    getCandles(instrument, "4h",  800),
+    getCandles(instrument, "15m", 420),
+    getCandles(instrument, "1h",  620),
+    getCandles(instrument, "4h",  820),
   ]);
-  if (!Array.isArray(m15) || m15.length < 50) return res.status(200).json({ ok: false, reason: "Missing 15m candles" });
+  if (!Array.isArray(m15) || m15.length < 60) return res.status(200).json({ ok: false, reason: "Missing 15m candles" });
 
-  const O15 = getOpens(m15), H15 = getHighs(m15), L15 = getLows(m15), C15 = getCloses(m15);
-  const H1  = getHighs(h1||[]),  L1  = getLows(h1||[]),  C1  = getCloses(h1||[]);
-  const H4  = getHighs(h4||[]),  L4  = getLows(h4||[]),  C4  = getCloses(h4||[]);
+  const O15 = getO(m15), H15 = getH(m15), L15 = getL(m15), C15 = getC(m15);
+  const H1  = getH(h1||[]),  L1  = getL(h1||[]),  C1  = getC(h1||[]);
+  const H4  = getH(h4||[]),  L4  = getL(h4||[]),  C4  = getC(h4||[]);
 
   const tick = tickSizeFor(instrument);
-  const dec  = (tick.toString().split(".")[1]?.length || 0);
-  const fmt  = (n: number) => Number(n.toFixed(dec));
+  const decimals = (tick.toString().split(".")[1]?.length || 0);
+  const fmt = (n: number) => Number(n.toFixed(decimals));
   const last = C15[C15.length - 1];
   const A15  = atr(H15, L15, C15, 14);
 
-  // ---- Structure (PA first) ----
+  // Swings/Structure
   const sw15 = detectSwings(H15, L15, 2);
   const sw1  = detectSwings(H1,  L1,  2);
   const sw4  = detectSwings(H4,  L4,  2);
 
-  const st15 = structureFromSwings(sw15);
-  const st1  = structureFromSwings(sw1);
-  const st4  = structureFromSwings(sw4);
+  const st15 = structureFromSwings(sw15, H15, L15, C15, A15);
+  const st1  = structureFromSwings(sw1,  H1,  L1,  C1,  atr(H1, L1, C1, 14) || A15);
+  const st4  = structureFromSwings(sw4,  H4,  L4,  C4,  atr(H4, L4, C4, 14) || A15);
 
-  // EMAs only for description (not scoring)
+  // EMAs for description only
   const ema21_15 = ema(C15, 21), ema50_15 = ema(C15, 50);
-  const emaCtx = ema21_15 > ema50_15 ? "ema-supportive" : "ema-against";
+  const emaCtx = ema21_15 > ema50_15 ? "ema-with" : "ema-against";
 
-  // ---- Strategy detections (PA) ----
-  const bos15 = detectBOS(C15, H15, L15, sw15);
+  // Strategies (PA)
+  const bos15    = detectBOS(C15, H15, L15, sw15);
   const srFlip15 = detectSRFlip(C15, H15, L15, sw15);
-  const sweep15 = detectLiquiditySweep(O15, C15, H15, L15, sw15);
-  const fvg15 = detectFVG(H15, L15);
-  const ob15  = detectOB(O15, H15, L15, C15, sw15);
-  const tlBreak = simpleTrendlineBreak(sw15, C15);
+  const sweep15  = detectLiquiditySweep(O15, C15, H15, L15, sw15);
+  const fvg15    = detectFVG(H15, L15);
+  const ob15     = detectOB(O15, H15, L15, C15, sw15);
 
   const lastH = lastSwing("H", sw15);
   const lastL = lastSwing("L", sw15);
   const fibZ  = fibZones(lastL, lastH);
 
-  // ---- Score long vs short from PA (no EMA weight) ----
+  // Score (PA only)
   let longPts = 0, shortPts = 0;
   const sigs: string[] = [];
 
-  // HTF alignment
-  if (st4 === "UP") longPts += 5; else if (st4 === "DOWN") shortPts += 5;
-  if (st1 === "UP") longPts += 3; else if (st1 === "DOWN") shortPts += 3;
-  if (st15 === "UP") longPts += 4; else if (st15 === "DOWN") shortPts += 4;
+  if (st4 === "UP") longPts += 6; else if (st4 === "DOWN") shortPts += 6;
+  if (st1 === "UP") longPts += 4; else if (st1 === "DOWN") shortPts += 4;
+  if (st15 === "UP") longPts += 5; else if (st15 === "DOWN") shortPts += 5;
 
-  if (bos15?.side === "up") { longPts += 4; sigs.push("BOS↑"); }
+  if (bos15?.side === "up")   { longPts += 4; sigs.push("BOS↑"); }
   if (bos15?.side === "down") { shortPts += 4; sigs.push("BOS↓"); }
 
   if (srFlip15?.side === "bull") { longPts += 3; sigs.push("SR-flip bull"); }
@@ -332,91 +305,86 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
   if (nearOBbull) { longPts += 3; sigs.push("OB bull"); }
   if (nearOBbear) { shortPts += 3; sigs.push("OB bear"); }
 
-  if (tlBreak?.side === "up") { longPts += 2; sigs.push("Trendline break ↑"); }
-  if (tlBreak?.side === "down") { shortPts += 2; sigs.push("Trendline break ↓"); }
-
   const dir: "Long" | "Short" = longPts >= shortPts ? "Long" : "Short";
   const dirSign = dir === "Long" ? 1 : -1;
 
-  // ---- Choose setup: Breakout vs Pullback (OB/FVG/Fib) ----
+  // Setup selection: Pullback (OB/FVG/Fib) preferred; else Breakout (close-based BOS)
   let orderType: "Buy Stop" | "Sell Stop" | "Buy Limit" | "Sell Limit" | "Market" = "Market";
   let trigger = "";
   let entry = last, sl = last, tp1 = last, tp2 = last;
   let setupName = "";
   let reason = "";
-  const buffer = Math.max(tick * 2, 0); // tiny buffer, **not** an artificial minimum
+  const buffer = tick; // 1 tick beyond level; NOT a stop-size minimum
 
   const nextBullSwingTarget = () => {
-    const h = sw15.filter(s => s.type === "H").map(s => s.price).filter(p => p > entry).sort((a,b)=>a-b)[0];
-    return h ?? (entry + Math.abs(entry - sl));
+    const ups = sw15.filter(s => s.type === "H").map(s => s.price).filter(p => p > entry).sort((a,b)=>a-b)[0];
+    return ups ?? (entry + Math.abs(entry - sl));
   };
   const nextBearSwingTarget = () => {
-    const l = sw15.filter(s => s.type === "L").map(s => s.price).filter(p => p < entry).sort((a,b)=>b-a)[0];
-    return l ?? (entry - Math.abs(entry - sl));
+    const dns = sw15.filter(s => s.type === "L").map(s => s.price).filter(p => p < entry).sort((a,b)=>b-a)[0];
+    return dns ?? (entry - Math.abs(entry - sl));
   };
 
   if (dir === "Long") {
-    // Prefer pullback if inside bull fib or OB/FVG
     const inBullFib = !!(fibZ.bull && last >= fibZ.bull.r382 && last <= fibZ.bull.r618);
     if (inBullFib || nearOBbull || nearBullFVG) {
       orderType = "Buy Limit";
       const zoneMid = fibZ.bull ? fibZ.bull.r5 : last;
-      const prefer = nearOBbull ? Math.min(zoneMid, nearOBbull.hi) : zoneMid;
-      entry = floorTick(prefer, tick);
-      // SL: purely technical — below protective swing / zone
+      const preferred = nearOBbull ? Math.min(zoneMid, nearOBbull.hi) :
+                        nearBullFVG ? Math.min(zoneMid, nearBullFVG.gapTop) : zoneMid;
+      entry = floorTick(preferred, tick);
       const zoneFloor = Math.min(
         fibZ.bull ? fibZ.bull.a : entry,
         nearOBbull ? nearOBbull.lo : entry
       );
-      sl = floorTick(zoneFloor - buffer, tick);
+      sl = floorTick(zoneFloor - buffer, tick);      // protective swing/zone only
       setupName = "Pullback (OB/FVG + Fib 0.5) Long";
-      reason = "Retrace into 15m confluence zone (OB/FVG/Fib) within HTF up-bias.";
+      reason = "Retrace into 15m confluence (OB/FVG/Fib) within HTF up-bias.";
       trigger = `Limit near 0.5 of last leg${nearOBbull ? ", OB confluence" : nearBullFVG ? ", FVG confluence" : ""}`;
     } else if (bos15?.side === "up" || srFlip15?.side === "bull") {
       orderType = "Buy Stop";
       const level = lastH ? lastH.price : last;
       entry = ceilTick(level + buffer, tick);
-      // SL: last protective swing low
-      const prot = lastL ? lastL.price : (entry - A15);
+      const prot = lastL ? lastL.price : Math.min(...L15.slice(-20));
       sl = floorTick(prot - buffer, tick);
       setupName = "Breakout + SR-flip Long";
       reason = "BOS/SR-flip through 15m high with HTF support.";
       trigger = `Stop above swing H ${fmt(level)}`;
     } else {
-      // fallback: market with protective swing SL
       orderType = "Buy Limit";
       entry = floorTick(last, tick);
-      const prot = lastL ? lastL.price : (entry - A15);
+      const prot = lastL ? lastL.price : Math.min(...L15.slice(-20));
       sl = floorTick(prot - buffer, tick);
       setupName = "Continuation Long (structure)";
-      reason = "HTF up-bias with supportive structure; conservative protective SL.";
+      reason = "HTF up-bias; conservative protective SL at swing.";
       trigger = "At market / minor pullback";
     }
+    // Targets (not equal to SL by construction)
     const risk = Math.abs(entry - sl);
     tp1 = fmt(nextBullSwingTarget());
-    if (tp1 - entry < risk) tp1 = fmt(entry + risk);
-    tp2 = fmt(Math.max(tp1, entry + risk * 1.8));
+    if (tp1 <= entry + tick) tp1 = fmt(entry + Math.max(risk, 3 * tick)); // ensure > entry
+    tp2 = fmt(Math.max(tp1, entry + Math.max(risk * 1.8, 5 * tick)));
   } else {
-    // Short
     const inBearFib = !!(fibZ.bear && last <= fibZ.bear.r382 && last >= fibZ.bear.r618);
     if (inBearFib || nearOBbear || nearBearFVG) {
       orderType = "Sell Limit";
       const zoneMid = fibZ.bear ? fibZ.bear.r5 : last;
-      const prefer = nearOBbear ? Math.max(zoneMid, nearOBbear.lo) : zoneMid;
-      entry = ceilTick(prefer, tick);
+      const preferred = nearOBbear ? Math.max(zoneMid, nearOBbear.lo) :
+                        nearBearFVG ? Math.max(zoneMid, nearBearFVG.gapBot) : zoneMid;
+      entry = ceilTick(preferred, tick);
       const zoneCeil = Math.max(
         fibZ.bear ? fibZ.bear.a : entry,
         nearOBbear ? nearOBbear.hi : entry
       );
       sl = ceilTick(zoneCeil + buffer, tick);
       setupName = "Pullback (OB/FVG + Fib 0.5) Short";
-      reason = "Retrace into 15m confluence zone (OB/FVG/Fib) within HTF down-bias.";
+      reason = "Retrace into 15m confluence (OB/FVG/Fib) within HTF down-bias.";
       trigger = `Limit near 0.5 of last leg${nearOBbear ? ", OB confluence" : nearBearFVG ? ", FVG confluence" : ""}`;
     } else if (bos15?.side === "down" || srFlip15?.side === "bear") {
       orderType = "Sell Stop";
       const level = lastL ? lastL.price : last;
       entry = floorTick(level - buffer, tick);
-      const prot = lastH ? lastH.price : (entry + A15);
+      const prot = lastH ? lastH.price : Math.max(...H15.slice(-20));
       sl = ceilTick(prot + buffer, tick);
       setupName = "Breakout + SR-flip Short";
       reason = "BOS/SR-flip through 15m low with HTF support.";
@@ -424,25 +392,27 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     } else {
       orderType = "Sell Limit";
       entry = ceilTick(last, tick);
-      const prot = lastH ? lastH.price : (entry + A15);
+      const prot = lastH ? lastH.price : Math.max(...H15.slice(-20));
       sl = ceilTick(prot + buffer, tick);
       setupName = "Continuation Short (structure)";
-      reason = "HTF down-bias with supportive structure; conservative protective SL.";
+      reason = "HTF down-bias; conservative protective SL at swing.";
       trigger = "At market / minor pullback";
     }
     const risk = Math.abs(entry - sl);
     tp1 = fmt(nextBearSwingTarget());
-    if (entry - tp1 < risk) tp1 = fmt(entry - risk);
-    tp2 = fmt(Math.min(tp1, entry - risk * 1.8));
+    if (tp1 >= entry - tick) tp1 = fmt(entry - Math.max(risk, 3 * tick)); // ensure < entry
+    tp2 = fmt(Math.min(tp1, entry - Math.max(risk * 1.8, 5 * tick)));
   }
 
-  // Final safety: ensure SL != Entry (still technical — one tick beyond)
+  // Guards (technical, not fictional): ensure sides & spacing are correct
   if (dir === "Long" && sl >= entry) sl = floorTick(entry - tick, tick);
   if (dir === "Short" && sl <= entry) sl = ceilTick(entry + tick, tick);
+  if (dir === "Long" && tp1 <= entry) tp1 = fmt(entry + Math.max(Math.abs(entry - sl), 3 * tick));
+  if (dir === "Short" && tp1 >= entry) tp1 = fmt(entry - Math.max(Math.abs(entry - sl), 3 * tick));
 
   entry = fmt(entry); sl = fmt(sl); tp1 = fmt(tp1); tp2 = fmt(tp2);
 
-  // ---- Fundamentals (headlines + optional calendar) ----
+  // Fundamentals (headlines + optional calendar)
   const scores = Array.isArray(headlines) ? headlines
     .map(h => Number(h?.sentiment?.score ?? 0))
     .filter(n => Number.isFinite(n)) : [];
@@ -475,11 +445,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     for (const r of macroRefs) watch.push(`• ${r}`);
   }
 
-  // ---- Conviction (PA-led + fundamentals assist) ----
+  // Conviction (PA-led; fundamentals small nudge)
   const techDelta = Math.abs(longPts - shortPts);
-  let baseConv = clamp(50 + techDelta * 4, 40, 85); // PA only
-  baseConv += newsBias * 5;                          // small nudge from headlines
-  const conviction = clamp(Math.round(baseConv), 25, 92);
+  let baseConv = clamp(55 + techDelta * 4, 40, 88);
+  baseConv += newsBias * 5;
+  const conviction = clamp(Math.round(baseConv), 25, 95);
 
   const t15 = `${st15.toLowerCase()} (${emaCtx})`;
   const t1  = `${st1.toLowerCase()}`;
@@ -488,18 +458,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     ? `Calendar ${calendar?.bias?.instrument?.score > 0 ? "bullish" : calendar?.bias?.instrument?.score < 0 ? "bearish" : "neutral"}; headlines ${newsText}`
     : `Calendar unavailable; headlines ${newsText}`;
   const align = (dirSign > 0 && newsBias >= 0) || (dirSign < 0 && newsBias <= 0) ? "Match" : "Mixed";
+
   const scenarios: string[] = [];
   if (orderType.endsWith("Limit")) {
     scenarios.push(dir === "Long" ? "Execute on bullish rejection/BOS inside zone; else wait."
                                   : "Execute on bearish rejection/BOS inside zone; else wait.");
   } else {
-    scenarios.push(dir === "Long" ? "If breakout fails back under swing H, stand down." :
-                                    "If breakout fails back above swing L, stand down.");
+    scenarios.push(dir === "Long" ? "If breakout fails back under swing H, stand down."
+                                  : "If breakout fails back above swing L, stand down.");
   }
   scenarios.push("Move to BE at TP1; trail partials behind 15m structure.");
-  const invalid = dir === "Long"
-    ? "Clean 15m close below protective swing/zone."
-    : "Clean 15m close above protective swing/zone.";
+  const invalid = dir === "Long" ? "Clean 15m close below protective swing/zone."
+                                 : "Clean 15m close above protective swing/zone.";
 
   const text = card({
     symbol: instrument,
@@ -522,11 +492,5 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     signals: sigs,
   });
 
-  return res.status(200).json({
-    ok: true,
-    text,
-    conviction,
-    setup: setupName,
-    signals: sigs,
-  });
+  return res.status(200).json({ ok: true, text, conviction, setup: setupName, signals: sigs });
 }
