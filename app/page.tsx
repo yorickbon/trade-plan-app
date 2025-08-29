@@ -115,7 +115,7 @@ export default function Page() {
       {/* Charts */}
       <TradingViewTriple symbol={instrument.code} />
 
-      {/* Two-column layout: headlines left, trade card right */}
+      {/* Two-column layout */}
       <div className="grid grid-cols-2 gap-6">
         <div>
           <h2 className="text-xl font-semibold mb-2">
