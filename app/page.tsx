@@ -1,11 +1,12 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 
 import CalendarPanel from "../components/CalendarPanel";
 import HeadlinesPanel from "../components/HeadlinesPanel";
 
+// charts client-only (prevents hydration issues)
 const TradingViewTriple = dynamic(
   () => import("../components/TradingViewTriple"),
   { ssr: false }
@@ -40,15 +41,20 @@ function currenciesFromBias(bias?: CalendarBias) {
   return bias ? Object.keys(bias.perCurrency || {}) : [];
 }
 
-/** ---- NEW: utils to ensure we always render a string ---- */
-function toDisplayString(v: any): string {
+/** Ensure readable multi-line text for Trade Card */
+function toReadableText(v: any): string {
+  let raw: string;
   if (v == null) return "";
-  if (typeof v === "string") return v;
-  try {
-    return JSON.stringify(v, null, 2);
-  } catch {
-    return String(v);
-  }
+  if (typeof v === "string") raw = v;
+  else if (typeof v === "object") {
+    if (v.card && typeof v.card.text === "string") raw = v.card.text;
+    else if (typeof v.text === "string") raw = v.text;
+    else if (typeof v.plan === "string") raw = v.plan;
+    else {
+      try { raw = JSON.stringify(v, null, 2); } catch { raw = String(v); }
+    }
+  } else raw = String(v);
+  return raw.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\\t/g, "    ");
 }
 
 export default function Page() {
@@ -64,6 +70,20 @@ export default function Page() {
   const [planText, setPlanText] = useState<string>("");
   const [generating, setGenerating] = useState(false);
 
+  // ---- prevent stale updates (only minimal use here) ----
+  const requestIdRef = useRef(0);
+  const planAbortRef = useRef<AbortController | null>(null);
+
+  // ✅ Reset plan whenever instrument OR date changes (your request)
+  useEffect(() => {
+    setPlanText("");
+    setGenerating(false);
+    if (planAbortRef.current) {
+      try { planAbortRef.current.abort(); } catch {}
+      planAbortRef.current = null;
+    }
+  }, [instrument, dateStr]);
+
   const calendarCurrencies = useMemo(
     () => currenciesFromBias((calendar as any)?.bias),
     [calendar]
@@ -76,9 +96,7 @@ export default function Page() {
     }
     setLoadingNews(true);
     try {
-      const r = await fetch(`/api/news?symbols=${symbols.join(",")}`, {
-        cache: "no-store",
-      });
+      const r = await fetch(`/api/news?symbols=${symbols.join(",")}`, { cache: "no-store" });
       const j: NewsResp = await r.json();
       if (j?.ok) setHeadlines(j.items || []);
       else setHeadlines([]);
@@ -117,45 +135,75 @@ export default function Page() {
     loadCalendar();
   }, [loadCalendar]);
 
-  /** ---- FIXED: always stringify response before rendering ---- */
   const generatePlan = useCallback(async () => {
+    // Abort any older request
+    const myId = ++requestIdRef.current;
+    if (planAbortRef.current) {
+      try { planAbortRef.current.abort(); } catch {}
+    }
+    const controller = new AbortController();
+    planAbortRef.current = controller;
+
     setGenerating(true);
     setPlanText("");
+
     try {
-      const r = await fetch("/api/plan", {
+      // ✅ ALSO include instrument/date in the URL query so legacy plan routes that read query still work
+      const r = await fetch(`/api/plan?instrument=${instrument}&date=${dateStr}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ instrument, date: dateStr, calendar, headlines }),
+        signal: controller.signal,
       });
 
-      // If the server returns a plain text body (not JSON), still handle it gracefully
+      if (myId !== requestIdRef.current) return; // ignore stale
+
       const contentType = r.headers.get("content-type") || "";
-      let j: any;
       if (contentType.includes("application/json")) {
-        j = await r.json();
+        const j: any = await r.json();
+        if (myId !== requestIdRef.current) return;
+        if (j?.ok) setPlanText(toReadableText(j));
+        else setPlanText(toReadableText(j?.reason || j));
       } else {
         const t = await r.text();
-        setPlanText(toDisplayString(t));
-        setGenerating(false);
-        return;
-      }
-
-      if (j?.ok) {
-        // prefer string fields; otherwise stringify whatever came back
-        const text =
-          (typeof j.plan === "string" && j.plan) ||
-          (typeof j.card === "string" && j.card) ||
-          toDisplayString(j.plan ?? j.card ?? j);
-        setPlanText(text);
-      } else {
-        setPlanText(toDisplayString(j?.reason || j));
+        if (myId !== requestIdRef.current) return;
+        setPlanText(toReadableText(t));
       }
     } catch (e: any) {
-      setPlanText(toDisplayString(e?.message || e));
+      if (controller.signal.aborted) return;
+      if (myId === requestIdRef.current) setPlanText(toReadableText(e?.message || e));
     } finally {
-      setGenerating(false);
+      if (myId === requestIdRef.current) setGenerating(false);
     }
   }, [instrument, dateStr, calendar, headlines]);
+
+  // Buttons you asked for (kept)
+  const resetAll = useCallback(() => {
+    setPlanText("");
+    setCalendar(null);
+    setHeadlines([]);
+    setLoadingCal(false);
+    setLoadingNews(false);
+    console.info("Reset complete.");
+  }, []);
+
+  const callMonitor = useCallback(
+    async (action: "start" | "stop") => {
+      try {
+        const r = await fetch("/api/monitor", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ action, instrument, date: dateStr }),
+        });
+        const j = await r.json();
+        if (j?.ok) console.info(`[monitor] ${action} ok`, j);
+        else console.warn(`[monitor] ${action} responded`, j);
+      } catch (e) {
+        console.warn(`[monitor] ${action} failed`, e);
+      }
+    },
+    [instrument, dateStr]
+  );
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 space-y-4">
@@ -205,9 +253,30 @@ export default function Page() {
         >
           {generating ? "Generating…" : "Generate Plan"}
         </button>
+
+        {/* Buttons restored */}
+        <button
+          onClick={resetAll}
+          className="px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
+        >
+          Reset
+        </button>
+
+        <button
+          onClick={() => callMonitor("start")}
+          className="px-3 py-1 text-sm rounded bg-sky-700 hover:bg-sky-600"
+        >
+          Start monitoring
+        </button>
+        <button
+          onClick={() => callMonitor("stop")}
+          className="px-3 py-1 text-sm rounded bg-rose-700 hover:bg-rose-600"
+        >
+          Stop monitoring
+        </button>
       </div>
 
-      {/* Charts */}
+      {/* Charts row (unchanged) */}
       <TradingViewTriple symbol={instrument} />
 
       {/* Calendar */}
@@ -224,9 +293,9 @@ export default function Page() {
         )}
       </div>
 
-      {/* Headlines + Trade Card */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div className="rounded-lg border border-neutral-800 p-4">
+      {/* Headlines (left) + Trade Card (right) */}
+      <div className="grid grid-cols-12 gap-4">
+        <div className="col-span-12 lg:col-span-7 rounded-lg border border-neutral-800 p-4">
           <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
           <HeadlinesPanel items={headlines} />
           <div className="text-xs mt-2 opacity-60">
@@ -238,10 +307,10 @@ export default function Page() {
           </div>
         </div>
 
-        <div className="rounded-lg border border-neutral-800 p-4">
+        <div className="col-span-12 lg:col-span-5 rounded-lg border border-neutral-800 p-4">
           <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
           {planText ? (
-            <pre className="whitespace-pre-wrap text-sm leading-5 opacity-95">
+            <pre className="whitespace-pre-wrap text-sm leading-5 opacity-95 max-h-[60vh] overflow-auto">
               {planText}
             </pre>
           ) : generating ? (
