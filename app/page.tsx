@@ -3,11 +3,10 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 
-// ✅ relative paths; do not import CalendarPaste at all
 import CalendarPanel from "../components/CalendarPanel";
 import HeadlinesPanel from "../components/HeadlinesPanel";
 
-// ✅ TradingView client-only to avoid hydration crash
+// ✅ client-only chart import to avoid client-side exception
 const TradingViewTriple = dynamic(
   () => import("../components/TradingViewTriple"),
   {
@@ -20,7 +19,7 @@ const TradingViewTriple = dynamic(
   }
 );
 
-// ----------------- types / helpers -----------------
+// ---------- types / helpers ----------
 type CalendarBias = {
   perCurrency: Record<
     string,
@@ -41,7 +40,15 @@ const todayISO = () => new Date().toISOString().slice(0, 10);
 const currenciesFromBias = (bias?: CalendarBias) =>
   bias ? Object.keys(bias.perCurrency || {}) : [];
 
-// ----------------- page -----------------
+function baseQuoteFromInstrument(instr: string): [string, string] {
+  const s = (instr || "").toUpperCase().replace("/", "");
+  if (s.length >= 6) return [s.slice(0, 3), s.slice(-3)];
+  // fallback for index/metals/crypto (treat like USD cross if needed)
+  if (s.endsWith("USD")) return [s.replace("USD", ""), "USD"];
+  return [s, "USD"];
+}
+
+// ---------- page ----------
 export default function Page() {
   // controls
   const [instrument, setInstrument] = useState<string>("EURUSD");
@@ -59,7 +66,28 @@ export default function Page() {
   const [generating, setGenerating] = useState<boolean>(false);
   const [monitoring, setMonitoring] = useState<boolean>(false);
 
-  // ------- load calendar from provider only -------
+  // ----- load headlines for a list of symbols -----
+  const loadHeadlinesForSymbols = useCallback(async (symbols: string[]) => {
+    if (!symbols.length) {
+      setHeadlines([]);
+      return;
+    }
+    setLoadingNews(true);
+    try {
+      const nr = await fetch(`/api/news?symbols=${symbols.join(",")}`, {
+        cache: "no-store",
+      });
+      const nj: NewsResp = await nr.json();
+      if (nj?.ok) setHeadlines(nj.items || []);
+      else setHeadlines([]);
+    } catch {
+      setHeadlines([]);
+    } finally {
+      setLoadingNews(false);
+    }
+  }, []);
+
+  // ----- load calendar from provider only (no manual fallback) -----
   const loadCalendar = useCallback(async () => {
     setLoadingCal(true);
     try {
@@ -68,43 +96,35 @@ export default function Page() {
       const j: CalendarResp = await r.json();
       setCalendar(j);
 
-      // headlines if we have currencies
       if (j?.ok) {
+        // Load headlines using currencies from calendar bias
         const ccy = currenciesFromBias(j.bias);
         if (ccy.length) {
-          setLoadingNews(true);
-          try {
-            const nr = await fetch(`/api/news?symbols=${ccy.join(",")}`, {
-              cache: "no-store",
-            });
-            const nj: NewsResp = await nr.json();
-            if (nj?.ok) setHeadlines(nj.items || []);
-            else setHeadlines([]);
-          } catch {
-            setHeadlines([]);
-          } finally {
-            setLoadingNews(false);
-          }
+          await loadHeadlinesForSymbols(ccy);
         } else {
-          setHeadlines([]);
+          // If bias missing, fallback to instrument symbols
+          const [base, quote] = baseQuoteFromInstrument(instrument);
+          await loadHeadlinesForSymbols([base, quote]);
         }
       } else {
-        // provider returned nothing
-        setHeadlines([]);
+        // Provider empty: fallback to instrument symbols (Google News will almost always have something)
+        const [base, quote] = baseQuoteFromInstrument(instrument);
+        await loadHeadlinesForSymbols([base, quote]);
       }
     } catch {
       setCalendar({ ok: false, reason: "Calendar request failed" });
-      setHeadlines([]);
+      const [base, quote] = baseQuoteFromInstrument(instrument);
+      await loadHeadlinesForSymbols([base, quote]);
     } finally {
       setLoadingCal(false);
     }
-  }, [dateStr, instrument]);
+  }, [dateStr, instrument, loadHeadlinesForSymbols]);
 
   useEffect(() => {
     loadCalendar();
   }, [loadCalendar]);
 
-  // ------- generate plan -------
+  // ----- generate plan -----
   const generatePlan = useCallback(async () => {
     setGenerating(true);
     setPlanText("");
@@ -134,7 +154,6 @@ export default function Page() {
     [calendar]
   );
 
-  // ----------------- UI -----------------
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 space-y-4">
       {/* Controls */}
@@ -214,7 +233,7 @@ export default function Page() {
 
       {/* Calendar + Headlines */}
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-        {/* Calendar panel */}
+        {/* Calendar */}
         <div className="rounded-lg border border-neutral-800 p-4">
           <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
 
@@ -228,8 +247,8 @@ export default function Page() {
 
           {!loadingCal && (!calendar || !calendar.ok) && (
             <div className="text-sm opacity-75">
-              No calendar items found from providers. (Once your TradingEconomics
-              key is active, this will populate automatically.)
+              No calendar items found from providers. (Once your
+              TradingEconomics key is active, this will populate automatically.)
             </div>
           )}
         </div>
@@ -245,7 +264,7 @@ export default function Page() {
               ? `${headlines.length} headlines found`
               : calendarCurrencies.length
               ? "No notable headlines."
-              : "Select an instrument or load calendar to fetch related headlines."}
+              : "Fetched by instrument (calendar empty)."}
           </div>
         </div>
       </div>
