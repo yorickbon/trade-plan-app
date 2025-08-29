@@ -26,26 +26,12 @@ function fmtWhen(s?: string) {
   });
 }
 
-export default function HeadlinesPanel({
-  items,
-  compact = false,
-}: {
-  items: any;
-  /** When true, render smaller typography for list items */
-  compact?: boolean;
-}) {
+export default function HeadlinesPanel({ items }: { items: any }) {
   const list: Headline[] = Array.isArray(items) ? items : [];
 
   if (!list.length) {
-    return (
-      <div className={compact ? "text-xs opacity-70" : "text-sm opacity-70"}>
-        No notable headlines.
-      </div>
-    );
+    return <div className="text-sm opacity-70">No notable headlines.</div>;
   }
-
-  const liClass = compact ? "text-xs" : "text-sm";
-  const linkClass = "text-sky-300 hover:underline";
 
   return (
     <ul className="space-y-1">
@@ -61,9 +47,14 @@ export default function HeadlinesPanel({
         }
 
         return (
-          <li key={`${i}-${title.slice(0, 40)}`} className={liClass}>
+          <li key={`${i}-${title.slice(0, 40)}`} className="text-sm">
             {url ? (
-              <a href={url} target="_blank" rel="noreferrer" className={linkClass}>
+              <a
+                href={url}
+                target="_blank"
+                rel="noreferrer"
+                className="text-sky-300 hover:underline"
+              >
                 {title}
               </a>
             ) : (
