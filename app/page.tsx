@@ -6,20 +6,15 @@ import dynamic from "next/dynamic";
 import CalendarPanel from "../components/CalendarPanel";
 import HeadlinesPanel from "../components/HeadlinesPanel";
 
-// ✅ client-only chart import to avoid client-side exception
-const TradingViewTriple = dynamic(
-  () => import("../components/TradingViewTriple"),
-  {
-    ssr: false,
-    loading: () => (
-      <div className="rounded-lg border border-neutral-800 p-4">
-        <div className="text-sm opacity-75">Loading charts…</div>
-      </div>
-    ),
-  }
-);
+const TradingViewTriple = dynamic(() => import("../components/TradingViewTriple"), {
+  ssr: false,
+  loading: () => (
+    <div className="rounded-lg border border-neutral-800 p-4">
+      <div className="text-sm opacity-75">Loading charts…</div>
+    </div>
+  ),
+});
 
-// ---------- types / helpers ----------
 type CalendarBias = {
   perCurrency: Record<
     string,
@@ -54,7 +49,6 @@ function baseQuoteFromInstrument(instr: string): [string, string] {
   return [s, "USD"];
 }
 
-// normalize plan text so it prints line-by-line
 function normalizePlanText(v: any): string {
   if (!v) return "";
   if (typeof v === "string") return v.replace(/\\n/g, "\n");
@@ -65,25 +59,20 @@ function normalizePlanText(v: any): string {
   }
 }
 
-// ---------- page ----------
 export default function Page() {
-  // controls
   const [instrument, setInstrument] = useState<string>("EURUSD");
   const [dateStr, setDateStr] = useState<string>(todayISO());
 
-  // calendar + headlines
   const [calendar, setCalendar] = useState<CalendarResp | null>(null);
   const [loadingCal, setLoadingCal] = useState<boolean>(false);
 
   const [headlines, setHeadlines] = useState<any[]>([]);
   const [loadingNews, setLoadingNews] = useState<boolean>(false);
 
-  // plan
   const [planText, setPlanText] = useState<string>("");
   const [generating, setGenerating] = useState<boolean>(false);
   const [monitoring, setMonitoring] = useState<boolean>(false);
 
-  // ----- load headlines for a list of symbols -----
   const loadHeadlinesForSymbols = useCallback(async (symbols: string[]) => {
     if (!symbols.length) {
       setHeadlines([]);
@@ -104,7 +93,6 @@ export default function Page() {
     }
   }, []);
 
-  // ----- load calendar from provider only (no manual fallback) -----
   const loadCalendar = useCallback(async () => {
     setLoadingCal(true);
     try {
@@ -114,17 +102,14 @@ export default function Page() {
       setCalendar(j);
 
       if (j?.ok) {
-        // Load headlines using currencies from calendar bias
         const ccy = currenciesFromBias(j.bias);
         if (ccy.length) {
           await loadHeadlinesForSymbols(ccy);
         } else {
-          // If bias missing, fallback to instrument symbols
           const [base, quote] = baseQuoteFromInstrument(instrument);
           await loadHeadlinesForSymbols([base, quote]);
         }
       } else {
-        // Provider empty: fallback to instrument symbols (Google News will almost always have something)
         const [base, quote] = baseQuoteFromInstrument(instrument);
         await loadHeadlinesForSymbols([base, quote]);
       }
@@ -141,7 +126,6 @@ export default function Page() {
     loadCalendar();
   }, [loadCalendar]);
 
-  // ----- generate plan -----
   const generatePlan = useCallback(async () => {
     setGenerating(true);
     setPlanText("");
@@ -173,13 +157,11 @@ export default function Page() {
     [calendar]
   );
 
-  // reset = clear outputs and re-fetch calendar/news
   const resetAll = useCallback(() => {
     setPlanText("");
     setHeadlines([]);
     setCalendar(null);
     setDateStr(todayISO());
-    // re-pull with fresh date/instrument
     setTimeout(() => loadCalendar(), 0);
   }, [loadCalendar]);
 
@@ -227,7 +209,6 @@ export default function Page() {
           />
         </div>
 
-        {/* 🔄 Reset replaces "Refresh Calendar" */}
         <button
           onClick={resetAll}
           className="px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
@@ -261,17 +242,14 @@ export default function Page() {
       {/* Charts */}
       <TradingViewTriple symbol={instrument} />
 
-      {/* 2+1 columns becomes 1+2: LEFT (Calendar + Headlines) | RIGHT (Trade Card, wider) */}
+      {/* Layout: LEFT (Calendar + smaller Headlines) | RIGHT (bigger Trade Card spanning two columns) */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
-        {/* LEFT: Calendar + Headlines stacked (span 1 column) */}
+        {/* LEFT side */}
         <div className="xl:col-span-1 space-y-4">
-          {/* Calendar */}
           <div className="rounded-lg border border-neutral-800 p-4">
             <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
 
-            {loadingCal && (
-              <div className="text-sm opacity-75">Loading calendar…</div>
-            )}
+            {loadingCal && <div className="text-sm opacity-75">Loading calendar…</div>}
 
             {!loadingCal && calendar?.ok && Array.isArray(calendar.items) && (
               <CalendarPanel items={calendar.items} />
@@ -279,19 +257,15 @@ export default function Page() {
 
             {!loadingCal && (!calendar || !calendar.ok) && (
               <div className="text-sm opacity-75">
-                No calendar items found from providers. (Once your
-                TradingEconomics key is active, this will populate automatically.)
+                No calendar items found from providers. (Once your TradingEconomics key is
+                active, this will populate automatically.)
               </div>
             )}
           </div>
 
-          {/* Headlines – smaller font */}
           <div className="rounded-lg border border-neutral-800 p-4">
             <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
-            {/* Make everything inside HeadlinesPanel smaller */}
-            <div className="text-[11px] leading-snug [&_li]:text-[11px] [&_a]:text-sky-300">
-              <HeadlinesPanel items={Array.isArray(headlines) ? headlines : []} />
-            </div>
+            <HeadlinesPanel items={Array.isArray(headlines) ? headlines : []} compact />
             <div className="text-[11px] mt-2 opacity-60">
               {loadingNews
                 ? "Loading headlines…"
@@ -304,7 +278,7 @@ export default function Page() {
           </div>
         </div>
 
-        {/* RIGHT: Trade Card – wider (spans 2 columns), larger font */}
+        {/* RIGHT side (wider Trade Card) */}
         <div className="xl:col-span-2 rounded-lg border border-neutral-800 p-4">
           <h2 className="text-xl font-semibold mb-2">Generated Trade Card</h2>
           {planText ? (
@@ -315,9 +289,8 @@ export default function Page() {
             <div className="text-sm opacity-80">Generating…</div>
           ) : (
             <div className="text-sm opacity-70">
-              Click <b>Generate Plan</b> to build a setup using 15m execution,
-              1h+4h context, fundamentals (calendar bias + headlines), and our
-              strategy logic.
+              Click <b>Generate Plan</b> to build a setup using 15m execution, 1h+4h context,
+              fundamentals (calendar bias + headlines), and our strategy logic.
             </div>
           )}
         </div>
