@@ -6,20 +6,12 @@ import dynamic from "next/dynamic";
 import CalendarPanel from "../components/CalendarPanel";
 import HeadlinesPanel from "../components/HeadlinesPanel";
 
-// client-only chart to avoid hydration issues
+// charts are client-only to avoid hydration errors
 const TradingViewTriple = dynamic(
   () => import("../components/TradingViewTriple"),
-  {
-    ssr: false,
-    loading: () => (
-      <div className="rounded-lg border border-neutral-800 p-4">
-        <div className="text-sm opacity-75">Loading charts…</div>
-      </div>
-    ),
-  }
+  { ssr: false }
 );
 
-// ---------- types ----------
 type CalendarBias = {
   perCurrency: Record<
     string,
@@ -37,8 +29,6 @@ type NewsResp =
   | { ok: false; reason: string };
 
 const todayISO = () => new Date().toISOString().slice(0, 10);
-const currenciesFromBias = (bias?: CalendarBias) =>
-  bias ? Object.keys(bias.perCurrency || {}) : [];
 
 function baseQuoteFromInstrument(instr: string): [string, string] {
   const s = (instr || "").toUpperCase().replace("/", "");
@@ -47,36 +37,40 @@ function baseQuoteFromInstrument(instr: string): [string, string] {
   return [s, "USD"];
 }
 
-export default function Page() {
-  // controls
-  const [instrument, setInstrument] = useState<string>("EURUSD");
-  const [dateStr, setDateStr] = useState<string>(todayISO());
+function currenciesFromBias(bias?: CalendarBias) {
+  return bias ? Object.keys(bias.perCurrency || {}) : [];
+}
 
-  // calendar + headlines
+export default function Page() {
+  const [instrument, setInstrument] = useState("EURUSD");
+  const [dateStr, setDateStr] = useState(todayISO());
+
   const [calendar, setCalendar] = useState<CalendarResp | null>(null);
-  const [loadingCal, setLoadingCal] = useState<boolean>(false);
+  const [loadingCal, setLoadingCal] = useState(false);
 
   const [headlines, setHeadlines] = useState<any[]>([]);
-  const [loadingNews, setLoadingNews] = useState<boolean>(false);
+  const [loadingNews, setLoadingNews] = useState(false);
 
-  // plan
-  const [planText, setPlanText] = useState<string>("");
-  const [generating, setGenerating] = useState<boolean>(false);
-  const [monitoring, setMonitoring] = useState<boolean>(false);
+  const [planText, setPlanText] = useState("");
+  const [generating, setGenerating] = useState(false);
 
-  // ----- load headlines for a list of symbols -----
-  const loadHeadlinesForSymbols = useCallback(async (symbols: string[]) => {
+  const calendarCurrencies = useMemo(
+    () => currenciesFromBias((calendar as any)?.bias),
+    [calendar]
+  );
+
+  const loadHeadlinesFor = useCallback(async (symbols: string[]) => {
     if (!symbols.length) {
       setHeadlines([]);
       return;
     }
     setLoadingNews(true);
     try {
-      const nr = await fetch(`/api/news?symbols=${symbols.join(",")}`, {
+      const r = await fetch(`/api/news?symbols=${symbols.join(",")}`, {
         cache: "no-store",
       });
-      const nj: NewsResp = await nr.json();
-      if (nj?.ok) setHeadlines(nj.items || []);
+      const j: NewsResp = await r.json();
+      if (j?.ok) setHeadlines(j.items || []);
       else setHeadlines([]);
     } catch {
       setHeadlines([]);
@@ -85,41 +79,34 @@ export default function Page() {
     }
   }, []);
 
-  // ----- load calendar from provider (no manual paste) -----
   const loadCalendar = useCallback(async () => {
     setLoadingCal(true);
     try {
-      const u = `/api/calendar?date=${dateStr}&instrument=${instrument}&windowHours=48`;
-      const r = await fetch(u, { cache: "no-store" });
+      const r = await fetch(
+        `/api/calendar?date=${dateStr}&instrument=${instrument}&windowHours=48`,
+        { cache: "no-store" }
+      );
       const j: CalendarResp = await r.json();
       setCalendar(j);
 
       if (j?.ok) {
         const ccy = currenciesFromBias(j.bias);
-        if (ccy.length) {
-          await loadHeadlinesForSymbols(ccy);
-        } else {
-          const [base, quote] = baseQuoteFromInstrument(instrument);
-          await loadHeadlinesForSymbols([base, quote]);
-        }
+        await loadHeadlinesFor(ccy.length ? ccy : baseQuoteFromInstrument(instrument));
       } else {
-        const [base, quote] = baseQuoteFromInstrument(instrument);
-        await loadHeadlinesForSymbols([base, quote]);
+        await loadHeadlinesFor(baseQuoteFromInstrument(instrument));
       }
     } catch {
       setCalendar({ ok: false, reason: "Calendar request failed" });
-      const [base, quote] = baseQuoteFromInstrument(instrument);
-      await loadHeadlinesForSymbols([base, quote]);
+      await loadHeadlinesFor(baseQuoteFromInstrument(instrument));
     } finally {
       setLoadingCal(false);
     }
-  }, [dateStr, instrument, loadHeadlinesForSymbols]);
+  }, [dateStr, instrument, loadHeadlinesFor]);
 
   useEffect(() => {
     loadCalendar();
   }, [loadCalendar]);
 
-  // ----- generate plan -----
   const generatePlan = useCallback(async () => {
     setGenerating(true);
     setPlanText("");
@@ -127,15 +114,10 @@ export default function Page() {
       const r = await fetch("/api/plan", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          instrument,
-          date: dateStr,
-          calendar,
-          headlines,
-        }),
+        body: JSON.stringify({ instrument, date: dateStr, calendar, headlines }),
       });
       const j = await r.json();
-      if (j?.ok) setPlanText(j?.plan || j?.card || JSON.stringify(j, null, 2));
+      if (j?.ok) setPlanText(j.plan || j.card || JSON.stringify(j, null, 2));
       else setPlanText(j?.reason || "Server error while generating plan.");
     } catch (e: any) {
       setPlanText(e?.message || "Error generating plan.");
@@ -143,11 +125,6 @@ export default function Page() {
       setGenerating(false);
     }
   }, [instrument, dateStr, calendar, headlines]);
-
-  const calendarCurrencies = useMemo(
-    () => currenciesFromBias((calendar as any)?.bias),
-    [calendar]
-  );
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 space-y-4">
@@ -161,25 +138,14 @@ export default function Page() {
             className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
           >
             {/* Forex */}
-            <option>AUDUSD</option>
-            <option>EURUSD</option>
-            <option>GBPUSD</option>
-            <option>USDJPY</option>
-            <option>USDCAD</option>
-            <option>EURGBP</option>
-            <option>EURJPY</option>
-            <option>GBPJPY</option>
-            <option>EURAUD</option>
+            <option>AUDUSD</option><option>EURUSD</option><option>GBPUSD</option>
+            <option>USDJPY</option><option>USDCAD</option><option>EURGBP</option>
+            <option>EURJPY</option><option>GBPJPY</option><option>EURAUD</option>
             <option>NZDUSD</option>
             {/* Indices */}
-            <option>SPX500</option>
-            <option>NAS100</option>
-            <option>US30</option>
-            <option>GER40</option>
+            <option>SPX500</option><option>NAS100</option><option>US30</option><option>GER40</option>
             {/* Metals/Crypto */}
-            <option>XAUUSD</option>
-            <option>BTCUSD</option>
-            <option>ETHUSD</option>
+            <option>XAUUSD</option><option>BTCUSD</option><option>ETHUSD</option>
           </select>
         </div>
 
@@ -193,7 +159,6 @@ export default function Page() {
           />
         </div>
 
-        {/* Keep manual retry button */}
         <button
           onClick={loadCalendar}
           className="px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
@@ -209,55 +174,36 @@ export default function Page() {
         >
           {generating ? "Generating…" : "Generate Plan"}
         </button>
-
-        <button
-          onClick={() => setMonitoring(true)}
-          className="px-3 py-1 text-sm rounded bg-sky-700 hover:bg-sky-600"
-        >
-          Start monitoring
-        </button>
-        <button
-          onClick={() => setMonitoring(false)}
-          className="px-3 py-1 text-sm rounded bg-rose-700 hover:bg-rose-600"
-        >
-          Stop monitoring
-        </button>
       </div>
 
-      {/* Charts: always side-by-side */}
+      {/* Charts – side-by-side (inline styles in component) */}
       <TradingViewTriple symbol={instrument} />
 
-      {/* Middle row: Calendar alone */}
+      {/* Calendar */}
       <div className="rounded-lg border border-neutral-800 p-4">
         <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
-
         {loadingCal && <div className="text-sm opacity-75">Loading calendar…</div>}
-
         {!loadingCal && calendar?.ok && Array.isArray(calendar.items) && (
           <CalendarPanel items={calendar.items} />
         )}
-
         {!loadingCal && (!calendar || !calendar.ok) && (
           <div className="text-sm opacity-75">
-            No calendar items found from providers. (Once your TradingEconomics
-            key is active, this will populate automatically.)
+            No calendar items found from providers. (Once your TradingEconomics key is active, this will populate automatically.)
           </div>
         )}
       </div>
 
-      {/* Bottom row: Headlines LEFT, Trade Card RIGHT */}
+      {/* Headlines left — Trade Card right */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div className="rounded-lg border border-neutral-800 p-4">
           <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
-          <HeadlinesPanel items={Array.isArray(headlines) ? headlines : []} />
+          <HeadlinesPanel items={headlines} />
           <div className="text-xs mt-2 opacity-60">
             {loadingNews
               ? "Loading headlines…"
               : headlines.length
               ? `${headlines.length} headlines found`
-              : calendarCurrencies.length
-              ? "No notable headlines."
-              : "Fetched by instrument (calendar empty)."}
+              : "No notable headlines."}
           </div>
         </div>
 
@@ -272,8 +218,7 @@ export default function Page() {
           ) : (
             <div className="text-sm opacity-70">
               Click <b>Generate Plan</b> to build a setup using 15m execution,
-              1h+4h context, fundamentals (calendar bias + headlines), and our
-              strategy logic.
+              1h+4h context, fundamentals (calendar bias + headlines), and our strategy logic.
             </div>
           )}
         </div>
