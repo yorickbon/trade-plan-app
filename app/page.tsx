@@ -1,150 +1,215 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
-import { INSTRUMENTS, findInstrument, Instrument } from "../lib/symbols";
+import React, { useEffect, useState } from "react";
 import TradingViewTriple from "../components/TradingViewTriple";
 import HeadlinesPanel from "../components/HeadlinesPanel";
+import { INSTRUMENTS, findInstrument, type Instrument } from "../lib/symbols";
+
+function todayISO() {
+  const d = new Date();
+  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()))
+    .toISOString()
+    .slice(0, 10);
+}
 
 export default function Page() {
+  // ---- state ----
   const [instrument, setInstrument] = useState<Instrument>(INSTRUMENTS[0]);
-  const [dateStr, setDateStr] = useState<string>(
-    new Date().toISOString().slice(0, 10)
-  );
+  const [dateStr, setDateStr] = useState<string>(todayISO());
+
+  const [calendarItems, setCalendarItems] = useState<any[]>([]);
   const [headlines, setHeadlines] = useState<any[]>([]);
-  const [loadingNews, setLoadingNews] = useState(false);
+
+  const [generating, setGenerating] = useState(false);
   const [planText, setPlanText] = useState<string>("");
 
-  // DEBUG – remove after confirming it loads the big list
-  // eslint-disable-next-line no-console
-  console.log("INSTRUMENTS loaded:", INSTRUMENTS.map(i => i.code));
-
-  // reset plan every time instrument changes
+  // Clear the Trade Card whenever instrument or date changes
   useEffect(() => {
     setPlanText("");
-  }, [instrument]);
+  }, [instrument, dateStr]);
 
-  const fetchHeadlines = async (inst: Instrument, date: string) => {
-    setLoadingNews(true);
+  // ---- fetchers (unchanged behavior) ----
+  async function refreshCalendar() {
     try {
-      const res = await fetch(
-        `/api/news?symbols=${inst.currencies.join(",")}&date=${date}`
+      const url = `/api/calendar?date=${encodeURIComponent(
+        dateStr
+      )}&instrument=${encodeURIComponent(instrument.code)}&windowHours=48`;
+      const r = await fetch(url, { cache: "no-store" });
+      const j = await r.json();
+      if (j?.ok && Array.isArray(j.items)) setCalendarItems(j.items);
+      else setCalendarItems([]);
+    } catch {
+      setCalendarItems([]);
+    }
+  }
+
+  async function refreshHeadlines() {
+    try {
+      // use currencies from your symbols meta
+      const ccy = (instrument as any).currencies ?? [];
+      const r = await fetch(
+        `/api/news?symbols=${encodeURIComponent(ccy.join(","))}&hours=48`,
+        { cache: "no-store" }
       );
-      const data = await res.json();
-      if (data.ok) {
-        setHeadlines(data.items || []);
-      } else {
-        setHeadlines([]);
-      }
-    } catch (err) {
-      console.error(err);
+      const j = await r.json();
+      setHeadlines(Array.isArray(j?.items) ? j.items : []);
+    } catch {
       setHeadlines([]);
-    } finally {
-      setLoadingNews(false);
     }
-  };
+  }
 
-  const generatePlan = async () => {
+  async function generatePlan() {
+    setGenerating(true);
+    setPlanText("");
     try {
-      const res = await fetch("/api/plan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          instrument,     // <- THIS is the selected instrument object
-          headlines,      // <- fresh headlines for current instrument
-          calendar: [],   // <- will wire your TE key here later
-        }),
-      });
-      const data = await res.json();
-      if (data.ok) {
-        setPlanText(data.text);
+      const r = await fetch(
+        `/api/plan?instrument=${encodeURIComponent(
+          instrument.code
+        )}&date=${encodeURIComponent(dateStr)}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            instrument,       // full instrument object from lib/symbols
+            date: dateStr,
+            calendar: calendarItems,
+            headlines,
+          }),
+        }
+      );
+      const ct = r.headers.get("content-type") || "";
+      if (ct.includes("application/json")) {
+        const j = await r.json();
+        if (j?.ok && typeof j.text === "string") setPlanText(j.text);
+        else if (j?.reason) setPlanText(`Standing down: ${j.reason}`);
+        else setPlanText("Standing down: Unknown server response.");
       } else {
-        setPlanText("Error: " + data.reason);
+        const t = await r.text();
+        setPlanText(t || "Standing down: Non-JSON response.");
       }
-    } catch (err) {
-      console.error(err);
-      setPlanText("Error generating plan");
+    } catch (e: any) {
+      setPlanText(`Standing down: ${e?.message || "Network error"}`);
+    } finally {
+      setGenerating(false);
     }
-  };
+  }
 
-  const resetAll = () => {
+  function resetAll() {
+    setInstrument(INSTRUMENTS[0]);
+    setDateStr(todayISO());
+    setCalendarItems([]);
     setHeadlines([]);
     setPlanText("");
-    setDateStr(new Date().toISOString().slice(0, 10));
-  };
+  }
 
+  // ---- UI ----
   return (
-    <div className="p-4 space-y-4">
-
+    <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 space-y-4">
       {/* Controls */}
-      <div className="flex flex-wrap items-center gap-3">
-        <select
-          value={instrument.code}
-          onChange={(e) => {
-            const inst = findInstrument(e.target.value);
-            if (inst) setInstrument(inst);
-          }}
-          className="bg-gray-900 text-white p-2 rounded"
-        >
-          {INSTRUMENTS.map((i) => (
-            <option key={i.code} value={i.code}>
-              {i.label} ({i.code})
-            </option>
-          ))}
-        </select>
+      <div className="flex flex-wrap gap-3 items-end">
+        <div className="flex flex-col">
+          <label className="text-xs opacity-70 mb-1">Instrument</label>
+          <select
+            value={instrument.code}
+            onChange={(e) => {
+              const next = findInstrument(e.target.value);
+              if (next) setInstrument(next);
+            }}
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
+          >
+            {INSTRUMENTS.map((i) => (
+              <option key={i.code} value={i.code}>
+                {(i as any).label ?? i.code} ({i.code})
+              </option>
+            ))}
+          </select>
+        </div>
 
-        <input
-          type="date"
-          value={dateStr}
-          onChange={(e) => setDateStr(e.target.value)}
-          className="bg-gray-900 text-white p-2 rounded"
-        />
+        <div className="flex flex-col">
+          <label className="text-xs opacity-70 mb-1">Date</label>
+          <input
+            type="date"
+            value={dateStr}
+            onChange={(e) => setDateStr(e.target.value)}
+            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
+          />
+        </div>
 
-        <button
-          onClick={() => fetchHeadlines(instrument, dateStr)}
-          className="bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded"
-        >
-          Refresh Calendar
-        </button>
-
-        <button
-          onClick={generatePlan}
-          className="bg-green-600 hover:bg-green-700 px-3 py-1 rounded"
-        >
-          Generate Plan
-        </button>
-
-        <button
-          onClick={resetAll}
-          className="bg-red-600 hover:bg-red-700 px-3 py-1 rounded"
-        >
-          Reset
-        </button>
-
-        {/* DEBUG – remove after confirming */}
-        <div className="text-xs opacity-60">
-          debug instruments: {INSTRUMENTS.length} –{" "}
-          {INSTRUMENTS.slice(0, 8).map((i) => i.code).join(", ")}
-          {INSTRUMENTS.length > 8 ? " …" : ""}
+        <div className="flex gap-2 ml-auto">
+          <button
+            onClick={resetAll}
+            className="px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
+          >
+            Reset
+          </button>
+          <button
+            onClick={refreshCalendar}
+            className="px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
+          >
+            Refresh Calendar
+          </button>
+          <button
+            onClick={refreshHeadlines}
+            className="px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
+          >
+            Refresh Headlines
+          </button>
+          <button
+            onClick={generatePlan}
+            className="px-3 py-1 text-sm rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
+            disabled={generating}
+          >
+            {generating ? "Generating…" : "Generate Plan"}
+          </button>
         </div>
       </div>
 
-      {/* Charts */}
+      {/* Charts row (your TradingViewTriple stays in charge of layout) */}
       <TradingViewTriple symbol={instrument.code} />
 
-      {/* Two-column layout: headlines left, plan right */}
-      <div className="grid grid-cols-2 gap-6">
-        <div>
-          <h2 className="text-xl font-semibold mb-2">
-            Macro Headlines (24–48h)
-          </h2>
-          <HeadlinesPanel items={headlines} loading={loadingNews} />
+      {/* Calendar note (kept lightweight until TE key) */}
+      <div className="rounded-lg border border-neutral-800 p-4">
+        <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
+        {calendarItems.length ? (
+          <ul className="text-sm">
+            {calendarItems.map((e, i) => (
+              <li key={i}>
+                {e?.time ?? ""} — <b>{e?.title ?? e?.name ?? "Event"}</b>{" "}
+                {e?.currency ? `(${e.currency})` : ""}{" "}
+                {e?.impact ? `— ${e.impact}` : ""}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="text-sm opacity-75">
+            No calendar items found from providers. (Once your TradingEconomics key is active, this will populate automatically.)
+          </div>
+        )}
+      </div>
+
+      {/* Headlines (left, smaller) + Trade Card (right, bigger) */}
+      <div className="grid grid-cols-12 gap-4 items-start">
+        <div className="col-span-12 lg:col-span-7 rounded-lg border border-neutral-800 p-4">
+          <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
+          <div className="text-xs">
+            <HeadlinesPanel items={headlines} />
+          </div>
         </div>
 
-        <div>
-          <h2 className="text-xl font-semibold mb-2">Generated Trade Card</h2>
-          <pre className="bg-gray-800 text-white p-4 rounded whitespace-pre-wrap text-base leading-6">
-            {planText || "Click Generate Plan to build a setup using the 15m execution, 1h/4h context, and fundamentals."}
-          </pre>
+        <div className="col-span-12 lg:col-span-5 rounded-lg border border-neutral-800 p-4">
+          <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
+          {planText ? (
+            <pre className="whitespace-pre-wrap text-base md:text-lg leading-[1.35] opacity-95 max-h-[60vh] overflow-auto">
+              {planText}
+            </pre>
+          ) : generating ? (
+            <div className="text-sm opacity-80">Generating…</div>
+          ) : (
+            <div className="text-sm opacity-70">
+              Click <b>Generate Plan</b> to build a setup using 15m execution,
+              1h+4h context, fundamentals (calendar bias + headlines), and your strategy logic.
+            </div>
+          )}
         </div>
       </div>
     </div>
