@@ -17,7 +17,6 @@ const getCloses = (a: Candle[]) => a.map((c) => c.c);
 const getHighs  = (a: Candle[]) => a.map((c) => c.h);
 const getLows   = (a: Candle[]) => a.map((c) => c.l);
 const getOpens  = (a: Candle[]) => a.map((c) => c.o);
-const getTimes  = (a: Candle[]) => a.map((c) => c.t);
 
 /** ===== Basic indicators ===== */
 function ema(vals: number[], period: number): number {
@@ -27,7 +26,6 @@ function ema(vals: number[], period: number): number {
   for (let i = 1; i < vals.length; i++) e = (vals[i] - e) * k + e;
   return e;
 }
-
 function emaSeries(vals: number[], period: number): number[] {
   if (vals.length === 0) return [];
   const k = 2 / (period + 1);
@@ -35,7 +33,6 @@ function emaSeries(vals: number[], period: number): number[] {
   for (let i = 1; i < vals.length; i++) out.push((vals[i] - out[i - 1]) * k + out[i - 1]);
   return out;
 }
-
 function atr(highs: number[], lows: number[], closes: number[], period = 14): number {
   if (highs.length < period + 1) return 0;
   const trs: number[] = [];
@@ -51,7 +48,6 @@ function atr(highs: number[], lows: number[], closes: number[], period = 14): nu
 type Swing = { idx: number; price: number; type: "H" | "L" };
 
 function detectSwings(highs: number[], lows: number[], lookback = 2): Swing[] {
-  // Simple pivot: high[i] > high[i-1..i-lookback] and > high[i+1..i+lookback]
   const swings: Swing[] = [];
   const n = highs.length;
   for (let i = lookback; i < n - lookback; i++) {
@@ -66,22 +62,14 @@ function detectSwings(highs: number[], lows: number[], lookback = 2): Swing[] {
   }
   return swings.sort((a, b) => a.idx - b.idx);
 }
-
 function structureBias(swings: Swing[]): "UP" | "DOWN" | "RANGE" {
-  // last 6 swings: if HH+HL dominate → UP, if LH+LL dominate → DOWN
   const recent = swings.slice(-6);
   if (recent.length < 4) return "RANGE";
   let hh = 0, hl = 0, lh = 0, ll = 0;
   for (let i = 1; i < recent.length; i++) {
     const prev = recent[i - 1], cur = recent[i];
-    if (cur.type === "H" && prev.type === "H") {
-      if (cur.price > prev.price) hh++;
-      else lh++;
-    }
-    if (cur.type === "L" && prev.type === "L") {
-      if (cur.price > prev.price) hl++; // higher low (note: higher low means price number is larger; but for "up", we actually want HL to be higher than prev L? In FX upward trend, lows rise → low price increases; so yes.)
-      else ll++;
-    }
+    if (cur.type === "H" && prev.type === "H") { if (cur.price > prev.price) hh++; else lh++; }
+    if (cur.type === "L" && prev.type === "L") { if (cur.price > prev.price) hl++; else ll++; }
   }
   const upScore = hh + hl;
   const dnScore = lh + ll;
@@ -89,115 +77,62 @@ function structureBias(swings: Swing[]): "UP" | "DOWN" | "RANGE" {
   if (dnScore > upScore + 1) return "DOWN";
   return "RANGE";
 }
-
 function lastSwingOf(type: "H" | "L", swings: Swing[]): Swing | null {
-  for (let i = swings.length - 1; i >= 0; i--) {
-    if (swings[i].type === type) return swings[i];
-  }
+  for (let i = swings.length - 1; i >= 0; i--) if (swings[i].type === type) return swings[i];
   return null;
 }
 
-/** ===== Fair Value Gap (3-candle) =====
- * Bullish FVG if low[i] > high[i-2]; Bearish FVG if high[i] < low[i-2]
- */
+/** ===== FVG / OB (simple) ===== */
 type FVG = { startIdx: number; endIdx: number; gapTop: number; gapBot: number; side: "bull" | "bear" };
-
 function detectFVG(highs: number[], lows: number[]): FVG[] {
   const out: FVG[] = [];
   for (let i = 2; i < highs.length; i++) {
-    const bull = lows[i - 0] > highs[i - 2];
-    const bear = highs[i - 0] < lows[i - 2];
+    const bull = lows[i] > highs[i - 2];
+    const bear = highs[i] < lows[i - 2];
     if (bull) out.push({ startIdx: i - 2, endIdx: i, gapTop: lows[i], gapBot: highs[i - 2], side: "bull" });
     if (bear) out.push({ startIdx: i - 2, endIdx: i, gapTop: lows[i - 2], gapBot: highs[i], side: "bear" });
   }
   return out.slice(-8);
 }
-
-/** ===== Order Block (simple) =====
- * Bullish OB: last down candle before an impulse that breaks a "H" swing
- * Bearish OB: last up candle before an impulse that breaks a "L" swing
- */
 type OB = { idx: number; hi: number; lo: number; side: "bull" | "bear" };
-
 function detectOB(opens: number[], highs: number[], lows: number[], closes: number[], swings: Swing[]): OB[] {
   const out: OB[] = [];
-  const n = closes.length;
   const swingH = swings.filter(s => s.type === "H").slice(-4);
   const swingL = swings.filter(s => s.type === "L").slice(-4);
-
-  // find breaks of structure and tag the prior opposite candle as OB
-  for (let i = 2; i < n; i++) {
-    // broke a recent swing high?
+  for (let i = 2; i < closes.length; i++) {
     const brokeH = swingH.some(s => closes[i] > s.price && i > s.idx);
     if (brokeH) {
-      // walk back to find last down candle
-      for (let j = i - 1; j >= Math.max(0, i - 10); j--) {
-        if (closes[j] < opens[j]) { // red candle
-          out.push({ idx: j, hi: highs[j], lo: lows[j], side: "bull" });
-          break;
-        }
-      }
+      for (let j = i - 1; j >= Math.max(0, i - 10); j--) if (closes[j] < opens[j]) { out.push({ idx: j, hi: highs[j], lo: lows[j], side: "bull" }); break; }
     }
-    // broke a recent swing low?
     const brokeL = swingL.some(s => closes[i] < s.price && i > s.idx);
     if (brokeL) {
-      for (let j = i - 1; j >= Math.max(0, i - 10); j--) {
-        if (closes[j] > opens[j]) { // green candle
-          out.push({ idx: j, hi: highs[j], lo: lows[j], side: "bear" });
-          break;
-        }
-      }
+      for (let j = i - 1; j >= Math.max(0, i - 10); j--) if (closes[j] > opens[j]) { out.push({ idx: j, hi: highs[j], lo: lows[j], side: "bear" }); break; }
     }
   }
   return out.slice(-6);
 }
 
-/** ===== SR Flip / Fakeout ===== */
-function brokeAndRetested(level: number, closes: number[], highs: number[], lows: number[]): boolean {
-  // break through 'level' then retest within last N bars
-  const N = 40;
-  const arrC = closes.slice(-N), arrH = highs.slice(-N), arrL = lows.slice(-N);
-  const brokeUp = arrC.some(c => c > level) && arrL.some(l => l <= level);
-  const brokeDn = arrC.some(c => c < level) && arrH.some(h => h >= level);
-  return brokeUp || brokeDn;
-}
-
-function wickFakeoutThrough(level: number, opens: number[], closes: number[], highs: number[], lows: number[]): boolean {
-  // long wick through level but close back within previous range
-  const N = 30;
-  const o = opens.slice(-N), c = closes.slice(-N), h = highs.slice(-N), l = lows.slice(-N);
-  for (let i = 0; i < o.length; i++) {
-    const upWick = h[i] > level && Math.max(o[i], c[i]) < level;
-    const dnWick = l[i] < level && Math.min(o[i], c[i]) > level;
-    if (upWick || dnWick) return true;
-  }
-  return false;
-}
-
-/** ===== Fib confluence ===== */
+/** ===== Fib zone ===== */
 type FibZone = { a: number; b: number; r382: number; r5: number; r618: number };
-
-function fibZoneFromSwings(lastUp: { a: number; b: number } | null, lastDn: { a: number; b: number } | null) {
-  // For bullish pullback: from swing low (a) to swing high (b) → buy zone 0.382..0.618
-  // For bearish pullback: from swing high (a) to swing low (b) → sell zone 0.382..0.618
+function fibZonesFromSwings(lastLow: Swing | null, lastHigh: Swing | null) {
   const zones: { bull?: FibZone; bear?: FibZone } = {};
-  if (lastUp) {
-    const { a, b } = lastUp; // a=low, b=high
+  if (lastLow && lastHigh && lastLow.idx < lastHigh.idx) {
+    const a = lastLow.price, b = lastHigh.price; // up leg
     zones.bull = { a, b, r382: a + (b - a) * 0.382, r5: a + (b - a) * 0.5, r618: a + (b - a) * 0.618 };
   }
-  if (lastDn) {
-    const { a, b } = lastDn; // a=high, b=low
+  if (lastHigh && lastLow && lastHigh.idx < lastLow.idx) {
+    const a = lastHigh.price, b = lastLow.price; // down leg
     zones.bear = { a, b, r382: b + (a - b) * 0.618, r5: b + (a - b) * 0.5, r618: b + (a - b) * 0.382 };
   }
   return zones;
 }
 
-/** ===== Sentiment keywords (for when calendar is missing) ===== */
+/** ===== Sentiment keywords (when calendar missing) ===== */
 const MACRO_KEYWORDS = [
-  "cpi","inflation","ppi","core","gdp","retail sales","industrial production",
-  "durable goods","pmi","ism","confidence","sentiment","unemployment","jobless",
-  "claims","payrolls","nfp","employment","rate decision","interest rate",
-  "fomc","ecb","boe","boj","rba","boc","snb","trade balance","current account","war","conflict","sanction"
+  "cpi","inflation","ppi","core","gdp","retail sales","industrial production","durable goods",
+  "pmi","ism","confidence","sentiment","unemployment","jobless","claims","payrolls","nfp","employment",
+  "rate decision","interest rate","fomc","ecb","boe","boj","rba","boc","snb","trade balance","current account",
+  "war","conflict","sanction","ceasefire","tariff","embargo","attack","strike"
 ];
 
 function minutesUntil(iso: string): number {
@@ -208,14 +143,15 @@ function minutesUntil(iso: string): number {
 
 /** ===== Card renderer ===== */
 function fmtPct(v: number) { return `${clamp(Math.round(v), 0, 100)}%`; }
-
 function toCard({
-  symbol, dir, entry, sl, tp1, tp2, conviction,
+  symbol, dir, orderType, trigger, entry, sl, tp1, tp2, conviction,
   tf15, tf1, tf4, shortReason, fundSummary, alignText, scenarios, invalidation, priorityBias,
   eventWatch, signals, setup,
 }: {
   symbol: string;
   dir: "Long" | "Short";
+  orderType: "Buy Limit" | "Sell Limit" | "Buy Stop" | "Sell Stop" | "Market";
+  trigger: string;
   entry: number;
   sl: number;
   tp1: number;
@@ -238,6 +174,8 @@ function toCard({
     "Quick Plan (Actionable)",
     "",
     `• Direction: ${dir}`,
+    `• Order Type: ${orderType}`,
+    `• Trigger: ${trigger}`,
     `• Entry: ${entry}`,
     `• Stop Loss: ${sl}`,
     `• Take Profit(s): TP1 ${tp1} / TP2 ${tp2}`,
@@ -284,13 +222,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     instrument = (fromQuery || "EURUSD").toUpperCase().replace(/\s+/g, "");
   }
 
-  // ---- Fetch candles (REAL data via your providers) ----
+  // ---- Fetch real candles ----
   const [m15, h1, h4] = await Promise.all([
     getCandles(instrument, "15m", LIMIT_15M),
     getCandles(instrument, "1h",  LIMIT_1H),
     getCandles(instrument, "4h",  LIMIT_4H),
   ]);
-
   if (!Array.isArray(m15) || m15.length === 0) {
     return res.status(200).json({ ok: false, reason: "Missing 15m candles; cannot build execution plan" });
   }
@@ -323,93 +260,139 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
   const fvg15 = detectFVG(H15, L15);
   const ob15  = detectOB(O15, H15, L15, C15, swings15);
 
-  // last swings for levels
   const lastH15 = lastSwingOf("H", swings15);
   const lastL15 = lastSwingOf("L", swings15);
-
   const last = C15[C15.length - 1];
 
-  // ---- Technical signal scoring (deterministic) ----
+  const zones = fibZonesFromSwings(lastL15, lastH15);
+
+  // ---- Technical signal scoring ----
   let longScore = 0, shortScore = 0;
   const fired: string[] = [];
 
-  // EMA momentum alignment
+  // EMA alignment
   if (trend15 === "UP") { longScore += 6; fired.push("EMA(21>50) 15m ↑"); }
-  else { shortScore += 6; fired.push("EMA(21<50) 15m ↓"); }
+  else if (trend15 === "DOWN") { shortScore += 6; fired.push("EMA(21<50) 15m ↓"); }
   if (trend1 === "UP") longScore += 4; else shortScore += 4;
   if (trend4 === "UP") longScore += 3; else shortScore += 3;
 
-  // Structure BOS/Context
+  // Structure
   if (struct15 === "UP") { longScore += 6; fired.push("Structure 15m HH/HL"); }
   if (struct15 === "DOWN") { shortScore += 6; fired.push("Structure 15m LH/LL"); }
   if (struct1 === "UP") longScore += 4; if (struct1 === "DOWN") shortScore += 4;
   if (struct4 === "UP") longScore += 3; if (struct4 === "DOWN") shortScore += 3;
 
-  // FVG confluence near price (15m)
+  // FVG proximity
   const nearFVGup = fvg15.find(g => g.side === "bull" && Math.abs(last - g.gapTop) <= ATR15 * 0.6);
   const nearFVGdn = fvg15.find(g => g.side === "bear" && Math.abs(last - g.gapBot) <= ATR15 * 0.6);
   if (nearFVGup) { longScore += 4; fired.push("Bull FVG nearby"); }
   if (nearFVGdn) { shortScore += 4; fired.push("Bear FVG nearby"); }
 
-  // OB tag proximity
+  // OB proximity
   const nearOBbull = ob15.find(o => o.side === "bull" && last >= o.lo && last <= o.hi + ATR15 * 0.2);
   const nearOBbear = ob15.find(o => o.side === "bear" && last <= o.hi && last >= o.lo - ATR15 * 0.2);
   if (nearOBbull) { longScore += 5; fired.push("Bull OB in play"); }
   if (nearOBbear) { shortScore += 5; fired.push("Bear OB in play"); }
 
-  // SR flip & fakeout using last swings
-  if (lastH15 && brokeAndRetested(lastH15.price, C15, H15, L15)) { longScore += 3; fired.push("SR Flip (over H)"); }
-  if (lastL15 && brokeAndRetested(lastL15.price, C15, H15, L15)) { shortScore += 3; fired.push("SR Flip (under L)"); }
-  if (lastH15 && wickFakeoutThrough(lastH15.price, O15, C15, H15, L15)) { shortScore += 2; fired.push("Fakeout above H"); }
-  if (lastL15 && wickFakeoutThrough(lastL15.price, O15, C15, H15, L15)) { longScore += 2; fired.push("Fakeout below L"); }
-
-  // Fib zones from recent swings (15m)
-  // Up leg: last L then later H; Down leg: last H then later L
-  const lastLow = lastL15, lastHigh = lastH15;
-  let upLeg: { a: number; b: number } | null = null;
-  let dnLeg: { a: number; b: number } | null = null;
-  if (lastLow && lastHigh) {
-    if (lastLow.idx < lastHigh.idx) upLeg = { a: lastLow.price, b: lastHigh.price };
-    if (lastHigh.idx < lastLow.idx) dnLeg = { a: lastHigh.price, b: lastLow.price };
-  }
-  const zones = fibZoneFromSwings(upLeg, dnLeg);
-  if (zones.bull && last >= zones.bull.r382 && last <= zones.bull.r618) { longScore += 4; fired.push("Fib 0.382–0.618 (bull)"); }
-  if (zones.bear && last <= zones.bear.r382 && last >= zones.bear.r618) { shortScore += 4; fired.push("Fib 0.382–0.618 (bear)"); }
-
-  // ---- Pick direction by higher score
+  // ---- Direction by score
   let dir: "Long" | "Short" = longScore >= shortScore ? "Long" : "Short";
-  const setupSignals: string[] = [];
-  const tf15 = `${trend15.toLowerCase()}/${struct15.toLowerCase()}`;
-  const tf1  = `${trend1.toLowerCase()}/${struct1.toLowerCase()}`;
-  const tf4  = `${trend4.toLowerCase()}/${struct4.toLowerCase()}`;
+  const dirSign = dir === "Long" ? 1 : -1;
 
-  // Build entry/SL/TP based on structure and ATR
+  // ---- Setup detection: Breakout (Stop) vs Pullback (Limit)
+  const buffer = ATR15 * 0.2; // small logical buffer beyond swings
+  let isBreakout = false;
+  if (dir === "Long" && lastH15) isBreakout = last > lastH15.price + buffer;
+  if (dir === "Short" && lastL15) isBreakout = last < lastL15.price - buffer;
+
+  // Pullback conditions: in fib 0.382–0.618 zone of last leg + OB/FVG confluence preferred
+  const inBullFib =
+    zones.bull && last >= zones.bull.r382 && last <= zones.bull.r618 ? true : false;
+  const inBearFib =
+    zones.bear && last <= zones.bear.r382 && last >= zones.bear.r618 ? true : false;
+  const hasConfluenceLong = !!(nearOBbull || nearFVGup);
+  const hasConfluenceShort = !!(nearOBbear || nearFVGdn);
+
+  let isPullback = false;
+  if (!isBreakout) {
+    if (dir === "Long") isPullback = !!inBullFib || hasConfluenceLong;
+    if (dir === "Short") isPullback = !!inBearFib || hasConfluenceShort;
+  }
+
+  // If neither clear → default to breakout plan at swings (range case)
+  if (!isBreakout && !isPullback) {
+    if (dir === "Long" && lastH15) isBreakout = true;
+    else if (dir === "Short" && lastL15) isBreakout = true;
+  }
+
+  // ---- Compute entry/SL/TP based on setup
+  let orderType: "Buy Limit" | "Sell Limit" | "Buy Stop" | "Sell Stop" | "Market" = "Market";
+  let trigger = "";
   let entry = last;
-  let stop: number;
-  if (dir === "Long") {
-    const baseSL = lastL15 ? lastL15.price : Math.min(...L15.slice(-20));
-    stop = Math.min(baseSL, last - ATR15 * 0.8);
+  let stop = last;
+  const riskFloor = Math.max(ATR15 * 0.6, last * 0.0008); // minimum sensible R distance
+
+  if (isBreakout) {
+    if (dir === "Long" && lastH15) {
+      orderType = "Buy Stop";
+      entry = round5(lastH15.price + buffer);
+      stop = round5((lastL15 ? Math.min(lastL15.price, entry - riskFloor) : entry - riskFloor));
+      trigger = `Breakout above 15m swing high ${round5(lastH15.price)} (+buffer)`;
+    } else if (dir === "Short" && lastL15) {
+      orderType = "Sell Stop";
+      entry = round5(lastL15.price - buffer);
+      stop = round5((lastH15 ? Math.max(lastH15.price, entry + riskFloor) : entry + riskFloor));
+      trigger = `Breakout below 15m swing low ${round5(lastL15.price)} (-buffer)`;
+    }
+  } else if (isPullback) {
+    if (dir === "Long" && zones.bull) {
+      orderType = "Buy Limit";
+      const zoneTop = zones.bull.r382, zoneMid = zones.bull.r5, zoneBot = zones.bull.r618;
+      // prefer OB/FVG edge if present near zone
+      const preferred = nearOBbull ? Math.min(nearOBbull.hi, zoneMid) :
+                        nearFVGup   ? Math.min(nearFVGup.gapTop, zoneMid) : zoneMid;
+      entry = round5(preferred);
+      stop = round5(Math.min(zones.bull.a, entry - riskFloor));
+      trigger = `Pullback into 0.382–0.618 (≈0.5) ${round5(zoneBot)}–${round5(zoneTop)} with OB/FVG confluence`;
+    }
+    if (dir === "Short" && zones.bear) {
+      orderType = "Sell Limit";
+      const zoneTop = zones.bear.r382, zoneMid = zones.bear.r5, zoneBot = zones.bear.r618;
+      const preferred = nearOBbear ? Math.max(nearOBbear.lo, zoneMid) :
+                        nearFVGdn   ? Math.max(nearFVGdn.gapBot, zoneMid) : zoneMid;
+      entry = round5(preferred);
+      stop = round5(Math.max(zones.bear.a, entry + riskFloor));
+      trigger = `Pullback into 0.382–0.618 (≈0.5) ${round5(zoneBot)}–${round5(zoneTop)} with OB/FVG confluence`;
+    }
   } else {
-    const baseSL = lastH15 ? lastH15.price : Math.max(...H15.slice(-20));
-    stop = Math.max(baseSL, last + ATR15 * 0.8);
+    // fallback market calculation (should rarely hit)
+    orderType = "Market";
+    entry = round5(last);
+    if (dir === "Long") stop = round5((lastL15 ? Math.min(lastL15.price, entry - riskFloor) : entry - riskFloor));
+    else stop = round5((lastH15 ? Math.max(lastH15.price, entry + riskFloor) : entry + riskFloor));
+    trigger = "No clean setup — using market with protective swing SL";
   }
+
   const risk = Math.abs(entry - stop);
-  const tp1  = dir === "Long" ? entry + risk : entry - risk;
-  const tp2  = dir === "Long" ? entry + risk * 1.8 : entry - risk * 1.8;
+  const tp1 = round5(dir === "Long" ? entry + Math.max(risk, riskFloor) : entry - Math.max(risk, riskFloor));
+  const tp2 = round5(dir === "Long" ? entry + Math.max(risk * 1.8, riskFloor * 1.8) : entry - Math.max(risk * 1.8, riskFloor * 1.8));
 
-  // Short reasoning and named setup
-  let shortReason = "Multi-signal confluence around recent structure.";
-  let setupName = dir === "Long" ? "Continuation Pullback Long" : "Continuation Pullback Short";
-  if (nearFVGup && dir === "Long") setupName = "15m FVG + OB Long";
-  if (nearFVGdn && dir === "Short") setupName = "15m FVG + OB Short";
-  if (lastH15 && dir === "Long" && entry > lastH15.price) setupName = "Range Break & Retest Long";
-  if (lastL15 && dir === "Short" && entry < lastL15.price) setupName = "Range Break & Retest Short";
+  // ---- Name + reasoning
+  let setupName = isBreakout ? (dir === "Long" ? "Breakout & Retest Long" : "Breakout & Retest Short")
+                             : (dir === "Long" ? "Pullback (OB/FVG + 0.5) Long" : "Pullback (OB/FVG + 0.5) Short");
+  let shortReason = isBreakout
+    ? "Momentum through 15m structure; use stop trigger beyond swing with protective SL at opposite swing."
+    : "Retracement toward confluence (OB/FVG/Fib 0.5) within HTF-aligned trend; use limit entry inside zone.";
 
-  // collect surfaced signals (top 6 only)
-  for (const s of fired) {
-    if (setupSignals.length >= 6) break;
-    setupSignals.push(s);
-  }
+  // collect notable signals (top 6)
+  const setupSignals: string[] = [];
+  for (const s of [
+    trend15 === "UP" ? "EMA 15m ↑" : "EMA 15m ↓",
+    `HTF: 1H ${trend1}, 4H ${trend4}`,
+    struct15 !== "RANGE" ? `Structure 15m ${struct15}` : "",
+    isBreakout ? "BOS/Breakout over swing" : "Fib 0.382–0.618 pullback",
+    nearOBbull || nearOBbear ? "Order Block confluence" : "",
+    nearFVGup || nearFVGdn ? "FVG confluence" : "",
+  ]) if (s) setupSignals.push(s);
 
   // ---- Fundamentals: Headlines (scores already attached by /api/news) ----
   const headlineScores: number[] = Array.isArray(headlines)
@@ -419,7 +402,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
   const newsBias = newsSum > 0 ? 1 : newsSum < 0 ? -1 : 0;
   const newsText = newsBias > 0 ? "positive" : newsBias < 0 ? "negative" : "neutral";
 
-  // Macro context from headlines when no calendar
+  // Macro context when no calendar
   const eventWatch: string[] = [];
   const now = Date.now();
   const macroMentions: string[] = [];
@@ -434,12 +417,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
   }
 
-  // ---- Calendar bias & upcoming warnings (optional) — WARNING ONLY (no cap) ----
-  let instBiasScore = 0; // -5..+5 expected if provided by /api/calendar
+  // ---- Calendar: bias + upcoming warnings (no cap; warning only)
+  let instBiasScore = 0; // -5..+5 expected
   if (calendar && calendar.ok) {
     const bias = (calendar as any)?.bias;
     instBiasScore = Number(bias?.instrument?.score || 0) || 0;
-
     const items: any[] = Array.isArray((calendar as any)?.items) ? (calendar as any).items : [];
     for (const e of items) {
       if (!e?.time) continue;
@@ -455,17 +437,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     for (const m of macroMentions) eventWatch.push(`• ${m}`);
   }
 
-  // ---- Conviction: Technical base + headlines + calendar (no blackout cap) ----
-  // Base from technical delta
-  let techScore = 50 + (dir === "Long" ? (longScore - shortScore) : (shortScore - longScore)) * 2;
-  // Normalize
-  techScore = clamp(techScore, 30, 80);
-  // Apply fundamentals
-  let conviction = techScore + newsBias * 7 + instBiasScore * 3;
-  conviction = clamp(Math.round(conviction), 25, 92);
+  // ---- Conviction
+  let techDelta = (dir === "Long" ? longScore - shortScore : shortScore - longScore);
+  let techScore = clamp(50 + techDelta * 2, 30, 80);
+  let conviction = clamp(Math.round(techScore + newsBias * 7 + instBiasScore * 3), 25, 92);
 
   // Alignment sentence
-  const dirSign = dir === "Long" ? 1 : -1;
   const fundComposite = newsBias * 0.5 + Math.sign(instBiasScore) * 0.5;
   const aligned = (dirSign > 0 && fundComposite >= 0) || (dirSign < 0 && fundComposite <= 0);
   const alignText = aligned ? "Match (fundamentals support technicals)" : "Mixed (partial or weak support)";
@@ -482,26 +459,32 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
   // Scenarios
   const scenarios: string[] = [];
-  scenarios.push(
-    dir === "Long"
-      ? "If price retests 15m OB / FVG / 0.5 fib and holds, consider continuation long."
-      : "If price retests 15m OB / FVG / 0.5 fib and rejects, consider continuation short."
-  );
-  scenarios.push("Move to break-even at TP1; trail partials behind structure.");
-  if (eventWatch.length) scenarios.push("If a high-impact release is imminent, prefer confirmation after the print.");
+  if (isPullback) {
+    scenarios.push(dir === "Long"
+      ? "If 15m prints bullish rejection or BOS after touching the zone, execute; else wait."
+      : "If 15m prints bearish rejection or BOS after touching the zone, execute; else wait.");
+  } else {
+    scenarios.push(dir === "Long"
+      ? "If breakout fails and re-enters below the swing, stand down and reassess."
+      : "If breakout fails and re-enters above the swing, stand down and reassess.");
+  }
+  scenarios.push("Move to break-even at TP1; trail partials behind 15m structure.");
+  if (eventWatch.length) scenarios.push("If a high-impact release is imminent, prefer confirmation right after the print.");
 
   const invalidation =
     dir === "Long"
-      ? "Clean 15m close below protective swing low or heavy acceptance below EMA50."
-      : "Clean 15m close above protective swing high or heavy acceptance above EMA50.";
+      ? "Clean 15m close below the protective swing/zone or heavy acceptance below EMA50."
+      : "Clean 15m close above the protective swing/zone or heavy acceptance above EMA50.";
 
   const card = toCard({
     symbol: instrument,
     dir,
-    entry: Number(entry.toFixed(5)),
-    sl: Number(stop.toFixed(5)),
-    tp1: Number(tp1.toFixed(5)),
-    tp2: Number(tp2.toFixed(5)),
+    orderType,
+    trigger,
+    entry: entry,
+    sl: stop,
+    tp1,
+    tp2,
     conviction,
     tf15: `${trend15.toLowerCase()} / ${struct15.toLowerCase()}`,
     tf1:  `${trend1.toLowerCase()} / ${struct1.toLowerCase()}`,
@@ -518,4 +501,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
   });
 
   return res.status(200).json({ ok: true, text: card, conviction, setup: setupName, signals: setupSignals });
+
+  function round5(n: number) {
+    // keep 5 decimals for FX-like pairs; metals/indices will just show more precision but safe
+    return Number(n.toFixed(5));
+  }
 }
