@@ -6,18 +6,15 @@ import dynamic from "next/dynamic";
 import CalendarPanel from "../components/CalendarPanel";
 import HeadlinesPanel from "../components/HeadlinesPanel";
 
-// ✅ client-only chart import to avoid client-side exception
-const TradingViewTriple = dynamic(
-  () => import("../components/TradingViewTriple"),
-  {
-    ssr: false,
-    loading: () => (
-      <div className="rounded-lg border border-neutral-800 p-4">
-        <div className="text-sm opacity-75">Loading charts…</div>
-      </div>
-    ),
-  }
-);
+// client-only chart import (avoids client-side exception)
+const TradingViewTriple = dynamic(() => import("../components/TradingViewTriple"), {
+  ssr: false,
+  loading: () => (
+    <div className="rounded-lg border border-neutral-800 p-4">
+      <div className="text-sm opacity-75">Loading charts…</div>
+    </div>
+  ),
+});
 
 // ---------- types / helpers ----------
 type CalendarBias = {
@@ -29,14 +26,7 @@ type CalendarBias = {
 };
 
 type CalendarResp =
-  | {
-      ok: true;
-      provider?: string;
-      date?: string;
-      count: number;
-      items: any[];
-      bias: CalendarBias;
-    }
+  | { ok: true; provider?: string; date?: string; count: number; items: any[]; bias: CalendarBias }
   | { ok: false; reason: string };
 
 type NewsResp =
@@ -52,17 +42,6 @@ function baseQuoteFromInstrument(instr: string): [string, string] {
   if (s.length >= 6) return [s.slice(0, 3), s.slice(-3)];
   if (s.endsWith("USD")) return [s.replace("USD", ""), "USD"];
   return [s, "USD"];
-}
-
-// normalize plan text so it prints line-by-line
-function normalizePlanText(v: any): string {
-  if (!v) return "";
-  if (typeof v === "string") return v.replace(/\\n/g, "\n");
-  try {
-    return JSON.stringify(v, null, 2);
-  } catch {
-    return String(v);
-  }
 }
 
 // ---------- page ----------
@@ -114,17 +93,14 @@ export default function Page() {
       setCalendar(j);
 
       if (j?.ok) {
-        // Load headlines using currencies from calendar bias
         const ccy = currenciesFromBias(j.bias);
         if (ccy.length) {
           await loadHeadlinesForSymbols(ccy);
         } else {
-          // If bias missing, fallback to instrument symbols
           const [base, quote] = baseQuoteFromInstrument(instrument);
           await loadHeadlinesForSymbols([base, quote]);
         }
       } else {
-        // Provider empty: fallback to instrument symbols (Google News will almost always have something)
         const [base, quote] = baseQuoteFromInstrument(instrument);
         await loadHeadlinesForSymbols([base, quote]);
       }
@@ -137,6 +113,7 @@ export default function Page() {
     }
   }, [dateStr, instrument, loadHeadlinesForSymbols]);
 
+  // auto-load when instrument/date changes
   useEffect(() => {
     loadCalendar();
   }, [loadCalendar]);
@@ -157,31 +134,25 @@ export default function Page() {
         }),
       });
       const j = await r.json();
-      if (j?.ok) {
-        const raw = j?.plan || j?.card || j?.text || j;
-        setPlanText(normalizePlanText(raw));
-      } else setPlanText(normalizePlanText(j?.reason || "Server error while generating plan."));
+      if (j?.ok) setPlanText(j?.plan || j?.card || JSON.stringify(j, null, 2));
+      else setPlanText(j?.reason || "Server error while generating plan.");
     } catch (e: any) {
-      setPlanText(normalizePlanText(e?.message || "Error generating plan."));
+      setPlanText(e?.message || "Error generating plan.");
     } finally {
       setGenerating(false);
     }
   }, [instrument, dateStr, calendar, headlines]);
 
+  // Reset (no Refresh Calendar button)
+  const resetAll = useCallback(() => {
+    setPlanText("");
+    loadCalendar();
+  }, [loadCalendar]);
+
   const calendarCurrencies = useMemo(
     () => currenciesFromBias((calendar as any)?.bias),
     [calendar]
   );
-
-  // reset = clear outputs and re-fetch calendar/news
-  const resetAll = useCallback(() => {
-    setPlanText("");
-    setHeadlines([]);
-    setCalendar(null);
-    setDateStr(todayISO());
-    // re-pull with fresh date/instrument
-    setTimeout(() => loadCalendar(), 0);
-  }, [loadCalendar]);
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 space-y-4">
@@ -227,7 +198,6 @@ export default function Page() {
           />
         </div>
 
-        {/* 🔄 Reset replaces "Refresh Calendar" */}
         <button
           onClick={resetAll}
           className="px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
@@ -261,17 +231,15 @@ export default function Page() {
       {/* Charts */}
       <TradingViewTriple symbol={instrument} />
 
-      {/* 2+1 columns: LEFT (Calendar + Headlines) | RIGHT (Trade Card) */}
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
-        {/* LEFT: Calendar + Headlines stacked (span 2 columns) */}
-        <div className="xl:col-span-2 space-y-4">
+      {/* Layout: LEFT (calendar + headlines) | RIGHT (trade card) */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        {/* LEFT side (span 2 cols on desktop) */}
+        <div className="lg:col-span-2 order-2 lg:order-1 space-y-4">
           {/* Calendar */}
           <div className="rounded-lg border border-neutral-800 p-4">
             <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
 
-            {loadingCal && (
-              <div className="text-sm opacity-75">Loading calendar…</div>
-            )}
+            {loadingCal && <div className="text-sm opacity-75">Loading calendar…</div>}
 
             {!loadingCal && calendar?.ok && Array.isArray(calendar.items) && (
               <CalendarPanel items={calendar.items} />
@@ -285,11 +253,10 @@ export default function Page() {
             )}
           </div>
 
-          {/* Headlines – smaller font */}
+          {/* Headlines (smaller text) */}
           <div className="rounded-lg border border-neutral-800 p-4">
             <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
-            {/* Make li/text inside HeadlinesPanel smaller without touching that component */}
-            <div className="text-xs [&_li]:text-xs [&_a]:text-sky-300">
+            <div className="text-xs [&_li]:text-xs">
               <HeadlinesPanel items={Array.isArray(headlines) ? headlines : []} />
             </div>
             <div className="text-[11px] mt-2 opacity-60">
@@ -304,11 +271,11 @@ export default function Page() {
           </div>
         </div>
 
-        {/* RIGHT: Trade Card – bigger font & vertical lines */}
-        <div className="rounded-lg border border-neutral-800 p-4">
-          <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
+        {/* RIGHT side: Trade Card (sticky on desktop, larger font) */}
+        <div className="rounded-lg border border-neutral-800 p-4 order-1 lg:order-2 lg:sticky lg:top-4 h-fit">
+          <h2 className="text-xl font-semibold mb-3">Generated Trade Card</h2>
           {planText ? (
-            <pre className="whitespace-pre-wrap text-base leading-6 opacity-95">
+            <pre className="whitespace-pre-wrap text-lg leading-7 opacity-95 max-w-prose">
               {planText}
             </pre>
           ) : generating ? (
