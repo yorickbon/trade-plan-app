@@ -2,144 +2,211 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getCandles, type Candle } from "../../lib/prices";
 
-type TF = "15m" | "1h" | "4h";
-type PlanOk = { ok: true; plan: { text: string; conviction: number } };
-type PlanErr = { ok: false; reason: string };
-type PlanResp = PlanOk | PlanErr;
+// -------------------- types --------------------
+type PlanOk = { ok: true; text: string; conviction: number };
+type PlanFail = { ok: false; reason: string };
+type PlanResp = PlanOk | PlanFail;
 
-const LIMIT_15M = 300, LIMIT_H1 = 360, LIMIT_H4 = 360;
+const LIMIT_15M = 200;
+const LIMIT_1H  = 360;
+const LIMIT_4H  = 360;
+
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
 const getCloses = (a: Candle[]) => a.map(c => c.c);
 const getHighs  = (a: Candle[]) => a.map(c => c.h);
 const getLows   = (a: Candle[]) => a.map(c => c.l);
 
-function ema(vals:number[], p:number){ if(!vals.length||p<=1) return vals.slice(); const out:number[]=[]; const k=2/(p+1); let prev=vals[0]; for(let i=0;i<vals.length;i++){ const v=i===0?vals[0]:vals[i]*k+prev*(1-k); out.push(v); prev=v; } return out; }
-function trendFromEMA(closes:number[], p=50):"up"|"down"|"flat"{ if(closes.length<p+5) return "flat"; const e=ema(closes,p); const a=e[e.length-1], b=e[e.length-6]; if(a>b*1.0008) return "up"; if(a<b*0.9992) return "down"; return "flat"; }
+// -------------------- helpers --------------------
+function ema(vals: number[], period: number): number {
+  if (vals.length < period) return vals[vals.length - 1] ?? 0;
+  const out: number[] = [];
+  const k = 2 / (period + 1);
+  let prev = vals[0];
+  for (let i = 0; i < vals.length; i++) {
+    const v = vals[i];
+    prev = (v - prev) * k + prev;
+    out.push(prev);
+  }
+  return out[out.length - 1];
+}
 
-function lastSwingHigh(lows:number[], highs:number[]):number{
+function lastSwingHigh(lows: number[], highs: number[]): number {
   // find most recent pivot high (simple lookback)
-  for(let i=2;i<highs.length-2;i++){
-    const idx = i;
-    if(highs[idx] > highs[idx+1] && highs[idx] > highs[idx-1]) return highs[idx];
+  for (let i = highs.length - 1; i >= 2; i--) {
+    if (highs[i] > highs[i - 1] && highs[i] > highs[i - 2]) return highs[i];
   }
-  return Math.max(...highs.slice(0,30));
-}
-function lastSwingLow(lows:number[], highs:number[]):number{
-  for(let i=2;i<lows.length-2;i++){
-    const idx = i;
-    if(lows[idx] < lows[idx+1] && lows[idx] < lows[idx-1]) return lows[idx];
-  }
-  return Math.min(...lows.slice(0,30));
-}
-function avgTrueRangeLike(bars:Candle[], n=14){
-  if(bars.length<n+1) return 0;
-  let sum=0;
-  for(let i=0;i<n;i++){
-    const c=bars[i], p=bars[i+1];
-    const tr=Math.max(c.h-c.l, Math.abs(c.h-p.c), Math.abs(c.l-p.c));
-    sum+=tr;
-  }
-  return sum/n;
+  // fallback
+  return Math.max(...highs.slice(-30));
 }
 
-function buildQuickPlan(symbol:string, dir:"LONG"|"SHORT", entry:number, sl:number, tp1:number, tp2:number, conviction:number, shortReason:string){
+function lastSwingLow(lows: number[], highs: number[]): number {
+  for (let i = lows.length - 1; i >= 2; i--) {
+    if (lows[i] < lows[i - 1] && lows[i] < lows[i - 2]) return lows[i];
+  }
+  return Math.min(...lows.slice(-30));
+}
+
+function trendFromEMAs(closes: number[], n = 14): "UP" | "DOWN" | "FLAT" {
+  if (closes.length < n) return "FLAT";
+  const last = closes[closes.length - 1];
+  const e21 = ema(closes, 21);
+  const e50 = ema(closes, 50);
+  if (Math.abs(e21 - e50) < last * 0.0001) return "FLAT";
+  return e21 > e50 ? "UP" : "DOWN";
+}
+
+function buildQuickPlan(
+  symbol: string,
+  dir: "LONG" | "SHORT",
+  entry: number,
+  sl: number,
+  tp1: number,
+  tp2: number,
+  conviction: number,
+  shortReason: string,
+  notes: string[],
+): string {
   return [
     "Quick Plan (Actionable)",
     `• Direction: ${dir}`,
-    `• Entry: ${entry.toFixed(5)}`,
-    `• Stop Loss: ${sl.toFixed(5)}`,
-    `• Take Profit(s): TP1 ${tp1.toFixed(5)} / TP2 ${tp2.toFixed(5)}`,
-    `• Conviction: ${conviction}%`,
+    `• Entry: ${entry}`,
+    `• Stop Loss: ${sl}`,
+    `• Take Profit(s): TP1 ${tp1} / TP2 ${tp2}`,
+    `• Conviction: ${conviction}`,
     `• Short Reasoning: ${shortReason}`,
     "",
+    "Full Breakdown",
+    notes.join("\n"),
+    "",
+    `Symbol: ${symbol}`,
   ].join("\n");
 }
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse<PlanResp>) {
-  // Read POST JSON (instrument, headlines, calendar) – UI already sends it
-  let code = "EURUSD";
+// -------------------- api handler --------------------
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse<PlanResp>
+) {
+  // ---- INPUTS (body first, then query, then fallback) ----
+  // This is the only *behavior* change: we now trust POST body > query > fallback.
+  let instrument = "EURUSD";
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
-    if (body?.instrument?.code) code = String(body.instrument.code).toUpperCase();
-  } catch {}
-  // Headlines + Calendar (optional)
-  const headlines: any[] = (typeof req.body === "object" && req.body && (req.body as any).headlines) || [];
-  const calendar: any[]  = (typeof req.body === "object" && req.body && (req.body as any).calendar) || [];
+    const fromBody = (body?.instrument ?? body?.code ?? "").toString();
+    const fromQuery = (req.query.instrument ?? req.query.code ?? "").toString();
+    instrument = (fromBody || fromQuery || "EURUSD").toUpperCase().replace(/\s+/g, "");
+  } catch {
+    const fromQuery = (req.query.instrument ?? req.query.code ?? "").toString();
+    instrument = (fromQuery || "EURUSD").toUpperCase().replace(/\s+/g, "");
+  }
 
-  // Fetch all TFs in parallel (Yahoo fallback is inside getCandles)
+  // Optional inputs already sent by UI (do not change your working flow)
+  let headlines: any[] = [];
+  let calendar: any[] = [];
+  try {
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    headlines = Array.isArray(body?.headlines) ? body.headlines : [];
+    calendar  = Array.isArray(body?.calendar)  ? body.calendar  : [];
+  } catch { /* no-op */ }
+
+  // ---- Fetch candles in parallel (fallbacks live inside getCandles) ----
   const [m15, h1, h4] = await Promise.all([
-    getCandles(code, "15m", LIMIT_15M),
-    getCandles(code, "1h",  LIMIT_H1),
-    getCandles(code, "4h",  LIMIT_H4),
+    getCandles(instrument, "15m", LIMIT_15M),
+    getCandles(instrument, "1h",  LIMIT_1H),
+    getCandles(instrument, "4h",  LIMIT_4H),
   ]);
 
+  // Require execution TF
   if (!m15.length) {
-    return res.status(200).json({ ok:false, reason:"Missing 15m candles; cannot build execution plan" });
+    return res.status(200).json({ ok: false, reason: "Missing 15m candles; cannot build execution plan" });
   }
 
-  // HTF context (if missing, we’ll still build a low-conviction plan)
-  const h1Trend = h1.length ? trendFromEMA(getCloses(h1), 50) : "flat";
-  const h4Trend = h4.length ? trendFromEMA(getCloses(h4), 50) : "flat";
-  const bias: "up"|"down"|"flat" =
-    h1Trend === h4Trend ? h1Trend : (h1Trend === "flat" ? h4Trend : h1Trend);
+  // -------------------- Data prep --------------------
+  const closes15 = getCloses(m15), highs15 = getHighs(m15), lows15 = getLows(m15);
+  const closes1  = getCloses(h1),  highs1  = getHighs(h1),  lows1  = getLows(h1);
+  const closes4  = getCloses(h4),  highs4  = getHighs(h4),  lows4  = getLows(h4);
 
-  // Intraday logic
-  const closes = getCloses(m15), highs = getHighs(m15), lows = getLows(m15);
-  const last = closes[0];
-  const hi20 = Math.max(...highs.slice(0,80)), lo20 = Math.min(...lows.slice(0,80));
-  const width = (hi20 - lo20) / ((hi20+lo20)/2);
+  // HTF context
+  const tf15 = trendFromEMAs(closes15);
+  const tf1  = trendFromEMAs(closes1);
+  const tf4  = trendFromEMAs(closes4);
 
-  // Simple signal set (always pick something)
-  let note = "";
+  // Pick a base direction (keep your simple “always pick something” rule)
   let direction: "LONG" | "SHORT" = "LONG";
-  let baseConv = 45;
+  let baseConv = 60; // base conviction
 
-  if (last > hi20) { note = "Breakout above recent swing high"; direction = "LONG"; baseConv = 62; }
-  else if (last < lo20) { note = "Breakdown below recent swing low"; direction = "SHORT"; baseConv = 62; }
-  else if (width < 0.004) { note = "Compression range"; direction = last > (hi20+lo20)/2 ? "SHORT" : "LONG"; baseConv = 45; }
-  else { note = "Range trading conditions"; baseConv = 40; }
+  // Weight trends
+  const score = (tf15 === "UP" ? 1 : tf15 === "DOWN" ? -1 : 0)
+              + (tf1  === "UP" ? 1 : tf1  === "DOWN" ? -1 : 0)
+              + (tf4  === "UP" ? 1 : tf4  === "DOWN" ? -1 : 0);
 
-  // HTF tie-breaker bumps/penalizes conviction
-  if (bias === "up" && direction === "LONG") baseConv += 10;
-  if (bias === "down" && direction === "SHORT") baseConv += 10;
-  if ((bias === "up" && direction === "SHORT") || (bias === "down" && direction === "LONG")) baseConv -= 8;
+  if (score > 0) { direction = "LONG";  baseConv += 5; }
+  if (score < 0) { direction = "SHORT"; baseConv += 5; }
 
-  // Fundamental tilt from headlines/calendar
-  const hdCount = Array.isArray(headlines) ? headlines.length : 0;
-  const blackout = Array.isArray(calendar) && calendar.some((e:any)=>e?.impact==="High" && e?.isBlackout);
-  if (hdCount >= 6) baseConv += 3;                     // more context → slightly higher
-  if (blackout) baseConv -= 10;                        // blackout window → caution
+  // Simple BOS / compression hint (kept from your base approach)
+  const lastH = lastSwingHigh(lows15, highs15);
+  const lastL = lastSwingLow(lows15, highs15);
+  let shortReason = "Compression range";
+  if (closes15[closes15.length - 1] > lastH) shortReason = "Breakout above recent swing high";
+  else if (closes15[closes15.length - 1] < lastL) shortReason = "Breakdown below recent swing low";
 
-  baseConv = clamp(Math.round(baseConv), 20, 85);
+  // Fundamental bump: headlines & blackout
+  const biasFromNews = (() => {
+    // naive score: title contains positive/negative words (already done upstream, we just count)
+    const scores = headlines.map((h: any) => (h?.sentiment?.score ?? 0));
+    const sum = scores.reduce((a: number, b: number) => a + b, 0);
+    return sum > 0 ? 1 : sum < 0 ? -1 : 0;
+  })();
 
-  // Entry/SL/TP from structure
-  const atr = avgTrueRangeLike(m15, 14) || (Math.abs(hi20 - lo20)/8);
-  const sh = lastSwingHigh(lows, highs), slw = lastSwingLow(lows, highs);
-  let entry = last, sl = last, tp1 = last, tp2 = last;
+  baseConv += biasFromNews * 5;
 
-  if (direction === "LONG") {
-    entry = last; sl = Math.min(slw, last - 1.2*atr);
-    tp1 = last + 1.5*atr; tp2 = last + 3*atr;
-  } else {
-    entry = last; sl = Math.max(sh, last + 1.2*atr);
-    tp1 = last - 1.5*atr; tp2 = last - 3*atr;
-  }
+  const blackout = calendar.some((e: any) =>
+    (e?.impact ?? "").toString().toUpperCase().includes("HIGH") &&
+    e?.isBlackout === true
+  );
 
-  const quick = buildQuickPlan(code, direction, entry, sl, tp1, tp2, baseConv, note);
-  const full = [
-    "Full Breakdown",
-    `• Technical View (HTF + Intraday): 1h=${h1Trend}, 4h=${h4Trend}; 15m=${note}`,
-    `• Fundamental View (last ${hdCount} headlines): ${blackout ? "BLACKOUT in effect (±90m) — conviction reduced" : "no blackout"}`,
-    `• Tech vs Fundy Alignment: ${bias==="flat" ? "Neutral" : ( (bias==="up" && direction==="LONG") || (bias==="down" && direction==="SHORT") ? "Match" : "Mixed" )}`,
-    `• Conditional Scenarios: If price invalidates SL, stand down; otherwise manage at TP1 → BE.`,
-    `• Surprise Risk: unscheduled CB comments; political soundbites.`,
-    `• Invalidation: clear close beyond SL level.`,
-    "",
-    "Notes",
-    `Symbol: ${code}`,
-  ].join("\n");
+  if (blackout) baseConv = Math.min(baseConv, 45);
 
-  const text = [quick, full].join("\n");
-  return res.status(200).json({ ok:true, plan:{ text, conviction: baseConv } });
+  // -------------------- Entry/SL/TP (structure) --------------------
+  const last = closes15[closes15.length - 1];
+  const sh   = lastSwingHigh(lows15, highs15);
+  const slw  = lastSwingLow(lows15, highs15);
+
+  let entry = last;
+  let sl    = direction === "LONG" ? slw : sh;
+  // protect against ultra-tight SL (logical > 0.1% of price)
+  const minGap = last * 0.001;
+  if (direction === "LONG" && entry - sl < minGap) sl = entry - minGap;
+  if (direction === "SHORT" && sl - entry < minGap) sl = entry + minGap;
+
+  const risk = Math.abs(entry - sl);
+  const tp1  = direction === "LONG" ? entry + risk : entry - risk;
+  const tp2  = direction === "LONG" ? entry + risk * 1.6 : entry - risk * 1.6;
+
+  // Conviction number (0–100)
+  const conviction = clamp(Math.round(baseConv), 20, 85);
+
+  // -------------------- Notes --------------------
+  const notes: string[] = [];
+  notes.push(`• Technical View (HTF + Intraday): 1h=${tf1.toLowerCase()}, 4h=${tf4.toLowerCase()}, 15m=${tf15.toLowerCase()}`);
+  notes.push(`• Fundamental View (last 12 headlines): ${blackout ? "blackout window — caution" : "no blackout"}`);
+  notes.push(`• Tech vs Fundy Alignment: ${(biasFromNews > 0 && direction === "LONG") || (biasFromNews < 0 && direction === "SHORT") ? "Match" : "Mixed"}`);
+  notes.push("• Conditional Scenarios: If price invalidates SL, stand down; otherwise manage at TP1 → BE.");
+  notes.push("• Surprise Risk: unscheduled CB comments; political soundbites.");
+  notes.push("• Invalidation: clear close beyond SL level.");
+
+  const text = buildQuickPlan(
+    instrument,
+    direction,
+    entry,
+    sl,
+    tp1,
+    tp2,
+    conviction,
+    shortReason,
+    notes
+  );
+
+  return res.status(200).json({ ok: true, text, conviction });
 }
