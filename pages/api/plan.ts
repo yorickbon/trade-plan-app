@@ -60,7 +60,6 @@ async function safeGET<T = any>(url: string, opts?: RequestInit): Promise<T | nu
 }
 
 /* -------------------------- swing/structure utils ------------------------- */
-// Simple fractal swing detection (pivot with k bars on each side)
 function swings(series: Candle[], k = 2) {
   const out: { idx: number; type: "H" | "L"; price: number }[] = [];
   for (let i = k; i < series.length - k; i++) {
@@ -171,14 +170,12 @@ function buildLLMUserPayload(params: {
   const A15 = atr(Hh15, Ll15, Cc15, 14);
   const last = Cc15.at(-1) || 0;
 
-  // strict TF labels from swings so LLM can't hand-wave
   const tf_summary = {
-    h4: labelTrend(h4, 2),  // "up"|"down"|"range"
+    h4: labelTrend(h4, 2),
     h1: labelTrend(h1, 2),
     m15: labelTrend(m15, 2),
   };
 
-  // headline sentiment & blackout watch
   const sentiment = summarizeHeadlines(headlines);
   const now = Date.now();
   const blackoutWatch: string[] = [];
@@ -201,8 +198,8 @@ function buildLLMUserPayload(params: {
     current_price: last,
     atr15: A15,
     tick_size: tickSizeFor(instrument),
-    tf_summary,                   // enforced structure summary
-    sentiment_summary: sentiment, // avoids constant "neutral"
+    tf_summary,
+    sentiment_summary: sentiment,
     candles: {
       m15: compressCandles(m15, 1, 240),
       h1:  compressCandles(h1, 1, 240),
@@ -267,17 +264,104 @@ function extractJSONFromFenced(text: string): any | null {
   return parseMaybeJSON(last.trim());
 }
 
+/* ----------------------------- card constructors -------------------------- */
+function isPlaceholderCard(s: string | undefined | null) {
+  if (!s) return true;
+  const t = s.toLowerCase();
+  return t.includes("full multiline card in sections");
+}
+
+function buildServerCard(parsed: any, instrument: string, extras: {
+  calendar?: any, tf_summary?: any, currentPrice: number
+}) {
+  const {
+    direction = "Flat",
+    order_type = "—",
+    entry,
+    stop_loss,
+    take_profit_1,
+    take_profit_2,
+    conviction,
+    setup,
+    short_reason,
+    signals,
+    tview,
+    fundamentals,
+    alignment,
+    scenarios,
+    invalidation,
+  } = parsed || {};
+
+  const calLines: string[] =
+    Array.isArray(extras.calendar?.items) && extras.calendar.items.length
+      ? extras.calendar.items.slice(0, 6).map((e: any) =>
+          `• ${e?.impact || ""} ${e?.title || ""} (${e?.currency || ""}) @ ${e?.time || ""}`)
+      : ["• No calendar connected or no events in window."];
+
+  const tf = tview || {
+    h4: (extras.tf_summary?.h4 || "").toUpperCase(),
+    h1: (extras.tf_summary?.h1 || "").toUpperCase(),
+    m15: (extras.tf_summary?.m15 || "").toUpperCase(),
+  };
+
+  const sigs = Array.isArray(signals) && signals.length ? `• Signals Triggered: ${signals.join(" • ")}` : "• Signals Triggered: —";
+
+  const headlineSnap: string[] = Array.isArray(fundamentals?.headline_snapshot)
+    ? fundamentals.headline_snapshot.slice(0, 6)
+    : [];
+
+  const fundBlock = [
+    `• Fundamental View (Calendar + Sentiment): ${fundamentals?.bias || "neutral"} bias.`,
+    headlineSnap.length ? `• Headline Snapshot:\n${headlineSnap.map((x) => `  - ${x}`).join("\n")}` : undefined
+  ].filter(Boolean).join("\n");
+
+  const scenBlock = Array.isArray(scenarios) && scenarios.length
+    ? scenarios.map((s: string) => `  - ${s}`).join("\n")
+    : "  - —";
+
+  const parts = [
+    "Quick Plan (Actionable)",
+    "",
+    `• Direction: ${direction}`,
+    `• Order Type: ${order_type}`,
+    `• Trigger: ${order_type === "Market" ? "—" : "As specified by setup"}`,
+    `• Entry: ${entry ?? extras.currentPrice}`,
+    `• Stop Loss: ${stop_loss ?? "—"}`,
+    `• Take Profit(s): TP1 ${take_profit_1 ?? "—"} / TP2 ${take_profit_2 ?? "—"}`,
+    `• Conviction: ${typeof conviction === "number" ? `${conviction}%` : "—"}`,
+    `• Setup: ${setup || "—"}`,
+    `• Short Reasoning: ${short_reason || "—"}`,
+    "",
+    "Full Breakdown",
+    "",
+    `• Technical View (HTF + Intraday): 4H=${tf.h4 || "—"} / 1H=${tf.h1 || "—"} / 15m=${tf.m15 || "—"}`,
+    sigs,
+    fundBlock,
+    `• Tech vs Fundy Alignment: ${alignment || "Mixed"}`,
+    "• Conditional Scenarios:",
+    scenBlock,
+    `• Invalidation: ${invalidation || "—"}`,
+    "",
+    "News / Event Watch",
+    ...calLines,
+    "",
+    "Notes",
+    "",
+    `• Symbol: ${instrument}`,
+  ].join("\n");
+
+  return parts;
+}
+
 /* --------------------------------- handler -------------------------------- */
 export default async function handler(req: NextApiRequest, res: NextApiResponse<PlanResp>) {
   try {
-    // Inputs
     const body = typeof req.body === "string" ? parseMaybeJSON(req.body) || {} : (req.body || {});
     const instrument = String(body.instrument || body.code || req.query.instrument || req.query.code || "EURUSD")
       .toUpperCase().replace(/\s+/g, "");
     const passHeadlines = Array.isArray(body.headlines) ? body.headlines : null;
     const passCalendar = body.calendar ?? null;
 
-    // Candles (real)
     const [m15, h1, h4] = await Promise.all([
       getCandles(instrument, "15m", 360),
       getCandles(instrument, "1h",  360),
@@ -287,7 +371,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       return res.status(200).json({ ok: false, reason: "Missing 15m candles" });
     }
 
-    // Headlines + Calendar
     let headlines = passHeadlines;
     let calendar = passCalendar;
     const base = originFromReq(req);
@@ -303,7 +386,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       calendar = (await safeGET<any>(u1)) || (await safeGET<any>(u2)) || { ok: false, items: [] };
     }
 
-    // Prompt + call
     const tick = tickSizeFor(instrument);
     const system = buildLLMSystem(instrument, tick);
     const userPayload = buildLLMUserPayload({ instrument, m15, h1, h4, headlines: headlines || [], calendar: calendar || {} });
@@ -312,7 +394,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     try { content = await callOpenAI(system, userPayload); }
     catch (e: any) { console.error("OpenAI error:", e?.message || e); }
 
-    // Parse + enforce rules
     const parsed = content ? extractJSONFromFenced(content) : null;
 
     const last = C(m15).at(-1) || 0;
@@ -345,12 +426,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       if (typeof stop_loss === "number" && typeof entry === "number") {
         const dist = Math.abs(entry - stop_loss);
         if (dist < slBuf) {
-          const isLong = (direction || "").toLowerCase() === "long" || order_type?.startsWith("Buy");
+          const isLong = (direction || "").toLowerCase() === "long" || (order_type||"").startsWith("Buy");
           stop_loss = isLong ? round(entry - slBuf) : round(entry + slBuf);
         }
       }
 
-      // TP1 minimum distance (avoid micro TP)
+      // TP1 minimum distance
       const risk = (typeof entry === "number" && typeof stop_loss === "number") ? Math.abs(entry - stop_loss) : 0;
       const needTP1 = minTPDist(risk);
       if (typeof take_profit_1 === "number" && typeof entry === "number" && needTP1 > 0) {
@@ -366,7 +447,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       parsed.take_profit_1 = take_profit_1;
       parsed.take_profit_2 = take_profit_2;
 
-      // Penalize conviction if TFs don’t align (strict, like manual)
+      // Conviction penalty if TFs misaligned
       const tf = userPayload.tf_summary;
       let misalignPenalty = 0;
       if (tf.h4 === "up" && (tf.h1 !== "up" || tf.m15 !== "up")) misalignPenalty += 12;
@@ -376,11 +457,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const rawConv = typeof parsed.conviction === "number" ? parsed.conviction : 55;
       conviction = clamp(Math.round(rawConv - misalignPenalty), 25, 95);
 
-      cardText = String(parsed.card_text || "").trim();
-      meta = { ...parsed, enforced: { sl_buffer: slBuf, min_tp1: needTP1, current_price: round(last), tf_summary: tf } };
+      // prefer model card if real; otherwise server-build
+      const maybeCard: string = String(parsed.card_text || "").trim();
+      if (!isPlaceholderCard(maybeCard) && maybeCard.length > 120) {
+        cardText = maybeCard;
+      } else {
+        cardText = buildServerCard(parsed, instrument, {
+          calendar,
+          tf_summary: tf,
+          currentPrice: round(last),
+        });
+      }
+
+      meta = { ...parsed, enforced: { sl_buffer: slBuf, tf_summary: tf, current_price: round(last) } };
     }
 
-    // Safe fallback if LLM didn’t return card_text
     if (!cardText) {
       const fallback = [
         "Quick Plan (Actionable)",
@@ -405,14 +496,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         "  - Wait for clear 15m structure (BOS + pullback into OB/FVG) before considering entry.",
         "• Surprise Risk: Unscheduled headlines.",
         "• Invalidation: —",
-        "",
-        "Advanced Reasoning (Pro-Level Context)",
-        "",
-        "• Priority Bias (fundamentals): —",
-        "• Structure Context: —",
-        "• Confirmation Logic: Wait for 15m confirmation.",
-        "• Fundamentals vs Technicals: —",
-        "• Scenario Planning: —",
         "",
         "News / Event Watch",
         ...(Array.isArray(calendar?.items) && calendar.items.length
