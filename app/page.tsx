@@ -80,6 +80,9 @@ export default function Page() {
   const [planText, setPlanText] = useState<string>("");
   const [busy, setBusy] = useState<boolean>(false); // used by VisionUpload
 
+  // force-reset signal for VisionUpload (increments on Reset and on instrument change)
+  const [resetTick, setResetTick] = useState<number>(0);
+
   // ----- load headlines for currencies / instrument -----
   const loadHeadlinesForSymbols = useCallback(async (symbols: string[]) => {
     if (!symbols.length) {
@@ -141,8 +144,23 @@ export default function Page() {
     setHeadlines([]);
     setCalendar(null);
     setDateStr(todayISO());
+    // hard reset the uploader
+    setResetTick((t) => t + 1);
+    // re-pull with fresh date/instrument
     setTimeout(() => loadCalendar(), 0);
   }, [loadCalendar]);
+
+  // when instrument changes, also hard-reset uploader & clear plan
+  const onInstrumentChange = useCallback(
+    (next: string) => {
+      setInstrument(next.toUpperCase());
+      setPlanText("");
+      setResetTick((t) => t + 1);
+      // calendar will reload via useEffect (dependency = instrument)
+      setTimeout(() => loadCalendar(), 0);
+    },
+    [loadCalendar]
+  );
 
   const calendarCurrencies = useMemo(
     () => currenciesFromBias((calendar as any)?.bias),
@@ -157,7 +175,7 @@ export default function Page() {
           <span className="text-sm opacity-80">Instrument</span>
           <select
             value={instrument}
-            onChange={(e) => setInstrument(e.target.value.toUpperCase())}
+            onChange={(e) => onInstrumentChange(e.target.value)}
             className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm inline-block w-auto"
           >
             {/* Forex */}
@@ -221,7 +239,9 @@ export default function Page() {
       <div className="rounded-lg border border-neutral-800 p-4">
         <h2 className="text-lg font-semibold mb-2">Image Upload (4H / 1H / 15M + optional Calendar)</h2>
         <VisionUpload
+          key={resetTick /* ensures hard remount as fallback */}
           instrument={instrument}
+          resetSignal={resetTick}
           onBusyChange={setBusy}
           onResult={(txt) => setPlanText(normalizePlanText(txt))}
         />
