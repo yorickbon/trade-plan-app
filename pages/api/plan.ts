@@ -1,52 +1,41 @@
 // pages/api/vision-plan.ts
 // Images-only Trade Plan generator (NO numeric fallback).
-// Expects multipart/form-data with files: m15, h1, h4 (required), calendar (optional), and an optional text field "instrument".
-// Returns a multiline Trade Card + meta. Uses OpenAI vision (gpt-4o-mini by default).
+// Expects multipart/form-data with files: m15, h1, h4 (required), calendar (optional), and optional text field "instrument".
+// Returns your multiline Trade Card + a small meta block. Uses OpenAI vision (gpt-4o-mini by default).
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "fs";
-import path from "path";
 
-// IMPORTANT: we disable Next's bodyParser to handle multipart uploads.
+// Disable Next body parsing so we can read multipart
 export const config = {
   api: {
     bodyParser: false,
-    sizeLimit: "12mb", // per file max, enforced in formidable too
+    sizeLimit: "12mb",
   },
 };
 
 type Json = Record<string, any>;
 
-// Lazy import to avoid type issues if formidable types not present
+// ---- multipart parsing ----
 async function getFormidable() {
-  // @ts-ignore
-  const formidable = await import("formidable");
-  // @ts-ignore
-  return formidable.default || formidable;
+  // dynamic import keeps build light
+  const mod: any = await import("formidable");
+  return mod.default || mod;
 }
 
 async function parseMultipart(req: NextApiRequest): Promise<{
   fields: Record<string, any>;
-  files: {
-    m15?: any;
-    h1?: any;
-    h4?: any;
-    calendar?: any;
-  };
+  files: { m15?: any; h1?: any; h4?: any; calendar?: any };
 }> {
   const formidable = await getFormidable();
-
   const form = formidable({
     multiples: false,
     maxFiles: 4,
-    maxFileSize: 12 * 1024 * 1024, // 12MB
-    filter: (part: any) => {
-      const nameOk = ["m15", "h1", "h4", "calendar"].includes(part.name);
-      const mimeOk =
-        typeof part.mimetype === "string" &&
-        part.mimetype.startsWith("image/");
-      return nameOk && mimeOk;
-    },
+    maxFileSize: 12 * 1024 * 1024,
+    filter: (part: any) =>
+      ["m15", "h1", "h4", "calendar"].includes(part.name) &&
+      typeof part.mimetype === "string" &&
+      part.mimetype.startsWith("image/"),
   });
 
   return new Promise((resolve, reject) => {
@@ -67,17 +56,19 @@ async function parseMultipart(req: NextApiRequest): Promise<{
   });
 }
 
-async function fileToDataUrl(file: any): Promise<string> {
-  const filepath = file?.filepath || file?.path; // formidable v3 vs v2
-  const mimetype = file?.mimetype || "image/png";
-  if (!filepath || !fs.existsSync(filepath)) {
-    throw new Error("Uploaded file path not found.");
-  }
-  const buff = await fs.promises.readFile(filepath);
-  const b64 = buff.toString("base64");
-  return `data:${mimetype};base64,${b64}`;
+function getFilePath(file: any) {
+  return file?.filepath || file?.path || undefined; // v3 vs v2
 }
 
+async function fileToDataUrl(file: any): Promise<string> {
+  const fp = getFilePath(file);
+  const mimetype = file?.mimetype || "image/png";
+  if (!fp || !fs.existsSync(fp)) throw new Error("Uploaded file not found.");
+  const b = await fs.promises.readFile(fp);
+  return `data:${mimetype};base64,${b.toString("base64")}`;
+}
+
+// ---- helpers ----
 function getOrigin(req: NextApiRequest): string {
   const proto =
     (req.headers["x-forwarded-proto"] as string) ||
@@ -89,29 +80,25 @@ function getOrigin(req: NextApiRequest): string {
 async function fetchHeadlinesText(req: NextApiRequest, instrument?: string) {
   try {
     const origin = getOrigin(req);
-    // Try to give model some recent context; keep it compact.
-    // If instrument not provided, we still fetch generic USD/EUR risk tone.
     const qs = new URLSearchParams({
-      symbols: instrument ? instrument : "USD,EUR,BTC,XAU",
+      symbols: instrument || "USD,EUR,BTC,XAU",
       hours: process.env.HEADLINES_SINCE_HOURS || "48",
       max: process.env.HEADLINES_MAX || "10",
     }).toString();
-
-    const res = await fetch(`${origin}/api/news?${qs}`);
-    if (!res.ok) return "";
-    const json = (await res.json()) as Json;
-    const items = Array.isArray(json.items) ? json.items.slice(0, 10) : [];
-    if (!items.length) return "";
-
-    const lines: string[] = [];
-    for (const it of items) {
-      const t = typeof it.title === "string" ? it.title : "";
-      const d =
-        typeof it.description === "string" && it.description
-          ? ` — ${it.description}`
-          : "";
-      if (t) lines.push(`• ${t}${d}`.slice(0, 240)); // limit length per item
-    }
+    const r = await fetch(`${origin}/api/news?${qs}`);
+    if (!r.ok) return "";
+    const j = (await r.json()) as Json;
+    const items: any[] = Array.isArray(j.items) ? j.items.slice(0, 10) : [];
+    const lines = items
+      .map((it) => {
+        const t = typeof it.title === "string" ? it.title : "";
+        const d =
+          typeof it.description === "string" && it.description
+            ? ` — ${it.description}`
+            : "";
+        return t ? `• ${`${t}${d}`.slice(0, 240)}` : "";
+      })
+      .filter(Boolean);
     return lines.join("\n");
   } catch {
     return "";
@@ -134,71 +121,63 @@ async function callOpenAIVision(params: {
     params;
 
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error("OPENAI_API_KEY not configured.");
-  }
+  if (!apiKey) throw new Error("OPENAI_API_KEY not configured.");
 
   const model = getModel();
 
-  // Build a single user message containing text + 3-4 images.
-  const content: any[] = [];
-
-  content.push({
-    type: "text",
-    text:
-      `Act as my Trade Plan Assistant. ` +
-      `Use ONLY the provided chart IMAGES to derive technical zones and structure. ` +
-      `Do NOT use numeric candles or any external data. ` +
-      `Instrument: ${instrument ?? "Unknown"}.\n\n` +
-      `Return the plan in this exact structure:\n` +
-      `Quick Plan (Actionable):\n` +
-      `• Direction: Long / Short / Stay Flat\n` +
-      `• Entry: Market / Pending @ ...\n` +
-      `• Stop Loss: ...\n` +
-      `• Take Profit(s): TP1 / TP2 …\n` +
-      `• Conviction: %\n` +
-      `• Short Reasoning: ...\n\n` +
-      `Full Breakdown:\n` +
-      `• Technical View (HTF + Intraday)\n` +
-      `• Fundamental View (Calendar + Sentiment)\n` +
-      `• Tech vs Fundy Alignment: Match / Mismatch (why)\n` +
-      `• Conditional Scenarios\n` +
-      `• Surprise Risk (unscheduled headlines, politics, central bank)\n` +
-      `• Invalidation\n` +
-      `• One-liner Summary\n\n` +
-      `Advanced Reasoning (Pro-Level Context):\n` +
-      `• Priority Bias (based on fundamentals)\n` +
-      `• Structure Context (retracements, fibs, supply/demand zones)\n` +
-      `• Confirmation Logic (e.g., wait for news release, candle confirmation, OB touch)\n` +
-      `• How fundamentals strengthen or weaken this technical setup\n` +
-      `• Scenario Planning (pre-news vs post-news breakout conviction)\n\n` +
-      `News Event Watch:\n` +
-      `• Upcoming/Recent events to watch and why\n\n` +
-      `Notes:\n` +
-      `• Any extra execution notes\n\n` +
-      `Final Table Summary (single line):\n` +
-      `Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction %\n\n` +
-      `Rules:\n` +
-      `• Derive zones/levels only from the images (4H, 1H, 15M). Be precise.\n` +
-      `• If headlines are provided below, use them for fundamentals. If not, keep fundy section minimal.\n` +
-      `• If a calendar image is provided, read it to infer bias and create a warning window (no blackout).\n` +
-      `• Never fabricate numbers; if uncertain, mark low conviction and explain briefly.`,
-  });
-
-  // Add images in HTF → LTF order
-  content.push({ type: "text", text: "4H Chart:" });
-  content.push({ type: "image_url", image_url: { url: h4DataUrl } });
-  content.push({ type: "text", text: "1H Chart:" });
-  content.push({ type: "image_url", image_url: { url: h1DataUrl } });
-  content.push({ type: "text", text: "15M Chart:" });
-  content.push({ type: "image_url", image_url: { url: m15DataUrl } });
+  const content: any[] = [
+    {
+      type: "text",
+      text:
+        `Act as my Trade Plan Assistant.\n` +
+        `Use ONLY the provided chart IMAGES to derive technical zones and structure. Do NOT use numeric candles or external data.\n` +
+        `Instrument: ${instrument ?? "Unknown"}.\n\n` +
+        `Return the plan in this exact structure:\n` +
+        `Quick Plan (Actionable):\n` +
+        `• Direction: Long / Short / Stay Flat\n` +
+        `• Entry: Market / Pending @ ...\n` +
+        `• Stop Loss: ...\n` +
+        `• Take Profit(s): TP1 / TP2 …\n` +
+        `• Conviction: %\n` +
+        `• Short Reasoning: ...\n\n` +
+        `Full Breakdown:\n` +
+        `• Technical View (HTF + Intraday)\n` +
+        `• Fundamental View (Calendar + Sentiment)\n` +
+        `• Tech vs Fundy Alignment: Match / Mismatch (why)\n` +
+        `• Conditional Scenarios\n` +
+        `• Surprise Risk (unscheduled headlines, politics, central bank)\n` +
+        `• Invalidation\n` +
+        `• One-liner Summary\n\n` +
+        `Advanced Reasoning (Pro-Level Context):\n` +
+        `• Priority Bias (based on fundamentals)\n` +
+        `• Structure Context (retracements, fibs, supply/demand zones)\n` +
+        `• Confirmation Logic (e.g., wait for news release, candle confirmation, OB touch)\n` +
+        `• How fundamentals strengthen or weaken this technical setup\n` +
+        `• Scenario Planning (pre-news vs post-news breakout conviction)\n\n` +
+        `News Event Watch:\n` +
+        `• Upcoming/Recent events to watch and why\n\n` +
+        `Notes:\n` +
+        `• Any extra execution notes\n\n` +
+        `Final Table Summary (single line): Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction %\n\n` +
+        `Rules:\n` +
+        `• Derive zones/levels only from the images (4H, 1H, 15M). Be precise.\n` +
+        `• If headlines are provided below, use them for fundamentals. If not, keep fundy section minimal.\n` +
+        `• If a calendar image is provided, read it to infer bias and create a warning window (no blackout).\n` +
+        `• Never fabricate numbers; if uncertain, mark low conviction and explain briefly.`,
+    },
+    { type: "text", text: "4H Chart:" },
+    { type: "image_url", image_url: { url: h4DataUrl } },
+    { type: "text", text: "1H Chart:" },
+    { type: "image_url", image_url: { url: h1DataUrl } },
+    { type: "text", text: "15M Chart:" },
+    { type: "image_url", image_url: { url: m15DataUrl } },
+  ];
 
   if (calendarDataUrl) {
     content.push({ type: "text", text: "Economic Calendar Image:" });
     content.push({ type: "image_url", image_url: { url: calendarDataUrl } });
   }
-
-  if (headlinesText && headlinesText.trim().length > 0) {
+  if (headlinesText && headlinesText.trim()) {
     content.push({
       type: "text",
       text:
@@ -214,12 +193,9 @@ async function callOpenAIVision(params: {
       {
         role: "system",
         content:
-          "You are a meticulous trading analyst. Use ONLY provided images for technicals. Be concise, structured, and precise.",
+          "You are a meticulous trading analyst. Use ONLY provided images for technicals. Be structured and precise.",
       },
-      {
-        role: "user",
-        content,
-      },
+      { role: "user", content },
     ],
   };
 
@@ -229,7 +205,7 @@ async function callOpenAIVision(params: {
     {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
@@ -242,12 +218,10 @@ async function callOpenAIVision(params: {
   }
 
   const data = (await resp.json()) as Json;
-  const text =
-    data?.choices?.[0]?.message?.content?.trim() ||
-    "No content returned from model.";
-  return text;
+  return data?.choices?.[0]?.message?.content?.trim() || "";
 }
 
+// ---- handler ----
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<Json>
@@ -261,24 +235,22 @@ export default async function handler(
   try {
     const { fields, files } = await parseMultipart(req);
     const instrument =
-      (typeof fields.instrument === "string" && fields.instrument) ||
-      undefined;
+      (typeof fields.instrument === "string" && fields.instrument) || undefined;
 
-    const required: Array<["m15" | "h1" | "h4", any]> = [
+    const required = [
       ["m15", files.m15],
       ["h1", files.h1],
       ["h4", files.h4],
-    ];
-    const missing = required.filter(([_, f]) => !f);
-    if (missing.length > 0) {
+    ].filter(([_, f]) => !f);
+
+    if (required.length) {
       return res.status(400).json({
         error:
           "Missing required chart images. Please upload all: m15, h1, h4 (PNG/JPG).",
-        missing: missing.map(([name]) => name),
+        missing: required.map(([name]) => name),
       });
     }
 
-    // Convert to data URLs for OpenAI vision
     const [m15DataUrl, h1DataUrl, h4DataUrl] = await Promise.all([
       fileToDataUrl(files.m15),
       fileToDataUrl(files.h1),
@@ -288,10 +260,7 @@ export default async function handler(
       ? await fileToDataUrl(files.calendar)
       : undefined;
 
-    // Optional: fetch recent headlines from our own /api/news (kept short)
     const headlinesText = await fetchHeadlinesText(req, instrument);
-
-    // Call OpenAI vision with images + optional headlines and calendar image
     const planText = await callOpenAIVision({
       instrument,
       m15DataUrl,
@@ -301,30 +270,32 @@ export default async function handler(
       headlinesText,
     });
 
-    // We expose a minimal meta for debugging. Calendar warning tuning will be refined in calendar.ts later step.
+    const size = (f: any) => {
+      const fp = getFilePath(f);
+      try {
+        return fp && fs.existsSync(fp) ? fs.statSync(fp).size : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+
     const meta = {
       instrument: instrument || null,
       usedVision: true,
       inputs: {
-        m15: { size: fs.existsSync(files.m15?.filepath) ? fs.statSync(files.m15.filepath).size : undefined },
-        h1: { size: fs.existsSync(files.h1?.filepath) ? fs.statSync(files.h1.filepath).size : undefined },
-        h4: { size: fs.existsSync(files.h4?.filepath) ? fs.statSync(files.h4.filepath).size : undefined },
-        calendar: files.calendar
-          ? {
-              size: fs.existsSync(files.calendar?.filepath)
-                ? fs.statSync(files.calendar.filepath).size
-                : undefined,
-            }
-          : null,
+        m15: { size: size(files.m15) },
+        h1: { size: size(files.h1) },
+        h4: { size: size(files.h4) },
+        calendar: files.calendar ? { size: size(files.calendar) } : null,
       },
-      // Placeholder: set by model text today; we’ll add programmatic warning in a later calendar.ts update.
-      warningWindow: false,
+      warningWindow: false, // calendar warning fine-tuning will come in calendar.ts update
     };
 
     return res.status(200).json({ text: planText, meta });
   } catch (err: any) {
-    const msg =
-      typeof err?.message === "string" ? err.message : "Unknown server error.";
-    return res.status(500).json({ error: msg });
+    return res.status(500).json({
+      error:
+        typeof err?.message === "string" ? err.message : "Unknown server error.",
+    });
   }
 }
