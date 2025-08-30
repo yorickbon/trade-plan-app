@@ -1,44 +1,38 @@
 // /pages/api/vision-plan.ts
-// Images-only Trade Plan generator with multi-strategy candidate scoring.
-// Refusal-proof: auto-retry with an educational/low-conviction framing if the first attempt refuses.
-// Accepts multipart/form-data with files: m15, h1, h4 (required), calendar (optional).
+// Images-only Trade Plan generator with strict anti-chase + Sell/Buy Limit bias.
+// Prints X-ray (detected structures) + Candidate Scores, and appends an ai_meta JSON block.
+// Accepts multipart/form-data: files m15, h1, h4 (required), calendar (optional).
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
 
 export const config = {
   api: {
-    bodyParser: false, // we handle multipart via formidable
+    bodyParser: false,
     sizeLimit: "25mb",
   },
 };
 
 const OPENAI_API_KEY =
   process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5"; // recommended
 const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
 
 type Ok = { ok: true; text: string; meta?: any };
 type Err = { ok: false; reason: string };
 
-// ───────────────── helpers ─────────────────
-
+// ───────────── helpers ─────────────
 async function getFormidable() {
   const mod: any = await import("formidable");
   return mod.default || mod;
 }
-
 function isMultipart(req: NextApiRequest) {
   const ct = String(req.headers["content-type"] || "");
   return ct.includes("multipart/form-data");
 }
-
 async function parseMultipart(req: NextApiRequest) {
   const formidable = await getFormidable();
-  const form = formidable({
-    multiples: false,
-    maxFileSize: 25 * 1024 * 1024,
-  });
+  const form = formidable({ multiples: false, maxFileSize: 25 * 1024 * 1024 });
   return new Promise<{ fields: Record<string, any>; files: Record<string, any> }>(
     (resolve, reject) => {
       form.parse(req as any, (err: any, fields: any, files: any) => {
@@ -48,12 +42,10 @@ async function parseMultipart(req: NextApiRequest) {
     }
   );
 }
-
 function pickFirst<T = any>(x: T | T[] | undefined | null): T | null {
   if (!x) return null;
   return Array.isArray(x) ? (x[0] ?? null) : x;
 }
-
 async function fileToDataUrl(file: any): Promise<string | null> {
   if (!file) return null;
   const p =
@@ -63,14 +55,12 @@ async function fileToDataUrl(file: any): Promise<string | null> {
   const mime = file.mimetype || "image/png";
   return `data:${mime};base64,${buf.toString("base64")}`;
 }
-
 function originFromReq(req: NextApiRequest) {
   const proto = (req.headers["x-forwarded-proto"] as string) || "https";
   const host =
     (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
-
 async function fetchHeadlines(req: NextApiRequest, instrument: string) {
   try {
     const base = originFromReq(req);
@@ -92,7 +82,6 @@ async function fetchHeadlines(req: NextApiRequest, instrument: string) {
     return [];
   }
 }
-
 function refusalLike(txt: string) {
   const t = (txt || "").toLowerCase();
   return (
@@ -104,7 +93,64 @@ function refusalLike(txt: string) {
   );
 }
 
-// ─────────────── OpenAI Vision via Chat Completions ───────────────
+// Extract a fenced JSON block (```ai_meta ...``` or ```json ...```) from the model output
+function extractAiMeta(text: string) {
+  const fences = [
+    /```ai_meta\s*([\s\S]*?)```/i,
+    /```json\s*([\s\S]*?)```/i,
+    /```([\s\S]*?)```/i,
+  ];
+  for (const re of fences) {
+    const m = text.match(re);
+    if (m && m[1]) {
+      try {
+        const parsed = JSON.parse(m[1]);
+        return parsed;
+      } catch {
+        continue;
+      }
+    }
+  }
+  return null;
+}
+
+function needsPendingRewriteByHeuristics(txt: string): boolean {
+  // If it's not Market, no rewrite
+  const t = (txt || "").toLowerCase();
+  if (!/entry:\s*market/.test(t)) return false;
+  // Allow Market only if explicit proofs are present
+  const hasClose =
+    /(body\s+close|decisive\s+close|strong\s+close)\s+(above|below)/.test(t);
+  const hasRetestHold =
+    /(retest\s+that\s+holds|held\s+on\s+retest|successful\s+retest|retest\s+held)/.test(t);
+  const hasSfpReclaim =
+    /(sfp\s+reclaim|sweep\s+and\s+reclaim|liquidity\s+sweep\s+and\s+reclaim)/.test(t);
+  const allowed = hasClose && (hasRetestHold || hasSfpReclaim);
+  return !allowed;
+}
+
+// ───────────── OpenAI calls ─────────────
+async function callOpenAI(messages: any[], temperature = 0.18) {
+  const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      temperature,
+      messages,
+    }),
+  });
+  if (!rsp.ok) {
+    const t = await rsp.text().catch(() => "");
+    throw new Error(`OpenAI vision request failed: ${rsp.status} ${t}`);
+  }
+  const json = await rsp.json();
+  const text = (json?.choices?.[0]?.message?.content || "").trim();
+  return text;
+}
 
 function buildMessages({
   instrument,
@@ -119,61 +165,36 @@ function buildMessages({
   headlinesText?: string | null;
   educationalRetry?: boolean;
 }) {
-  const policyHeader = educationalRetry
-    ? [
-        "You are providing an educational market analysis, NOT financial advice.",
-        "If exact numeric levels cannot be read from the images, provide precise ZONES with clear relative anchors (e.g., 'retest of the 1H OB just above the prior swing high') and mark conviction lower.",
-        "Never refuse. If uncertain, say 'low confidence' and still provide a complete plan.",
-      ].join(" ")
-    : "You are a meticulous trading analyst. Use ONLY provided images for technicals. Be precise. Never invent numeric candles.";
+  const policy = [
+    educationalRetry
+      ? "You are providing an educational market analysis, NOT financial advice."
+      : "You are a meticulous trading analyst.",
+    "Use ONLY the provided images for technicals. Never fabricate numeric candles.",
+    "",
+    "ENTRY SELECTION RULES:",
+    "• DEFAULT to Pending @ confluence (OB/FVG/Fib 0.50–0.62–0.705 / SR flip).",
+    "• Allow Entry: Market ONLY IF you explicitly prove BOTH: (A) a decisive BODY CLOSE beyond the key level, AND (B) a successful RETEST that HOLDS (or a clear SFP-reclaim). If not, choose Pending (Sell Limit/Buy Limit) at the best confluence zone.",
+    "• When 4H & 1H are bearish and 15m is basing under a 1H supply/OB, PREFER a Sell Limit into that OB. Symmetrically, for bullish cases prefer a Buy Limit into demand.",
+    "• Stops are price-action based beyond invalidation. If the first stop is too tight (wick risk), escalate to the next structural extreme with a small buffer. Do NOT reject low RR; reflect it with lower conviction instead.",
+  ].join(" ");
 
-  const userTextHeader = [
-    "Act as my Trade Plan Assistant.",
-    "Use ONLY the provided chart IMAGES for technicals. Do NOT use numeric candles.",
-    "It is OK to estimate zones from the image scales. If price scales are not fully visible, describe zones/levels precisely via structure (OB/FVG/SR/swing anchors).",
-    `Instrument: ${instrument}.`,
+  const userText = [
+    `Instrument: ${instrument}`,
     "",
-    "=== ANALYSIS TASKS ===",
-    "1) Multi-timeframe structure (4H → 1H → 15m): identify trend (HH/HL vs LH/LL), BOS/CHOCH, key supply/demand (OB), FVGs, SR flip zones, range bounds, equal highs/lows/liquidity, obvious swing points.",
-    "2) Generate candidates on 15m execution (BOTH directions where valid):",
-    "   • Pullback Confluence (OB + FVG + Fib 0.50–0.62–0.705)",
-    "   • Breakout & Retest (range/structure edge; body close beyond, clean retest)",
-    "   • Liquidity Sweep / SFP & Reclaim (fake-out through EQH/EQL/swing, then reclaim)",
-    "   • Range Reversion (fade edges when range is dominant)",
-    "   • SR Flip (prior S→R or R→S; test/hold becomes trigger)",
-    "   • Trendline/Channel Break & Retest (if clearly visible)",
-    "   • Double top/bottom + neckline break/retest (classic where obvious)",
-    "   • Compression/triangle break (where obvious)",
-    "   • Momentum push + shallow pullback (flag/pennant if seen)",
-    "For each candidate, define Entry/SL/TP1/TP2 from the image levels or as zones if exact prices are unclear.",
+    "TASKS:",
+    "1) Multi-TF structure (4H→1H→15m): trend (HH/HL vs LH/LL), BOS/CHOCH, OB (supply/demand), FVGs, SR flip, range bounds, equal highs/lows, clear swing map.",
+    "2) Generate candidates (both directions where valid): Pullback Confluence, Breakout+Retest, Liquidity Sweep/SFP+Reclaim, Range Reversion, SR Flip, Trendline/Channel break+retest, Double top/bottom+neckline, Compression/Triangle, Flag/Pennant (only if obvious).",
+    "3) Stops: PA-based only; beyond invalidation structure; escalate if needed (small buffer).",
+    "4) Fundamentals overlay: use the headlines text; if calendar image provided, warn on ±90m (no blackout).",
+    "5) Scoring (0–100): HTF align 25, trigger 20, confluence 20, stop validity 15, path to target 10, macro fit 5, ±90m penalty ≤5.",
+    "6) Choose TOP candidate by score. If all weak, still print a plan and mark low conviction.",
     "",
-    "3) Stops are PRICE-ACTION BASED ONLY:",
-    "   • Primary: beyond the invalidation structure (zone edge, sweep wick, broken/retest level, or last opposing swing).",
-    "   • If the first stop is too tight (wick risk), escalate to the NEXT structural extreme (second swing, full OB extreme, or HTF/1H boundary).",
-    "   • Add a SMALL buffer relative to the immediate swing/zone size (NOT ATR).",
-    "",
-    "4) Fundamentals overlay:",
-    "   • If headlines provided below, use them for bias only; do not invent facts.",
-    "   • If a calendar image is provided, read it and issue a ±90m WARNING (no blackout) if applicable.",
-    "",
-    "5) Scoring (0–100) for each candidate (weights):",
-    "   • HTF alignment (4H+1H) .......... 25",
-    "   • Trigger quality (15m) .......... 20",
-    "   • Confluence (OB/FVG/Fib/SR/Liq) . 20",
-    "   • Stop validity (PA-based) ........ 15",
-    "   • Path to target (opp. struct.) ... 10",
-    "   • Macro fit (headlines tone) ...... 5",
-    "   • Event risk penalty (±90m) ....... −0..5 (warning-only; still print plan)",
-    "   NOTE: Do NOT reject a candidate because RR < 1.5R. RR is NOT a hard filter.",
-    "",
-    "6) Choose the TOP candidate by score. If all are weak, still choose one and mark conviction low.",
-    "",
-    "=== OUTPUT FORMAT (exact structure) ===",
+    "OUTPUT (exact order):",
     "Quick Plan (Actionable):",
     "• Direction: Long / Short / Stay Flat",
-    "• Entry: Market / Pending @ … (or Zone description if exact value unclear)",
-    "• Stop Loss: … (PA-based; which structure is beyond it?)",
-    "• Take Profit(s): TP1 / TP2 … (targets or zones)",
+    "• Entry: Pending @ … (Sell Limit/Buy Limit preferred) — use Market ONLY if you proved body-close + retest hold or SFP-reclaim",
+    "• Stop Loss: … (beyond which structure?)",
+    "• Take Profit(s): TP1 / TP2 …",
     "• Conviction: %",
     "• Setup: <Chosen Strategy>",
     "• Short Reasoning: ...",
@@ -182,34 +203,42 @@ function buildMessages({
     "• Technical View (HTF + Intraday): ...",
     "• Fundamental View (Calendar + Sentiment): ...",
     "• Tech vs Fundy Alignment: Match / Mismatch (why)",
-    "• Conditional Scenarios: ...",
-    "• Surprise Risk (unscheduled headlines, politics, CB comments): ...",
+    "• Conditional Scenarios: include an explicit Sell/Buy-Limit alternative if you selected Market for any reason",
+    "• Surprise Risk: ...",
     "• Invalidation: ...",
     "• One-liner Summary: ...",
     "",
-    "Advanced Reasoning (Pro-Level Context):",
-    "• Priority Bias (based on fundamentals)",
-    "• Structure Context (retracements, fibs, supply/demand zones)",
-    "• Confirmation Logic (e.g., wait for news release, candle confirmation, OB touch)",
-    "• How fundamentals strengthen or weaken this technical setup",
-    "• Scenario Planning (pre-news vs post-news breakout conviction)",
+    "Advanced Reasoning (Pro-Level Context): ...",
     "",
-    "News Event Watch:",
-    "• Upcoming/Recent events to watch and why",
+    "News Event Watch: ...",
     "",
-    "Notes:",
-    "• Any extra execution notes",
+    "Notes: ...",
+    "",
+    "Detected Structures (X-ray):",
+    "• 4H: OB/FVG/SR/range/sweeps/swing map ...",
+    "• 1H: OB/FVG/SR/range/sweeps/swing map ...",
+    "• 15m: OB/FVG/SR/range/sweeps/swing map ...",
+    "",
+    "Candidate Scores:",
+    "• <name> – <score>/100 – <one-line reason>",
+    "• ...",
     "",
     "Final Table Summary:",
     "Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction %",
     "",
-    "Append at the end:",
-    "Chosen Strategy: <one of the candidates you scored>",
-    "Alt Candidates (scores): <name – score/100, …>",
+    "At the very end, APPEND a fenced JSON block labeled ai_meta with:",
+    `{
+  "selectedStrategy": string,
+  "entryType": "Pending" | "Market",
+  "direction": "Long" | "Short" | "Flat",
+  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },
+  "candidateScores": [{ "name": string, "score": number, "reason": string }],
+  "note": "one line on why this was chosen"
+}`,
   ].join("\n");
 
   const userContent: any[] = [
-    { type: "text", text: userTextHeader },
+    { type: "text", text: userText },
     { type: "text", text: "4H Chart:" },
     { type: "image_url", image_url: { url: dataUrls.h4 } },
     { type: "text", text: "1H Chart:" },
@@ -230,34 +259,10 @@ function buildMessages({
   }
 
   const messages = [
-    { role: "system", content: policyHeader },
+    { role: "system", content: policy },
     { role: "user", content: userContent },
   ];
-
   return messages;
-}
-
-async function callOpenAI(messages: any[], temperature = 0.15) {
-  const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      temperature,
-      messages,
-      // response_format: { type: "text" } // (explicit; not required but safe)
-    }),
-  });
-  if (!rsp.ok) {
-    const t = await rsp.text().catch(() => "");
-    throw new Error(`OpenAI vision request failed: ${rsp.status} ${t}`);
-  }
-  const json = await rsp.json();
-  const text = (json?.choices?.[0]?.message?.content || "").trim();
-  return text;
 }
 
 async function askVision(params: {
@@ -265,22 +270,45 @@ async function askVision(params: {
   dataUrls: { m15: string; h1: string; h4: string };
   calendarDataUrl?: string | null;
   headlinesText?: string | null;
-}): Promise<string> {
-  // First attempt (precise, strict)
+}): Promise<{ text: string; aiMeta: any }> {
   const messages1 = buildMessages({ ...params, educationalRetry: false });
-  let text = await callOpenAI(messages1, 0.15);
-
-  // If refusal/empty, retry with educational framing + explicit “don’t refuse”
+  let text = await callOpenAI(messages1, 0.18);
   if (refusalLike(text)) {
     const messages2 = buildMessages({ ...params, educationalRetry: true });
-    text = await callOpenAI(messages2, 0.2);
+    text = await callOpenAI(messages2, 0.22);
   }
-
-  return text;
+  const aiMeta = extractAiMeta(text);
+  return { text, aiMeta };
 }
 
-// ─────────────── handler ───────────────
+function aiMetaDemandsRewrite(aiMeta: any): boolean {
+  if (!aiMeta) return true; // if we couldn't parse, be conservative
+  if (String(aiMeta.entryType || "").toLowerCase() !== "market") return false;
+  const bp = aiMeta.breakoutProof || {};
+  const ok =
+    (bp.bodyCloseBeyond === true) &&
+    (bp.retestHolds === true || bp.sfpReclaim === true);
+  return !ok;
+}
 
+async function rewriteToPending(instrument: string, text: string) {
+  const messages = [
+    {
+      role: "system",
+      content:
+        "Rewrite the trade card to use a PENDING Limit entry at the best OB/FVG/Fib/SR confluence. If direction is Short, use a Sell Limit; if Long, use a Buy Limit. Keep PA-based stops beyond invalidation. Preserve structure (X-ray and Candidate Scores included). Do not use 'Entry: Market'.",
+    },
+    {
+      role: "user",
+      content:
+        `Instrument: ${instrument}\nRewrite this card as Pending Limit (no Market):\n\`\`\`\n${text}\n\`\`\``,
+    },
+  ];
+  const out = await callOpenAI(messages, 0.15);
+  return out || text;
+}
+
+// ───────────── handler ─────────────
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<Ok | Err>
@@ -292,7 +320,7 @@ export default async function handler(
       return res.status(400).json({
         ok: false,
         reason:
-          "Use multipart/form-data with files m15,h1,h4 (optional calendar) and optional text field 'instrument'.",
+          "Use multipart/form-data with files m15,h1,h4 (optional calendar) and optional field 'instrument'.",
       });
     if (!OPENAI_API_KEY)
       return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
@@ -306,7 +334,6 @@ export default async function handler(
     const fH1 = pickFirst(files.h1);
     const fH4 = pickFirst(files.h4);
     const fCal = pickFirst(files.calendar);
-
     if (!fM15 || !fH1 || !fH4) {
       return res
         .status(400)
@@ -319,7 +346,6 @@ export default async function handler(
       fileToDataUrl(fH4),
       fCal ? fileToDataUrl(fCal) : Promise.resolve(null),
     ]);
-
     if (!m15Url || !h1Url || !h4Url) {
       return res
         .status(400)
@@ -329,53 +355,73 @@ export default async function handler(
     const headlinesList = await fetchHeadlines(req, instrument);
     const headlinesText = headlinesList.length ? headlinesList.join("\n") : null;
 
-    const text = await askVision({
+    // 1) Primary pass
+    let { text, aiMeta } = await askVision({
       instrument,
       dataUrls: { m15: m15Url, h1: h1Url, h4: h4Url },
       calendarDataUrl: calUrl || undefined,
       headlinesText,
     });
 
+    // 2) If Market without valid breakout proof, rewrite to Pending Limit
+    let pendingRewritten = false;
+    if (aiMetaDemandsRewrite(aiMeta) || needsPendingRewriteByHeuristics(text)) {
+      text = await rewriteToPending(instrument, text);
+      pendingRewritten = true;
+      // Try to re-extract ai_meta from the rewritten text
+      aiMeta = extractAiMeta(text) || aiMeta;
+    }
+
+    // 3) Refusal fallback (still produce a low-conviction card)
     if (refusalLike(text)) {
-      // Final safety net: a friendly, explicit low-conviction card so UI never shows empty.
       const fallback = [
         "Quick Plan (Actionable):",
         "• Direction: Stay Flat (low conviction)",
-        "• Entry: Wait for a clean trigger (breakout & retest or SFP reclaim)",
-        "• Stop Loss: Behind the invalidation structure of the chosen trigger",
+        "• Entry: Pending @ confluence (OB/FVG/SR) after a clean signal",
+        "• Stop Loss: Beyond the invalidation structure with small buffer",
         "• Take Profit(s): Prior swing/liquidity, then trail",
         "• Conviction: 30%",
         "• Setup: Await valid trigger (images inconclusive)",
-        "• Short Reasoning: Images didn’t clearly expose price scale or decisive structure; wait for clarity.",
         "",
         "Full Breakdown:",
-        "• Technical View (HTF + Intraday): Indecisive; likely range.",
-        "• Fundamental View (Calendar + Sentiment): Mixed; keep size conservative.",
+        "• Technical View: Indecisive; likely range.",
+        "• Fundamental View: Mixed; keep size conservative.",
         "• Tech vs Fundy Alignment: Mixed",
-        "• Conditional Scenarios: Breakout & retest above range high for longs; SFP of range high or breakdown & retest for shorts.",
+        "• Conditional Scenarios: Break & retest for continuation; SFP & reclaim for reversal.",
         "• Surprise Risk: Headlines; CB speakers.",
         "• Invalidation: Opposite-side body close beyond range edge.",
         "• One-liner Summary: Stand by for a clean trigger.",
         "",
-        "Advanced Reasoning (Pro-Level Context):",
-        "• Priority Bias: Neutral until a clear break or sweep/reclaim.",
-        "• Structure Context: Trade the edges once structure confirms.",
-        "• Confirmation Logic: Body close beyond level and retest that holds, or SFP wick + reclaim.",
-        "• Fundamentals: Only nudge conviction; do not override PA without strong catalyst.",
-        "• Scenario Planning: Pre-news: fakeouts likely; post-news: wait for first retest.",
+        "Detected Structures (X-ray):",
+        "• 4H: —",
+        "• 1H: —",
+        "• 15m: —",
         "",
-        "News Event Watch:",
-        "• Watch high-impact events; caution in ±90m window.",
-        "",
-        "Notes:",
-        "• Educational analysis only; not financial advice.",
+        "Candidate Scores:",
+        "• —",
         "",
         "Final Table Summary:",
         "Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction %",
         `${instrument} | Neutral | Wait for trigger | Structure-based | Prior swing | Next liquidity | 30%`,
         "",
-        "Chosen Strategy: Await valid trigger",
-        "Alt Candidates (scores): none (images inconclusive)",
+        "```ai_meta",
+        JSON.stringify(
+          {
+            selectedStrategy: "Await valid trigger",
+            entryType: "Pending",
+            direction: "Flat",
+            breakoutProof: {
+              bodyCloseBeyond: false,
+              retestHolds: false,
+              sfpReclaim: false,
+            },
+            candidateScores: [],
+            note: "Fallback used due to refusal/empty output",
+          },
+          null,
+          2
+        ),
+        "```",
       ].join("\n");
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
@@ -386,7 +432,9 @@ export default async function handler(
           hasCalendar: !!calUrl,
           headlinesCount: headlinesList.length,
           strategySelection: false,
+          pendingRewritten: false,
           fallbackUsed: true,
+          aiMeta: extractAiMeta(fallback),
         },
       });
     }
@@ -400,7 +448,9 @@ export default async function handler(
         hasCalendar: !!calUrl,
         headlinesCount: headlinesList.length,
         strategySelection: true,
+        pendingRewritten,
         fallbackUsed: false,
+        aiMeta: aiMeta || null,
       },
     });
   } catch (err: any) {
