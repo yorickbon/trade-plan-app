@@ -5,19 +5,18 @@ import dynamic from "next/dynamic";
 
 import CalendarPanel from "../components/CalendarPanel";
 import HeadlinesPanel from "../components/HeadlinesPanel";
+import ChatDock from "../components/ChatDock";
+import VisionUpload from "../components/VisionUpload";
 
 // ✅ client-only chart import to avoid client-side exception
-const TradingViewTriple = dynamic(
-  () => import("../components/TradingViewTriple"),
-  {
-    ssr: false,
-    loading: () => (
-      <div className="rounded-lg border border-neutral-800 p-4">
-        <div className="text-sm opacity-75">Loading charts…</div>
-      </div>
-    ),
-  }
-);
+const TradingViewTriple = dynamic(() => import("../components/TradingViewTriple"), {
+  ssr: false,
+  loading: () => (
+    <div className="rounded-lg border border-neutral-800 p-4">
+      <div className="text-sm opacity-75">Loading charts…</div>
+    </div>
+  ),
+});
 
 // ---------- types / helpers ----------
 type CalendarBias = {
@@ -81,7 +80,10 @@ export default function Page() {
   // plan
   const [planText, setPlanText] = useState<string>("");
   const [generating, setGenerating] = useState<boolean>(false);
-  const [monitoring, setMonitoring] = useState<boolean>(false);
+
+  // mode toggle
+  type Mode = "images" | "numeric";
+  const [mode, setMode] = useState<Mode>("images"); // default to Images
 
   // ----- load headlines for a list of symbols -----
   const loadHeadlinesForSymbols = useCallback(async (symbols: string[]) => {
@@ -141,8 +143,8 @@ export default function Page() {
     loadCalendar();
   }, [loadCalendar]);
 
-  // ----- generate plan -----
-  const generatePlan = useCallback(async () => {
+  // ----- generate (numeric) plan -----
+  const generatePlanNumeric = useCallback(async () => {
     setGenerating(true);
     setPlanText("");
     try {
@@ -227,7 +229,30 @@ export default function Page() {
           />
         </div>
 
-        {/* 🔄 Reset replaces "Refresh Calendar" */}
+        {/* Mode toggle */}
+        <div className="flex items-center gap-2 ml-2">
+          <span className="text-sm opacity-80">Mode</span>
+          <div className="inline-flex rounded-lg overflow-hidden border border-neutral-700">
+            <button
+              onClick={() => setMode("images")}
+              className={`px-3 py-1 text-sm ${
+                mode === "images" ? "bg-emerald-600" : "bg-neutral-800 hover:bg-neutral-700"
+              }`}
+            >
+              Images
+            </button>
+            <button
+              onClick={() => setMode("numeric")}
+              className={`px-3 py-1 text-sm ${
+                mode === "numeric" ? "bg-emerald-600" : "bg-neutral-800 hover:bg-neutral-700"
+              }`}
+            >
+              Numeric
+            </button>
+          </div>
+        </div>
+
+        {/* Buttons — one line */}
         <button
           onClick={resetAll}
           className="px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
@@ -236,24 +261,23 @@ export default function Page() {
           Reset
         </button>
 
-        <button
-          onClick={generatePlan}
-          className="px-3 py-1 text-sm rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
-          disabled={generating}
-        >
-          {generating ? "Generating…" : "Generate Plan"}
-        </button>
+        {mode === "numeric" ? (
+          <button
+            onClick={generatePlanNumeric}
+            className="px-3 py-1 text-sm rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
+            disabled={generating}
+          >
+            {generating ? "Generating…" : "Generate Plan"}
+          </button>
+        ) : (
+          <span className="text-xs opacity-70">Use the uploader below to Generate from Images</span>
+        )}
 
-        <button
-          onClick={() => setMonitoring(true)}
-          className="px-3 py-1 text-sm rounded bg-sky-700 hover:bg-sky-600"
-        >
+        {/* (future) wire these to your monitoring endpoints */}
+        <button className="px-3 py-1 text-sm rounded bg-sky-700 hover:bg-sky-600">
           Start monitoring
         </button>
-        <button
-          onClick={() => setMonitoring(false)}
-          className="px-3 py-1 text-sm rounded bg-rose-700 hover:bg-rose-600"
-        >
+        <button className="px-3 py-1 text-sm rounded bg-rose-700 hover:bg-rose-600">
           Stop monitoring
         </button>
       </div>
@@ -261,7 +285,19 @@ export default function Page() {
       {/* Charts */}
       <TradingViewTriple symbol={instrument} />
 
-      {/* 2+1 columns: LEFT (Calendar + Headlines) | RIGHT (Trade Card) */}
+      {/* Images uploader (only in Images mode) */}
+      {mode === "images" && (
+        <div className="rounded-lg border border-neutral-800 p-4">
+          <h2 className="text-lg font-semibold mb-2">Image Upload (4H / 1H / 15M + optional Calendar)</h2>
+          <VisionUpload
+            instrument={instrument}
+            onBusyChange={setGenerating}
+            onResult={(txt) => setPlanText(normalizePlanText(txt))}
+          />
+        </div>
+      )}
+
+      {/* 2+1 columns: LEFT (Calendar + Headlines) | RIGHT (Trade Card + Chat) */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
         {/* LEFT: Calendar + Headlines stacked (span 2 columns) */}
         <div className="xl:col-span-2 space-y-4">
@@ -269,9 +305,7 @@ export default function Page() {
           <div className="rounded-lg border border-neutral-800 p-4">
             <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
 
-            {loadingCal && (
-              <div className="text-sm opacity-75">Loading calendar…</div>
-            )}
+            {loadingCal && <div className="text-sm opacity-75">Loading calendar…</div>}
 
             {!loadingCal && calendar?.ok && Array.isArray(calendar.items) && (
               <CalendarPanel items={calendar.items} />
@@ -279,8 +313,8 @@ export default function Page() {
 
             {!loadingCal && (!calendar || !calendar.ok) && (
               <div className="text-sm opacity-75">
-                No calendar items found from providers. (Once your
-                TradingEconomics key is active, this will populate automatically.)
+                No calendar items found from providers. (Once your TradingEconomics key is active,
+                this will populate automatically.)
               </div>
             )}
           </div>
@@ -289,7 +323,7 @@ export default function Page() {
           <div className="rounded-lg border border-neutral-800 p-4">
             <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
             {/* Make li/text inside HeadlinesPanel smaller without touching that component */}
-            <div className="text-xs [&_li]:text-xs [&_a]:text-sky-300">
+            <div className="text-xs leading-5 [&_li]:text-xs [&_a]:text-sky-300">
               <HeadlinesPanel items={Array.isArray(headlines) ? headlines : []} />
             </div>
             <div className="text-[11px] mt-2 opacity-60">
@@ -304,22 +338,36 @@ export default function Page() {
           </div>
         </div>
 
-        {/* RIGHT: Trade Card – bigger font & vertical lines */}
-        <div className="rounded-lg border border-neutral-800 p-4">
-          <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
-          {planText ? (
-            <pre className="whitespace-pre-wrap text-base leading-6 opacity-95">
-              {planText}
-            </pre>
-          ) : generating ? (
-            <div className="text-sm opacity-80">Generating…</div>
-          ) : (
-            <div className="text-sm opacity-70">
-              Click <b>Generate Plan</b> to build a setup using 15m execution,
-              1h+4h context, fundamentals (calendar bias + headlines), and our
-              strategy logic.
-            </div>
-          )}
+        {/* RIGHT: Trade Card – bigger font & now easier to read */}
+        <div className="rounded-lg border border-neutral-800 p-4 flex flex-col gap-4 max-h-[80vh]">
+          <div>
+            <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
+            {planText ? (
+              <pre className="whitespace-pre-wrap text-[15px] leading-7 opacity-95 max-h-[50vh] overflow-auto pr-2">
+                {planText}
+              </pre>
+            ) : generating ? (
+              <div className="text-sm opacity-80">Generating…</div>
+            ) : (
+              <div className="text-sm opacity-70">
+                {mode === "images" ? (
+                  <>Upload your 4H/1H/15M (and optional calendar) above, then click <b>Generate</b>.</>
+                ) : (
+                  <>Click <b>Generate Plan</b> to build a setup from numeric candles + fundamentals.</>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* ChatDock: discuss the current plan */}
+          <div className="border-t border-neutral-800 pt-3">
+            <h3 className="text-base font-semibold mb-2">Discuss the Plan</h3>
+            <ChatDock
+              planText={planText}
+              headlines={Array.isArray(headlines) ? headlines : []}
+              calendar={Array.isArray((calendar as any)?.items) ? (calendar as any).items : []}
+            />
+          </div>
         </div>
       </div>
     </div>
