@@ -1,7 +1,8 @@
 // pages/api/chat.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
+const OPENAI_API_KEY =
+  process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -10,56 +11,98 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (!OPENAI_API_KEY) return res.status(400).json({ error: "Missing OPENAI_API_KEY" });
 
     const {
-      instrument, // { code: 'EURUSD', currencies: ['EUR','USD'] }
-      date,       // 'YYYY-MM-DD'
-      calendar = [],      // [{date, time, country, currency, impact, title, ...}]
-      headlines = [],     // [{title, url, source, seen, ...}]
-      candles = null,     // { h4: Candle[], h1: Candle[], m15: Candle[] }
-      question = "",      // user message
-    } = req.body || {};
+      instrument,            // e.g. 'EURUSD'
+      date,                  // 'YYYY-MM-DD'
+      calendar = [],         // [{date,time,country,currency,impact,title,...}]
+      headlines = [],        // [{title,url,source,...}]
+      candles = null,        // { h4: Candle[], h1: Candle[], m15: Candle[] } | null
+      question = "",         // user message
+      planText = "",         // <<< the generated trade plan text (vision or numeric)
+    } = (typeof req.body === "string" ? safeParse(req.body) : req.body) || {};
 
+    // Trim inputs (avoid token bloat + keep latency low)
     const trimmed = {
-      instrument,
-      date,
+      instrument: String(instrument || "").toUpperCase().slice(0, 20),
+      date: String(date || "").slice(0, 20),
       calendar: Array.isArray(calendar) ? calendar.slice(0, 40) : [],
       headlines: Array.isArray(headlines) ? headlines.slice(0, 40) : [],
-      candles: candles ? {
-        h4: Array.isArray(candles.h4) ? candles.h4.slice(-200) : [],
-        h1: Array.isArray(candles.h1) ? candles.h1.slice(-200) : [],
-        m15: Array.isArray(candles.m15) ? candles.m15.slice(-200) : [],
-      } : { h4: [], h1: [], m15: [] },
+      candles: candles
+        ? {
+            h4: Array.isArray(candles.h4) ? candles.h4.slice(-120) : [],
+            h1: Array.isArray(candles.h1) ? candles.h1.slice(-160) : [],
+            m15: Array.isArray(candles.m15) ? candles.m15.slice(-160) : [],
+          }
+        : { h4: [], h1: [], m15: [] },
+      planText: String(planText || "").slice(0, 8000),
       question: String(question || "").slice(0, 2000),
     };
 
+    // --- System rules ---
+    // Note: WARNING-ONLY for ±90m events; never force "NO TRADE".
     const system = [
       "You are a trading assistant who must NEVER guess.",
-      "You have 4H/1H/15M OHLCV arrays (objects with at least t/o/h/l/c).",
-      "Bias/confirmation rules: 15m = execution, 1h & 4h = confirmation.",
-      "Identify BOS + retest, pullback to 0.62± (fib 61.8–70.5 zone), FVG/OB confluence.",
+      "You are given a Trade Plan text (\"planText\"). Treat it as the baseline truth for levels and logic.",
+      "Do NOT change the plan's numbers (entry, SL, TP1, TP2) unless the user explicitly asks for an update.",
+      "If candles are missing or empty, rely on planText + headlines + calendar (do NOT invent OHLCV).",
+      "Bias/confirmation rules: 15m = execution, 1h & 4h = confirmation (only if candles provided).",
+      "Identify BOS + retest, pullback to 0.62± (fib 61.8–70.5), and FVG/OB confluence when applicable.",
       "Prefer entries AWAY from current price unless a well-defined retest is occurring.",
-      "Respect economic calendar and recent macro headlines; if high-impact in ±90m, recommend NO TRADE.",
-      "Always return precise levels (entry, SL, TP1, TP2), invalidation, and timeframe alignment.",
-      "If something is missing, explicitly say so rather than inventing.",
+      "Respect economic calendar and recent macro headlines; if high-impact is within ±90m, ISSUE A WARNING but STILL provide guidance.",
+      "Always give precise, practical explanations tied to the given planText and the user's question.",
+      "If something is missing, say so explicitly rather than inventing.",
     ].join(" ");
 
-    const user = `Context:
-Instrument: ${JSON.stringify(trimmed.instrument)}
-Date: ${trimmed.date}
+    // --- Build a compact user prompt ---
+    const headlinesList = trimmed.headlines
+      .map((h: any) =>
+        `- ${String(h?.title || "").slice(0, 160)}${h?.source ? ` (${h.source})` : ""}`
+      )
+      .slice(0, 12)
+      .join("\n");
 
-Calendar (truncated): ${JSON.stringify(trimmed.calendar)}
-Headlines (truncated): ${JSON.stringify(trimmed.headlines)}
+    const calList = trimmed.calendar
+      .map((e: any) => {
+        const t = e?.time || e?.date || "";
+        const imp = e?.impact || e?.importance || "";
+        const cur = e?.currency || e?.country || "";
+        return `- ${String(e?.title || "Event").slice(0, 120)} | ${cur} | ${imp} | ${t}`;
+      })
+      .slice(0, 20)
+      .join("\n");
 
-Candles (last ~200 each, truncated):
-H4: ${JSON.stringify(trimmed.candles.h4?.slice(-60) ?? [])}
-H1: ${JSON.stringify(trimmed.candles.h1?.slice(-120) ?? [])}
-M15: ${JSON.stringify(trimmed.candles.m15?.slice(-120) ?? [])}
-
-Trader question: ${trimmed.question}`;
+    const user = [
+      `Instrument: ${JSON.stringify(trimmed.instrument)}`,
+      trimmed.date ? `Date: ${trimmed.date}` : "",
+      "",
+      "Trade Plan (planText):",
+      "```",
+      trimmed.planText || "(none provided)",
+      "```",
+      "",
+      "Headlines (truncated):",
+      headlinesList || "(none)",
+      "",
+      "Calendar (truncated):",
+      calList || "(none)",
+      "",
+      "Candles provided? ",
+      `H4: ${Array.isArray(trimmed.candles.h4) && trimmed.candles.h4.length ? "yes" : "no"},`,
+      ` H1: ${Array.isArray(trimmed.candles.h1) && trimmed.candles.h1.length ? "yes" : "no"},`,
+      ` M15: ${Array.isArray(trimmed.candles.m15) && trimmed.candles.m15.length ? "yes" : "no"}.`,
+      "",
+      "User question:",
+      trimmed.question,
+      "",
+      "Answer requirements:",
+      "- Ground your answer in the planText. Explain the why behind its levels and logic.",
+      "- If asked about conviction or news impact, use the headlines/calendar above to justify.",
+      "- If asked to modify levels, first state that you will keep the original numbers unless explicitly authorized to recalc; if the user confirms, outline how you'd update them.",
+    ].filter(Boolean).join("\n");
 
     const rsp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -77,13 +120,16 @@ Trader question: ${trimmed.question}`;
       throw new Error(`OpenAI chat failed: ${rsp.status} ${txt}`);
     }
     const json = await rsp.json();
-    const answer = json.choices?.[0]?.message?.content ?? "(no answer)";
+    const answer = json?.choices?.[0]?.message?.content ?? "No answer.";
 
-    // modest client-side caching hint
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({ answer });
   } catch (err: any) {
     console.error("chat error", err);
     return res.status(500).json({ error: err?.message || "chat failed" });
   }
+}
+
+function safeParse(s: string) {
+  try { return JSON.parse(s); } catch { return {}; }
 }
