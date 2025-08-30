@@ -12,12 +12,8 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 /* ---------------------------- numeric helpers ----------------------------- */
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const nowIso = () => new Date().toISOString();
-const toJSON = (x: any) => {
-  try { return JSON.stringify(x); } catch { return "{}"; }
-};
-const parseMaybeJSON = (s: string) => {
-  try { return JSON.parse(s); } catch { return null; }
-};
+const toJSON = (x: any) => { try { return JSON.stringify(x); } catch { return "{}"; } };
+const parseMaybeJSON = (s: string) => { try { return JSON.parse(s); } catch { return null; } };
 
 const H = (a: Candle[]) => a.map(c => c.h);
 const L = (a: Candle[]) => a.map(c => c.l);
@@ -53,8 +49,7 @@ const roundToTick = (n: number, t: number) => Math.round(n / t) * t;
 function originFromReq(req: NextApiRequest) {
   const proto = (req.headers["x-forwarded-proto"] as string) || "https";
   const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
-  if (host.startsWith("http")) return host;
-  return `${proto}://${host}`;
+  return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 async function safeGET<T = any>(url: string): Promise<T | null> {
   try {
@@ -119,9 +114,11 @@ function summarizeHeadlines(headlines: any[]) {
 }
 
 /* -------------------------- deterministic plan core ------------------------ */
+type OrderType = "Buy Limit" | "Sell Limit" | "Market"; // (no Stop variants here)
+
 type PlanCore = {
   direction: "Long" | "Short" | "Flat",
-  order_type: "Buy Limit" | "Sell Limit" | "Buy Stop" | "Sell Stop" | "Market",
+  order_type: OrderType,
   entry: number, stop: number, tp1: number, tp2: number,
   setup: string, short_reason: string,
   signals: string[], tview: { h4: string, h1: string, m15: string },
@@ -178,13 +175,12 @@ function buildDeterministicPlan(params: {
   else if (tview.m15 === "up" && sent.bias === "bullish") dir = "Long";
   else if (tview.m15 === "down" && sent.bias === "bearish") dir = "Short";
   if (dir === "Flat") {
-    // range mean-reversion toward nearest structure
     if (lastLow && last < (lastLow + ((lastHigh ?? lastLow) - lastLow) * 0.35)) dir = "Long";
     else if (lastHigh && last > (lastHigh - ((lastHigh - (lastLow ?? lastHigh)) * 0.35))) dir = "Short";
   }
 
   // Initial numbers (pullback)
-  let order: PlanCore["order_type"] = "Buy Limit";
+  let order: OrderType = "Market";
   let entry = last, stop = last, tp1 = last, tp2 = last;
   const signals: string[] = [];
   let setup = "", short_reason = "";
@@ -214,7 +210,6 @@ function buildDeterministicPlan(params: {
     short_reason = "Sell the rally toward 15m resistance; SL beyond swing w/ ATR buffer.";
     signals.push("OB", "FVG", "Fib0.5");
   } else {
-    // conservative placeholder when rangey
     order = "Market";
     entry = rnd(last);
     stop = rnd(entry - slBuf);
@@ -225,7 +220,7 @@ function buildDeterministicPlan(params: {
     short_reason = "Wait for 15m BOS + pullback with HTF confluence.";
   }
 
-  // Final consistency gate (fixes 'sell limit below market' etc.)
+  // Final consistency gate (only for the three order types we actually use)
   const fixes: string[] = [];
   if (order === "Market") {
     entry = rnd(last); fixes.push("market=last");
@@ -233,27 +228,22 @@ function buildDeterministicPlan(params: {
     entry = rnd(last - 0.25 * A15); fixes.push("buyLimitBelowLast");
   } else if (order === "Sell Limit" && entry <= last) {
     entry = rnd(last + 0.25 * A15); fixes.push("sellLimitAboveLast");
-  } else if (order === "Buy Stop" && entry <= last) {
-    entry = rnd(last + 0.05 * A15); fixes.push("buyStopAboveLast");
-  } else if (order === "Sell Stop" && entry >= last) {
-    entry = rnd(last - 0.05 * A15); fixes.push("sellStopBelowLast");
   }
 
   // Rebuild SL/TP after any entry correction
   if (fixes.length) {
-    if (dir === "Long" || order.startsWith("Buy")) {
+    if (dir === "Long" || order === "Buy Limit") {
       stop = rnd(entry - Math.max(3 * tick, 0.2 * A15));
       const r = Math.abs(entry - stop);
       tp1 = rnd(entry + Math.max(1.0 * r, 0.3 * A15));
       tp2 = rnd(tp1 + 0.5 * r);
-    } else if (dir === "Short" || order.startsWith("Sell")) {
+    } else if (dir === "Short" || order === "Sell Limit") {
       stop = rnd(entry + Math.max(3 * tick, 0.2 * A15));
       const r = Math.abs(entry - stop);
       tp1 = rnd(entry - Math.max(1.0 * r, 0.3 * A15));
       tp2 = rnd(tp1 - 0.5 * r);
     }
   } else {
-    // even if no entry fix, enforce sensible TP spacing
     const r = Math.abs(entry - stop);
     const min1 = Math.max(1.0 * r, 0.3 * A15);
     if (dir === "Long") {
