@@ -1,7 +1,6 @@
 // /pages/api/vision-plan.ts
 // Images-only Trade Plan generator (NO numeric fallback).
-// Accepts multipart/form-data with files: m15, h1, h4 (required), calendar (optional),
-// plus optional text field "instrument". Returns multiline Trade Card.
+// Accepts multipart/form-data with files: m15, h1, h4 (required), calendar (optional).
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -21,7 +20,7 @@ type Json = Record<string, any>;
 type Ok = { ok: true; text: string; meta?: any };
 type Err = { ok: false; reason: string };
 
-// ───────────────── helpers ─────────────────
+/* ───────────────── helpers ───────────────── */
 
 async function getFormidable() {
   const mod: any = await import("formidable");
@@ -93,7 +92,7 @@ async function fetchHeadlines(req: NextApiRequest, instrument: string) {
   }
 }
 
-// ─────────────── OpenAI Vision (chat.completions) ───────────────
+/* ─────────────── OpenAI Vision (Responses API) ─────────────── */
 
 async function askVision(params: {
   instrument: string;
@@ -107,75 +106,73 @@ async function askVision(params: {
 
   const userContent: any[] = [
     {
-      type: "text",
-      text:
-        [
-          "Act as my Trade Plan Assistant.",
-          "Use ONLY the provided chart IMAGES to derive technical zones and structure. Do NOT use numeric candles.",
-          `Instrument: ${instrument}.`,
-          "",
-          "Return the plan in this exact structure:",
-          "Quick Plan (Actionable):",
-          "• Direction: Long / Short / Stay Flat",
-          "• Entry: Market / Pending @ ...",
-          "• Stop Loss: ...",
-          "• Take Profit(s): TP1 / TP2 …",
-          "• Conviction: %",
-          "• Short Reasoning: ...",
-          "",
-          "Full Breakdown:",
-          "• Technical View (HTF + Intraday)",
-          "• Fundamental View (Calendar + Sentiment)",
-          "• Tech vs Fundy Alignment: Match / Mismatch (why)",
-          "• Conditional Scenarios",
-          "• Surprise Risk (unscheduled headlines, politics, central bank comments)",
-          "• Invalidation",
-          "• One-liner Summary",
-          "",
-          "Advanced Reasoning (Pro-Level Context):",
-          "• Priority Bias (based on fundamentals)",
-          "• Structure Context (retracements, fibs, supply/demand zones)",
-          "• Confirmation Logic (e.g., wait for news release, candle confirmation, OB touch)",
-          "• How fundamentals strengthen or weaken this technical setup",
-          "• Scenario Planning (pre-news vs post-news breakout conviction)",
-          "",
-          "News Event Watch:",
-          "• Upcoming/Recent events to watch and why",
-          "",
-          "Notes:",
-          "• Any extra execution notes",
-          "",
-          "Final Table Summary (single line): Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction %",
-          "",
-          "Rules:",
-          "• Derive zones/levels only from the images (4H, 1H, 15M). Be precise.",
-          "• If headlines are provided below, use them for fundamentals.",
-          "• If a calendar image is provided, read it to infer bias and create a warning window (no blackout).",
-          "• Never fabricate numbers; if uncertain, mark low conviction and explain briefly.",
-        ].join("\n"),
+      type: "input_text",
+      text: [
+        "Act as my Trade Plan Assistant.",
+        "Use ONLY the provided chart IMAGES to derive technical zones and structure. Do NOT use numeric candles.",
+        `Instrument: ${instrument}.`,
+        "",
+        "Return the plan in this exact structure:",
+        "Quick Plan (Actionable):",
+        "• Direction: Long / Short / Stay Flat",
+        "• Entry: Market / Pending @ …",
+        "• Stop Loss: …",
+        "• Take Profit(s): TP1 / TP2 …",
+        "• Conviction: %",
+        "• Short Reasoning: …",
+        "",
+        "Full Breakdown:",
+        "• Technical View (HTF + Intraday)",
+        "• Fundamental View (Calendar + Sentiment)",
+        "• Tech vs Fundy Alignment: Match / Mismatch (why)",
+        "• Conditional Scenarios",
+        "• Surprise Risk (unscheduled headlines, politics, central bank comments)",
+        "• Invalidation",
+        "• One-liner Summary",
+        "",
+        "Advanced Reasoning (Pro-Level Context):",
+        "• Priority Bias (based on fundamentals)",
+        "• Structure Context (retracements, fibs, supply/demand zones)",
+        "• Confirmation Logic (e.g., wait for news release, candle confirmation, OB touch)",
+        "• How fundamentals strengthen or weaken this technical setup",
+        "• Scenario Planning (pre-news vs post-news breakout conviction)",
+        "",
+        "News Event Watch:",
+        "• Upcoming/Recent events to watch and why",
+        "",
+        "Notes:",
+        "• Any extra execution notes",
+        "",
+        "Final Table Summary (single line): Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction %",
+        "",
+        "Rules:",
+        "• Derive zones/levels only from the images (4H, 1H, 15M). Be precise.",
+        "• If headlines are provided below, use them for fundamentals.",
+        "• If a calendar image is provided, read it to infer bias and create a warning window (no blackout).",
+        "• Never fabricate numbers; if uncertain, mark low conviction and explain briefly.",
+      ].join("\n"),
     },
-    { type: "text", text: "4H Chart:" },
-    { type: "image_url", image_url: { url: dataUrls.h4 } },
-    { type: "text", text: "1H Chart:" },
-    { type: "image_url", image_url: { url: dataUrls.h1 } },
-    { type: "text", text: "15M Chart:" },
-    { type: "image_url", image_url: { url: dataUrls.m15 } },
+    { type: "input_text", text: "4H Chart:" },
+    { type: "input_image", image_url: { url: dataUrls.h4 } },
+    { type: "input_text", text: "1H Chart:" },
+    { type: "input_image", image_url: { url: dataUrls.h1 } },
+    { type: "input_text", text: "15M Chart:" },
+    { type: "input_image", image_url: { url: dataUrls.m15 } },
   ];
 
   if (calendarDataUrl) {
-    userContent.push({ type: "text", text: "Economic Calendar Image:" });
-    userContent.push({ type: "image_url", image_url: { url: calendarDataUrl } });
+    userContent.push({ type: "input_text", text: "Economic Calendar Image:" });
+    userContent.push({ type: "input_image", image_url: { url: calendarDataUrl } });
   }
   if (headlinesText && headlinesText.trim()) {
     userContent.push({
-      type: "text",
+      type: "input_text",
       text: "Recent headlines snapshot:\n" + headlinesText,
     });
   }
 
   const resp = await fetch(
-    (process.env.OPENAI_API_BASE || "https://api.openai.com/v1") +
-      "/chat/completions",
+    (process.env.OPENAI_API_BASE || "https://api.openai.com/v1") + "/responses",
     {
       method: "POST",
       headers: {
@@ -185,13 +182,15 @@ async function askVision(params: {
       body: JSON.stringify({
         model: OPENAI_MODEL,
         temperature: 0.2,
-        messages: [
+        input: [
           {
             role: "system",
-            content:
-              "You are a meticulous trading analyst. Use ONLY provided images for technicals. Be structured and precise.",
+            content: [{ type: "input_text", text: "You are a meticulous trading analyst. Use ONLY provided images for technicals. Be structured and precise." }],
           },
-          { role: "user", content: userContent },
+          {
+            role: "user",
+            content: userContent,
+          },
         ],
       }),
     }
@@ -202,10 +201,13 @@ async function askVision(params: {
     throw new Error(`OpenAI vision request failed: ${resp.status} ${txt}`);
   }
   const data = (await resp.json()) as Json;
-  return data?.choices?.[0]?.message?.content?.trim() || "";
+  // Responses API convenience field:
+  return (data?.output_text ||
+          data?.output?.[0]?.content?.[0]?.text ||
+          "").trim();
 }
 
-// ─────────────── handler ───────────────
+/* ─────────────── handler ─────────────── */
 
 export default async function handler(
   req: NextApiRequest,
@@ -215,13 +217,11 @@ export default async function handler(
     if (req.method !== "POST")
       return res.status(405).json({ ok: false, reason: "Method not allowed" });
     if (!isMultipart(req))
-      return res
-        .status(400)
-        .json({
-          ok: false,
-          reason:
-            "Use multipart/form-data with files m15,h1,h4 (optional calendar) and optional text field 'instrument'.",
-        });
+      return res.status(400).json({
+        ok: false,
+        reason:
+          "Use multipart/form-data with files m15,h1,h4 (optional calendar) and optional text field 'instrument'.",
+      });
     if (!OPENAI_API_KEY)
       return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
 
@@ -236,10 +236,9 @@ export default async function handler(
     const fCal = pickFirst(files.calendar);
 
     if (!fM15 || !fH1 || !fH4) {
-      return res.status(400).json({
-        ok: false,
-        reason: "Please upload all three charts: m15, h1, h4 (PNG/JPG).",
-      });
+      return res
+        .status(400)
+        .json({ ok: false, reason: "Please upload all three charts: m15, h1, h4 (PNG/JPG)." });
     }
 
     const [m15Url, h1Url, h4Url, calUrl] = await Promise.all([
@@ -256,9 +255,7 @@ export default async function handler(
     }
 
     const headlinesList = await fetchHeadlines(req, instrument);
-    const headlinesText = headlinesList.length
-      ? headlinesList.join("\n")
-      : null;
+    const headlinesText = headlinesList.length ? headlinesList.join("\n") : null;
 
     const text = await askVision({
       instrument,
