@@ -1,40 +1,73 @@
-// pages/api/ask.ts
+// /pages/api/ask.ts
 import type { NextApiRequest, NextApiResponse } from "next";
-import OpenAI from "openai";
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+function originFromReq(req: NextApiRequest) {
+  const proto = (req.headers["x-forwarded-proto"] as string) || "https";
+  const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
+  return host.startsWith("http") ? host : `${proto}://${host}`;
+}
+
+function parseBody(req: NextApiRequest) {
+  try {
+    if (typeof req.body === "string") return JSON.parse(req.body || "{}");
+    return req.body || {};
+  } catch {
+    return {};
+  }
+}
+
+// Try to capture symbols like "EURUSD", "XAU/USD", "BTCUSD" from the card text
+function extractInstrument(planText?: string): string | undefined {
+  if (!planText) return undefined;
+  const m =
+    planText.match(/Symbol:\s*([A-Z0-9/.\-]+)/i) ||
+    planText.match(/\b(?:Instrument|Pair)\s*[:=]\s*([A-Z0-9/.\-]{6,12})/i);
+  const raw = m?.[1]?.toUpperCase().replace(/\s+/g, "");
+  if (!raw) return undefined;
+  return raw.includes("/") ? raw.replace("/", "") : raw;
+}
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
-    const { question, planText, headlines, calendar } =
-      typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-    if (!question) return res.status(400).json({ error: "question required" });
+    const { question = "", planText = "", headlines = [], calendar = [] } = parseBody(req);
+    const instrument = extractInstrument(planText);
 
-    const system = `
-You are a trading assistant. Answer strictly using the provided Trade Card, Headlines, and Calendar.
-If something is unknown, say so. Be concise, tactical, and specific.`.trim();
+    // We include the rendered plan text as context so the model answers
+    // specifically about *this* setup without changing any numbers.
+    const enrichedQuestion = [
+      "We are discussing this trade plan text (do NOT change its numbers; use it only as context):",
+      planText ? String(planText).slice(0, 6000) : "(no plan text provided)",
+      "",
+      "User question:",
+      String(question).slice(0, 2000),
+    ].join("\n");
 
-    const context = {
-      planText: planText || "",
-      headlines: Array.isArray(headlines) ? headlines : [],
-      calendar: Array.isArray(calendar) ? calendar : [],
+    const payload = {
+      instrument,
+      date: new Date().toISOString().slice(0, 10),
+      calendar: Array.isArray(calendar) ? calendar.slice(0, 40) : [],
+      headlines: Array.isArray(headlines) ? headlines.slice(0, 40) : [],
+      candles: null,                 // ChatDock Q&A does not use numeric candles
+      question: enrichedQuestion,
     };
 
-    const rsp = await client.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-      temperature: 0.2,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: "Context:\n" + JSON.stringify(context) },
-        { role: "user", content: "Question: " + question },
-      ],
+    const base = originFromReq(req);
+    const rsp = await fetch(`${base}/api/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
     });
 
-    const answer = rsp.choices[0]?.message?.content?.trim() || "No answer.";
-    return res.status(200).json({ answer });
+    const json = await rsp.json().catch(() => ({} as any));
+    if (!rsp.ok) {
+      return res.status(500).json({ error: json?.error || `Proxy failed (${rsp.status})` });
+    }
+    // Pass through the LLM’s answer for the dock
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).json({ answer: json?.answer || "(no answer)" });
   } catch (err: any) {
-    console.error(err);
-    return res.status(500).json({ error: err?.message || "Server error" });
+    return res.status(500).json({ error: err?.message || "ask failed" });
   }
 }
