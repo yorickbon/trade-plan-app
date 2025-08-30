@@ -1,5 +1,5 @@
 // /pages/api/vision-plan.ts
-// Images-only Trade Plan generator (NO numeric fallback).
+// Images-only Trade Plan generator with multi-strategy candidate scoring.
 // Accepts multipart/form-data with files: m15, h1, h4 (required), calendar (optional).
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -14,6 +14,7 @@ export const config = {
 
 const OPENAI_API_KEY =
   process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
+// NOTE: default to gpt-4o-mini (works with text+image_url in chat.completions)
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
 type Ok = { ok: true; text: string; meta?: any };
@@ -69,7 +70,6 @@ function originFromReq(req: NextApiRequest) {
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 
-// Pull a few headlines (titles only) to add macro context
 async function fetchHeadlines(req: NextApiRequest, instrument: string) {
   try {
     const base = originFromReq(req);
@@ -108,26 +108,62 @@ async function askVision(params: {
       type: "text",
       text: [
         "Act as my Trade Plan Assistant.",
-        "Use ONLY the provided chart IMAGES to derive technical zones and structure. Do NOT use numeric candles.",
+        "Use ONLY the provided chart IMAGES for technicals. Do NOT use numeric candles. Never fabricate values.",
         `Instrument: ${instrument}.`,
         "",
-        "Return the plan in this exact structure:",
+        "=== ANALYSIS TASKS ===",
+        "1) Multi-timeframe structure (4H → 1H → 15m): identify trend (HH/HL vs LH/LL), BOS/CHOCH, key supply/demand (OB), FVGs, SR flip zones, range bounds, equal highs/lows/liquidity, obvious swing points.",
+        "2) Generate candidates on 15m execution (BOTH directions where valid):",
+        "   • Pullback Confluence (OB + FVG + Fib 0.50–0.62–0.705)",
+        "   • Breakout & Retest (range/structure edge; body close beyond, clean retest)",
+        "   • Liquidity Sweep / SFP & Reclaim (fake-out through EQH/EQL/swing, then reclaim)",
+        "   • Range Reversion (fade edges when range is dominant)",
+        "   • SR Flip (prior S→R or R→S; test/hold becomes trigger)",
+        "   • Trendline/Channel Break & Retest (if clearly visible)",
+        "   • Double top/bottom + neckline break/retest (classic where obvious)",
+        "   • Compression/triangle break (where obvious)",
+        "   • Momentum push + shallow pullback (flag/pennant if seen)",
+        "For each candidate, define Entry/SL/TP1/TP2 from the image levels.",
+        "",
+        "3) Stops are PRICE-ACTION BASED ONLY:",
+        "   • Primary: just beyond the invalidation structure (zone edge, sweep wick, broken/retest level, or last opposing swing).",
+        "   • If the first stop is too tight (wick risk), escalate to the NEXT structural extreme (second swing, full OB extreme, or HTF/1H boundary).",
+        "   • Add a SMALL buffer relative to the immediate swing/zone size (NOT ATR).",
+        "",
+        "4) Fundamentals overlay:",
+        "   • If headlines provided below, use them for bias only; do not invent facts.",
+        "   • If a calendar image is provided, read it and issue a ±90m WARNING (no blackout) if applicable.",
+        "",
+        "5) Scoring (0–100) for each candidate (use these exact weights):",
+        "   • HTF alignment (4H+1H) .......... 25",
+        "   • Trigger quality (15m) .......... 20",
+        "   • Confluence (OB/FVG/Fib/SR/Liq) . 20",
+        "   • Stop validity (PA-based) ........ 15",
+        "   • Path to target (opp. struct.) ... 10",
+        "   • Macro fit (headlines tone) ...... 5",
+        "   • Event risk penalty (±90m) ....... −0..5 (warning-only; still print plan)",
+        "   NOTE: Do NOT reject a candidate because RR < 1.5R. RR is not a hard filter.",
+        "",
+        "6) Choose the TOP candidate by score. If all are weak, still choose one and mark conviction low.",
+        "",
+        "=== OUTPUT FORMAT (exact structure) ===",
         "Quick Plan (Actionable):",
         "• Direction: Long / Short / Stay Flat",
-        "• Entry: Market / Pending @ …",
-        "• Stop Loss: …",
+        "• Entry: Market / Pending @ ...",
+        "• Stop Loss: ...",
         "• Take Profit(s): TP1 / TP2 …",
         "• Conviction: %",
-        "• Short Reasoning: …",
+        "• Setup: <Chosen Strategy>",
+        "• Short Reasoning: ...",
         "",
         "Full Breakdown:",
-        "• Technical View (HTF + Intraday)",
-        "• Fundamental View (Calendar + Sentiment)",
+        "• Technical View (HTF + Intraday): ...",
+        "• Fundamental View (Calendar + Sentiment): ...",
         "• Tech vs Fundy Alignment: Match / Mismatch (why)",
-        "• Conditional Scenarios",
-        "• Surprise Risk (unscheduled headlines, politics, central bank comments)",
-        "• Invalidation",
-        "• One-liner Summary",
+        "• Conditional Scenarios: ...",
+        "• Surprise Risk (unscheduled headlines, politics, CB comments): ...",
+        "• Invalidation: ...",
+        "• One-liner Summary: ...",
         "",
         "Advanced Reasoning (Pro-Level Context):",
         "• Priority Bias (based on fundamentals)",
@@ -142,13 +178,16 @@ async function askVision(params: {
         "Notes:",
         "• Any extra execution notes",
         "",
-        "Final Table Summary (single line): Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction %",
+        "Final Table Summary:",
+        "Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction %",
+        "",
+        "Append at the end:",
+        "Chosen Strategy: <one of the candidates you scored>",
+        "Alt Candidates (scores): <name – score/100, …>",
         "",
         "Rules:",
-        "• Derive zones/levels only from the images (4H, 1H, 15M). Be precise.",
-        "• If headlines are provided below, use them for fundamentals.",
-        "• If a calendar image is provided, read it to infer bias and create a warning window (no blackout).",
-        "• Never fabricate numbers; if uncertain, mark low conviction and explain briefly.",
+        "• Use ONLY the 4H/1H/15m images for levels. If something is ambiguous on the image, note low confidence.",
+        "• Stops must be price-action based as above. No ATR cutoffs. Do not reject low RR setups; reflect with conviction.",
       ].join("\n"),
     },
     { type: "text", text: "4H Chart:" },
@@ -178,12 +217,12 @@ async function askVision(params: {
     },
     body: JSON.stringify({
       model: OPENAI_MODEL,
-      temperature: 0.2,
+      temperature: 0.15,
       messages: [
         {
           role: "system",
           content:
-            "You are a meticulous trading analyst. Use ONLY provided images for technicals. Be structured and precise.",
+            "You are a meticulous trading analyst. Use ONLY provided images for technicals. Generate multiple PA candidates, score them, choose the best, and print the plan. Be precise. Never invent numeric candles.",
         },
         { role: "user", content: userContent },
       ],
@@ -263,6 +302,7 @@ export default async function handler(
         instrument,
         hasCalendar: !!calUrl,
         headlinesCount: headlinesList.length,
+        strategySelection: true,
       },
     });
   } catch (err: any) {
