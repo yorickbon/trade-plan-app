@@ -1,460 +1,330 @@
-// pages/api/plan.ts
+// pages/api/vision-plan.ts
+// Images-only Trade Plan generator (NO numeric fallback).
+// Expects multipart/form-data with files: m15, h1, h4 (required), calendar (optional), and an optional text field "instrument".
+// Returns a multiline Trade Card + meta. Uses OpenAI vision (gpt-4o-mini by default).
+
 import type { NextApiRequest, NextApiResponse } from "next";
-import { getCandles, type Candle } from "../../lib/prices";
+import fs from "fs";
+import path from "path";
 
-type PlanOk = { ok: true; text: string; conviction?: number; meta?: any };
-type PlanFail = { ok: false; reason: string };
-type PlanResp = PlanOk | PlanFail;
-
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-/* ---------------------------- numeric helpers ----------------------------- */
-const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
-const nowIso = () => new Date().toISOString();
-const toJSON = (x: any) => { try { return JSON.stringify(x); } catch { return "{}"; } };
-const parseMaybeJSON = (s: string) => { try { return JSON.parse(s); } catch { return null; } };
-
-const H = (a: Candle[]) => a.map(c => c.h);
-const L = (a: Candle[]) => a.map(c => c.l);
-const C = (a: Candle[]) => a.map(c => c.c);
-
-/* -------------------------------- ATR(14) --------------------------------- */
-function atr(Hh: number[], Ll: number[], Cc: number[], period = 14) {
-  if (Hh.length < period + 1) return 0;
-  const tr: number[] = [];
-  for (let i = 1; i < Hh.length; i++) {
-    const a = Hh[i] - Ll[i];
-    const b = Math.abs(Hh[i] - Cc[i - 1]);
-    const c = Math.abs(Ll[i] - Cc[i - 1]);
-    tr.push(Math.max(a, b, c));
-  }
-  const last = tr.slice(-period);
-  return last.reduce((s, x) => s + x, 0) / last.length;
-}
-
-/* --------------------------- tick size per symbol -------------------------- */
-function tickSizeFor(sym: string): number {
-  const s = sym.toUpperCase();
-  if (s.endsWith("JPY")) return 0.01;
-  if (s.includes("XAU")) return 0.1;
-  if (s.includes("XAG")) return 0.01;
-  if (s.includes("BTC") || s.includes("ETH")) return 1;
-  if (/^(US30|DJI|US100|NAS100|NDX|US500|SPX|GER40|DE40|UK100|FTSE|DAX|CAC40|EU50|HK50|JP225)/.test(s)) return 1;
-  return 0.0001; // FX default
-}
-const roundToTick = (n: number, t: number) => Math.round(n / t) * t;
-
-/* ------------------------------- HTTP utils -------------------------------- */
-function originFromReq(req: NextApiRequest) {
-  const proto = (req.headers["x-forwarded-proto"] as string) || "https";
-  const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
-  if (host.startsWith("http")) return host;
-  return `${proto}://${host}`;
-}
-async function safeGET<T = any>(url: string): Promise<T | null> {
-  try {
-    const r = await fetch(url, { method: "GET", headers: { "content-type": "application/json" } });
-    if (!r.ok) return null;
-    return (await r.json()) as T;
-  } catch { return null; }
-}
-
-/* -------------------------- swing/structure helpers ------------------------ */
-function swings(series: Candle[], k = 2) {
-  const out: { idx: number; type: "H" | "L"; price: number }[] = [];
-  for (let i = k; i < series.length - k; i++) {
-    const hi = series[i].h, lo = series[i].l;
-    let isH = true, isL = true;
-    for (let j = 1; j <= k; j++) {
-      if (!(hi > series[i - j].h && hi > series[i + j].h)) isH = false;
-      if (!(lo < series[i - j].l && lo < series[i + j].l)) isL = false;
-      if (!isH && !isL) break;
-    }
-    if (isH) out.push({ idx: i, type: "H", price: hi });
-    if (isL) out.push({ idx: i, type: "L", price: lo });
-  }
-  return out.sort((a,b)=>a.idx-b.idx);
-}
-
-function labelTrend(series: Candle[], k = 2) {
-  const sw = swings(series, k);
-  const last = sw.slice(-6);
-  let upSeq = 0, dnSeq = 0;
-  for (let i = 1; i < last.length; i++) {
-    const prev = last[i-1], cur = last[i];
-    if (prev.type === "H" && cur.type === "H" && cur.price > prev.price) upSeq++;
-    if (prev.type === "L" && cur.type === "L" && cur.price < prev.price) dnSeq++;
-  }
-  const closes = C(series).slice(-20);
-  const drift = closes.length ? (closes[closes.length-1] - closes[0]) : 0;
-  if (upSeq >= 2 && drift > 0) return "up";
-  if (dnSeq >= 2 && drift < 0) return "down";
-  return "range";
-}
-
-function lastSupportResistance(m15: Candle[]) {
-  const sw = swings(m15, 2);
-  const lastH = [...sw].reverse().find(s => s.type === "H");
-  const lastL = [...sw].reverse().find(s => s.type === "L");
-  return { lastHigh: lastH?.price ?? null, lastLow: lastL?.price ?? null };
-}
-
-/* ------------------------- headline sentiment quick ------------------------ */
-function summarizeHeadlines(headlines: any[]) {
-  const out = { pos: 0, neg: 0, neu: 0, examples: [] as string[] };
-  for (const h of headlines || []) {
-    const s = typeof h?.sentiment?.score === "number" ? h.sentiment.score : 0;
-    if (s > 0.05) out.pos++;
-    else if (s < -0.05) out.neg++;
-    else out.neu++;
-    if (out.examples.length < 6 && h?.title) out.examples.push(String(h.title).slice(0, 160));
-  }
-  let bias: "bullish"|"bearish"|"neutral" = "neutral";
-  if (out.pos > out.neg + 1) bias = "bullish";
-  else if (out.neg > out.pos + 1) bias = "bearish";
-  return { ...out, bias };
-}
-
-/* -------------------------- deterministic plan core ------------------------ */
-type PlanCore = {
-  direction: "Long" | "Short" | "Flat",
-  order_type: "Buy Limit" | "Sell Limit" | "Buy Stop" | "Sell Stop" | "Market",
-  entry: number, stop: number, tp1: number, tp2: number,
-  setup: string, short_reason: string,
-  signals: string[], tview: { h4:string, h1:string, m15:string },
-  alignment: "Match"|"Mixed"|"Conflict",
-  fundamentals: { bias: "bullish"|"bearish"|"neutral", headline_snapshot: string[], calendar_watch: string[] },
-  scenarios: string[], invalidation: string, conviction: number
+// IMPORTANT: we disable Next's bodyParser to handle multipart uploads.
+export const config = {
+  api: {
+    bodyParser: false,
+    sizeLimit: "12mb", // per file max, enforced in formidable too
+  },
 };
 
-function tickRounder(instrument: string) {
-  const tick = tickSizeFor(instrument);
-  const dec = (tick.toString().split(".")[1]?.length || 0);
-  return { tick, dec, rnd: (n: number) => Number(roundToTick(n, tick).toFixed(dec)) };
+type Json = Record<string, any>;
+
+// Lazy import to avoid type issues if formidable types not present
+async function getFormidable() {
+  // @ts-ignore
+  const formidable = await import("formidable");
+  // @ts-ignore
+  return formidable.default || formidable;
 }
 
-function buildDeterministicPlan(params: {
-  instrument: string,
-  m15: Candle[], h1: Candle[], h4: Candle[],
-  headlines: any[], calendar: any
-}) {
-  const { instrument, m15, h1, h4, headlines, calendar } = params;
-
-  const { tick, rnd } = tickRounder(instrument);
-  const last = C(m15).at(-1) || 0;
-  const A15 = atr(H(m15), L(m15), C(m15), 14);
-  const slBuf = Math.max(3*tick, 0.2*A15);
-  const minTPFromRisk = (risk: number) => Math.max(1.0*risk, 0.3*A15);
-
-  const tview = {
-    h4: labelTrend(h4, 2),
-    h1: labelTrend(h1, 2),
-    m15: labelTrend(m15, 2),
+async function parseMultipart(req: NextApiRequest): Promise<{
+  fields: Record<string, any>;
+  files: {
+    m15?: any;
+    h1?: any;
+    h4?: any;
+    calendar?: any;
   };
-  const { lastHigh, lastLow } = lastSupportResistance(m15);
+}> {
+  const formidable = await getFormidable();
 
-  const sent = summarizeHeadlines(headlines);
-  const calWatch: string[] = [];
-  const now = Date.now();
-  for (const e of (calendar?.items || [])) {
-    const t = e?.time || e?.date;
-    const imp = (e?.impact || e?.importance || "").toString().toLowerCase();
-    if (!t) continue;
-    const ts = Date.parse(t);
-    if (!Number.isFinite(ts)) continue;
-    const mins = Math.abs(ts - now) / 60000;
-    if (mins <= 90 && (imp.includes("high") || imp.includes("red") || e?.isBlackout)) {
-      calWatch.push(`${e?.title || "Event"} (${e?.currency || ""}) @ ${t}`);
-    }
-  }
-
-  // Choose direction
-  let dir: PlanCore["direction"] = "Flat";
-  if (tview.h4 === "up" && (tview.h1 === "up" || tview.m15 === "up")) dir = "Long";
-  else if (tview.h4 === "down" && (tview.h1 === "down" || tview.m15 === "down")) dir = "Short";
-  else if (tview.m15 === "up" && sent.bias === "bullish") dir = "Long";
-  else if (tview.m15 === "down" && sent.bias === "bearish") dir = "Short";
-  if (dir === "Flat") {
-    // range mean-reversion toward nearest structure
-    if (lastLow && last < (lastLow + ((lastHigh ?? lastLow) - lastLow) * 0.35)) dir = "Long";
-    else if (lastHigh && last > (lastHigh - ((lastHigh - (lastLow ?? lastHigh)) * 0.35))) dir = "Short";
-  }
-
-  // Initial numbers (pullback)
-  let order: PlanCore["order_type"] = "Buy Limit";
-  let entry = last, stop = last, tp1 = last, tp2 = last;
-  const signals: string[] = [];
-  let setup = "", short_reason = "";
-
-  if (dir === "Long") {
-    order = "Buy Limit";
-    const support = lastLow ?? (last - A15*0.8);
-    const pullbackMid = support + Math.max(0, (last - support)) * 0.5;
-    entry = rnd(pullbackMid);
-    stop = rnd(entry - slBuf);
-    const risk = Math.abs(entry - stop);
-    tp1 = rnd(Math.max(entry + minTPFromRisk(risk), (lastHigh ?? entry + 1.5*risk)));
-    tp2 = rnd(Math.max(tp1 + 0.5*risk, tp1 + minTPFromRisk(risk)*0.6));
-    setup = "Pullback (OB/FVG + Fib 0.5) Long";
-    short_reason = "Buy the dip toward 15m support; SL beyond swing w/ ATR buffer.";
-    signals.push("OB","FVG","Fib0.5");
-  } else if (dir === "Short") {
-    order = "Sell Limit";
-    const resistance = lastHigh ?? (last + A15*0.8);
-    const pullbackMid = resistance - Math.max(0, (resistance - last)) * 0.5;
-    entry = rnd(pullbackMid);
-    stop = rnd(entry + slBuf);
-    const risk = Math.abs(entry - stop);
-    tp1 = rnd(Math.min(entry - minTPFromRisk(risk), (lastLow ?? entry - 1.5*risk)));
-    tp2 = rnd(Math.min(tp1 - 0.5*risk, tp1 - minTPFromRisk(risk)*0.6));
-    setup = "Pullback (OB/FVG + Fib 0.5) Short";
-    short_reason = "Sell the rally toward 15m resistance; SL beyond swing w/ ATR buffer.";
-    signals.push("OB","FVG","Fib0.5");
-  } else {
-    order = "Market";
-    entry = rnd(last);
-    stop = rnd(entry - slBuf);
-    const risk = Math.abs(entry - stop);
-    tp1 = rnd(entry + minTPFromRisk(risk));
-    tp2 = rnd(tp1 + 0.5*risk);
-    setup = "Sideways: conservative reference only.";
-    short_reason = "Wait for 15m BOS + pullback with HTF confluence.";
-  }
-
-  // Final consistency gate (fixes 'sell limit below market' etc.)
-  const fixes: string[] = [];
-  const risk0 = Math.abs(entry - stop);
-  const needTP1 = Math.max(1.0*risk0, 0.3*A15);
-
-  if (order === "Market") {
-    if (entry !== last) { entry = rnd(last); fixes.push("market=last"); }
-  } else if (order === "Buy Limit") {
-    if (entry >= last) { entry = rnd(last - 0.25*A15); fixes.push("buyLimitBelowLast"); }
-  } else if (order === "Sell Limit") {
-    if (entry <= last) { entry = rnd(last + 0.25*A15); fixes.push("sellLimitAboveLast"); }
-  } else if (order === "Buy Stop") {
-    if (entry <= last) { entry = rnd(last + 0.05*A15); fixes.push("buyStopAboveLast"); }
-  } else if (order === "Sell Stop") {
-    if (entry >= last) { entry = rnd(last - 0.05*A15); fixes.push("sellStopBelowLast"); }
-  }
-
-  // Rebuild SL/TP after any entry correction
-  if (fixes.length) {
-    if (dir === "Long" || order.startsWith("Buy")) {
-      stop = rnd(entry - Math.max(3*tick, 0.2*A15));
-      const r = Math.abs(entry - stop);
-      tp1 = rnd(entry + Math.max(1.0*r, 0.3*A15));
-      tp2 = rnd(tp1 + 0.5*r);
-    } else if (dir === "Short" || order.startsWith("Sell")) {
-      stop = rnd(entry + Math.max(3*tick, 0.2*A15));
-      const r = Math.abs(entry - stop);
-      tp1 = rnd(entry - Math.max(1.0*r, 0.3*A15));
-      tp2 = rnd(tp1 - 0.5*r);
-    }
-  } else {
-    // even if no entry fix, enforce sensible TP spacing
-    const r = Math.abs(entry - stop);
-    const min1 = Math.max(1.0*r, 0.3*A15);
-    if (dir === "Long") {
-      if (tp1 <= entry + min1) tp1 = rnd(entry + min1);
-      if (tp2 <= tp1 + 0.5*r) tp2 = rnd(tp1 + 0.5*r);
-    } else if (dir === "Short") {
-      if (tp1 >= entry - min1) tp1 = rnd(entry - min1);
-      if (tp2 >= tp1 - 0.5*r) tp2 = rnd(tp1 - 0.5*r);
-    }
-  }
-
-  // Alignment → conviction
-  let alignment: PlanCore["alignment"] = "Mixed";
-  const tfAgree = (tview.h4 === tview.h1) && (tview.h1 === tview.m15) && tview.h1 !== "range";
-  if (tfAgree) alignment = "Match";
-  else if (tview.h1 === tview.m15) alignment = "Mixed";
-  else alignment = "Conflict";
-
-  let conviction = 55;
-  if (alignment === "Match") conviction += 10;
-  if (alignment === "Conflict") conviction -= 15;
-  if (sent.bias === "bullish" && (dir === "Long")) conviction += 6;
-  if (sent.bias === "bearish" && (dir === "Short")) conviction += 6;
-  if (sent.bias === "bullish" && (dir === "Short")) conviction -= 6;
-  if (sent.bias === "bearish" && (dir === "Long")) conviction -= 6;
-  if ((calendar?.blackoutWithin90m || []).length) conviction = Math.max(35, conviction - 10);
-  conviction = clamp(Math.round(conviction), 25, 92);
-
-  const fundamentals = {
-    bias: sent.bias,
-    headline_snapshot: sent.examples,
-    calendar_watch: (calendar?.blackoutWithin90m || []) as string[],
-  };
-
-  const scenarios = dir === "Long"
-    ? [
-        "If pullback holds at 15m support, continuation to TP1 then trail toward TP2.",
-        "Break of swing low (below SL) = invalidate; wait for new 15m BOS up."
-      ]
-    : dir === "Short"
-    ? [
-        "If rally rejects at 15m resistance, continuation to TP1 then trail toward TP2.",
-        "Break above swing high (above SL) = invalidate; wait for new 15m BOS down."
-      ]
-    : [
-        "Wait for 15m BOS + pullback into OB/FVG with HTF confluence.",
-        "Avoid entries ahead of high-impact releases."
-      ];
-
-  const invalidation = dir === "Long"
-    ? "Clean 15m close below protective swing/zone."
-    : dir === "Short"
-    ? "Clean 15m close above protective swing/zone."
-    : "No active setup – wait for BOS + pullback.";
-
-  return {
-    core: {
-      direction: dir, order_type: order,
-      entry, stop, tp1, tp2,
-      setup, short_reason, signals,
-      tview, alignment, fundamentals, scenarios, invalidation,
-      conviction
+  const form = formidable({
+    multiples: false,
+    maxFiles: 4,
+    maxFileSize: 12 * 1024 * 1024, // 12MB
+    filter: (part: any) => {
+      const nameOk = ["m15", "h1", "h4", "calendar"].includes(part.name);
+      const mimeOk =
+        typeof part.mimetype === "string" &&
+        part.mimetype.startsWith("image/");
+      return nameOk && mimeOk;
     },
-    debug: { last, atr15: A15, fixes }
-  };
-}
-
-/* ------------------------- LLM (reasoning only, optional) ------------------ */
-async function llmReasoning(instrument: string, userPayload: any) {
-  if (!OPENAI_API_KEY) return null;
-  const system =
-    "You are a trading assistant. Provide only short reasoning text (6–10 lines). Do NOT output numbers or levels. Do NOT change direction or plan.";
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      temperature: 0.2,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: `Instrument: ${instrument}. Inputs:\n\`\`\`json\n${toJSON(userPayload)}\n\`\`\`\nWrite a concise rationale (no numbers) that explains HTF context, execution logic, and how headlines/calendar affect conviction.` }
-      ]
-    })
   });
-  if (!resp.ok) return null;
-  const data = await resp.json();
-  return (data?.choices?.[0]?.message?.content || "").trim();
+
+  return new Promise((resolve, reject) => {
+    form.parse(req as any, (err: any, fields: any, files: any) => {
+      if (err) return reject(err);
+      resolve({
+        fields,
+        files: {
+          m15: Array.isArray(files.m15) ? files.m15[0] : files.m15,
+          h1: Array.isArray(files.h1) ? files.h1[0] : files.h1,
+          h4: Array.isArray(files.h4) ? files.h4[0] : files.h4,
+          calendar: Array.isArray(files.calendar)
+            ? files.calendar[0]
+            : files.calendar,
+        },
+      });
+    });
+  });
 }
 
-/* ------------------------------ card formatter ----------------------------- */
-function buildCard(instrument: string, core: PlanCore, reasoning?: string, debug?: any, showDebug=false) {
-  const lines: string[] = [];
-  lines.push("Quick Plan (Actionable)", "");
-  lines.push(`• Direction: ${core.direction}`);
-  lines.push(`• Order Type: ${core.order_type}`);
-  lines.push(`• Trigger: ${core.order_type === "Market" ? "—" : "Limit pullback / zone touch"}`);
-  lines.push(`• Entry: ${core.entry}`);
-  lines.push(`• Stop Loss: ${core.stop}`);
-  lines.push(`• Take Profit(s): TP1 ${core.tp1} / TP2 ${core.tp2}`);
-  lines.push(`• Conviction: ${core.conviction}%`);
-  lines.push(`• Setup: ${core.setup}`);
-  lines.push(`• Short Reasoning: ${core.short_reason}`);
-  lines.push("");
-  lines.push("Full Breakdown", "");
-  lines.push(`• Technical View (HTF + Intraday): 4H=${core.tview.h4} / 1H=${core.tview.h1} / 15m=${core.tview.m15}`);
-  lines.push(core.signals.length ? `• Signals Triggered: ${core.signals.join(" • ")}` : "• Signals Triggered: —");
-  lines.push(`• Fundamental View (Calendar + Sentiment): ${core.fundamentals.bias} bias.`);
-  if (core.fundamentals.headline_snapshot.length) {
-    lines.push("• Headline Snapshot:");
-    for (const h of core.fundamentals.headline_snapshot) lines.push(`  - ${h}`);
+async function fileToDataUrl(file: any): Promise<string> {
+  const filepath = file?.filepath || file?.path; // formidable v3 vs v2
+  const mimetype = file?.mimetype || "image/png";
+  if (!filepath || !fs.existsSync(filepath)) {
+    throw new Error("Uploaded file path not found.");
   }
-  lines.push(`• Tech vs Fundy Alignment: ${core.alignment}`);
-  lines.push("• Conditional Scenarios:");
-  for (const s of core.scenarios) lines.push(`  - ${s}`);
-  lines.push(`• Invalidation: ${core.invalidation}`);
-  if (reasoning) {
-    lines.push("");
-    lines.push("Advanced Reasoning (Pro-Level Context)");
-    lines.push("");
-    lines.push(reasoning);
-  }
-  lines.push("");
-  lines.push("News / Event Watch");
-  if (core.fundamentals.calendar_watch.length) {
-    for (const w of core.fundamentals.calendar_watch) lines.push(`• ${w}`);
-  } else {
-    lines.push("• No high-impact events in the ±90m window or calendar unavailable.");
-  }
-  lines.push("");
-  lines.push("Notes", "");
-  lines.push(`• Symbol: ${instrument}`);
-
-  if (showDebug) {
-    lines.push("");
-    lines.push("Debug (server)");
-    lines.push(`• last: ${debug?.last}`);
-    lines.push(`• atr15: ${debug?.atr15}`);
-    if (debug?.fixes?.length) lines.push(`• fixes: ${debug.fixes.join(", ")}`);
-  }
-  return lines.join("\n");
+  const buff = await fs.promises.readFile(filepath);
+  const b64 = buff.toString("base64");
+  return `data:${mimetype};base64,${b64}`;
 }
 
-/* --------------------------------- handler -------------------------------- */
-export default async function handler(req: NextApiRequest, res: NextApiResponse<PlanResp>) {
+function getOrigin(req: NextApiRequest): string {
+  const proto =
+    (req.headers["x-forwarded-proto"] as string) ||
+    (process.env.VERCEL ? "https" : "http");
+  const host = req.headers.host || "localhost:3000";
+  return `${proto}://${host}`;
+}
+
+async function fetchHeadlinesText(req: NextApiRequest, instrument?: string) {
   try {
-    const body = typeof req.body === "string" ? parseMaybeJSON(req.body) || {} : (req.body || {});
-    const instrument = String(body.instrument || body.code || req.query.instrument || req.query.code || "EURUSD")
-      .toUpperCase().replace(/\s+/g, "");
-    const showDebug = String(req.query.debug || body.debug || "") === "1";
+    const origin = getOrigin(req);
+    // Try to give model some recent context; keep it compact.
+    // If instrument not provided, we still fetch generic USD/EUR risk tone.
+    const qs = new URLSearchParams({
+      symbols: instrument ? instrument : "USD,EUR,BTC,XAU",
+      hours: process.env.HEADLINES_SINCE_HOURS || "48",
+      max: process.env.HEADLINES_MAX || "10",
+    }).toString();
 
-    // Candles
-    const [m15, h1, h4] = await Promise.all([
-      getCandles(instrument, "15m", 360),
-      getCandles(instrument, "1h",  360),
-      getCandles(instrument, "4h",  360),
-    ]);
-    if (!m15?.length || !h1?.length || !h4?.length) {
-      return res.status(200).json({ ok: false, reason: "Missing candles for one or more timeframes" });
+    const res = await fetch(`${origin}/api/news?${qs}`);
+    if (!res.ok) return "";
+    const json = (await res.json()) as Json;
+    const items = Array.isArray(json.items) ? json.items.slice(0, 10) : [];
+    if (!items.length) return "";
+
+    const lines: string[] = [];
+    for (const it of items) {
+      const t = typeof it.title === "string" ? it.title : "";
+      const d =
+        typeof it.description === "string" && it.description
+          ? ` — ${it.description}`
+          : "";
+      if (t) lines.push(`• ${t}${d}`.slice(0, 240)); // limit length per item
+    }
+    return lines.join("\n");
+  } catch {
+    return "";
+  }
+}
+
+function getModel(): string {
+  return process.env.OPENAI_MODEL || "gpt-4o-mini";
+}
+
+async function callOpenAIVision(params: {
+  instrument?: string;
+  m15DataUrl: string;
+  h1DataUrl: string;
+  h4DataUrl: string;
+  calendarDataUrl?: string;
+  headlinesText?: string;
+}): Promise<string> {
+  const { instrument, m15DataUrl, h1DataUrl, h4DataUrl, calendarDataUrl, headlinesText } =
+    params;
+
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY not configured.");
+  }
+
+  const model = getModel();
+
+  // Build a single user message containing text + 3-4 images.
+  const content: any[] = [];
+
+  content.push({
+    type: "text",
+    text:
+      `Act as my Trade Plan Assistant. ` +
+      `Use ONLY the provided chart IMAGES to derive technical zones and structure. ` +
+      `Do NOT use numeric candles or any external data. ` +
+      `Instrument: ${instrument ?? "Unknown"}.\n\n` +
+      `Return the plan in this exact structure:\n` +
+      `Quick Plan (Actionable):\n` +
+      `• Direction: Long / Short / Stay Flat\n` +
+      `• Entry: Market / Pending @ ...\n` +
+      `• Stop Loss: ...\n` +
+      `• Take Profit(s): TP1 / TP2 …\n` +
+      `• Conviction: %\n` +
+      `• Short Reasoning: ...\n\n` +
+      `Full Breakdown:\n` +
+      `• Technical View (HTF + Intraday)\n` +
+      `• Fundamental View (Calendar + Sentiment)\n` +
+      `• Tech vs Fundy Alignment: Match / Mismatch (why)\n` +
+      `• Conditional Scenarios\n` +
+      `• Surprise Risk (unscheduled headlines, politics, central bank)\n` +
+      `• Invalidation\n` +
+      `• One-liner Summary\n\n` +
+      `Advanced Reasoning (Pro-Level Context):\n` +
+      `• Priority Bias (based on fundamentals)\n` +
+      `• Structure Context (retracements, fibs, supply/demand zones)\n` +
+      `• Confirmation Logic (e.g., wait for news release, candle confirmation, OB touch)\n` +
+      `• How fundamentals strengthen or weaken this technical setup\n` +
+      `• Scenario Planning (pre-news vs post-news breakout conviction)\n\n` +
+      `News Event Watch:\n` +
+      `• Upcoming/Recent events to watch and why\n\n` +
+      `Notes:\n` +
+      `• Any extra execution notes\n\n` +
+      `Final Table Summary (single line):\n` +
+      `Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction %\n\n` +
+      `Rules:\n` +
+      `• Derive zones/levels only from the images (4H, 1H, 15M). Be precise.\n` +
+      `• If headlines are provided below, use them for fundamentals. If not, keep fundy section minimal.\n` +
+      `• If a calendar image is provided, read it to infer bias and create a warning window (no blackout).\n` +
+      `• Never fabricate numbers; if uncertain, mark low conviction and explain briefly.`,
+  });
+
+  // Add images in HTF → LTF order
+  content.push({ type: "text", text: "4H Chart:" });
+  content.push({ type: "image_url", image_url: { url: h4DataUrl } });
+  content.push({ type: "text", text: "1H Chart:" });
+  content.push({ type: "image_url", image_url: { url: h1DataUrl } });
+  content.push({ type: "text", text: "15M Chart:" });
+  content.push({ type: "image_url", image_url: { url: m15DataUrl } });
+
+  if (calendarDataUrl) {
+    content.push({ type: "text", text: "Economic Calendar Image:" });
+    content.push({ type: "image_url", image_url: { url: calendarDataUrl } });
+  }
+
+  if (headlinesText && headlinesText.trim().length > 0) {
+    content.push({
+      type: "text",
+      text:
+        "Recent headlines (last 24–48h) to inform sentiment and News Event Watch:\n" +
+        headlinesText,
+    });
+  }
+
+  const payload = {
+    model,
+    temperature: 0.2,
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are a meticulous trading analyst. Use ONLY provided images for technicals. Be concise, structured, and precise.",
+      },
+      {
+        role: "user",
+        content,
+      },
+    ],
+  };
+
+  const resp = await fetch(
+    (process.env.OPENAI_API_BASE || "https://api.openai.com/v1") +
+      "/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+
+  if (!resp.ok) {
+    const errTxt = await resp.text();
+    throw new Error(`OpenAI error ${resp.status}: ${errTxt}`);
+  }
+
+  const data = (await resp.json()) as Json;
+  const text =
+    data?.choices?.[0]?.message?.content?.trim() ||
+    "No content returned from model.";
+  return text;
+}
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse<Json>
+) {
+  if (req.method !== "POST") {
+    return res
+      .status(405)
+      .json({ error: "Method not allowed. Use POST multipart/form-data." });
+  }
+
+  try {
+    const { fields, files } = await parseMultipart(req);
+    const instrument =
+      (typeof fields.instrument === "string" && fields.instrument) ||
+      undefined;
+
+    const required: Array<["m15" | "h1" | "h4", any]> = [
+      ["m15", files.m15],
+      ["h1", files.h1],
+      ["h4", files.h4],
+    ];
+    const missing = required.filter(([_, f]) => !f);
+    if (missing.length > 0) {
+      return res.status(400).json({
+        error:
+          "Missing required chart images. Please upload all: m15, h1, h4 (PNG/JPG).",
+        missing: missing.map(([name]) => name),
+      });
     }
 
-    // Headlines + Calendar
-    const base = originFromReq(req);
-    let headlines: any[] = [];
-    let calendar: any = { ok: false, items: [], blackoutWithin90m: [] };
+    // Convert to data URLs for OpenAI vision
+    const [m15DataUrl, h1DataUrl, h4DataUrl] = await Promise.all([
+      fileToDataUrl(files.m15),
+      fileToDataUrl(files.h1),
+      fileToDataUrl(files.h4),
+    ]);
+    const calendarDataUrl = files.calendar
+      ? await fileToDataUrl(files.calendar)
+      : undefined;
 
-    const n1 = await safeGET<any>(`${base}/api/news?instrument=${encodeURIComponent(instrument)}&hours=48`);
-    if (n1?.ok && Array.isArray(n1.items)) headlines = n1.items;
-    else if (Array.isArray(n1)) headlines = n1;
+    // Optional: fetch recent headlines from our own /api/news (kept short)
+    const headlinesText = await fetchHeadlinesText(req, instrument);
 
-    const c1 = await safeGET<any>(`${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&hours=48`);
-    if (c1?.ok) calendar = c1;
-    else if (c1) calendar = c1;
-
-    // Deterministic plan (levels from real data only)
-    const { core, debug } = buildDeterministicPlan({ instrument, m15, h1, h4, headlines, calendar });
-
-    // Optional short reasoning (no numbers)
-    let reasoning: string | undefined;
-    try {
-      const payload = {
-        instrument,
-        generated_at: nowIso(),
-        current_price: C(m15).at(-1) || 0,
-        tf_summary: core.tview,
-        sentiment: summarizeHeadlines(headlines),
-        calendar,
-        headlines: headlines.slice(0, 10).map((h: any) => ({ title: h?.title, source: h?.source, sentiment: h?.sentiment?.score ?? null })),
-      };
-      reasoning = await llmReasoning(instrument, payload) || undefined;
-    } catch {}
-
-    const card = buildCard(instrument, core, reasoning, debug, showDebug);
-
-    return res.status(200).json({
-      ok: true,
-      text: card,
-      conviction: core.conviction,
-      meta: { core, debug, usedLLM: !!reasoning }
+    // Call OpenAI vision with images + optional headlines and calendar image
+    const planText = await callOpenAIVision({
+      instrument,
+      m15DataUrl,
+      h1DataUrl,
+      h4DataUrl,
+      calendarDataUrl,
+      headlinesText,
     });
+
+    // We expose a minimal meta for debugging. Calendar warning tuning will be refined in calendar.ts later step.
+    const meta = {
+      instrument: instrument || null,
+      usedVision: true,
+      inputs: {
+        m15: { size: fs.existsSync(files.m15?.filepath) ? fs.statSync(files.m15.filepath).size : undefined },
+        h1: { size: fs.existsSync(files.h1?.filepath) ? fs.statSync(files.h1.filepath).size : undefined },
+        h4: { size: fs.existsSync(files.h4?.filepath) ? fs.statSync(files.h4.filepath).size : undefined },
+        calendar: files.calendar
+          ? {
+              size: fs.existsSync(files.calendar?.filepath)
+                ? fs.statSync(files.calendar.filepath).size
+                : undefined,
+            }
+          : null,
+      },
+      // Placeholder: set by model text today; we’ll add programmatic warning in a later calendar.ts update.
+      warningWindow: false,
+    };
+
+    return res.status(200).json({ text: planText, meta });
   } catch (err: any) {
-    console.error("plan.ts error:", err?.message || err);
-    return res.status(200).json({ ok: false, reason: err?.message || "Plan generation failed" });
+    const msg =
+      typeof err?.message === "string" ? err.message : "Unknown server error.";
+    return res.status(500).json({ error: msg });
   }
 }
