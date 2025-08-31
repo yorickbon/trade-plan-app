@@ -1,11 +1,7 @@
 // /pages/api/vision-plan.ts
-// Images-only planner with multi-strategy "tournament" selection.
-// - Generates multiple candidate strategies, scores them, and selects the best.
-// - Anti-chase: MARKET only if body close + retest (or SFP reclaim) is proven.
-// - Zones (min–max), not single prices.
-// - Order sanity: Sell Limit must be ABOVE current price; Buy Limit BELOW.
-// - Auto-rewrites invalid outputs.
-// - Returns card text + ai_meta for debugging.
+// Tournament-style, images-only planner.
+// Upload files: m15 (execution), h1 (context), h4 (HTF), optional calendar.
+// This API chooses the best trade idea by scoring multiple strategy candidates.
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -23,7 +19,7 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
 const OPENAI_API_BASE =
   process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
 
-// ───────────── helpers ─────────────
+// ───────────────── helpers ─────────────────
 async function getFormidable() {
   const mod: any = await import("formidable");
   return mod.default || mod;
@@ -67,12 +63,12 @@ async function fetchHeadlines(req: NextApiRequest, instrument: string) {
     const base = originFromReq(req);
     const url = `${base}/api/news?instrument=${encodeURIComponent(
       instrument
-    )}&hours=48&max=10`;
+    )}&hours=48&max=12`;
     const r = await fetch(url, { cache: "no-store" });
     if (!r.ok) return [];
     const j = await r.json();
     const items = Array.isArray(j?.items) ? j.items : Array.isArray(j) ? j : [];
-    return items.slice(0, 10).map((it: any) => {
+    return items.slice(0, 12).map((it: any) => {
       const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
       const tag = s === null ? "neu" : s >= 0.05 ? "pos" : s <= -0.05 ? "neg" : "neu";
       return `• ${String(it?.title || "").slice(0, 200)} (${tag})`;
@@ -86,7 +82,7 @@ function refusalLike(txt: string) {
   const t = (txt || "").toLowerCase();
   return (
     !t ||
-    t.length < 40 ||
+    t.length < 50 ||
     /unable to assist|cannot assist|can't assist|cannot help|can't help|i can’t help|refuse|not able to comply/.test(
       t
     )
@@ -113,8 +109,9 @@ function extractAiMeta(text: string) {
   return null;
 }
 
+// → Market only if BODY CLOSE + (RETEST HOLDS or SFP RECLAIM)
 function aiMetaDemandsPending(aiMeta: any): boolean {
-  if (!aiMeta) return true; // conservative
+  if (!aiMeta) return true;
   const entryType = String(aiMeta.entryType || "").toLowerCase();
   if (entryType !== "market") return false;
   const bp = aiMeta.breakoutProof || {};
@@ -123,7 +120,6 @@ function aiMetaDemandsPending(aiMeta: any): boolean {
 }
 
 function invalidOrderRelativeToPrice(aiMeta: any): string | null {
-  // returns reason string if inconsistent, else null
   if (!aiMeta) return "missing ai_meta";
   const dir = String(aiMeta.direction || "").toLowerCase();
   const ord = String(aiMeta.entryOrder || "").toLowerCase();
@@ -132,7 +128,6 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   const zmin = Number(zone.min);
   const zmax = Number(zone.max);
   if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return "missing zone/price";
-
   if (dir === "short" && ord === "sell limit") {
     if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price";
   }
@@ -142,7 +137,7 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   return null;
 }
 
-// ───────────── OpenAI ─────────────
+// ───────────────── OpenAI ─────────────────
 async function callOpenAI(messages: any[], temperature = 0.18) {
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
@@ -160,7 +155,8 @@ async function callOpenAI(messages: any[], temperature = 0.18) {
   return (json?.choices?.[0]?.message?.content || "").trim();
 }
 
-function buildMessages({
+// ───────────────── prompts ─────────────────
+function tournamentMessages({
   instrument,
   dataUrls,
   calendarDataUrl,
@@ -173,41 +169,40 @@ function buildMessages({
   headlinesText?: string | null;
   educationalRetry?: boolean;
 }) {
-  const policy = [
+  const system = [
     educationalRetry
       ? "You provide educational market analysis (NOT financial advice)."
       : "You are a meticulous price-action trading analyst.",
-    "Use ONLY the provided images for technicals; do not invent numeric candles.",
+    "Use ONLY the provided chart images for technicals; do not invent numeric candles.",
+    "",
+    "TOURNAMENT MODE:",
+    "• Generate at least FIVE named strategy candidates (both directions when valid):",
+    "  Pullback→OB/Demand/Supply, FVG/Imbalance fill, Breakout+Retest, SFP/Liquidity grab+reclaim, Range reversion, plus TL/Channel retest or Double top/btm when clean.",
+    "• Score each candidate on a 0–100 rubric:",
+    "  HTF alignment(30), Trigger proof(20), Confluence quality(15), Clean path to target(10), Stop validity(10), Fundamentals fit(10), ±90m news penalty(−10).",
+    "• Choose the TOP candidate by score (ties → prefer fundamental alignment, then avoid chasing).",
     "",
     "ENTRY POLICY:",
-    "• Generate multiple candidate strategies (tournament).",
-    "• MARKET entry ONLY if you explicitly prove BOTH: a decisive BODY CLOSE beyond level AND a successful RETEST that HOLDS (or a clear SFP-reclaim).",
-    "• Otherwise prefer LIMIT entries into OB/FVG/SR confluence; always output a zone (min–max).",
-    "• Stops are PA-based beyond invalidation; if first is too tight (wick risk), escalate to next structural extreme + buffer.",
+    "• Entry type follows the chosen strategy (no default).",
+    "• MARKET allowed ONLY if you explicitly prove BOTH: decisive BODY CLOSE beyond the level AND a successful RETEST that HOLDS (or a clear SFP reclaim). Otherwise prefer Pending Limit zone.",
+    "• Always output an ENTRY ZONE (min–max), not a single price. BTC zones are typically 0.3–0.5%.",
+    "• Stops are PA-based beyond invalidation; if the first is too tight, escalate to the next structural extreme + small buffer.",
     "• Format prices with thousands separators where natural (e.g., 109,800).",
   ].join(" ");
 
-  const userText = [
+  const user = [
     `Instrument: ${instrument}`,
     "",
     "TASKS:",
-    "0) Read the 4H/1H/15m images. Do NOT use external candles.",
-    "1) Multi-timeframe structure: trend, BOS/CHOCH, sweeps, OB (supply/demand), FVGs, SR flips, range bounds, swing map.",
-    "2) Generate candidates (both directions if valid):",
-    "   - Pullback to OB/Demand/Supply (with FVG/Fib confluence, SR flip)",
-    "   - Breakout + Retest (only with body close + retest hold OR SFP reclaim)",
-    "   - SFP / Liquidity grab + reclaim",
-    "   - Range reversion (edge to mid / opposite edge)",
-    "   - Optional if clean: TL/Channel retest, Double top/bottom + neckline, Breaker/QML",
-    "3) Score each candidate (0–100) using:",
-    "   HTF alignment 30, Trigger proof 20, Confluence 15, Clean path to target 10, Stop validity 10, Fundamentals 10, ±90m news penalty ≤5.",
-    "4) Pick the HIGHEST SCORE candidate and build the Trade Card.",
-    "5) Fundamentals: use headlines and calendar (if image provided). WARN on ±90m; do not blackout.",
+    "1) Multi-timeframe read (4H→1H→15m): trend, BOS/CHOCH, OB/SD, FVGs, SR flips, range bounds, sweeps.",
+    "2) Generate ≥5 strategy candidates with a one-line rationale each, then score them using the rubric.",
+    "3) Pick the top-scoring candidate and produce a full trade card.",
+    "4) Fundamentals overlay from headlines; if calendar image provided, WARN on ±90m (do not blackout).",
     "",
     "OUTPUT (exact order):",
     "Quick Plan (Actionable):",
     "• Direction: Long / Short / Stay Flat",
-    "• Entry: Pending @ <zone min–max> (Sell/Buy Limit preferred) — use Market ONLY if you proved body-close + retest hold or SFP-reclaim",
+    "• Entry: Pending @ <zone min–max> (or Market only if proof is shown)",
     "• Stop Loss: … (beyond which structure?)",
     "• Take Profit(s): TP1 / TP2 …",
     "• Conviction: %",
@@ -218,7 +213,7 @@ function buildMessages({
     "• Technical View (HTF + Intraday): ...",
     "• Fundamental View (Calendar + Sentiment): ...",
     "• Tech vs Fundy Alignment: Match / Mismatch (why)",
-    "• Conditional Scenarios: include opposite-side idea if relevant",
+    "• Conditional Scenarios: include the opposite-side idea if relevant",
     "• Surprise Risk: ...",
     "• Invalidation: ...",
     "• One-liner Summary: ...",
@@ -227,14 +222,13 @@ function buildMessages({
     "",
     "News Event Watch: ...",
     "",
-    "Notes: ...",
-    "",
     "Detected Structures (X-ray):",
     "• 4H: OB/FVG/SR/range/sweeps/swing map ...",
     "• 1H: OB/FVG/SR/range/sweeps/swing map ...",
     "• 15m: OB/FVG/SR/range/sweeps/swing map ...",
     "",
-    "Candidate Scores: (list each candidate you evaluated with name, score, and one-line reason)",
+    "Candidate Scores (tournament):",
+    "• <name> – <score>/100 – <one-line reason>",
     "",
     "Final Table Summary:",
     "Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction %",
@@ -250,12 +244,12 @@ function buildMessages({
   "stop": number, "tp1": number, "tp2": number,
   "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },
   "candidateScores": [{ "name": string, "score": number, "reason": string }],
-  "note": "one line on why this was chosen"
+  "note": "why this candidate won"
 }`,
   ].join("\n");
 
   const content: any[] = [
-    { type: "text", text: userText },
+    { type: "text", text: user },
     { type: "text", text: "4H Chart:" },
     { type: "image_url", image_url: { url: dataUrls.h4 } },
     { type: "text", text: "1H Chart:" },
@@ -271,23 +265,22 @@ function buildMessages({
     content.push({ type: "text", text: "Recent headlines snapshot:\n" + headlinesText });
   }
 
-  const messages = [
-    { role: "system", content: policy },
+  return [
+    { role: "system", content: system },
     { role: "user", content },
   ];
-  return messages;
 }
 
-async function askVision(params: {
+async function askTournament(params: {
   instrument: string;
   dataUrls: { m15: string; h1: string; h4: string };
   calendarDataUrl?: string | null;
   headlinesText?: string | null;
 }): Promise<{ text: string; aiMeta: any }> {
-  const m1 = buildMessages({ ...params, educationalRetry: false });
+  const m1 = tournamentMessages({ ...params, educationalRetry: false });
   let text = await callOpenAI(m1, 0.18);
   if (refusalLike(text)) {
-    const m2 = buildMessages({ ...params, educationalRetry: true });
+    const m2 = tournamentMessages({ ...params, educationalRetry: true });
     text = await callOpenAI(m2, 0.22);
   }
   const aiMeta = extractAiMeta(text);
@@ -299,55 +292,54 @@ async function rewriteAsPending(instrument: string, text: string) {
     {
       role: "system",
       content:
-        "Rewrite the trade card as PENDING Limit @ OB/FVG/SR confluence (zone min–max). No Market unless proof exists. Keep X-ray & Candidate Scores.",
+        "Rewrite the trade card as PENDING Limit zone @ OB/FVG/SR confluence. No Market unless proof exists. Keep tournament section and X-ray.",
     },
     {
       role: "user",
-      content: `Instrument: ${instrument}\nRewrite this card as Pending Limit:\n\`\`\`\n${text}\n\`\`\``,
+      content: `Instrument: ${instrument}\nRewrite this card as Pending Limit (no Market):\n\`\`\`\n${text}\n\`\`\``,
     },
   ];
   return await callOpenAI(messages, 0.15);
 }
-
 async function normalizeSetupIfNoBreakout(text: string) {
   const messages = [
     {
       role: "system",
       content:
-        "If 'Breakout + Retest' is claimed but no explicit proof (body close + retest hold OR SFP reclaim), rename to Pullback (OB/FVG confluence) and ensure Entry is a Pending Limit zone.",
+        "If 'Breakout + Retest' is claimed but there is no explicit proof (body close + retest hold or SFP reclaim), rename setup to Pullback (OB/FVG confluence) and ensure Pending Limit zone.",
     },
     { role: "user", content: text },
   ];
   return await callOpenAI(messages, 0.12);
 }
-
 async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
   const reason = invalidOrderRelativeToPrice(aiMeta);
   if (!reason) return text;
 
   const sideHint =
     reason === "sell-limit-below-price"
-      ? "For SHORT + Sell Limit, zone must be ABOVE current price. Pick nearest valid 1H/15m supply/OB above price and output a min–max zone."
-      : "For LONG + Buy Limit, zone must be BELOW current price. Pick nearest valid 1H/15m demand/OB below price and output a min–max zone.";
+      ? "SHORT + Sell Limit must be ABOVE current price. Pick nearest valid 1H/15m supply/OB above current and output a zone."
+      : "LONG + Buy Limit must be BELOW current price. Pick nearest valid 1H/15m demand/OB below current and output a zone.";
 
   const messages = [
     {
       role: "system",
       content: [
-        "Fix entry/order to respect PA rules:",
+        "Fix the entry/order to respect price-action rules:",
         sideHint,
-        "Keep PA-based stops; keep X-ray & Candidate Scores. Format with thousands separators.",
+        "Use a min–max zone with thousands separators.",
+        "Keep PA-based stops beyond invalidation; preserve Candidate Scores and X-ray.",
       ].join(" "),
     },
     {
       role: "user",
-      content: `Instrument: ${instrument}\nFix this card:\n\`\`\`\n${text}\n\`\`\``,
+      content: `Instrument: ${instrument}\nCurrent card (fix it):\n\`\`\`\n${text}\n\`\`\``,
     },
   ];
   return await callOpenAI(messages, 0.14);
 }
 
-// ───────────── handler ─────────────
+// ───────────────── handler ─────────────────
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<Ok | Err>
@@ -392,21 +384,21 @@ export default async function handler(
     const headlinesList = await fetchHeadlines(req, instrument);
     const headlinesText = headlinesList.length ? headlinesList.join("\n") : null;
 
-    // 1) Primary pass → multi-strategy tournament inside model
-    let { text, aiMeta } = await askVision({
+    // 1) Tournament pass
+    let { text, aiMeta } = await askTournament({
       instrument,
       dataUrls: { m15: m15Url, h1: h1Url, h4: h4Url },
       calendarDataUrl: calUrl || undefined,
       headlinesText,
     });
 
-    // 2) If Market without valid proof → rewrite to Pending
+    // 2) If Market without valid proof → rewrite to Pending Limit
     if (aiMetaDemandsPending(aiMeta)) {
       text = await rewriteAsPending(instrument, text);
       aiMeta = extractAiMeta(text) || aiMeta;
     }
 
-    // 3) Normalize misleading setups (Breakout+Retest without proof → Pullback)
+    // 3) If mislabeled Breakout+Retest without proof → normalize to Pullback
     const bp = aiMeta?.breakoutProof || {};
     const breakoutOK = bp?.bodyCloseBeyond && (bp?.retestHolds || bp?.sfpReclaim);
     if (!breakoutOK && /Breakout\s*\+\s*Retest/i.test(text)) {
@@ -423,13 +415,13 @@ export default async function handler(
       }
     }
 
-    // 5) Fallback if the model refused
+    // 5) Fallback if model refused
     if (refusalLike(text)) {
       const fallback = [
         "Quick Plan (Actionable):",
         "• Direction: Stay Flat (low conviction)",
-        "• Entry: Pending @ confluence (OB/FVG/SR) after a clean signal",
-        "• Stop Loss: Beyond the invalidation structure with small buffer",
+        "• Entry: Pending @ confluence (OB/FVG/SR) after a clean trigger",
+        "• Stop Loss: Beyond invalidation with small buffer",
         "• Take Profit(s): Prior swing/liquidity, then trail",
         "• Conviction: 30%",
         "• Setup: Await valid trigger (images inconclusive)",
@@ -448,7 +440,7 @@ export default async function handler(
         "• 1H: —",
         "• 15m: —",
         "",
-        "Candidate Scores:",
+        "Candidate Scores (tournament):",
         "• —",
         "",
         "Final Table Summary:",
