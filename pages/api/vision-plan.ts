@@ -1,10 +1,7 @@
 // /pages/api/vision-plan.ts
 // Images-only planner: pick the best idea by scoring multiple strategies.
 // Upload: m15 (execution), h1 (context), h4 (HTF), optional calendar.
-// BASE PRESERVED. Minimal additions ONLY:
-// 1) Option 2 — Market (independent conviction) when breakout-proof OR already-at-entry.
-// 2) Small guard to ALWAYS deliver an actionable idea (never "Stay Flat").
-//    If model returns JSON-only/empty: synthesize full card from ai_meta (same sections).
+// Keeps your existing style, fixes roles + image parts for chat/completions.
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -21,7 +18,7 @@ const OPENAI_API_KEY =
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
 const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
 
-// ---------- helpers (BASE) ----------
+// ---------- helpers ----------
 
 async function getFormidable() {
   const mod: any = await import("formidable");
@@ -106,6 +103,7 @@ function refusalLike(s: string) {
 // fenced JSON extractor for trailing ai_meta
 function extractAiMeta(text: string) {
   if (!text) return null;
+  // look for ```json ... ```
   const fences = [/```ai_meta\s*({[\s\S]*?})\s*```/i, /```json\s*({[\s\S]*?})\s*```/i];
   for (const re of fences) {
     const m = text.match(re);
@@ -118,38 +116,19 @@ function extractAiMeta(text: string) {
   return null;
 }
 
-// ---------- Option 2 (minimal additions) ----------
-
-// breakout proof rule for Market (kept exactly as requested)
-function hasBreakoutProof(aiMeta: any): boolean {
-  const bp = aiMeta?.breakoutProof || {};
-  return !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
-}
-
-// allow Market also if we are already inside the entry zone (tiny tolerance)
-function alreadyAtEntry(aiMeta: any): boolean {
-  const p = Number(aiMeta?.currentPrice);
-  const z = aiMeta?.zone || {};
-  const zmin = Number(z?.min);
-  const zmax = Number(z?.max);
-  if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return false;
-  const tol = Math.abs(p) * 0.0005; // ~0.05%
-  const lo = Math.min(zmin, zmax) - tol;
-  const hi = Math.max(zmin, zmax) + tol;
-  return p >= lo && p <= hi;
-}
-
-// if model chose Market but no proof, force Pending (your existing rule)
+// Market entry allowed only if proof of breakout+retest (or SFP reclaim)
 function needsPendingLimit(aiMeta: any): boolean {
-  const et = String(aiMeta?.entryType || "").toLowerCase();
+  const et = String(aiMeta?.entryType || "").toLowerCase(); // "market" | "pending"
   if (et !== "market") return false;
-  return !hasBreakoutProof(aiMeta);
+  const bp = aiMeta?.breakoutProof || {};
+  const ok = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+  return !ok; // if not proven, require Pending
 }
 
-// sanity: Sell Limit must be above / Buy Limit below current price
+// invalid Buy/Sell Limit vs current price and zone
 function invalidOrderRelativeToPrice(aiMeta: any): string | null {
-  const o = String(aiMeta?.entryOrder || "").toLowerCase();
-  const dir = String(aiMeta?.direction || "").toLowerCase();
+  const o = String(aiMeta?.entryOrder || "").toLowerCase(); // buy limit / sell limit
+  const dir = String(aiMeta?.direction || "").toLowerCase(); // long / short / flat
   const z = aiMeta?.zone || {};
   const p = Number(aiMeta?.currentPrice);
   const zmin = Number(z?.min);
@@ -157,60 +136,17 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return null;
 
   if (o === "sell limit" && dir === "short") {
+    // zone must be ABOVE current price (pullback into supply)
     if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price";
   }
   if (o === "buy limit" && dir === "long") {
+    // zone must be BELOW current price (pullback into demand)
     if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price";
   }
   return null;
 }
 
-// parse "Conviction: 62%"
-function parseConvictionPercent(text: string): number | null {
-  const m = text.match(/Conviction:\s*~?\s*(\d{1,3})\s*%/i);
-  if (!m) return null;
-  const n = Number(m[1]);
-  if (!Number.isFinite(n)) return null;
-  return Math.max(0, Math.min(100, n));
-}
-
-// inject Option 2 — Market before "Full Breakdown"
-function injectOption2Market(text: string, aiMeta: any, convPending: number): string {
-  const cp = Number(aiMeta?.currentPrice);
-  const stop = aiMeta?.stop ?? "Same as Option 1";
-  const tp1 = aiMeta?.tp1 ?? "Same as Option 1";
-  const tp2 = aiMeta?.tp2 ?? "Same as Option 1";
-
-  // independent conviction: pending ± small bonuses, capped
-  let convMarket = convPending;
-  if (hasBreakoutProof(aiMeta)) convMarket += 5;
-  if (alreadyAtEntry(aiMeta)) convMarket += 3;
-  convMarket = Math.max(0, Math.min(95, convMarket));
-
-  const option = [
-    "",
-    "Option 2 — Market",
-    `• Order Type: Market`,
-    `• Entry: ${Number.isFinite(cp) ? cp : "current price"}`,
-    `• Stop Loss: ${typeof stop === "number" ? stop : String(stop)}`,
-    `• Take Profit(s): TP1 ${typeof tp1 === "number" ? tp1 : String(tp1)} / TP2 ${typeof tp2 === "number" ? tp2 : String(tp2)}`,
-    `• Conviction: ${convMarket}%`,
-  ].join("\n");
-
-  const idx = text.search(/(^|\n)Full Breakdown/i);
-  if (idx !== -1) return text.slice(0, idx) + "\n" + option + "\n" + text.slice(idx);
-  return text + "\n" + option;
-}
-
-// upsert ai_meta fence after edits
-function upsertAiMetaFence(text: string, aiMeta: any) {
-  const block = "```ai_meta\n" + JSON.stringify(aiMeta, null, 2) + "\n```";
-  if (/```ai_meta[\s\S]*?```/i.test(text)) return text.replace(/```ai_meta[\s\S]*?```/i, block);
-  return text.trim() + "\n\n" + block;
-}
-
-// ---------- OpenAI call (BASE) ----------
-
+// OpenAI call (chat/completions, vision content parts)
 async function callOpenAI(messages: any[]) {
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
@@ -221,7 +157,6 @@ async function callOpenAI(messages: any[]) {
     body: JSON.stringify({
       model: OPENAI_MODEL,
       messages,
-      max_completion_tokens: 1600, // stability only
     }),
   });
   const json = await rsp.json().catch(() => ({} as any));
@@ -238,7 +173,7 @@ async function callOpenAI(messages: any[]) {
   return String(out || "");
 }
 
-// ---------- prompt builders (BASE + one line to always give a trade idea) ----------
+// ---------- prompt builders ----------
 
 function tournamentMessages(params: {
   instrument: string;
@@ -269,8 +204,6 @@ function tournamentMessages(params: {
     "Market entry allowed only when **explicit proof**: body close beyond level **and** retest holds (or SFP reclaim). Otherwise label EntryType: Pending and use Buy/Sell Limit zone.",
     "Stops just beyond invalidation (swing/zone) with small buffer. RR can be < 1.5R if structure says so.",
     "Use calendar/headlines as bias overlay if provided.",
-    "",
-    "**IMPORTANT: Always output at least ONE actionable trade idea (Long or Short). Do NOT return a 'Stay Flat' plan. If conviction is low, mark it low but still provide the setup.**",
     "",
     "OUTPUT format:",
     "Quick Plan (Actionable)",
@@ -362,7 +295,7 @@ async function askTournament(args: {
   return { text, aiMeta };
 }
 
-// rewrite card -> Pending limit (no Market) when proof missing (BASE)
+// rewrite card -> Pending limit (no Market) when proof missing
 async function rewriteAsPending(instrument: string, text: string) {
   const messages = [
     {
@@ -378,7 +311,7 @@ async function rewriteAsPending(instrument: string, text: string) {
   return callOpenAI(messages);
 }
 
-// normalize mislabeled Breakout+Retest without proof -> Pullback (BASE)
+// normalize mislabeled Breakout+Retest without proof -> Pullback
 async function normalizeBreakoutLabel(text: string) {
   const messages = [
     {
@@ -391,7 +324,7 @@ async function normalizeBreakoutLabel(text: string) {
   return callOpenAI(messages);
 }
 
-// fix Buy/Sell Limit vs current price and zone (BASE)
+// fix Buy/Sell Limit level direction vs current price
 async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
   const reason = invalidOrderRelativeToPrice(aiMeta);
   if (!reason) return text;
@@ -412,55 +345,7 @@ async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
   return callOpenAI(messages);
 }
 
-// synthesize full card (same sections) if model returns JSON-only/empty
-function synthesizeCardFromMeta(instrument: string, aiMeta: any, headlinesText?: string | null) {
-  const dir = aiMeta?.direction === "Short" ? "Short" : "Long";
-  const order = aiMeta?.entryOrder || "Pending";
-  const zone =
-    aiMeta?.zone && typeof aiMeta.zone === "object"
-      ? `${aiMeta.zone.min ?? "—"} – ${aiMeta.zone.max ?? "—"}`
-      : "—";
-  const stop = aiMeta?.stop ?? "—";
-  const tp1 = aiMeta?.tp1 ?? "—";
-  const tp2 = aiMeta?.tp2 ?? "—";
-
-  return [
-    "Quick Plan (Actionable)",
-    "",
-    `• Direction: ${dir}`,
-    `• Order Type: ${order}`,
-    "• Trigger: Structure confluence (OB/FVG/SR/Fib/BOS)",
-    `• Entry: ${zone}`,
-    `• Stop Loss: ${stop}`,
-    `• Take Profit(s): TP1 ${tp1} / TP2 ${tp2}`,
-    "• Conviction: 55%",
-    `• Setup: ${aiMeta?.selectedStrategy || "Tournament winner"}`,
-    "• Short Reasoning: Synthesized from ai_meta.",
-    "",
-    "Full Breakdown",
-    "• Technical View (HTF + Intraday): Based on 4H/1H/15m images.",
-    `• Fundamental View (Calendar + Sentiment): ${headlinesText ? "Recent headlines included." : "—"}`,
-    "• Tech vs Fundy Alignment: —",
-    "• Conditional Scenarios: —",
-    "• Surprise Risk: —",
-    "• Invalidation: —",
-    "• One-liner Summary: —",
-    "",
-    "Detected Structures (X-ray):",
-    "• 4H: —",
-    "• 1H: —",
-    "• 15m: —",
-    "",
-    "Candidate Scores (tournament):",
-    "- —",
-    "",
-    "Final Table Summary:",
-    "| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |",
-    `| ${instrument} | ${dir} | ${zone} | ${stop} | ${tp1} | ${tp2} | 55% |`,
-  ].join("\n");
-}
-
-// ---------- handler (BASE + minimal) ----------
+// ---------- handler ----------
 
 export default async function handler(
   req: NextApiRequest,
@@ -503,7 +388,7 @@ export default async function handler(
     const headlinesText = await fetchedHeadlines(req, instrument);
     const dateStr = new Date().toISOString().slice(0, 10);
 
-    // 1) Tournament pass (BASE)
+    // 1) Tournament pass
     let { text, aiMeta } = await askTournament({
       instrument,
       dateStr,
@@ -514,19 +399,13 @@ export default async function handler(
       h4,
     });
 
-    // If output was JSON-only/empty -> synthesize readable card with same sections
-    if ((!text || /^```(?:ai_meta|json)/i.test(text.trim())) && aiMeta) {
-      text = synthesizeCardFromMeta(instrument, aiMeta, headlinesText || "");
-      text = upsertAiMetaFence(text, aiMeta);
-    }
-
-    // 2) Force Pending if Market without proof (BASE rule kept)
-    if (aiMeta && needsPendingLimit(aiMeta)) {
+    // 2) Force Pending if Market without proof
+    if (needsPendingLimit(aiMeta)) {
       text = await rewriteAsPending(instrument, text);
       aiMeta = extractAiMeta(text) || aiMeta;
     }
 
-    // 3) Normalize mislabeled Breakout+Retest if no proof (BASE)
+    // 3) Normalize mislabeled Breakout+Retest if no proof
     const bp = aiMeta?.breakoutProof || {};
     const hasProof =
       !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
@@ -535,7 +414,7 @@ export default async function handler(
       aiMeta = extractAiMeta(text) || aiMeta;
     }
 
-    // 4) Sanity: zone vs price (BASE)
+    // 4) Enforce order vs current price (Sell Limit above / Buy Limit below)
     if (aiMeta) {
       const bad = invalidOrderRelativeToPrice(aiMeta);
       if (bad) {
@@ -544,25 +423,82 @@ export default async function handler(
       }
     }
 
-    // 5) Add Option 2 — Market when allowed; give its own conviction
-    if (aiMeta) {
-      const allowMarket = hasBreakoutProof(aiMeta) || alreadyAtEntry(aiMeta);
-      const convPending = parseConvictionPercent(text) ?? 55;
-      if (allowMarket) {
-        text = injectOption2Market(text, aiMeta, convPending);
-      } else {
-        const anchor = /(^|\n)Full Breakdown/i;
-        const line = `\n*Market withheld:* Needs breakout proof or price at entry zone.\n`;
-        text = anchor.test(text) ? text.replace(anchor, `${line}$&`) : text + line;
-      }
-      text = upsertAiMetaFence(text, aiMeta);
-    }
+    // 5) Fallback if refusal/empty
+    if (!text || refusalLike(text)) {
+      const fallback =
+        [
+          "Quick Plan (Actionable)",
+          "",
+          "• Direction: Stay Flat (low conviction).",
+          "• Order Type: Pending",
+          "• Trigger: Confluence (OB/FVG/SR) after a clean trigger.",
+          "• Entry: zone below/above current (structure based).",
+          "• Stop Loss: beyond invalidation with small buffer.",
+          "• Take Profit(s): Prior swing/liquidity; then trail.",
+          "• Conviction: 30%",
+          "• Setup: Await valid trigger (images inconclusive).",
+          "",
+          "Full Breakdown",
+          "• Technical View: Indecisive; likely range.",
+          "• Fundamental View: Mixed; keep size conservative.",
+          "• Tech vs Fundy Alignment: Mixed.",
+          "• Conditional Scenarios: Break+retest for continuation; SFP & reclaim for reversal.",
+          "• Surprise Risk: Headlines; CB speakers.",
+          "• Invalidation: Opposite-side body close beyond range edge.",
+          "• One-liner Summary: Stand by for a clean trigger.",
+          "",
+          "Detected Structures (X-ray):",
+          "• 4H: –",
+          "• 1H: –",
+          "• 15m: –",
+          "",
+          "Candidate Scores (tournament):",
+          "–",
+          "",
+          "Final Table Summary:",
+          `| Instrument | Bias   | Entry Zone | SL  | TP1 | TP2 | Conviction % |`,
+          `| ${instrument} | Neutral | Wait for trigger | Structure-based | Prior swing | Next liquidity | 30% |`,
+          "",
+          "```ai_meta",
+          JSON.stringify(
+            {
+              selectedStrategy: "Await valid trigger",
+              entryType: "Pending",
+              entryOrder: "Pending",
+              direction: "Flat",
+              currentPrice: null,
+              zone: null,
+              stop: null,
+              tp1: null,
+              tp2: null,
+              breakoutProof: {
+                bodyCloseBeyond: false,
+                retestHolds: false,
+                sfpReclaim: false,
+              },
+              candidateScores: [],
+              note: "Fallback used due to refusal/empty output.",
+            },
+            null,
+            2
+          ),
+          "```",
+        ].join("\n");
 
-    // 6) Final guard: never return flat/empty. If model still tried to go "Stay Flat",
-    //    we synthesize a low-conviction directional idea from ai_meta.
-    if (/Direction:\s*Stay\s*Flat/i.test(text) && aiMeta) {
-      text = synthesizeCardFromMeta(instrument, aiMeta, headlinesText || "");
-      text = upsertAiMetaFence(text, aiMeta);
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).json({
+        ok: true,
+        text: fallback,
+        meta: {
+          instrument,
+          hasCalendar: !!calUrl,
+          headlinesCount: headlinesText ? headlinesText.length : 0,
+          strategySelection: false,
+          rewritten: false,
+          fallbackUsed: true,
+          aiMeta: extractAiMeta(fallback),
+        },
+      });
     }
 
     res.setHeader("Cache-Control", "no-store");
