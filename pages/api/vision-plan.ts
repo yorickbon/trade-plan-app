@@ -2,8 +2,12 @@
 // Images-only planner: pick the best idea by scoring multiple strategies.
 // Upload: m15 (execution), h1 (context), h4 (HTF), optional calendar.
 // Keeps your existing style, fixes roles + image parts for chat/completions.
-// UPDATED: (1) Strategy-aware Option 2 (Market) or explicit “not available” note.
-//          (2) PA-based Stop Loss guard (swings/SR/zone) without extra model passes.
+//
+// UPDATE:
+// 1) Option 2 (Market) line is always visible under "Quick Plan (Actionable)"
+//    - Shows "Market entry..." if strategy has confirmation
+//    - Else "Not available (missing confirmation...)"
+// 2) After use, all uploaded temp images are deleted (fs.unlink)
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -54,10 +58,21 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null {
   return Array.isArray(x) ? (x[0] ?? null) : (x as any);
 }
 
+// pull a best-effort temp file path from formidable's File object
+function filePathFromUpload(file: any): string | null {
+  if (!file) return null;
+  return (
+    file.filepath ||
+    file.path ||
+    file._writeStream?.path ||
+    file.originalFilepath ||
+    null
+  );
+}
+
 async function fileToDataUrl(file: any): Promise<string | null> {
   if (!file) return null;
-  const p =
-    file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
+  const p = filePathFromUpload(file);
   if (!p) return null;
   const buf = await fs.readFile(p);
   const mime = file.mimetype || "image/png";
@@ -114,27 +129,6 @@ function extractAiMeta(text: string) {
         return JSON.parse(m[1]);
       } catch {}
     }
-  }
-  return null;
-}
-
-// invalid Buy/Sell Limit vs current price and zone
-function invalidOrderRelativeToPrice(aiMeta: any): string | null {
-  const o = String(aiMeta?.entryOrder || "").toLowerCase(); // buy limit / sell limit
-  const dir = String(aiMeta?.direction || "").toLowerCase(); // long / short / flat
-  const z = aiMeta?.zone || {};
-  const p = Number(aiMeta?.currentPrice);
-  const zmin = Number(z?.min);
-  const zmax = Number(z?.max);
-  if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return null;
-
-  if (o === "sell limit" && dir === "short") {
-    // zone must be ABOVE current price (pullback into supply)
-    if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price";
-  }
-  if (o === "buy limit" && dir === "long") {
-    // zone must be BELOW current price (pullback into demand)
-    if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price";
   }
   return null;
 }
@@ -297,7 +291,7 @@ async function askTournament(args: {
   return { text, aiMeta };
 }
 
-// ---------- local post-processing (no extra model calls) ----------
+// ---------- local Option 2 helpers (no extra model calls) ----------
 
 // Check if strategy has enough confirmation to allow Market (Option 2)
 function strategyAllowsMarket(aiMeta: any): boolean {
@@ -332,97 +326,49 @@ function strategyAllowsMarket(aiMeta: any): boolean {
     return !!(bos?.htfBos === true && bos?.ltfMomentumClose === true);
   }
 
-  // Default: fall back to breakout-style test if unknown
+  // Fallback: breakout-style test if unknown
   return !!(breakout?.bodyCloseBeyond === true &&
     (breakout?.retestHolds === true || breakout?.sfpReclaim === true));
 }
 
-// Insert one or more lines right under the "Quick Plan (Actionable)" section bullets
-function injectQuickPlanLines(text: string, lines: string[]): string {
-  if (!text || !/Quick Plan/i.test(text)) return text;
-  const parts = text.split(/\n/);
-  // Find the Conviction line within Quick Plan to insert after for consistency
-  let insertIdx = -1;
-  let inQuick = false;
-  for (let i = 0; i < parts.length; i++) {
-    const line = parts[i];
-    if (/^##\s*Quick Plan/i.test(line)) {
-      inQuick = true;
-      continue;
-    }
-    if (inQuick && /^##\s+/.test(line)) break; // reached next section
-    if (inQuick && /^\s*•\s*Conviction/i.test(line)) {
-      insertIdx = i + 1;
+// Insert Option 2 line under "Quick Plan (Actionable)" robustly
+function ensureOption2Line(text: string, allows: boolean, convMinus5: number): string {
+  if (!text) return text;
+  const lines = text.split(/\n/);
+
+  // find "Quick Plan (Actionable)" line
+  let qpIdx = lines.findIndex((l) => /quick plan\s*\(actionable\)/i.test(l));
+  if (qpIdx === -1) {
+    // no explicit header; append at top
+    const optLine = allows
+      ? `• Option 2 (Market): Market entry (post-confirmation). SL/TPs same as Option 1. Conviction ~${convMinus5}%`
+      : `• Option 2 (Market): Not available (missing confirmation for this setup).`;
+    return `${optLine}\n` + text;
+  }
+
+  // try to place after "Conviction:" if present, else after header or after Short Reasoning
+  let insertAt = -1;
+  for (let i = qpIdx + 1; i < Math.min(lines.length, qpIdx + 40); i++) {
+    const li = lines[i] || "";
+    if (/^\s*•\s*Conviction\s*:/i.test(li)) {
+      insertAt = i + 1;
       break;
     }
+    // stop if next major section
+    if (/^\s*Full Breakdown/i.test(li) || /^\s*##\s+/.test(li)) break;
   }
-  if (insertIdx === -1) {
-    // fallback: append near top of Quick Plan
-    const qpIndex = parts.findIndex((l) => /^##\s*Quick Plan/i.test(l));
-    insertIdx = qpIndex >= 0 ? qpIndex + 1 : parts.length;
-  }
-  parts.splice(insertIdx, 0, ...lines);
-  return parts.join("\n");
-}
+  if (insertAt === -1) insertAt = qpIdx + 1;
 
-// Replace Stop Loss bullet in Quick Plan if needed
-function patchStopLossInQuickPlan(text: string, newSL: number | null): string {
-  if (!text || newSL == null || !isFinite(newSL)) return text;
-  const parts = text.split(/\n/);
-  let inQuick = false;
-  for (let i = 0; i < parts.length; i++) {
-    const line = parts[i];
-    if (/^##\s*Quick Plan/i.test(line)) {
-      inQuick = true;
-      continue;
-    }
-    if (inQuick && /^##\s+/.test(line)) break;
-    if (inQuick && /^\s*•\s*Stop\s*Loss\s*:/i.test(line)) {
-      parts[i] = line.replace(/(:\s*)(.*)$/i, (_m, p1) => `${p1}${Number(newSL).toFixed(2)}`);
-      break;
-    }
-  }
-  return parts.join("\n");
-}
+  const opt2 = allows
+    ? `• Option 2 (Market): Market entry (post-confirmation). SL/TPs same as Option 1. Conviction ~${convMinus5}%`
+    : `• Option 2 (Market): Not available (missing confirmation for this setup).`;
 
-// Price-action stop loss guard: uses swings/SR/zone edges; escalates if too close/wrong side
-function computePAStop(aiMeta: any): number | null {
-  if (!aiMeta) return null;
-  const dir = String(aiMeta?.direction || "").toLowerCase();
-  if (!dir.includes("long") && !dir.includes("short")) return null;
+  // avoid duplicate insertions
+  const already = lines.some((l) => /option\s*2\s*\(market\)/i.test(l));
+  if (already) return text;
 
-  const z = aiMeta?.zone || {};
-  const zmin = Number(z?.min);
-  const zmax = Number(z?.max);
-  const entryMid = Number.isFinite(zmin) && Number.isFinite(zmax) ? (zmin + zmax) / 2 : Number(aiMeta?.entry || aiMeta?.entryPrice || NaN);
-
-  // Candidate PA levels (ordered better -> worse)
-  const cands: number[] = [];
-  const prevHigh = Number(aiMeta?.prevSwingHigh);
-  const prevLow = Number(aiMeta?.prevSwingLow);
-  const srAbove: number[] = Array.isArray(aiMeta?.srAbove) ? aiMeta.srAbove.filter((n: any) => Number.isFinite(n)).map(Number) : [];
-  const srBelow: number[] = Array.isArray(aiMeta?.srBelow) ? aiMeta.srBelow.filter((n: any) => Number.isFinite(n)).map(Number) : [];
-
-  if (dir.includes("long")) {
-    // SL below price → prefer prev swing low, zone.min, then deeper SR levels
-    if (Number.isFinite(prevLow)) cands.push(prevLow);
-    if (Number.isFinite(zmin)) cands.push(zmin);
-    if (srBelow.length) cands.push(...srBelow);
-    const current = Number(aiMeta?.stop || aiMeta?.stopLoss || NaN);
-    if (Number.isFinite(current)) cands.unshift(current); // allow current if valid
-    // Choose first strictly below entryMid
-    const chosen = cands.find((v) => Number.isFinite(entryMid) ? v < entryMid : true);
-    return Number.isFinite(chosen as number) ? (chosen as number) : null;
-  } else {
-    // dir short → SL above price → prefer prev swing high, zone.max, then higher SR levels
-    if (Number.isFinite(prevHigh)) cands.push(prevHigh);
-    if (Number.isFinite(zmax)) cands.push(zmax);
-    if (srAbove.length) cands.push(...srAbove);
-    const current = Number(aiMeta?.stop || aiMeta?.stopLoss || NaN);
-    if (Number.isFinite(current)) cands.unshift(current);
-    const chosen = cands.find((v) => Number.isFinite(entryMid) ? v > entryMid : true);
-    return Number.isFinite(chosen as number) ? (chosen as number) : null;
-  }
+  lines.splice(insertAt, 0, opt2);
+  return lines.join("\n");
 }
 
 // ---------- handler ----------
@@ -452,6 +398,9 @@ export default async function handler(
     const h4f = pickFirst(files.h4);
     const calF = pickFirst(files.calendar);
 
+    // Remember file paths for cleanup
+    const tempPaths = [m15f, h1f, h4f, calF].map((f) => filePathFromUpload(f)).filter(Boolean) as string[];
+
     const [m15, h1, h4, calUrl] = await Promise.all([
       fileToDataUrl(m15f),
       fileToDataUrl(h1f),
@@ -460,6 +409,10 @@ export default async function handler(
     ]);
 
     if (!m15 || !h1 || !h4) {
+      // best-effort cleanup even on early return
+      await Promise.all(
+        tempPaths.map((p) => fs.unlink(p).catch(() => {}))
+      );
       return res
         .status(400)
         .json({ ok: false, reason: "Upload all three charts: m15, h1, h4 (PNG/JPG)." });
@@ -468,7 +421,7 @@ export default async function handler(
     const headlinesText = await fetchedHeadlines(req, instrument);
     const dateStr = new Date().toISOString().slice(0, 10);
 
-    // 1) Single tournament pass (one OpenAI call)
+    // 1) Tournament pass
     let { text, aiMeta } = await askTournament({
       instrument,
       dateStr,
@@ -479,44 +432,18 @@ export default async function handler(
       h4,
     });
 
-    // 2) PA-based stop loss guard (adjust ai_meta.stop/stopLoss locally)
-    if (aiMeta) {
-      const paSL = computePAStop(aiMeta);
-      if (Number.isFinite(paSL as number)) {
-        if ("stop" in aiMeta) aiMeta.stop = paSL;
-        if ("stopLoss" in aiMeta) aiMeta.stopLoss = paSL;
-        // also patch the visible card bullet if present
-        text = patchStopLossInQuickPlan(text, paSL as number);
-      }
-    }
+    // 2) Always show Option 2 line (Market or Not available)
+    const allows = strategyAllowsMarket(aiMeta);
+    // try to read "Conviction: 64%" from the card; fall back to 60
+    let convPct = 60;
+    try {
+      const m = text.match(/Conviction:\s*([0-9]{1,3})\s*%/i);
+      if (m) convPct = Math.max(0, Math.min(100, parseInt(m[1], 10)));
+    } catch {}
+    const opt2Conv = Math.max(0, convPct - 5);
+    text = ensureOption2Line(text, allows, opt2Conv);
 
-    // 3) Enforce order vs current price (Sell Limit above / Buy Limit below) — minimal extra logic
-    if (aiMeta) {
-      const bad = invalidOrderRelativeToPrice(aiMeta);
-      if (bad) {
-        // We won't call model again; just leave text as-is to avoid latency.
-        // (If you want, enable your prior fixOrderVsPrice() again — but that adds a second call.)
-      }
-    }
-
-    // 4) Strategy-aware Option 2 (Market) — or explicit "not available" note (no extra model calls)
-    if (aiMeta && /##\s*Quick Plan/i.test(text)) {
-      const allows = strategyAllowsMarket(aiMeta);
-      // Try to infer base conviction to subtract ~5pp for Option 2
-      let convPct = 0;
-      try {
-        const m = text.match(/Conviction:\s*([0-9]+)\s*%/i);
-        if (m) convPct = Math.max(0, Math.min(100, parseInt(m[1], 10)));
-      } catch {}
-      const opt2Conv = Math.max(0, convPct - 5);
-      const opt2 = allows
-        ? [`• Option 2 (Market): Market entry (post-confirmation). SL/TPs same as Option 1. Conviction ~${opt2Conv}%`]
-        : [`• Option 2 (Market): Not available (missing confirmation for this setup).`];
-
-      text = injectQuickPlanLines(text, opt2);
-    }
-
-    // 5) Fallback if refusal/empty
+    // 3) Fallback if refusal/empty
     if (!text || refusalLike(text)) {
       const fallback =
         [
@@ -575,6 +502,9 @@ export default async function handler(
           "```",
         ].join("\n");
 
+      // cleanup temp files before returning
+      await Promise.all(tempPaths.map((p) => fs.unlink(p).catch(() => {})));
+
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
         ok: true,
@@ -590,6 +520,9 @@ export default async function handler(
         },
       });
     }
+
+    // cleanup temp files before final response
+    await Promise.all(tempPaths.map((p) => fs.unlink(p).catch(() => {})));
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
