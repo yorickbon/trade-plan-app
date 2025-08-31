@@ -75,7 +75,7 @@ async function backfillCurrentPrice(file15mPath: string): Promise<number | null>
           role: "user",
           content: [
             {
-              type: "input_image",
+              type: "image_url",
               image_url: { url: "data:image/png;base64," + fs.readFileSync(file15mPath).toString("base64") },
             },
           ],
@@ -130,7 +130,7 @@ If model-only JSON is produced, that’s okay — the server will synthesize the
           content: [
             { type: "text", text: `Instrument: ${instr}. Generate full trade plan.` },
             ...fileArray.map((f) => ({
-              type: "input_image",
+              type: "image_url",
               image_url: {
                 url: "data:image/png;base64," + fs.readFileSync(f.filepath).toString("base64"),
               },
