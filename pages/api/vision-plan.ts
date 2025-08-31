@@ -2,6 +2,11 @@
 // Images-only planner: pick the best idea by scoring multiple strategies.
 // Upload: m15 (execution), h1 (context), h4 (HTF), optional calendar.
 // Keeps your existing style, fixes roles + image parts for chat/completions.
+// CHANGELOG (minimal):
+// - Added Option 2 — Market for ALL strategies when breakout proof OR already-at-entry.
+// - Option 2 has an independent conviction. Inserted before "Full Breakdown".
+// - Explicit max_completion_tokens for stability.
+// - Everything else (strategies, scoring, sections) preserved.
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -116,12 +121,69 @@ function extractAiMeta(text: string) {
   return null;
 }
 
+// --- Option 2 helpers (minimal additions) ---
+
+function hasBreakoutProof(aiMeta: any): boolean {
+  const bp = aiMeta?.breakoutProof || {};
+  return !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+}
+
+function alreadyAtEntry(aiMeta: any): boolean {
+  const p = Number(aiMeta?.currentPrice);
+  const z = aiMeta?.zone || {};
+  const zmin = Number(z?.min);
+  const zmax = Number(z?.max);
+  if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return false;
+  // tiny tolerance (~0.05%)
+  const tol = Math.abs(p) * 0.0005;
+  const lo = Math.min(zmin, zmax) - tol;
+  const hi = Math.max(zmin, zmax) + tol;
+  return p >= lo && p <= hi;
+}
+
+function parseConvictionPercent(text: string): number | null {
+  const m = text.match(/Conviction:\s*~?\s*(\d{1,3})\s*%/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.min(100, n));
+}
+
+function injectOption2Market(text: string, aiMeta: any, convPending: number): string {
+  const cp = Number(aiMeta?.currentPrice);
+  const stop = aiMeta?.stop ?? "Same as Option 1";
+  const tp1 = aiMeta?.tp1 ?? "Same as Option 1";
+  const tp2 = aiMeta?.tp2 ?? "Same as Option 1";
+
+  // independent conviction: start from pending and adjust based on signals
+  let convMarket = convPending;
+  if (hasBreakoutProof(aiMeta)) convMarket += 5;
+  if (alreadyAtEntry(aiMeta)) convMarket += 3;
+  convMarket = Math.max(0, Math.min(95, convMarket));
+
+  const option = [
+    "",
+    "Option 2 — Market",
+    `• Order Type: Market`,
+    `• Entry: ${Number.isFinite(cp) ? cp : "current price"}`,
+    `• Stop Loss: ${typeof stop === "number" ? stop : String(stop)}`,
+    `• Take Profit(s): TP1 ${typeof tp1 === "number" ? tp1 : String(tp1)} / TP2 ${typeof tp2 === "number" ? tp2 : String(tp2)}`,
+    `• Conviction: ${convMarket}%`,
+  ].join("\n");
+
+  // insert just before "Full Breakdown"
+  const idx = text.search(/(^|\n)Full Breakdown/i);
+  if (idx !== -1) {
+    return text.slice(0, idx) + "\n" + option + "\n" + text.slice(idx);
+  }
+  return text + "\n" + option;
+}
+
 // Market entry allowed only if proof of breakout+retest (or SFP reclaim)
 function needsPendingLimit(aiMeta: any): boolean {
   const et = String(aiMeta?.entryType || "").toLowerCase(); // "market" | "pending"
   if (et !== "market") return false;
-  const bp = aiMeta?.breakoutProof || {};
-  const ok = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+  const ok = hasBreakoutProof(aiMeta);
   return !ok; // if not proven, require Pending
 }
 
@@ -157,6 +219,7 @@ async function callOpenAI(messages: any[]) {
     body: JSON.stringify({
       model: OPENAI_MODEL,
       messages,
+      max_completion_tokens: 1600, // stability only
     }),
   });
   const json = await rsp.json().catch(() => ({} as any));
@@ -400,7 +463,7 @@ export default async function handler(
     });
 
     // 2) Force Pending if Market without proof
-    if (needsPendingLimit(aiMeta)) {
+    if (aiMeta && needsPendingLimit(aiMeta)) {
       text = await rewriteAsPending(instrument, text);
       aiMeta = extractAiMeta(text) || aiMeta;
     }
@@ -423,7 +486,25 @@ export default async function handler(
       }
     }
 
-    // 5) Fallback if refusal/empty
+    // 5) Add Option 2 — Market (for ALL strategies) when allowed, with its own conviction.
+    if (aiMeta) {
+      const allowMarket = hasBreakoutProof(aiMeta) || alreadyAtEntry(aiMeta);
+      const convPending = parseConvictionPercent(text) ?? 50;
+      if (allowMarket) {
+        text = injectOption2Market(text, aiMeta, convPending);
+      } else {
+        // Explain why Market is withheld (one line, minimal)
+        const anchor = /(^|\n)Full Breakdown/i;
+        const line = `\n*Market withheld:* Needs breakout proof or price at entry zone.\n`;
+        if (anchor.test(text)) {
+          text = text.replace(anchor, `${line}$&`);
+        } else {
+          text += line;
+        }
+      }
+    }
+
+    // 6) Fallback if refusal/empty (unchanged from your base intent)
     if (!text || refusalLike(text)) {
       const fallback =
         [
