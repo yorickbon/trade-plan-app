@@ -345,6 +345,37 @@ async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
   return callOpenAI(messages);
 }
 
+/** NEW: add Option 2 (Market) when breakout proof exists */
+async function addMarketOptionIfProof(text: string, aiMeta: any) {
+  const bp = aiMeta?.breakoutProof || {};
+  const hasProof =
+    !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+
+  if (!hasProof) return text;
+
+  // We only *augment* the Quick Plan by inserting an "Option 2 — Market" block,
+  // keeping Entry/SL/TP identical (Market uses currentPrice where applicable),
+  // and lowering conviction by ~5pp. All other content must remain unchanged.
+  const messages = [
+    {
+      role: "system",
+      content:
+        "Augment the following trade card by adding an 'Option 2 — Market' line in the Quick Plan, immediately after the existing Entry/SL/TP/Conviction lines. Keep EVERYTHING else exactly as-is.",
+    },
+    {
+      role: "user",
+      content:
+        `Card:\n${text}\n\n` +
+        `Rules:\n` +
+        `- Add: "• Option 2 (Market): Market entry (post-confirmation). Use same SL/TP1/TP2 as Option 1.\n"` +
+        `- If a conviction % is shown, duplicate it and subtract ~5 percentage points for Option 2.\n` +
+        `- Do not remove or rename any existing sections. Do not add opinions.\n` +
+        `- Keep formatting identical to existing bullets (use the same bullet style and spacing).`,
+    },
+  ];
+  return callOpenAI(messages);
+}
+
 // ---------- handler ----------
 
 export default async function handler(
@@ -423,7 +454,13 @@ export default async function handler(
       }
     }
 
-    // 5) Fallback if refusal/empty
+    // 5) NEW: add Option 2 (Market) ONLY when proof exists; formatting identical to Option 1
+    if (aiMeta && hasProof) {
+      text = await addMarketOptionIfProof(text, aiMeta);
+      // no need to re-parse ai_meta; we didn't change it here
+    }
+
+    // 6) Fallback if refusal/empty
     if (!text || refusalLike(text)) {
       const fallback =
         [
