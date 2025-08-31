@@ -80,6 +80,9 @@ export default function Page() {
   const [planText, setPlanText] = useState<string>("");
   const [busy, setBusy] = useState<boolean>(false); // used by VisionUpload
 
+  // NEW: fullscreen toggle for trade card
+  const [showFullCard, setShowFullCard] = useState<boolean>(false);
+
   // force-reset signal for VisionUpload (increments on Reset and on instrument change)
   const [resetTick, setResetTick] = useState<number>(0);
 
@@ -280,7 +283,7 @@ export default function Page() {
                 ? "Loading headlines…"
                 : headlines.length
                 ? `${headlines.length} headlines found`
-                : calendarCurrencies.length
+                : currenciesFromBias((calendar as any)?.bias).length
                 ? "No notable headlines."
                 : "Fetched by instrument (calendar empty)."}
             </div>
@@ -289,8 +292,21 @@ export default function Page() {
 
         {/* RIGHT: Trade Card (bigger) + Chat */}
         <div className="rounded-lg border border-neutral-800 p-4 flex flex-col gap-4 max-h-[80vh]">
-          <div>
+          <div className="flex items-center justify-between">
             <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
+            {/* NEW: fullscreen toggle button */}
+            <button
+              type="button"
+              className="ml-3 inline-flex items-center justify-center whitespace-nowrap px-2 py-1 text-xs rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
+              onClick={() => setShowFullCard(true)}
+              disabled={!planText}
+              title="Open fullscreen"
+            >
+              Fullscreen
+            </button>
+          </div>
+
+          <div>
             {planText ? (
               <pre className="whitespace-pre-wrap text-base md:text-[17px] leading-7 opacity-95 max-h-[54vh] overflow-auto pr-2">
                 {planText}
@@ -315,6 +331,31 @@ export default function Page() {
           </div>
         </div>
       </div>
+
+      {/* NEW: fullscreen overlay for the trade card */}
+      {showFullCard && planText && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="relative w-full h-full max-w-6xl max-h-[95vh] bg-neutral-950 border border-neutral-800 rounded-lg shadow-xl overflow-hidden">
+            <div className="flex items-center justify-between p-3 border-b border-neutral-800">
+              <div className="text-base font-semibold">Generated Trade Card — {instrument}</div>
+              <button
+                type="button"
+                aria-label="Close"
+                className="inline-flex items-center justify-center w-8 h-8 rounded hover:bg-neutral-800"
+                onClick={() => setShowFullCard(false)}
+                title="Close"
+              >
+                ×
+              </button>
+            </div>
+            <div className="p-4 overflow-auto">
+              <pre className="whitespace-pre-wrap text-[17px] md:text-[18px] leading-8 opacity-95">
+                {planText}
+              </pre>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
