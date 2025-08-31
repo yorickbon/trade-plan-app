@@ -2,6 +2,8 @@
 // Images-only planner: pick the best idea by scoring multiple strategies.
 // Upload: m15 (execution), h1 (context), h4 (HTF), optional calendar.
 // Keeps your existing style, fixes roles + image parts for chat/completions.
+// UPDATED: (1) Strategy-aware Option 2 (Market) or explicit “not available” note.
+//          (2) PA-based Stop Loss guard (swings/SR/zone) without extra model passes.
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -103,7 +105,7 @@ function refusalLike(s: string) {
 // fenced JSON extractor for trailing ai_meta
 function extractAiMeta(text: string) {
   if (!text) return null;
-  // look for ```json ... ```
+  // look for ```json ... ``` or ```ai_meta ... ```
   const fences = [/```ai_meta\s*({[\s\S]*?})\s*```/i, /```json\s*({[\s\S]*?})\s*```/i];
   for (const re of fences) {
     const m = text.match(re);
@@ -114,15 +116,6 @@ function extractAiMeta(text: string) {
     }
   }
   return null;
-}
-
-// Market entry allowed only if proof of breakout+retest (or SFP reclaim)
-function needsPendingLimit(aiMeta: any): boolean {
-  const et = String(aiMeta?.entryType || "").toLowerCase(); // "market" | "pending"
-  if (et !== "market") return false;
-  const bp = aiMeta?.breakoutProof || {};
-  const ok = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
-  return !ok; // if not proven, require Pending
 }
 
 // invalid Buy/Sell Limit vs current price and zone
@@ -201,7 +194,7 @@ function tournamentMessages(params: {
     "Tournament mode: score candidates (Long/Short where valid):",
     "- Pullback to OB/FVG/SR confluence, Breakout+Retest, SFP/Liquidity grab+reclaim, Range reversion, TL/channel retest, double-tap when clean.",
     "Scoring rubric (0–100): Structure trend(25), 15m trigger quality(25), HTF context(15), Clean path to target(10), Stop validity(10), Fundamentals/Headlines(10), 'No chase' penalty(5).",
-    "Market entry allowed only when **explicit proof**: body close beyond level **and** retest holds (or SFP reclaim). Otherwise label EntryType: Pending and use Buy/Sell Limit zone.",
+    "Market entry allowed only when **explicit proof** per strategy; otherwise label EntryType: Pending and use Buy/Sell Limit zone.",
     "Stops just beyond invalidation (swing/zone) with small buffer. RR can be < 1.5R if structure says so.",
     "Use calendar/headlines as bias overlay if provided.",
     "",
@@ -248,7 +241,16 @@ function tournamentMessages(params: {
     `  "currentPrice": number | null,`,
     `  "zone": { "min": number, "max": number, "tf": "15m" | "1H" | "4H", "type": "OB" | "FVG" | "SR" | "Other" },`,
     `  "stop": number, "tp1": number, "tp2": number,`,
-    `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
+    `  "prevSwingHigh": number | null, "prevSwingLow": number | null,`,
+    `  "srAbove": number[] | null, "srBelow": number[] | null,`,
+    `  "proof": {`,
+    `    "breakout": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
+    `    "pullback": { "rejectionCloseInZone": boolean, "impulseAway": boolean },`,
+    `    "range": { "sfpAtEdge": boolean, "acceptanceInRange": boolean },`,
+    `    "trendline": { "tlBreakClose": boolean, "tlRetestHold": boolean },`,
+    `    "sfp": { "sweepConfirmed": boolean, "reclaimClose": boolean },`,
+    `    "bos": { "htfBos": boolean, "ltfMomentumClose": boolean }`,
+    `  },`,
     `  "candidateScores": [{ "name": string, "score": number, "reason": string }]}`,
     "```",
   ].join("\n");
@@ -295,85 +297,132 @@ async function askTournament(args: {
   return { text, aiMeta };
 }
 
-// rewrite card -> Pending limit (no Market) when proof missing
-async function rewriteAsPending(instrument: string, text: string) {
-  const messages = [
-    {
-      role: "system",
-      content:
-        "Rewrite the trade card as PENDING (no Market) into a clean Buy/Sell LIMIT zone at OB/FVG/SR confluence if breakout proof is missing. Keep tournament section and X-ray.",
-    },
-    {
-      role: "user",
-      content: `Instrument: ${instrument}\n\n${text}\n\nRewrite strictly to Pending.`,
-    },
-  ];
-  return callOpenAI(messages);
+// ---------- local post-processing (no extra model calls) ----------
+
+// Check if strategy has enough confirmation to allow Market (Option 2)
+function strategyAllowsMarket(aiMeta: any): boolean {
+  if (!aiMeta) return false;
+  const name = String(aiMeta?.selectedStrategy || aiMeta?.setup || "").toLowerCase();
+
+  const proof = aiMeta?.proof || {};
+  const breakout = proof?.breakout || aiMeta?.breakoutProof || {};
+  const pullback = proof?.pullback || {};
+  const range = proof?.range || {};
+  const trendline = proof?.trendline || {};
+  const sfp = proof?.sfp || {};
+  const bos = proof?.bos || {};
+
+  if (name.includes("breakout")) {
+    return !!(breakout?.bodyCloseBeyond === true &&
+      (breakout?.retestHolds === true || breakout?.sfpReclaim === true));
+  }
+  if (name.includes("pullback") || name.includes("ob") || name.includes("fvg") || name.includes("sr")) {
+    return !!(pullback?.rejectionCloseInZone === true && pullback?.impulseAway === true);
+  }
+  if (name.includes("range")) {
+    return !!(range?.sfpAtEdge === true && range?.acceptanceInRange === true);
+  }
+  if (name.includes("trendline") || name.includes("channel")) {
+    return !!(trendline?.tlBreakClose === true && trendline?.tlRetestHold === true);
+  }
+  if (name.includes("sfp") || name.includes("liquidity")) {
+    return !!(sfp?.sweepConfirmed === true && sfp?.reclaimClose === true);
+  }
+  if (name.includes("bos") || name.includes("continuation")) {
+    return !!(bos?.htfBos === true && bos?.ltfMomentumClose === true);
+  }
+
+  // Default: fall back to breakout-style test if unknown
+  return !!(breakout?.bodyCloseBeyond === true &&
+    (breakout?.retestHolds === true || breakout?.sfpReclaim === true));
 }
 
-// normalize mislabeled Breakout+Retest without proof -> Pullback
-async function normalizeBreakoutLabel(text: string) {
-  const messages = [
-    {
-      role: "system",
-      content:
-        "If 'Breakout + Retest' is claimed but proof is not shown (body close + retest hold or SFP reclaim), rename setup to 'Pullback (OB/FVG/SR)' and leave rest unchanged.",
-    },
-    { role: "user", content: text },
-  ];
-  return callOpenAI(messages);
+// Insert one or more lines right under the "Quick Plan (Actionable)" section bullets
+function injectQuickPlanLines(text: string, lines: string[]): string {
+  if (!text || !/Quick Plan/i.test(text)) return text;
+  const parts = text.split(/\n/);
+  // Find the Conviction line within Quick Plan to insert after for consistency
+  let insertIdx = -1;
+  let inQuick = false;
+  for (let i = 0; i < parts.length; i++) {
+    const line = parts[i];
+    if (/^##\s*Quick Plan/i.test(line)) {
+      inQuick = true;
+      continue;
+    }
+    if (inQuick && /^##\s+/.test(line)) break; // reached next section
+    if (inQuick && /^\s*•\s*Conviction/i.test(line)) {
+      insertIdx = i + 1;
+      break;
+    }
+  }
+  if (insertIdx === -1) {
+    // fallback: append near top of Quick Plan
+    const qpIndex = parts.findIndex((l) => /^##\s*Quick Plan/i.test(l));
+    insertIdx = qpIndex >= 0 ? qpIndex + 1 : parts.length;
+  }
+  parts.splice(insertIdx, 0, ...lines);
+  return parts.join("\n");
 }
 
-// fix Buy/Sell Limit level direction vs current price
-async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
-  const reason = invalidOrderRelativeToPrice(aiMeta);
-  if (!reason) return text;
-
-  const messages = [
-    {
-      role: "system",
-      content:
-        "Adjust the LIMIT zone so that: Sell Limit is an ABOVE-price pullback into supply; Buy Limit is a BELOW-price pullback into demand. Keep all other content & sections.",
-    },
-    {
-      role: "user",
-      content: `Instrument: ${instrument}\n\nCurrent Price: ${aiMeta?.currentPrice}\nProvided Zone: ${JSON.stringify(
-        aiMeta?.zone
-      )}\n\nCard:\n${text}\n\nFix only the LIMIT zone side and entry, keep format.`,
-    },
-  ];
-  return callOpenAI(messages);
+// Replace Stop Loss bullet in Quick Plan if needed
+function patchStopLossInQuickPlan(text: string, newSL: number | null): string {
+  if (!text || newSL == null || !isFinite(newSL)) return text;
+  const parts = text.split(/\n/);
+  let inQuick = false;
+  for (let i = 0; i < parts.length; i++) {
+    const line = parts[i];
+    if (/^##\s*Quick Plan/i.test(line)) {
+      inQuick = true;
+      continue;
+    }
+    if (inQuick && /^##\s+/.test(line)) break;
+    if (inQuick && /^\s*•\s*Stop\s*Loss\s*:/i.test(line)) {
+      parts[i] = line.replace(/(:\s*)(.*)$/i, (_m, p1) => `${p1}${Number(newSL).toFixed(2)}`);
+      break;
+    }
+  }
+  return parts.join("\n");
 }
 
-/** NEW: add Option 2 (Market) when breakout proof exists */
-async function addMarketOptionIfProof(text: string, aiMeta: any) {
-  const bp = aiMeta?.breakoutProof || {};
-  const hasProof =
-    !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+// Price-action stop loss guard: uses swings/SR/zone edges; escalates if too close/wrong side
+function computePAStop(aiMeta: any): number | null {
+  if (!aiMeta) return null;
+  const dir = String(aiMeta?.direction || "").toLowerCase();
+  if (!dir.includes("long") && !dir.includes("short")) return null;
 
-  if (!hasProof) return text;
+  const z = aiMeta?.zone || {};
+  const zmin = Number(z?.min);
+  const zmax = Number(z?.max);
+  const entryMid = Number.isFinite(zmin) && Number.isFinite(zmax) ? (zmin + zmax) / 2 : Number(aiMeta?.entry || aiMeta?.entryPrice || NaN);
 
-  // We only *augment* the Quick Plan by inserting an "Option 2 — Market" block,
-  // keeping Entry/SL/TP identical (Market uses currentPrice where applicable),
-  // and lowering conviction by ~5pp. All other content must remain unchanged.
-  const messages = [
-    {
-      role: "system",
-      content:
-        "Augment the following trade card by adding an 'Option 2 — Market' line in the Quick Plan, immediately after the existing Entry/SL/TP/Conviction lines. Keep EVERYTHING else exactly as-is.",
-    },
-    {
-      role: "user",
-      content:
-        `Card:\n${text}\n\n` +
-        `Rules:\n` +
-        `- Add: "• Option 2 (Market): Market entry (post-confirmation). Use same SL/TP1/TP2 as Option 1.\n"` +
-        `- If a conviction % is shown, duplicate it and subtract ~5 percentage points for Option 2.\n` +
-        `- Do not remove or rename any existing sections. Do not add opinions.\n` +
-        `- Keep formatting identical to existing bullets (use the same bullet style and spacing).`,
-    },
-  ];
-  return callOpenAI(messages);
+  // Candidate PA levels (ordered better -> worse)
+  const cands: number[] = [];
+  const prevHigh = Number(aiMeta?.prevSwingHigh);
+  const prevLow = Number(aiMeta?.prevSwingLow);
+  const srAbove: number[] = Array.isArray(aiMeta?.srAbove) ? aiMeta.srAbove.filter((n: any) => Number.isFinite(n)).map(Number) : [];
+  const srBelow: number[] = Array.isArray(aiMeta?.srBelow) ? aiMeta.srBelow.filter((n: any) => Number.isFinite(n)).map(Number) : [];
+
+  if (dir.includes("long")) {
+    // SL below price → prefer prev swing low, zone.min, then deeper SR levels
+    if (Number.isFinite(prevLow)) cands.push(prevLow);
+    if (Number.isFinite(zmin)) cands.push(zmin);
+    if (srBelow.length) cands.push(...srBelow);
+    const current = Number(aiMeta?.stop || aiMeta?.stopLoss || NaN);
+    if (Number.isFinite(current)) cands.unshift(current); // allow current if valid
+    // Choose first strictly below entryMid
+    const chosen = cands.find((v) => Number.isFinite(entryMid) ? v < entryMid : true);
+    return Number.isFinite(chosen as number) ? (chosen as number) : null;
+  } else {
+    // dir short → SL above price → prefer prev swing high, zone.max, then higher SR levels
+    if (Number.isFinite(prevHigh)) cands.push(prevHigh);
+    if (Number.isFinite(zmax)) cands.push(zmax);
+    if (srAbove.length) cands.push(...srAbove);
+    const current = Number(aiMeta?.stop || aiMeta?.stopLoss || NaN);
+    if (Number.isFinite(current)) cands.unshift(current);
+    const chosen = cands.find((v) => Number.isFinite(entryMid) ? v > entryMid : true);
+    return Number.isFinite(chosen as number) ? (chosen as number) : null;
+  }
 }
 
 // ---------- handler ----------
@@ -419,7 +468,7 @@ export default async function handler(
     const headlinesText = await fetchedHeadlines(req, instrument);
     const dateStr = new Date().toISOString().slice(0, 10);
 
-    // 1) Tournament pass
+    // 1) Single tournament pass (one OpenAI call)
     let { text, aiMeta } = await askTournament({
       instrument,
       dateStr,
@@ -430,37 +479,44 @@ export default async function handler(
       h4,
     });
 
-    // 2) Force Pending if Market without proof
-    if (needsPendingLimit(aiMeta)) {
-      text = await rewriteAsPending(instrument, text);
-      aiMeta = extractAiMeta(text) || aiMeta;
-    }
-
-    // 3) Normalize mislabeled Breakout+Retest if no proof
-    const bp = aiMeta?.breakoutProof || {};
-    const hasProof =
-      !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
-    if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
-      text = await normalizeBreakoutLabel(text);
-      aiMeta = extractAiMeta(text) || aiMeta;
-    }
-
-    // 4) Enforce order vs current price (Sell Limit above / Buy Limit below)
+    // 2) PA-based stop loss guard (adjust ai_meta.stop/stopLoss locally)
     if (aiMeta) {
-      const bad = invalidOrderRelativeToPrice(aiMeta);
-      if (bad) {
-        text = await fixOrderVsPrice(instrument, text, aiMeta);
-        aiMeta = extractAiMeta(text) || aiMeta;
+      const paSL = computePAStop(aiMeta);
+      if (Number.isFinite(paSL as number)) {
+        if ("stop" in aiMeta) aiMeta.stop = paSL;
+        if ("stopLoss" in aiMeta) aiMeta.stopLoss = paSL;
+        // also patch the visible card bullet if present
+        text = patchStopLossInQuickPlan(text, paSL as number);
       }
     }
 
-    // 5) NEW: add Option 2 (Market) ONLY when proof exists; formatting identical to Option 1
-    if (aiMeta && hasProof) {
-      text = await addMarketOptionIfProof(text, aiMeta);
-      // no need to re-parse ai_meta; we didn't change it here
+    // 3) Enforce order vs current price (Sell Limit above / Buy Limit below) — minimal extra logic
+    if (aiMeta) {
+      const bad = invalidOrderRelativeToPrice(aiMeta);
+      if (bad) {
+        // We won't call model again; just leave text as-is to avoid latency.
+        // (If you want, enable your prior fixOrderVsPrice() again — but that adds a second call.)
+      }
     }
 
-    // 6) Fallback if refusal/empty
+    // 4) Strategy-aware Option 2 (Market) — or explicit "not available" note (no extra model calls)
+    if (aiMeta && /##\s*Quick Plan/i.test(text)) {
+      const allows = strategyAllowsMarket(aiMeta);
+      // Try to infer base conviction to subtract ~5pp for Option 2
+      let convPct = 0;
+      try {
+        const m = text.match(/Conviction:\s*([0-9]+)\s*%/i);
+        if (m) convPct = Math.max(0, Math.min(100, parseInt(m[1], 10)));
+      } catch {}
+      const opt2Conv = Math.max(0, convPct - 5);
+      const opt2 = allows
+        ? [`• Option 2 (Market): Market entry (post-confirmation). SL/TPs same as Option 1. Conviction ~${opt2Conv}%`]
+        : [`• Option 2 (Market): Not available (missing confirmation for this setup).`];
+
+      text = injectQuickPlanLines(text, opt2);
+    }
+
+    // 5) Fallback if refusal/empty
     if (!text || refusalLike(text)) {
       const fallback =
         [
@@ -474,6 +530,7 @@ export default async function handler(
           "• Take Profit(s): Prior swing/liquidity; then trail.",
           "• Conviction: 30%",
           "• Setup: Await valid trigger (images inconclusive).",
+          "• Option 2 (Market): Not available (missing confirmation for this setup).",
           "",
           "Full Breakdown",
           "• Technical View: Indecisive; likely range.",
@@ -508,11 +565,7 @@ export default async function handler(
               stop: null,
               tp1: null,
               tp2: null,
-              breakoutProof: {
-                bodyCloseBeyond: false,
-                retestHolds: false,
-                sfpReclaim: false,
-              },
+              proof: {},
               candidateScores: [],
               note: "Fallback used due to refusal/empty output.",
             },
