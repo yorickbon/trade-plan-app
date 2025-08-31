@@ -8,7 +8,6 @@ import HeadlinesPanel from "../components/HeadlinesPanel";
 import ChatDock from "../components/ChatDock";
 import VisionUpload from "../components/VisionUpload";
 
-// client-only chart import
 const TradingViewTriple = dynamic(() => import("../components/TradingViewTriple"), {
   ssr: false,
   loading: () => (
@@ -18,33 +17,19 @@ const TradingViewTriple = dynamic(() => import("../components/TradingViewTriple"
   ),
 });
 
-// ---------- types / helpers ----------
 type CalendarBias = {
-  perCurrency: Record<
-    string,
-    { score: number; label: string; count: number; evidence: any[] }
-  >;
+  perCurrency: Record<string, { score: number; label: string; count: number; evidence: any[] }>;
   instrument?: { pair: string; score: number; label: string };
 };
 
 type CalendarResp =
-  | {
-      ok: true;
-      provider?: string;
-      date?: string;
-      count: number;
-      items: any[];
-      bias: CalendarBias;
-    }
+  | { ok: true; provider?: string; date?: string; count: number; items: any[]; bias: CalendarBias }
   | { ok: false; reason: string };
 
-type NewsResp =
-  | { ok: true; items: any[]; count?: number; provider?: string }
-  | { ok: false; reason: string };
+type NewsResp = { ok: true; items: any[]; count?: number; provider?: string } | { ok: false; reason: string };
 
 const todayISO = () => new Date().toISOString().slice(0, 10);
-const currenciesFromBias = (bias?: CalendarBias) =>
-  bias ? Object.keys(bias.perCurrency || {}) : [];
+const currenciesFromBias = (bias?: CalendarBias) => (bias ? Object.keys(bias.perCurrency || {}) : []);
 
 function baseQuoteFromInstrument(instr: string): [string, string] {
   const s = (instr || "").toUpperCase().replace("/", "");
@@ -63,42 +48,32 @@ function normalizePlanText(v: any): string {
   }
 }
 
-// ---------- page ----------
 export default function Page() {
-  // controls
   const [instrument, setInstrument] = useState<string>("EURUSD");
   const [dateStr, setDateStr] = useState<string>(todayISO());
 
-  // calendar + headlines
   const [calendar, setCalendar] = useState<CalendarResp | null>(null);
   const [loadingCal, setLoadingCal] = useState<boolean>(false);
 
   const [headlines, setHeadlines] = useState<any[]>([]);
   const [loadingNews, setLoadingNews] = useState<boolean>(false);
 
-  // plan
   const [planText, setPlanText] = useState<string>("");
-  const [busy, setBusy] = useState<boolean>(false); // used by VisionUpload
+  const [busy, setBusy] = useState<boolean>(false);
 
-  // fullscreen toggle for trade card
   const [enlargedCard, setEnlargedCard] = useState<boolean>(false);
-
-  // force-reset signal for VisionUpload (increments on Reset and on instrument change)
   const [resetTick, setResetTick] = useState<number>(0);
 
   // headlines request coordination
   const headlinesSeqRef = useRef(0);
   const headlinesAbortRef = useRef<AbortController | null>(null);
 
-  // ----- load headlines for currencies / instrument -----
+  // -------- headlines loader with cache-buster + last-request-wins --------
   const loadHeadlinesForSymbols = useCallback(async (symbols: string[]) => {
-    // Immediate clear (so old instrument doesn't linger)
-    setHeadlines([]);
-    if (!symbols.length) {
-      return;
-    }
+    setHeadlines([]); // clear immediately so old list doesn’t linger
+    if (!symbols.length) return;
 
-    // Cancel any in-flight request
+    // cancel any in-flight
     if (headlinesAbortRef.current) {
       try {
         headlinesAbortRef.current.abort();
@@ -111,25 +86,22 @@ export default function Page() {
 
     setLoadingNews(true);
     try {
-      const nr = await fetch(`/api/news?symbols=${symbols.join(",")}`, {
-        cache: "no-store",
-        signal: controller.signal,
-      });
+      const cacheBuster = `_t=${reqId}`; // defeats any edge/browser cache
+      const url = `/api/news?symbols=${encodeURIComponent(symbols.join(","))}&${cacheBuster}`;
+      const nr = await fetch(url, { cache: "no-store", signal: controller.signal });
       const nj: NewsResp = await nr.json();
 
-      // Apply only if this is the latest request and not aborted
       if (reqId === headlinesSeqRef.current) {
         setHeadlines(nj?.ok ? nj.items || [] : []);
       }
-    } catch (e: any) {
-      // Ignore abort errors; only clear if this was the latest request
+    } catch {
       if (reqId === headlinesSeqRef.current) setHeadlines([]);
     } finally {
       if (reqId === headlinesSeqRef.current) setLoadingNews(false);
     }
   }, []);
 
-  // ----- load calendar (provider only) -----
+  // ----- calendar loader -----
   const loadCalendar = useCallback(async () => {
     setLoadingCal(true);
     try {
@@ -163,33 +135,27 @@ export default function Page() {
     loadCalendar();
   }, [loadCalendar]);
 
-  // reset
   const resetAll = useCallback(() => {
     setPlanText("");
     setHeadlines([]);
     setCalendar(null);
     setDateStr(todayISO());
     setEnlargedCard(false);
-    // cancel any in-flight headlines request
     if (headlinesAbortRef.current) {
       try {
         headlinesAbortRef.current.abort();
       } catch {}
     }
-    // hard reset the uploader
     setResetTick((t) => t + 1);
-    // re-pull with fresh date/instrument
     setTimeout(() => loadCalendar(), 0);
   }, [loadCalendar]);
 
-  // when instrument changes, also hard-reset uploader & clear plan
   const onInstrumentChange = useCallback(
     (next: string) => {
       setInstrument(next.toUpperCase());
       setPlanText("");
       setEnlargedCard(false);
 
-      // cancel any in-flight headlines request and clear immediately
       if (headlinesAbortRef.current) {
         try {
           headlinesAbortRef.current.abort();
@@ -198,13 +164,11 @@ export default function Page() {
       setHeadlines([]);
 
       setResetTick((t) => t + 1);
-      // calendar will reload via useEffect (dependency = instrument)
       setTimeout(() => loadCalendar(), 0);
     },
     [loadCalendar]
   );
 
-  // ESC closes fullscreen
   useEffect(() => {
     if (!enlargedCard) return;
     const onEsc = (e: KeyboardEvent) => {
@@ -214,230 +178,32 @@ export default function Page() {
     return () => window.removeEventListener("keydown", onEsc);
   }, [enlargedCard]);
 
-  const calendarCurrencies = useMemo(
-    () => currenciesFromBias((calendar as any)?.bias),
-    [calendar]
-  );
+  const calendarCurrencies = useMemo(() => currenciesFromBias((calendar as any)?.bias), [calendar]);
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 space-y-4">
-      {/* Controls (single row) */}
-      <div className="flex flex-wrap items-center gap-3">
-        <div className="flex items-center gap-2">
-          <span className="text-sm opacity-80">Instrument</span>
-          <select
-            value={instrument}
-            onChange={(e) => onInstrumentChange(e.target.value)}
-            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm inline-block w-auto"
-          >
-            {/* Forex */}
-            <option>AUDUSD</option>
-            <option>EURUSD</option>
-            <option>GBPUSD</option>
-            <option>USDJPY</option>
-            <option>USDCAD</option>
-            <option>EURGBP</option>
-            <option>EURJPY</option>
-            <option>GBPJPY</option>
-            <option>EURAUD</option>
-            <option>NZDUSD</option>
-            {/* Indices */}
-            <option>SPX500</option>
-            <option>NAS100</option>
-            <option>US30</option>
-            <option>GER40</option>
-            {/* Metals/Crypto */}
-            <option>XAUUSD</option>
-            <option>BTCUSD</option>
-            <option>ETHUSD</option>
-          </select>
-        </div>
+      {/* controls, charts, uploader — unchanged from your current working version */}
+      {/* ... */}
+      {/* (Omitted here only to keep this answer focused; keep the rest of your file exactly as we last shipped) */}
 
-        <div className="flex items-center gap-2">
-          <span className="text-sm opacity-80">Date</span>
-          <input
-            type="date"
-            value={dateStr}
-            onChange={(e) => setDateStr(e.target.value)}
-            className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm inline-block w-auto"
-          />
-        </div>
-
-        <button
-          onClick={resetAll}
-          className="inline-flex items-center justify-center whitespace-nowrap w-auto px-3 py-1 text-sm rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
-          disabled={loadingCal || busy}
-        >
-          Reset
-        </button>
-
-        {/* (future) monitoring hooks */}
-        <button className="inline-flex items-center justify-center whitespace-nowrap w-auto px-3 py-1 text-sm rounded bg-sky-700 hover:bg-sky-600">
-          Start monitoring
-        </button>
-        <button className="inline-flex items-center justify-center whitespace-nowrap w-auto px-3 py-1 text-sm rounded bg-rose-700 hover:bg-rose-600">
-          Stop monitoring
-        </button>
-
-        <span className="text-xs opacity-70 ml-auto">
-          Images only. Numeric candles are disabled by design.
-        </span>
-      </div>
-
-      {/* Charts */}
-      <TradingViewTriple symbol={instrument} />
-
-      {/* Image uploader */}
+      {/* Headlines panel (unchanged UI) */}
       <div className="rounded-lg border border-neutral-800 p-4">
-        <h2 className="text-lg font-semibold mb-2">Image Upload (4H / 1H / 15M + optional Calendar)</h2>
-        <VisionUpload
-          key={resetTick /* ensures hard remount as fallback */}
-          instrument={instrument}
-          resetSignal={resetTick}
-          onBusyChange={setBusy}
-          onResult={(txt) => setPlanText(normalizePlanText(txt))}
-        />
-      </div>
-
-      {/* Two columns: LEFT (Calendar + Headlines) | RIGHT (Trade Card + Chat) */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* LEFT: Calendar + Headlines stacked (span 2 columns) */}
-        <div className="lg:col-span-2 space-y-4">
-          {/* Calendar */}
-          <div className="rounded-lg border border-neutral-800 p-4">
-            <h2 className="text-lg font-semibold mb-2">Calendar Snapshot</h2>
-
-            {loadingCal && <div className="text-sm opacity-75">Loading calendar…</div>}
-
-            {!loadingCal && calendar?.ok && Array.isArray(calendar.items) && (
-              <CalendarPanel items={calendar.items} />
-            )}
-
-            {!loadingCal && (!calendar || !calendar.ok) && (
-              <div className="text-sm opacity-75">
-                No calendar items found from providers. (Once your TradingEconomics key is active,
-                this will populate automatically.)
-              </div>
-            )}
-          </div>
-
-          {/* Headlines – forced small font */}
-          <div className="rounded-lg border border-neutral-800 p-4">
-            <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
-            <div style={{ fontSize: "12px", lineHeight: "1.3" }}>
-              <HeadlinesPanel items={Array.isArray(headlines) ? headlines : []} />
-            </div>
-            <div className="text-[11px] mt-2 opacity-60">
-              {loadingNews
-                ? "Loading headlines…"
-                : headlines.length
-                ? `${headlines.length} headlines found`
-                : currenciesFromBias((calendar as any)?.bias).length
-                ? "No notable headlines."
-                : "Fetched by instrument (calendar empty)."}
-            </div>
-          </div>
+        <h2 className="text-lg font-semibold mb-2">Macro Headlines (24–48h)</h2>
+        <div style={{ fontSize: "12px", lineHeight: "1.3" }}>
+          <HeadlinesPanel items={Array.isArray(headlines) ? headlines : []} />
         </div>
-
-        {/* RIGHT: Trade Card (normal) + Chat */}
-        <div className="rounded-lg border border-neutral-800 p-4 flex flex-col gap-4 max-h-[80vh]">
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
-
-            {/* Fullscreen toggle now expands to a full-width reader below */}
-            <button
-              type="button"
-              className="ml-3 inline-flex items-center justify-center whitespace-nowrap px-2 py-1 text-xs rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
-              onClick={() => setEnlargedCard((v) => !v)}
-              title={enlargedCard ? "Close fullscreen" : "Open fullscreen"}
-            >
-              {enlargedCard ? "Close fullscreen" : "Fullscreen"}
-            </button>
-          </div>
-
-          {/* In-panel normal reader (hidden when enlarged to full width) */}
-          {!enlargedCard && (
-            <div>
-              {planText ? (
-                <pre className="whitespace-pre-wrap text-base md:text-[17px] leading-7 opacity-95 max-h-[54vh] overflow-auto pr-2">
-                  {planText}
-                </pre>
-              ) : busy ? (
-                <div className="text-sm opacity-80">Analyzing images…</div>
-              ) : (
-                <div className="text-sm opacity-70">
-                  Upload your 4H/1H/15M (and optional calendar) above, then click <b>Generate from Images</b>.
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* ChatDock */}
-          <div className="border-top border-neutral-800 pt-3">
-            <h3 className="text-base font-semibold mb-2">Discuss the Plan</h3>
-            <ChatDock
-              planText={planText}
-              headlines={Array.isArray(headlines) ? headlines : []}
-              calendar={Array.isArray((calendar as any)?.items) ? (calendar as any).items : []}
-            />
-          </div>
+        <div className="text-[11px] mt-2 opacity-60">
+          {loadingNews
+            ? "Loading headlines…"
+            : headlines.length
+            ? `${headlines.length} headlines found`
+            : calendarCurrencies.length
+            ? "No notable headlines."
+            : "Fetched by instrument (calendar empty)."}
         </div>
       </div>
 
-      {/* Full-width reader row below the grid (appears when enlarged) */}
-      {enlargedCard && (
-        <div className="rounded-lg border border-neutral-800 bg-neutral-950">
-          {/* Sticky header */}
-          <div className="sticky top-0 z-10 bg-neutral-950/95 backdrop-blur-sm border-b border-neutral-800">
-            <div className="max-w-[1100px] mx-auto flex items-center justify-between px-6 py-3">
-              <h2 className="text-lg font-semibold">Generated Trade Card — Full Width</h2>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  className="inline-flex items-center justify-center whitespace-nowrap px-2 py-1 text-xs rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
-                  onClick={() => {
-                    if (planText) navigator.clipboard?.writeText(planText).catch(() => {});
-                  }}
-                  title="Copy card to clipboard"
-                >
-                  Copy
-                </button>
-                <button
-                  type="button"
-                  className="inline-flex items-center justify-center whitespace-nowrap px-2 py-1 text-xs rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
-                  onClick={() => setEnlargedCard(false)}
-                  title="Close fullscreen (Esc)"
-                >
-                  Close
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* Reader content — use <pre> to preserve layout exactly */}
-          <div className="max-w-[1100px] mx-auto p-6">
-            {planText ? (
-              <pre className="card-enlarged-pre whitespace-pre-wrap font-mono opacity-95">
-                {planText}
-                <style jsx>{`
-                  .card-enlarged-pre {
-                    font-size: 24px !important;        /* Preset A */
-                    line-height: 2.0rem !important;
-                    letter-spacing: 0.005em;
-                    white-space: pre-wrap !important;   /* preserve line breaks */
-                    tab-size: 2;
-                  }
-                  @media (min-width: 768px) {
-                    .card-enlarged-pre { font-size: 26px !important; }
-                  }
-                `}</style>
-              </pre>
-            ) : (
-              <div className="text-base opacity-80 p-2">No plan yet.</div>
-            )}
-          </div>
-        </div>
-      )}
+      {/* keep the rest of page.tsx as we already finalized (fullscreen reader, etc.) */}
     </div>
   );
 }
