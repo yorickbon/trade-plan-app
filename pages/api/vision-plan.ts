@@ -1,7 +1,12 @@
 // /pages/api/vision-plan.ts
 // Images-only planner: pick the best idea by scoring multiple strategies.
 // Upload: m15 (execution), h1 (context), h4 (HTF), optional calendar.
-// Keeps your existing style and headings. Small, targeted fixes only.
+// Keeps your existing style, fixes image parts for chat/completions, and adds:
+// - Dual options (Pending vs Market) with independent conviction
+// - Market allowed for ALL strategies if: breakout-proof OR already-at-entry
+// - Tiny 15m vision backfill for currentPrice
+// - Zone vs price sanity (adjust zone only)
+// - Synthesis if model returns JSON-only (keeps all sections incl. X-ray & Tournament)
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -15,7 +20,7 @@ type Err = { ok: false; reason: string };
 
 const OPENAI_API_KEY =
   process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-2025-08-07";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
 const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
 
 // ---------- helpers ----------
@@ -64,7 +69,7 @@ async function fileToDataUrl(file: any): Promise<string | null> {
 
 function originFromReq(req: NextApiRequest) {
   const proto = (req.headers["x-forwarded-proto"] as string) || "https";
-  const host = (req.headers.host as string) || (process.env.VERCEL_URL || "localhost:3000");
+  const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 
@@ -75,15 +80,22 @@ async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
       instrument
     )}&hours=48&max=12`;
     const r = await fetch(url, { cache: "no-store" });
-    if (!r.ok) return "";
-    const data = (await r.json().catch(() => ({}))) as any;
-    const items: any[] = Array.isArray(data?.items) ? data.items : [];
-    return items
-      .map((x) => `• ${x.title || x.headline || ""}`.trim())
-      .filter(Boolean)
+    const j = await r.json().catch(() => ({}));
+    const items: any[] = Array.isArray(j?.items) ? j.items : [];
+    const lines = items
+      .slice(0, 12)
+      .map((it: any) => {
+        const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
+        const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
+        const t = String(it?.title || "").slice(0, 200);
+        const src = it?.source || "";
+        const when = it?.ago || "";
+        return `• ${t} — ${src}, ${when} — ${lab}`;
+      })
       .join("\n");
+    return lines || null;
   } catch {
-    return "";
+    return null;
   }
 }
 
@@ -96,7 +108,6 @@ function refusalLike(s: string) {
 // fenced JSON extractor for trailing ai_meta
 function extractAiMeta(text: string) {
   if (!text) return null;
-  // look for ```ai_meta ...``` or ```json ...```
   const fences = [/```ai_meta\s*({[\s\S]*?})\s*```/i, /```json\s*({[\s\S]*?})\s*```/i];
   for (const re of fences) {
     const m = text.match(re);
@@ -109,36 +120,50 @@ function extractAiMeta(text: string) {
   return null;
 }
 
-// Market entry allowed only if proof of breakout+retest (or SFP reclaim)
+// breakout proof gate
 function hasBreakoutProof(aiMeta: any): boolean {
   const bp = aiMeta?.breakoutProof || {};
   return !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
 }
+
+// if output asked for Market but no proof -> require Pending
 function needsPendingLimit(aiMeta: any): boolean {
-  const et = String(aiMeta?.entryType || "").toLowerCase(); // "market" | "pending"
+  const et = String(aiMeta?.entryType || "").toLowerCase();
   if (et !== "market") return false;
-  return !hasBreakoutProof(aiMeta); // if not proven, require Pending
+  return !hasBreakoutProof(aiMeta);
 }
 
 // invalid Buy/Sell Limit vs current price and zone
 function invalidOrderRelativeToPrice(aiMeta: any): string | null {
-  const o = String(aiMeta?.entryOrder || "").toLowerCase(); // buy limit / sell limit
-  const dir = String(aiMeta?.direction || "").toLowerCase(); // long / short / flat
+  const o = String(aiMeta?.entryOrder || "").toLowerCase();
+  const dir = String(aiMeta?.direction || "").toLowerCase();
   const z = aiMeta?.zone || {};
   const p = Number(aiMeta?.currentPrice);
   const zmin = Number(z?.min);
   const zmax = Number(z?.max);
-  if (!Number.isFinite(p) || !Number.isFinite(zmin) || !Number.isFinite(zmax)) return null;
+  if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return null;
 
-  if (o.includes("sell") && o.includes("limit")) {
-    if (!(zmin > p && zmax > p)) return "Sell Limit must be above current price.";
+  if (o === "sell limit" && dir === "short") {
+    if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price";
   }
-  if (o.includes("buy") && o.includes("limit")) {
-    if (!(zmin < p && zmax < p)) return "Buy Limit must be below current price.";
+  if (o === "buy limit" && dir === "long") {
+    if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price";
   }
-  if (dir === "long" && o.includes("sell")) return "Long setups cannot use Sell Limit.";
-  if (dir === "short" && o.includes("buy")) return "Short setups cannot use Buy Limit.";
   return null;
+}
+
+// already-at-entry check for Market option (any strategy)
+function alreadyAtEntry(aiMeta: any): boolean {
+  const p = Number(aiMeta?.currentPrice);
+  const z = aiMeta?.zone || {};
+  const zmin = Number(z?.min);
+  const zmax = Number(z?.max);
+  if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return false;
+  // tiny buffer relative to price to account for ticks; ~0.05%
+  const buf = Math.abs(p) * 0.0005;
+  const lo = Math.min(zmin, zmax) - buf;
+  const hi = Math.max(zmin, zmax) + buf;
+  return p >= lo && p <= hi;
 }
 
 // Replace / append fenced ai_meta with updated one
@@ -155,7 +180,9 @@ function upsertAiMetaFence(text: string, aiMeta: any) {
 function hasReadableCard(text: string) {
   if (!text) return false;
   const noFences = text.replace(/```[\s\S]*?```/g, "").trim();
-  return /Quick Plan|Full Breakdown|Final Table Summary|•/.test(noFences);
+  return /Quick Plan|Full Breakdown|Final Table Summary|Detected Structures|Candidate Scores/i.test(
+    noFences
+  );
 }
 
 // Parse "Conviction: 62%" from the card
@@ -167,36 +194,38 @@ function parseConvictionPercent(text: string): number | null {
   return Math.max(0, Math.min(100, n));
 }
 
-// Inject a one-line reason why Market is withheld
-function addMarketWithheldReason(text: string, reason: string) {
-  const anchor = /(^|\n)Full Breakdown/i;
-  const line = `\n*Market withheld:* ${reason}\n`;
-  if (anchor.test(text)) {
-    return text.replace(anchor, `${line}$&`);
-  }
-  return text + line;
+// Inject/Update Fundamental & Headline Snapshot on top
+function withFundamentalSnapshot(text: string, snapshot?: string | null) {
+  if (!snapshot) return text;
+  const block =
+    "Fundamental & Headline Snapshot\n" +
+    (snapshot?.trim() ? snapshot.trim() + "\n" : "") +
+    "\n";
+  if (/^Fundamental\s*&\s*Headline Snapshot/i.test(text.trim())) return text; // already present
+  return block + text;
 }
 
-// Inject "Option 2 — Market" when breakout proof exists
-function injectMarketOption(text: string, aiMeta: any) {
+// Insert Option 2 — Market with its own conviction
+function injectOption2Market(text: string, aiMeta: any, convPending: number): string {
   const cp = Number(aiMeta?.currentPrice);
   const stop = aiMeta?.stop ?? "Same as Option 1";
   const tp1 = aiMeta?.tp1 ?? "Same as Option 1";
   const tp2 = aiMeta?.tp2 ?? "Same as Option 1";
 
-  let conv = parseConvictionPercent(text);
-  let conv2: string;
-  if (conv === null) conv2 = "~5% lower than Option 1";
-  else conv2 = String(Math.max(0, conv - 5)) + "%";
+  // heuristics: if breakout-proof -> +5; if already-at-entry -> +3; cap 95
+  let bonus = 0;
+  if (hasBreakoutProof(aiMeta)) bonus += 5;
+  if (alreadyAtEntry(aiMeta)) bonus += 3;
+  const convMarket = Math.max(0, Math.min(95, convPending + bonus));
 
   const option = [
     "",
-    "Option 2 — Market (only with breakout proof)",
+    "Option 2 — Market",
     `• Order Type: Market`,
     `• Entry: ${Number.isFinite(cp) ? cp : "current price"}`,
     `• Stop Loss: ${typeof stop === "number" ? stop : String(stop)}`,
     `• Take Profit(s): TP1 ${typeof tp1 === "number" ? tp1 : String(tp1)} / TP2 ${typeof tp2 === "number" ? tp2 : String(tp2)}`,
-    `• Conviction: ${conv2}`,
+    `• Conviction: ${convMarket}%`,
   ].join("\n");
 
   // Place just before "Full Breakdown"
@@ -233,7 +262,6 @@ async function backfillCurrentPriceFromM15(m15: string): Promise<number | null> 
       body: JSON.stringify({
         model: OPENAI_MODEL,
         messages,
-        // fast + cheap; small completion
         max_completion_tokens: 64,
       }),
     });
@@ -245,8 +273,7 @@ async function backfillCurrentPriceFromM15(m15: string): Promise<number | null> 
         ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
         : "");
     const s = String(out || "").trim();
-    if (!s) return null;
-    if (/^null$/i.test(s)) return null;
+    if (!s || /^null$/i.test(s)) return null;
     const num = Number(s.replace(/[^\d.\-]/g, ""));
     return Number.isFinite(num) ? num : null;
   } catch {
@@ -254,53 +281,66 @@ async function backfillCurrentPriceFromM15(m15: string): Promise<number | null> 
   }
 }
 
-// Create a readable card from ai_meta if model returned JSON-only
-function synthesizeCardFromMeta(instrument: string, aiMeta: any) {
+// Create a full card from ai_meta (keeps all your sections)
+function synthesizeCardFromMeta(instrument: string, aiMeta: any, snapshot?: string | null) {
   const dir = aiMeta?.direction ?? "Flat";
-  const entryOrder = aiMeta?.entryOrder ?? "Pending";
-  const zone = aiMeta?.zone
-    ? typeof aiMeta.zone === "object"
+  const order = aiMeta?.entryOrder ?? "Pending";
+  const zone =
+    aiMeta?.zone && typeof aiMeta.zone === "object"
       ? `${aiMeta.zone.min ?? "…"} – ${aiMeta.zone.max ?? "…"}`
-      : String(aiMeta.zone)
-    : "—";
+      : "—";
   const stop = aiMeta?.stop ?? "—";
   const tp1 = aiMeta?.tp1 ?? "—";
   const tp2 = aiMeta?.tp2 ?? "—";
+  const conv = 50;
 
-  const lines: string[] = [
-    "Quick Plan (Actionable)",
-    "",
-    `• Direction: ${dir}`,
-    `• Order Type: ${entryOrder}`,
-    `• Trigger: Structure-based limit pullback or breakout with proof`,
-    `• Entry: ${zone}`,
-    `• Stop Loss: ${stop}`,
-    `• Take Profit(s): TP1 ${tp1} / TP2 ${tp2}`,
-    `• Conviction: 50%`,
-    `• Setup: ${aiMeta?.selectedStrategy || "Images-driven setup"}`,
-    "",
-    "Full Breakdown",
-    "• Technical View (HTF + Intraday): Based on uploaded 4H/1H/15m images.",
-    "• Fundamental View (Calendar + Sentiment): Based on headlines/calendar image.",
-    "• Tech vs Fundy Alignment: —",
-    "• Conditional Scenarios: —",
-    "• Surprise Risk: —",
-    "• Invalidation: —",
-    "• One-liner Summary: —",
-    "",
-    "Detected Structures (X-ray):",
-    "• 4H: —",
-    "• 1H: —",
-    "• 15m: —",
-    "",
-    "Candidate Scores (tournament):",
-    "—",
-    "",
-    "Final Table Summary:",
-    "| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |",
-    `| ${instrument} | ${dir} | ${zone} | ${stop} | ${tp1} | ${tp2} | 50% |`,
-  ];
-  return lines.join("\n");
+  const base =
+    [
+      "Quick Plan (Actionable)",
+      "",
+      `• Direction: ${dir}`,
+      `• Order Type: ${order}`,
+      `• Trigger: Structure-based trigger (OB/FVG/SR/Fib/BOS)`,
+      `• Entry: ${zone}`,
+      `• Stop Loss: ${stop}`,
+      `• Take Profit(s): TP1 ${tp1} / TP2 ${tp2}`,
+      `• Conviction: ${conv}%`,
+      `• Setup: ${aiMeta?.selectedStrategy || "Images-driven setup"}`,
+      `• Short Reasoning: —`,
+      "",
+      "Full Breakdown",
+      "• Technical View (HTF + Intraday): Based on 4H/1H/15m images.",
+      "• Fundamental View (Calendar + Sentiment): Headlines snapshot considered.",
+      "• Tech vs Fundy Alignment: —",
+      "• Conditional Scenarios: —",
+      "• Surprise Risk: —",
+      "• Invalidation: —",
+      "• One-liner Summary: —",
+      "",
+      "Detected Structures (X-ray):",
+      "• 4H: —",
+      "• 1H: —",
+      "• 15m: —",
+      "",
+      "Candidate Scores (tournament):",
+      "- —",
+      "",
+      "Advanced Reasoning (Pro-Level Context)",
+      "• Priority Bias: —",
+      "• Structure Context: —",
+      "• Confirmation Logic: —",
+      "• Fundies vs Techs: —",
+      "• Scenario Planning: —",
+      "",
+      "Notes",
+      "—",
+      "",
+      "Final Table Summary:",
+      "| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |",
+      `| ${instrument} | ${dir} | ${zone} | ${stop} | ${tp1} | ${tp2} | ${conv}% |`,
+    ].join("\n");
+
+  return withFundamentalSnapshot(base, snapshot || null);
 }
 
 // ---------- OpenAI caller ----------
@@ -315,8 +355,7 @@ async function callOpenAI(messages: any[]) {
     body: JSON.stringify({
       model: OPENAI_MODEL,
       messages,
-      // Important for GPT-5: use max_completion_tokens, leave temperature default
-      max_completion_tokens: 1600,
+      max_completion_tokens: 1600, // stability as agreed
     }),
   });
   const json = await rsp.json().catch(() => ({} as any));
@@ -356,36 +395,21 @@ function tournamentMessages(params: {
 
   const system = [
     "You are a professional discretionary trader.",
-    "Perform **visual** analysis only (no fetched data).",
-    "Return a **readable markdown trade card** with the exact headings used below.",
-    "At the very end, append a fenced JSON block labeled ai_meta with:",
-    "{ selectedStrategy, entryType, entryOrder, direction, currentPrice, zone, stop, tp1, tp2, breakoutProof }.",
-  ].join("\n");
-
-  const userParts: any[] = [
-    { type: "text", text: `Instrument: ${instrument}\nDate: ${dateStr}\n\nPick the best idea by scoring multiple strategies (tournament). Always output the card below, then the ai_meta fence.` },
-    { type: "image_url", image_url: { url: h4 } as any },
-    { type: "image_url", image_url: { url: h1 } as any },
-    { type: "image_url", image_url: { url: m15 } as any },
-  ];
-  if (calendarDataUrl) {
-    userParts.unshift({
-      type: "text",
-      text: "Calendar image (consider only if relevant):",
-    });
-    userParts.splice(1, 0, { type: "image_url", image_url: { url: calendarDataUrl } as any });
-  }
-  if (headlinesText) {
-    userParts.push({
-      type: "text",
-      text: `Recent headlines snapshot:\n${headlinesText}`,
-    });
-  }
-
-  const template = [
+    "Perform visual price-action market analysis from the images only (no numeric candles fetched).",
+    "Multi-timeframe alignment: 15m execution, 1H context, 4H HTF.",
+    "Tournament mode: create candidates for these strategies and score them (0–100):",
+    "- BOS continuation (break + retest), Pullback to Fibs (0.382/0.5/0.618/0.786) with confluence, OB/FVG/Structure retest, Range breakout (incl. ORB), Liquidity grab/SFP + reclaim, SR flip, EMA momentum as tie-breaker, Trendline break + retest, Breaker/momentum blocks, Post-news reaction.",
+    "Scoring rubric (0–100): Structure trend(25), 15m trigger quality(25), HTF context(15), Clean path to target(10), Stop validity(10), Fundamentals/Headlines(10), 'No chase' penalty(5).",
+    "Market entry (Option 2) rules: allowed for ANY strategy when either (a) explicit breakout proof exists (body close beyond + retest holds OR SFP reclaim), or (b) price is already at the proposed entry zone (tiny tolerance). Otherwise only Pending.",
+    "Stops just beyond invalidation with a small buffer.",
+    "Use calendar/headlines as bias overlay if provided.",
+    "",
+    "OUTPUT format (must include ALL sections exactly in this order):",
+    "Fundamental & Headline Snapshot",
+    "",
     "Quick Plan (Actionable)",
     "",
-    "• Direction: <Long | Short | Flat>",
+    "• Direction: Long | Short | Stay Flat",
     "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
     "• Trigger: (ex: Limit pullback / zone touch)",
     "• Entry: <min–max> or specific level",
@@ -412,14 +436,60 @@ function tournamentMessages(params: {
     "Candidate Scores (tournament):",
     "- name — score — reason",
     "",
+    "Advanced Reasoning (Pro-Level Context)",
+    "• Priority Bias:",
+    "• Structure Context:",
+    "• Confirmation Logic:",
+    "• How fundamentals strengthen/weakens the setup:",
+    "• Scenario Planning:",
+    "",
+    "Notes",
+    "—",
+    "",
     "Final Table Summary:",
     "| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |",
     `| ${instrument} | ... | ... | ... | ... | ... | ... |`,
+    "",
+    "At the very end, append a fenced JSON block labeled ai_meta with:",
+    "```ai_meta",
+    `{ "selectedStrategy": string,`,
+    `  "entryType": "Pending" | "Market",`,
+    `  "entryOrder": "Sell Limit" | "Buy Limit" | "Sell Stop" | "Buy Stop" | "Market",`,
+    `  "direction": "Long" | "Short" | "Flat",`,
+    `  "currentPrice": number | null,`,
+    `  "zone": { "min": number, "max": number, "tf": "15m" | "1H" | "4H", "type": "OB" | "FVG" | "SR" | "Other" },`,
+    `  "stop": number, "tp1": number, "tp2": number,`,
+    `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
+    `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
+    `  "convictionPending": number | null,`,
+    `  "convictionMarket": number | null }`,
+    "```",
   ].join("\n");
+
+  const userParts: any[] = [
+    { type: "text", text: `Instrument: ${instrument}\nDate: ${dateStr}` },
+    { type: "text", text: "HTF 4H Chart:" },
+    { type: "image_url", image_url: { url: h4 } },
+    { type: "text", text: "Context 1H Chart:" },
+    { type: "image_url", image_url: { url: h1 } },
+    { type: "text", text: "Execution 15M Chart:" },
+    { type: "image_url", image_url: { url: m15 } },
+  ];
+
+  if (calendarDataUrl) {
+    userParts.push({ type: "text", text: "Economic Calendar Image:" });
+    userParts.push({ type: "image_url", image_url: { url: calendarDataUrl } });
+  }
+  if (headlinesText) {
+    userParts.push({
+      type: "text",
+      text: `Recent headlines snapshot:\n${headlinesText}`,
+    });
+  }
 
   return [
     { role: "system", content: system },
-    { role: "user", content: [ { type: "text", text: template }, ...userParts ] },
+    { role: "user", content: userParts },
   ];
 }
 
@@ -444,7 +514,7 @@ async function rewriteAsPending(instrument: string, text: string) {
     {
       role: "system",
       content:
-        "Rewrite the trade card as PENDING (no Market) into a clean Buy/Sell LIMIT plan, because breakout proof is missing. Keep tournament section and X-ray.",
+        "Rewrite the trade card as PENDING (no Market) into a clean Buy/Sell LIMIT zone at OB/FVG/SR confluence if breakout proof is missing. Keep tournament section and X-ray.",
     },
     {
       role: "user",
@@ -454,13 +524,13 @@ async function rewriteAsPending(instrument: string, text: string) {
   return callOpenAI(messages);
 }
 
-// If 'Breakout + Retest' is claimed but proof isn't shown, normalize label
+// normalize mislabeled Breakout+Retest without proof -> Pullback
 async function normalizeBreakoutLabel(text: string) {
   const messages = [
     {
       role: "system",
       content:
-        "If 'Breakout + Retest' is claimed but proof is not shown, rename setup to 'Pullback (OB/FVG/SR)' and leave rest unchanged.",
+        "If 'Breakout + Retest' is claimed but proof is not shown (body close + retest hold or SFP reclaim), rename setup to 'Pullback (OB/FVG/SR)' and leave rest unchanged.",
     },
     { role: "user", content: text },
   ];
@@ -501,73 +571,69 @@ export default async function handler(
       return res.status(400).json({
         ok: false,
         reason:
-          "Use multipart/form-data with files: m15, h1, h4 (and optional calendar).",
+          "Use multipart/form-data with files: m15, h1, h4 (PNG/JPG) and optional 'calendar'. Also include 'instrument' field.",
       });
     }
 
     const { fields, files } = await parseMultipart(req);
-    const instrument = String(pickFirst(fields.instrument) || "").trim();
-    const dateStr = String(pickFirst(fields.dateStr) || "").trim() || new Date().toISOString();
-    const m15Url = await fileToDataUrl(pickFirst(files.m15));
-    const h1Url = await fileToDataUrl(pickFirst(files.h1));
-    const h4Url = await fileToDataUrl(pickFirst(files.h4));
-    const calUrl = await fileToDataUrl(pickFirst(files.calendar));
-    if (!m15Url || !h1Url || !h4Url) {
-      return res.status(400).json({
-        ok: false,
-        reason: "Missing required images m15, h1, h4.",
-      });
+    const instrument = String(fields.instrument || fields.code || "EURUSD")
+      .toUpperCase()
+      .replace(/\s+/g, "");
+
+    const m15f = pickFirst(files.m15);
+    const h1f = pickFirst(files.h1);
+    const h4f = pickFirst(files.h4);
+    const calF = pickFirst(files.calendar);
+
+    const [m15, h1, h4, calUrl] = await Promise.all([
+      fileToDataUrl(m15f),
+      fileToDataUrl(h1f),
+      fileToDataUrl(h4f),
+      calF ? fileToDataUrl(calF) : Promise.resolve(null),
+    ]);
+
+    if (!m15 || !h1 || !h4) {
+      return res
+        .status(400)
+        .json({ ok: false, reason: "Upload all three charts: m15, h1, h4 (PNG/JPG)." });
     }
 
-    // 0) Headlines (no-store) — used for sentiment bias, optional
     const headlinesText = await fetchedHeadlines(req, instrument);
+    const dateStr = new Date().toISOString().slice(0, 10);
 
-    // 1) Ask the vision tournament
+    // 1) Tournament pass
     let { text, aiMeta } = await askTournament({
       instrument,
       dateStr,
       calendarDataUrl: calUrl || undefined,
       headlinesText: headlinesText || undefined,
-      m15: m15Url,
-      h1: h1Url,
-      h4: h4Url,
+      m15,
+      h1,
+      h4,
     });
 
-    // 1.a) If model returned only JSON or no readable card, synthesize from ai_meta
+    // Ensure fundamental snapshot header exists (front-load headlines)
+    text = withFundamentalSnapshot(text, headlinesText || "");
+
+    // 1a) If JSON-only or missing readable card -> synthesize base card with all sections
     if ((!hasReadableCard(text) || /^```(?:ai_meta|json)/i.test(text.trim())) && aiMeta) {
-      const synthesized = synthesizeCardFromMeta(instrument, aiMeta);
-      text = [synthesized, "", "```ai_meta", JSON.stringify(aiMeta, null, 2), "```"].join("\n");
+      text = synthesizeCardFromMeta(instrument, aiMeta, headlinesText || "");
+      text = upsertAiMetaFence(text, aiMeta);
     }
 
-    // 1.b) Backfill currentPrice if missing with a tiny vision call on the 15m image
+    // 1b) Backfill currentPrice if missing
     if (aiMeta && !(Number.isFinite(Number(aiMeta.currentPrice)))) {
-      const backfilled = await backfillCurrentPriceFromM15(m15Url);
+      const backfilled = await backfillCurrentPriceFromM15(m15);
       if (backfilled != null) {
         aiMeta.currentPrice = backfilled;
         text = upsertAiMetaFence(text, aiMeta);
       }
     }
 
-    // 2) Force Pending if Market without proof, and add withheld reason
-    if (aiMeta) {
-      if (needsPendingLimit(aiMeta)) {
-        text = await rewriteAsPending(instrument, text);
-        aiMeta = extractAiMeta(text) || aiMeta;
-        text = addMarketWithheldReason(
-          text,
-          "Missing breakout proof (require body close beyond + retest holds or SFP reclaim)."
-        );
-        aiMeta = extractAiMeta(text) || aiMeta;
-      } else if (hasBreakoutProof(aiMeta)) {
-        // 2.b) Add Option 2 (Market) section (~5% lower conviction)
-        text = injectMarketOption(text, aiMeta);
-      } else {
-        // Not market, but still no proof: add reason to explain why Market is withheld
-        text = addMarketWithheldReason(
-          text,
-          "Missing breakout proof (require body close beyond + retest holds or SFP reclaim)."
-        );
-      }
+    // 2) Force Pending if Market without breakout proof
+    if (aiMeta && needsPendingLimit(aiMeta)) {
+      text = await rewriteAsPending(instrument, text);
+      aiMeta = extractAiMeta(text) || aiMeta;
     }
 
     // 3) Normalize mislabeled Breakout+Retest if no proof
@@ -588,65 +654,55 @@ export default async function handler(
       }
     }
 
-    // 5) If blank or refusal -> skeleton fallback (still append ai_meta)
-    if (!text || refusalLike(text)) {
-      const fallback =
-        [
-          "Quick Plan (Actionable)",
-          "",
-          "• Direction: Stay Flat (low conviction).",
-          "• Order Type: Pending",
-          "• Trigger: Confluence (OB/FVG/SR) after a clean trigger.",
-          "• Entry: zone below/above current (structure based).",
-          "• Stop Loss: beyond invalidation with small buffer.",
-          "• Take Profit(s): Prior swing/liquidity; then trail.",
-          "• Conviction: 30%",
-          "• Setup: Await valid trigger (images inconclusive).",
-          "",
-          "Full Breakdown",
-          "• Technical View: Indecisive; likely range.",
-          "• Fundamental View: Mixed; keep size conservative.",
-          "• Tech vs Fundy Alignment: Mixed.",
-          "• Conditional Scenarios: Break+retest for continuation; SFP & reclaim for reversal.",
-          "• Surprise Risk: Headlines; CB speakers.",
-          "• Invalidation: Opposite-side body close beyond range edge.",
-          "• One-liner Summary: Stand by for a clean trigger.",
-          "",
-          "Detected Structures (X-ray):",
-          "• 4H: –",
-          "• 1H: –",
-          "• 15m: –",
-          "",
-          "Candidate Scores (tournament):",
-          "–",
-          "",
-          "Final Table Summary:",
-          `| Instrument | Bias   | Entry Zone | SL  | TP1 | TP2 | Conviction % |`,
-          `| ${instrument} | Neutral | Wait for trigger | Structure-based | Prior swing | Next liquidity | 30% |`,
-        ].join("\n");
+    // 5) Dual options (independent convictions)
+    if (aiMeta) {
+      // Conviction for Option 1 (Pending) parsed from card or ai_meta.convictionPending or 50
+      let convPending = parseConvictionPercent(text) ?? Number(aiMeta?.convictionPending);
+      if (!Number.isFinite(convPending as any)) convPending = 50;
 
+      // Decide if Option 2 (Market) is allowed:
+      const allowMarket = hasBreakoutProof(aiMeta) || alreadyAtEntry(aiMeta);
+
+      if (allowMarket) {
+        text = injectOption2Market(text, aiMeta, convPending as number);
+      } else {
+        // Add a one-liner explaining absence of Market
+        const anchor = /(^|\n)Full Breakdown/i;
+        const line = `\n*Market withheld:* Needs breakout proof or price at entry zone.\n`;
+        if (anchor.test(text)) text = text.replace(anchor, `${line}$&`);
+        else text += line;
+      }
+    }
+
+    // 6) Fallback if refusal/empty
+    if (!text || refusalLike(text)) {
+      const fallback = synthesizeCardFromMeta(instrument, aiMeta || {}, headlinesText || "");
       const fallbackMeta = {
-        selectedStrategy: "Await valid trigger",
+        selectedStrategy: aiMeta?.selectedStrategy || "Await valid trigger",
         entryType: "Pending",
         entryOrder: "Pending",
-        direction: "Flat",
+        direction: aiMeta?.direction || "Flat",
         currentPrice: aiMeta?.currentPrice ?? null,
-        zone: null,
-        stop: null,
-        tp1: null,
-        tp2: null,
+        zone: aiMeta?.zone ?? null,
+        stop: aiMeta?.stop ?? null,
+        tp1: aiMeta?.tp1 ?? null,
+        tp2: aiMeta?.tp2 ?? null,
         breakoutProof: {
           bodyCloseBeyond: false,
           retestHolds: false,
           sfpReclaim: false,
         },
+        candidateScores: aiMeta?.candidateScores || [],
+        convictionPending: 30,
+        convictionMarket: null,
+        note: "Fallback used due to refusal/empty output.",
       };
-
       return res.status(200).json({
         ok: true,
-        text: [fallback, "", "```ai_meta", JSON.stringify(fallbackMeta, null, 2), "```"].join("\n"),
+        text: upsertAiMetaFence(fallback, fallbackMeta),
         meta: {
           instrument,
+          hasCalendar: !!calUrl,
           headlinesCount: headlinesText ? headlinesText.length : 0,
           strategySelection: false,
           rewritten: false,
@@ -656,11 +712,8 @@ export default async function handler(
       });
     }
 
-    // Ensure we always return a readable card + ai_meta fence
-    if (!hasReadableCard(text) && aiMeta) {
-      const synth = synthesizeCardFromMeta(instrument, aiMeta);
-      text = [synth, "", "```ai_meta", JSON.stringify(aiMeta, null, 2), "```"].join("\n");
-    } else if (aiMeta) {
+    // Ensure we always return the ai_meta fence reflecting any updates
+    if (aiMeta) {
       text = upsertAiMetaFence(text, aiMeta);
     }
 
@@ -670,6 +723,7 @@ export default async function handler(
       text,
       meta: {
         instrument,
+        hasCalendar: !!calUrl,
         headlinesCount: headlinesText ? headlinesText.length : 0,
         strategySelection: true,
         rewritten: false,
