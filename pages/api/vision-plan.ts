@@ -1,9 +1,7 @@
 // /pages/api/vision-plan.ts
-// Images-only planner: m15 (execution), 1H + 4H context, optional calendar image.
-// Minimal changes from your base:
-//  - Require ai_meta.currentPrice in prompt (approx last price from 15m; never null).
-//  - If still missing, backfill with a tiny follow-up vision call.
-//  - Market orders are allowed only with explicit breakout proof; otherwise Pending Limit.
+// Images-only planner: pick the best idea by scoring multiple strategies.
+// Upload: m15 (execution), h1 (context), h4 (HTF), optional calendar.
+// Keeps your existing style, fixes roles + image parts for chat/completions.
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -17,10 +15,10 @@ type Err = { ok: false; reason: string };
 
 const OPENAI_API_KEY =
   process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-2025-08-07";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
 const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
 
-// ---------- helpers (unchanged style) ----------
+// ---------- helpers ----------
 
 async function getFormidable() {
   const mod: any = await import("formidable");
@@ -61,21 +59,21 @@ async function fileToDataUrl(file: any): Promise<string | null> {
   if (!p) return null;
   const buf = await fs.readFile(p);
   const mime = file.mimetype || "image/png";
-  return data:${mime};base64,${buf.toString("base64")};
+  return `data:${mime};base64,${buf.toString("base64")}`;
 }
 
 function originFromReq(req: NextApiRequest) {
   const proto = (req.headers["x-forwarded-proto"] as string) || "https";
   const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
-  return host.startsWith("http") ? host : ${proto}://${host};
+  return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 
 async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
   try {
     const base = originFromReq(req);
-    const url = ${base}/api/news?instrument=${encodeURIComponent(
+    const url = `${base}/api/news?instrument=${encodeURIComponent(
       instrument
-    )}&hours=48&max=12;
+    )}&hours=48&max=12`;
     const r = await fetch(url, { cache: "no-store" });
     const j = await r.json().catch(() => ({}));
     const items: any[] = Array.isArray(j?.items) ? j.items : [];
@@ -87,7 +85,7 @@ async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
         const t = String(it?.title || "").slice(0, 200);
         const src = it?.source || "";
         const when = it?.ago || "";
-        return • ${t} — ${src}, ${when} — ${lab};
+        return `• ${t} — ${src}, ${when} — ${lab}`;
       })
       .join("\n");
     return lines || null;
@@ -105,16 +103,8 @@ function refusalLike(s: string) {
 // fenced JSON extractor for trailing ai_meta
 function extractAiMeta(text: string) {
   if (!text) return null;
-  // look for 
-ai_meta ...
- or 
-json ...
-
-  const fences = [/
-ai_meta\s*({[\s\S]*?})\s*
-/i, /
-json\s*({[\s\S]*?})\s*
-/i];
+  // look for ```json ... ```
+  const fences = [/```ai_meta\s*({[\s\S]*?})\s*```/i, /```json\s*({[\s\S]*?})\s*```/i];
   for (const re of fences) {
     const m = text.match(re);
     if (m && m[1]) {
@@ -131,9 +121,7 @@ function needsPendingLimit(aiMeta: any): boolean {
   const et = String(aiMeta?.entryType || "").toLowerCase(); // "market" | "pending"
   if (et !== "market") return false;
   const bp = aiMeta?.breakoutProof || {};
-  const ok =
-    bp?.bodyCloseBeyond === true &&
-    (bp?.retestHolds === true || bp?.sfpReclaim === true);
+  const ok = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
   return !ok; // if not proven, require Pending
 }
 
@@ -158,13 +146,13 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   return null;
 }
 
-// --- OpenAI call (chat/completions with vision parts). Keep params minimal for GPT-5.
+// OpenAI call (chat/completions, vision content parts)
 async function callOpenAI(messages: any[]) {
-  const rsp = await fetch(${OPENAI_API_BASE}/chat/completions, {
+  const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: Bearer ${OPENAI_API_KEY},
+      authorization: `Bearer ${OPENAI_API_KEY}`,
     },
     body: JSON.stringify({
       model: OPENAI_MODEL,
@@ -174,7 +162,7 @@ async function callOpenAI(messages: any[]) {
   const json = await rsp.json().catch(() => ({} as any));
   if (!rsp.ok) {
     throw new Error(
-      OpenAI vision request failed: ${rsp.status} ${JSON.stringify(json)}
+      `OpenAI vision request failed: ${rsp.status} ${JSON.stringify(json)}`
     );
   }
   const out =
@@ -211,21 +199,19 @@ function tournamentMessages(params: {
     "Perform **visual** price-action market analysis from the images (no numeric candles).",
     "Multi-timeframe alignment: 15m execution, 1H context, 4H HTF.",
     "Tournament mode: score candidates (Long/Short where valid):",
-    "- Pullback to OB/FVG/SR confluence, Breakout+Retest, SFP/Liquidity grab+reclaim, Range reversion, TL/channel retest, Double-tap.",
+    "- Pullback to OB/FVG/SR confluence, Breakout+Retest, SFP/Liquidity grab+reclaim, Range reversion, TL/channel retest, double-tap when clean.",
     "Scoring rubric (0–100): Structure trend(25), 15m trigger quality(25), HTF context(15), Clean path to target(10), Stop validity(10), Fundamentals/Headlines(10), 'No chase' penalty(5).",
+    "Market entry allowed only when **explicit proof**: body close beyond level **and** retest holds (or SFP reclaim). Otherwise label EntryType: Pending and use Buy/Sell Limit zone.",
+    "Stops just beyond invalidation (swing/zone) with small buffer. RR can be < 1.5R if structure says so.",
+    "Use calendar/headlines as bias overlay if provided.",
     "",
-    // Market handling:
-    "Market order is OPTIONAL: choose it only with explicit proof of breakout (BODY CLOSE beyond level AND a successful RETEST that HOLDS, or an SFP reclaim).",
-    "Otherwise use a Pending LIMIT order at the confluence zone (OB/FVG/SR) on the correct side of price.",
-    "Stops just beyond invalidation (swing/zone) with a small buffer. RR may be < 1.5R if structure justifies it.",
-    "Use calendar/headlines for bias overlay if provided.",
-    "",
-    "OUTPUT format (exact order and headings):",
+    "OUTPUT format:",
     "Quick Plan (Actionable)",
+    "",
     "• Direction: Long | Short | Stay Flat",
     "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-    "• Trigger: (e.g., Limit pullback / zone touch or Break & Retest)",
-    "• Entry: <min–max> or a specific level (Market only if proof shown)",
+    "• Trigger: (ex: Limit pullback / zone touch)",
+    "• Entry: <min–max> or specific level",
     "• Stop Loss: <level>",
     "• Take Profit(s): TP1 <level> / TP2 <level>",
     "• Conviction: <0–100>%",
@@ -233,7 +219,7 @@ function tournamentMessages(params: {
     "• Short Reasoning: <1–2 lines>",
     "",
     "Full Breakdown",
-    "• Technical View (HTF + Intraday): 4H / 1H / 15m structure",
+    "• Technical View (HTF + Intraday): 4H/1H/15m structure",
     "• Fundamental View (Calendar + Sentiment):",
     "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
     "• Conditional Scenarios:",
@@ -251,26 +237,24 @@ function tournamentMessages(params: {
     "",
     "Final Table Summary:",
     "| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |",
-    | ${instrument} | ... | ... | ... | ... | ... | ... |,
+    `| ${instrument} | ... | ... | ... | ... | ... | ... |`,
     "",
-    "At the very end, append a fenced JSON block labeled ai_meta with **all** fields present:",
-    "
-ai_meta",
+    "At the very end, append a fenced JSON block labeled ai_meta with:",
+    "```ai_meta",
     `{ "selectedStrategy": string,`,
     `  "entryType": "Pending" | "Market",`,
     `  "entryOrder": "Sell Limit" | "Buy Limit" | "Sell Stop" | "Buy Stop" | "Market",`,
     `  "direction": "Long" | "Short" | "Flat",`,
-    `  "currentPrice": number,  // REQUIRED: approx last traded price read from the 15m chart; if unreadable, estimate from visible levels (do NOT return null)`,
+    `  "currentPrice": number | null,`,
     `  "zone": { "min": number, "max": number, "tf": "15m" | "1H" | "4H", "type": "OB" | "FVG" | "SR" | "Other" },`,
     `  "stop": number, "tp1": number, "tp2": number,`,
     `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
     `  "candidateScores": [{ "name": string, "score": number, "reason": string }]}`,
-    "
-",
+    "```",
   ].join("\n");
 
   const userParts: any[] = [
-    { type: "text", text: Instrument: ${instrument}\nDate: ${dateStr} },
+    { type: "text", text: `Instrument: ${instrument}\nDate: ${dateStr}` },
     { type: "text", text: "HTF 4H Chart:" },
     { type: "image_url", image_url: { url: h4 } },
     { type: "text", text: "Context 1H Chart:" },
@@ -286,7 +270,7 @@ ai_meta",
   if (headlinesText) {
     userParts.push({
       type: "text",
-      text: Recent headlines snapshot:\n${headlinesText},
+      text: `Recent headlines snapshot:\n${headlinesText}`,
     });
   }
 
@@ -296,26 +280,69 @@ ai_meta",
   ];
 }
 
-// Tiny backfill: if currentPrice is missing, ask model for a single number from the 15m image
-async function backfillCurrentPrice(instrument: string, imgs: { m15: string; h1: string; h4: string; cal?: string | null }) {
+async function askTournament(args: {
+  instrument: string;
+  dateStr: string;
+  calendarDataUrl?: string | null;
+  headlinesText?: string | null;
+  m15: string;
+  h1: string;
+  h4: string;
+}) {
+  const messages = tournamentMessages(args);
+  const text = await callOpenAI(messages);
+  const aiMeta = extractAiMeta(text);
+  return { text, aiMeta };
+}
+
+// rewrite card -> Pending limit (no Market) when proof missing
+async function rewriteAsPending(instrument: string, text: string) {
   const messages = [
     {
       role: "system",
       content:
-        "Return ONLY a number (no words): the approximate current/last traded price read from the 15m chart image. If unreadable, give your best numeric estimate from visible levels. No commas, no currency symbols.",
+        "Rewrite the trade card as PENDING (no Market) into a clean Buy/Sell LIMIT zone at OB/FVG/SR confluence if breakout proof is missing. Keep tournament section and X-ray.",
     },
     {
       role: "user",
-      content: [
-        { type: "text", text: Instrument: ${instrument} },
-        { type: "text", text: "15m Chart (execution):" },
-        { type: "image_url", image_url: { url: imgs.m15 } },
-      ],
+      content: `Instrument: ${instrument}\n\n${text}\n\nRewrite strictly to Pending.`,
     },
   ];
-  const txt = (await callOpenAI(messages)).trim();
-  const m = txt.match(/-?\d+(?:\.\d+)?/);
-  return m ? Number(m[0]) : null;
+  return callOpenAI(messages);
+}
+
+// normalize mislabeled Breakout+Retest without proof -> Pullback
+async function normalizeBreakoutLabel(text: string) {
+  const messages = [
+    {
+      role: "system",
+      content:
+        "If 'Breakout + Retest' is claimed but proof is not shown (body close + retest hold or SFP reclaim), rename setup to 'Pullback (OB/FVG/SR)' and leave rest unchanged.",
+    },
+    { role: "user", content: text },
+  ];
+  return callOpenAI(messages);
+}
+
+// fix Buy/Sell Limit level direction vs current price
+async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
+  const reason = invalidOrderRelativeToPrice(aiMeta);
+  if (!reason) return text;
+
+  const messages = [
+    {
+      role: "system",
+      content:
+        "Adjust the LIMIT zone so that: Sell Limit is an ABOVE-price pullback into supply; Buy Limit is a BELOW-price pullback into demand. Keep all other content & sections.",
+    },
+    {
+      role: "user",
+      content: `Instrument: ${instrument}\n\nCurrent Price: ${aiMeta?.currentPrice}\nProvided Zone: ${JSON.stringify(
+        aiMeta?.zone
+      )}\n\nCard:\n${text}\n\nFix only the LIMIT zone side and entry, keep format.`,
+    },
+  ];
+  return callOpenAI(messages);
 }
 
 // ---------- handler ----------
@@ -331,7 +358,7 @@ export default async function handler(
       return res.status(400).json({
         ok: false,
         reason:
-          "Use multipart/form-data with files: m15, h1, h4 (PNG/JPG) and optional 'calendar'. Include 'instrument' field from the dropdown.",
+          "Use multipart/form-data with files: m15, h1, h4 (PNG/JPG) and optional 'calendar'. Also include 'instrument' field.",
       });
     }
 
@@ -362,7 +389,7 @@ export default async function handler(
     const dateStr = new Date().toISOString().slice(0, 10);
 
     // 1) Tournament pass
-    const tourMsgs = tournamentMessages({
+    let { text, aiMeta } = await askTournament({
       instrument,
       dateStr,
       calendarDataUrl: calUrl || undefined,
@@ -371,66 +398,32 @@ export default async function handler(
       h1,
       h4,
     });
-    let text = await callOpenAI(tourMsgs);
-    let aiMeta = extractAiMeta(text);
-
-    // 1a) Backfill currentPrice if missing
-    if (!aiMeta || !Number.isFinite(Number(aiMeta.currentPrice))) {
-      const cp = await backfillCurrentPrice(instrument, { m15, h1, h4, cal: calUrl || undefined });
-      if (Number.isFinite(cp)) {
-        aiMeta = { ...(aiMeta || {}), currentPrice: Number(cp) };
-      }
-    }
 
     // 2) Force Pending if Market without proof
-    if (aiMeta && needsPendingLimit(aiMeta)) {
-      // Only rewrite the card (ai_meta will be re-extracted)
-      const messages = [
-        {
-          role: "system",
-          content:
-            "Rewrite the trade card as PENDING LIMIT (no Market) unless explicit breakout proof is present (body close beyond + retest holds or SFP reclaim). Keep tournament and X-ray.",
-        },
-        { role: "user", content: Instrument: ${instrument}\n\n${text} },
-      ];
-      text = await callOpenAI(messages);
+    if (needsPendingLimit(aiMeta)) {
+      text = await rewriteAsPending(instrument, text);
       aiMeta = extractAiMeta(text) || aiMeta;
-      // ensure currentPrice stays filled if model dropped it
-      if (!Number.isFinite(Number(aiMeta.currentPrice)) && Number.isFinite(Number(aiMeta?.currentPrice))) {
-        aiMeta.currentPrice = Number(aiMeta.currentPrice);
-      }
     }
 
-    // 3) Enforce order vs current price (Sell Limit above / Buy Limit below)
+    // 3) Normalize mislabeled Breakout+Retest if no proof
+    const bp = aiMeta?.breakoutProof || {};
+    const hasProof =
+      !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+    if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
+      text = await normalizeBreakoutLabel(text);
+      aiMeta = extractAiMeta(text) || aiMeta;
+    }
+
+    // 4) Enforce order vs current price (Sell Limit above / Buy Limit below)
     if (aiMeta) {
       const bad = invalidOrderRelativeToPrice(aiMeta);
       if (bad) {
-        const messages = [
-          {
-            role: "system",
-            content:
-              "Adjust ONLY the LIMIT zone so it’s on the correct side of current price (Sell Limit above price into supply; Buy Limit below price into demand). Keep format and all other sections untouched.",
-          },
-          {
-            role: "user",
-            content:
-              Instrument: ${instrument}\n +
-              Current Price: ${aiMeta.currentPrice}\n +
-              Provided Zone: ${JSON.stringify(aiMeta.zone)}\n\n +
-              Card:\n${text}\n\n +
-              Fix only the LIMIT side/entry.,
-          },
-        ];
-        text = await callOpenAI(messages);
+        text = await fixOrderVsPrice(instrument, text, aiMeta);
         aiMeta = extractAiMeta(text) || aiMeta;
-        // keep currentPrice if model omitted it
-        if (!Number.isFinite(Number(aiMeta.currentPrice)) && Number.isFinite(Number(aiMeta?.currentPrice))) {
-          aiMeta.currentPrice = Number(aiMeta.currentPrice);
-        }
       }
     }
 
-    // 4) Fallback if refusal/empty
+    // 5) Fallback if refusal/empty
     if (!text || refusalLike(text)) {
       const fallback =
         [
@@ -463,11 +456,10 @@ export default async function handler(
           "–",
           "",
           "Final Table Summary:",
-          | Instrument | Bias   | Entry Zone | SL  | TP1 | TP2 | Conviction % |,
-          | ${instrument} | Neutral | Wait for trigger | Structure-based | Prior swing | Next liquidity | 30% |,
+          `| Instrument | Bias   | Entry Zone | SL  | TP1 | TP2 | Conviction % |`,
+          `| ${instrument} | Neutral | Wait for trigger | Structure-based | Prior swing | Next liquidity | 30% |`,
           "",
-          "
-ai_meta",
+          "```ai_meta",
           JSON.stringify(
             {
               selectedStrategy: "Await valid trigger",
@@ -490,8 +482,7 @@ ai_meta",
             null,
             2
           ),
-          "
-",
+          "```",
         ].join("\n");
 
       res.setHeader("Cache-Control", "no-store");
@@ -531,5 +522,3 @@ ai_meta",
     });
   }
 }
-
-
