@@ -1,5 +1,33 @@
+// pages/api/openai-ping.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import OpenAI from "openai";
+
+function extractResponseText(rr: any): string {
+  // Try SDK convenience field:
+  if (rr && typeof rr.output_text === "string") return rr.output_text;
+
+  // Fallback: walk the output array structure
+  try {
+    const out0 = rr?.output?.[0];
+    const content = out0?.content ?? out0?.message?.content;
+
+    if (Array.isArray(content)) {
+      // Find a text-like item
+      const textPart =
+        content.find((c: any) => typeof c?.text === "string") ||
+        content.find((c: any) => c?.type === "output_text" && typeof c?.text === "string") ||
+        content.find((c: any) => typeof c?.value === "string");
+
+      if (textPart?.text) return textPart.text;
+      if (textPart?.value) return textPart.value;
+    }
+
+    if (typeof content === "string") return content;
+  } catch {
+    // ignore
+  }
+  return "";
+}
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
@@ -9,24 +37,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     const isGpt5 = defaultModel.toLowerCase().includes("gpt-5");
 
-    // We’ll return "pong" either way.
     let reply = "";
     let usedModel = defaultModel;
 
     if (isGpt5) {
-      // ▶ GPT-5 path: use Responses API (no temperature override; use max_output_tokens)
+      // ▶ GPT-5: Responses API (no temperature override; use max_output_tokens)
       const rr = await client.responses.create({
         model: defaultModel,
         input: "Reply with exactly: pong",
         max_output_tokens: 16,
       });
-      // Unified text accessor:
-      // @ts-expect-error: output_text is available at runtime in openai v4+
-      reply = rr.output_text ?? "";
-      // @ts-expect-error: model can be present on the response
-      usedModel = (rr as any).model || defaultModel;
+      reply = extractResponseText(rr) || "";
+      usedModel = (rr as any)?.model || defaultModel;
     } else {
-      // ▶ Non-GPT-5 path: use Chat Completions (classic)
+      // ▶ Other models: Chat Completions
       const r = await client.chat.completions.create({
         model: defaultModel,
         messages: [
@@ -34,7 +58,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           { role: "user", content: "ping" },
         ],
         max_tokens: 16,
-        // temperature omitted for broad compatibility
       });
       reply = r.choices?.[0]?.message?.content ?? "";
       usedModel = r.model || defaultModel;
