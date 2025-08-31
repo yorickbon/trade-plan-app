@@ -2,7 +2,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import formidable from "formidable";
 import fs from "fs";
-import path from "path";
 import OpenAI from "openai";
 
 export const config = {
@@ -44,17 +43,16 @@ function synthesizeQuickPlan(aiMeta: any): string {
   ].join("\n");
 }
 
-// Ensure numeric price sanity
 function enforceZoneSanity(aiMeta: any) {
   if (!aiMeta || typeof aiMeta.currentPrice !== "number") return aiMeta;
   const p = aiMeta.currentPrice;
   if (aiMeta.direction?.toLowerCase().includes("buy")) {
     if (typeof aiMeta.entryPrice === "number" && aiMeta.entryPrice >= p) {
-      aiMeta.entryPrice = p * 0.999; // nudge just below
+      aiMeta.entryPrice = p * 0.999;
     }
   } else if (aiMeta.direction?.toLowerCase().includes("sell")) {
     if (typeof aiMeta.entryPrice === "number" && aiMeta.entryPrice <= p) {
-      aiMeta.entryPrice = p * 1.001; // nudge just above
+      aiMeta.entryPrice = p * 1.001;
     }
   }
   return aiMeta;
@@ -96,7 +94,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   if (req.method !== "POST") return res.status(405).json({ ok: false, reason: "Method not allowed" });
 
   const form = formidable({ multiples: true });
-  form.parse(req, async (err, fields, files) => {
+  form.parse(req, async (err: Error | null, fields: formidable.Fields, files: formidable.Files) => {
     if (err) return res.status(500).json({ ok: false, reason: "Form parse failed" });
 
     try {
@@ -105,7 +103,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         .concat(files?.images || [])
         .filter((f: any) => f && f.filepath);
 
-      // Build OpenAI messages
       const messages: any[] = [
         {
           role: "system",
@@ -148,20 +145,17 @@ If model-only JSON is produced, that’s okay — the server will synthesize the
       let outTxt = rsp.choices[0]?.message?.content?.trim() || "";
       let aiMeta: any = null;
 
-      // Extract ai_meta if present
       try {
         const metaMatch = outTxt.match(/```ai_meta([\s\S]+?)```/);
         if (metaMatch) {
           aiMeta = JSON.parse(metaMatch[1]);
         } else {
-          // if entire output is JSON
           if (outTxt.startsWith("{")) aiMeta = JSON.parse(outTxt);
         }
       } catch {
         aiMeta = null;
       }
 
-      // Backfill currentPrice if missing
       if (aiMeta && (aiMeta.currentPrice == null || isNaN(aiMeta.currentPrice))) {
         const f15 = fileArray.find((f) => f.originalFilename?.includes("15"));
         if (f15) {
@@ -172,7 +166,6 @@ If model-only JSON is produced, that’s okay — the server will synthesize the
 
       aiMeta = enforceZoneSanity(aiMeta);
 
-      // Synthesize card if needed
       if (aiMeta && (!outTxt.includes("Quick Plan") || outTxt.startsWith("{"))) {
         const quick = synthesizeQuickPlan(aiMeta);
         outTxt = `${quick}\n\n---\n\n\`\`\`ai_meta\n${JSON.stringify(aiMeta, null, 2)}\n\`\`\``;
