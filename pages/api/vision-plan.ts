@@ -220,7 +220,7 @@ async function backfillCurrentPriceFromM15(m15: string): Promise<number | null> 
         role: "user",
         content: [
           { type: "text", text: "Return only the latest traded price visible on this 15m chart. If unreadable, reply null." },
-          { type: "input_image", image_url: { url: m15 } as any },
+          { type: "image_url", image_url: { url: m15 } as any },
         ],
       },
     ];
@@ -364,16 +364,16 @@ function tournamentMessages(params: {
 
   const userParts: any[] = [
     { type: "text", text: `Instrument: ${instrument}\nDate: ${dateStr}\n\nPick the best idea by scoring multiple strategies (tournament). Always output the card below, then the ai_meta fence.` },
-    { type: "input_image", image_url: { url: h4 } as any },
-    { type: "input_image", image_url: { url: h1 } as any },
-    { type: "input_image", image_url: { url: m15 } as any },
+    { type: "image_url", image_url: { url: h4 } as any },
+    { type: "image_url", image_url: { url: h1 } as any },
+    { type: "image_url", image_url: { url: m15 } as any },
   ];
   if (calendarDataUrl) {
     userParts.unshift({
       type: "text",
       text: "Calendar image (consider only if relevant):",
     });
-    userParts.splice(1, 0, { type: "input_image", image_url: { url: calendarDataUrl } as any });
+    userParts.splice(1, 0, { type: "image_url", image_url: { url: calendarDataUrl } as any });
   }
   if (headlinesText) {
     userParts.push({
