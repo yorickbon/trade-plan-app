@@ -8,12 +8,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const altModel = process.env.OPENAI_MODEL_ALT || "gpt-4o-mini";
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
-    // Tiny no-op call just to verify the model & params are accepted.
+    // Small, deterministic ping that works with GPT-5 (uses max_completion_tokens)
     const r = await client.chat.completions.create({
       model: defaultModel,
-      // GPT-5 (and reasoning models) want max_completion_tokens instead of max_tokens
-      max_completion_tokens: 1,
-      messages: [{ role: "user", content: "ping" }],
+      temperature: 0,
+      max_completion_tokens: 32, // give GPT-5 enough space
+      messages: [
+        { role: "system", content: "Reply with just the word: pong" },
+        { role: "user", content: "ping" },
+      ],
     });
 
     res.setHeader("Cache-Control", "no-store");
@@ -21,8 +24,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       ok: true,
       defaultModel,
       altModel,
-      usedModel: r.model, // what OpenAI actually served
+      usedModel: r.model,        // what OpenAI actually served
       id: r.id,
+      reply: r.choices?.[0]?.message?.content ?? "",
     });
   } catch (err: any) {
     res.setHeader("Cache-Control", "no-store");
