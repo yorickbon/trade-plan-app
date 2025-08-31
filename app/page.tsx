@@ -352,7 +352,7 @@ export default function Page() {
             </button>
           </div>
           {planText ? (
-            <pre className="whitespace-pre-wrap text-[20px] md:text-[22px] leading-9 opacity-95 p-4">
+            <pre className="whitespace-pre-wrap text-[40px] md:text-[44px] leading-[3.5rem] opacity-95 p-6">
               {planText}
             </pre>
           ) : (
