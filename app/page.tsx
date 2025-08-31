@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 
 import CalendarPanel from "../components/CalendarPanel";
@@ -86,24 +86,46 @@ export default function Page() {
   // force-reset signal for VisionUpload (increments on Reset and on instrument change)
   const [resetTick, setResetTick] = useState<number>(0);
 
+  // headlines request coordination
+  const headlinesSeqRef = useRef(0);
+  const headlinesAbortRef = useRef<AbortController | null>(null);
+
   // ----- load headlines for currencies / instrument -----
   const loadHeadlinesForSymbols = useCallback(async (symbols: string[]) => {
+    // Immediate clear (so old instrument doesn't linger)
+    setHeadlines([]);
     if (!symbols.length) {
-      setHeadlines([]);
       return;
     }
+
+    // Cancel any in-flight request
+    if (headlinesAbortRef.current) {
+      try {
+        headlinesAbortRef.current.abort();
+      } catch {}
+    }
+
+    const controller = new AbortController();
+    headlinesAbortRef.current = controller;
+    const reqId = ++headlinesSeqRef.current;
+
     setLoadingNews(true);
     try {
       const nr = await fetch(`/api/news?symbols=${symbols.join(",")}`, {
         cache: "no-store",
+        signal: controller.signal,
       });
       const nj: NewsResp = await nr.json();
-      if (nj?.ok) setHeadlines(nj.items || []);
-      else setHeadlines([]);
-    } catch {
-      setHeadlines([]);
+
+      // Apply only if this is the latest request and not aborted
+      if (reqId === headlinesSeqRef.current) {
+        setHeadlines(nj?.ok ? nj.items || [] : []);
+      }
+    } catch (e: any) {
+      // Ignore abort errors; only clear if this was the latest request
+      if (reqId === headlinesSeqRef.current) setHeadlines([]);
     } finally {
-      setLoadingNews(false);
+      if (reqId === headlinesSeqRef.current) setLoadingNews(false);
     }
   }, []);
 
@@ -148,6 +170,12 @@ export default function Page() {
     setCalendar(null);
     setDateStr(todayISO());
     setEnlargedCard(false);
+    // cancel any in-flight headlines request
+    if (headlinesAbortRef.current) {
+      try {
+        headlinesAbortRef.current.abort();
+      } catch {}
+    }
     // hard reset the uploader
     setResetTick((t) => t + 1);
     // re-pull with fresh date/instrument
@@ -160,6 +188,15 @@ export default function Page() {
       setInstrument(next.toUpperCase());
       setPlanText("");
       setEnlargedCard(false);
+
+      // cancel any in-flight headlines request and clear immediately
+      if (headlinesAbortRef.current) {
+        try {
+          headlinesAbortRef.current.abort();
+        } catch {}
+      }
+      setHeadlines([]);
+
       setResetTick((t) => t + 1);
       // calendar will reload via useEffect (dependency = instrument)
       setTimeout(() => loadCalendar(), 0);
