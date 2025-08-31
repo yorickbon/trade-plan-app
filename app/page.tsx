@@ -377,22 +377,24 @@ export default function Page() {
             </div>
           </div>
 
-          {/* Reader content */}
+          {/* Reader content — use <pre> to preserve layout exactly */}
           <div className="max-w-[1100px] mx-auto p-6">
             {planText ? (
-              <div className="card-enlarged whitespace-pre-wrap font-mono opacity-95">
+              <pre className="card-enlarged-pre whitespace-pre-wrap font-mono opacity-95">
                 {planText}
                 <style jsx>{`
-                  .card-enlarged {
+                  .card-enlarged-pre {
                     font-size: 24px !important;        /* Preset A */
                     line-height: 2.0rem !important;
                     letter-spacing: 0.005em;
+                    white-space: pre-wrap !important;   /* preserve line breaks */
+                    tab-size: 2;
                   }
                   @media (min-width: 768px) {
-                    .card-enlarged { font-size: 26px !important; }
+                    .card-enlarged-pre { font-size: 26px !important; }
                   }
                 `}</style>
-              </div>
+              </pre>
             ) : (
               <div className="text-base opacity-80 p-2">No plan yet.</div>
             )}
