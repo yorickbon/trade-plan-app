@@ -80,8 +80,8 @@ export default function Page() {
   const [planText, setPlanText] = useState<string>("");
   const [busy, setBusy] = useState<boolean>(false); // used by VisionUpload
 
-  // NEW: fullscreen toggle for trade card
-  const [showFullCard, setShowFullCard] = useState<boolean>(false);
+  // NEW: expand/collapse trade card to a full-width reader row
+  const [enlargedCard, setEnlargedCard] = useState<boolean>(false);
 
   // force-reset signal for VisionUpload (increments on Reset and on instrument change)
   const [resetTick, setResetTick] = useState<number>(0);
@@ -147,6 +147,7 @@ export default function Page() {
     setHeadlines([]);
     setCalendar(null);
     setDateStr(todayISO());
+    setEnlargedCard(false);
     // hard reset the uploader
     setResetTick((t) => t + 1);
     // re-pull with fresh date/instrument
@@ -158,6 +159,7 @@ export default function Page() {
     (next: string) => {
       setInstrument(next.toUpperCase());
       setPlanText("");
+      setEnlargedCard(false);
       setResetTick((t) => t + 1);
       // calendar will reload via useEffect (dependency = instrument)
       setTimeout(() => loadCalendar(), 0);
@@ -294,31 +296,34 @@ export default function Page() {
         <div className="rounded-lg border border-neutral-800 p-4 flex flex-col gap-4 max-h-[80vh]">
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
-            {/* NEW: fullscreen toggle button */}
+
+            {/* Fullscreen toggle now expands to a full-width reader below */}
             <button
               type="button"
               className="ml-3 inline-flex items-center justify-center whitespace-nowrap px-2 py-1 text-xs rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
-              onClick={() => setShowFullCard(true)}
-              disabled={!planText}
-              title="Open fullscreen"
+              onClick={() => setEnlargedCard((v) => !v)}
+              title={enlargedCard ? "Close fullscreen" : "Open fullscreen"}
             >
-              Fullscreen
+              {enlargedCard ? "Close fullscreen" : "Fullscreen"}
             </button>
           </div>
 
-          <div>
-            {planText ? (
-              <pre className="whitespace-pre-wrap text-base md:text-[17px] leading-7 opacity-95 max-h-[54vh] overflow-auto pr-2">
-                {planText}
-              </pre>
-            ) : busy ? (
-              <div className="text-sm opacity-80">Analyzing images…</div>
-            ) : (
-              <div className="text-sm opacity-70">
-                Upload your 4H/1H/15M (and optional calendar) above, then click <b>Generate from Images</b>.
-              </div>
-            )}
-          </div>
+          {/* In-panel normal reader (hidden when enlarged to full width) */}
+          {!enlargedCard && (
+            <div>
+              {planText ? (
+                <pre className="whitespace-pre-wrap text-base md:text-[17px] leading-7 opacity-95 max-h-[54vh] overflow-auto pr-2">
+                  {planText}
+                </pre>
+              ) : busy ? (
+                <div className="text-sm opacity-80">Analyzing images…</div>
+              ) : (
+                <div className="text-sm opacity-70">
+                  Upload your 4H/1H/15M (and optional calendar) above, then click <b>Generate from Images</b>.
+                </div>
+              )}
+            </div>
+          )}
 
           {/* ChatDock */}
           <div className="border-top border-neutral-800 pt-3">
@@ -332,28 +337,27 @@ export default function Page() {
         </div>
       </div>
 
-      {/* NEW: fullscreen overlay for the trade card */}
-      {showFullCard && planText && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="relative w-full h-full max-w-6xl max-h-[95vh] bg-neutral-950 border border-neutral-800 rounded-lg shadow-xl overflow-hidden">
-            <div className="flex items-center justify-between p-3 border-b border-neutral-800">
-              <div className="text-base font-semibold">Generated Trade Card — {instrument}</div>
-              <button
-                type="button"
-                aria-label="Close"
-                className="inline-flex items-center justify-center w-8 h-8 rounded hover:bg-neutral-800"
-                onClick={() => setShowFullCard(false)}
-                title="Close"
-              >
-                ×
-              </button>
-            </div>
-            <div className="p-4 overflow-auto">
-              <pre className="whitespace-pre-wrap text-[17px] md:text-[18px] leading-8 opacity-95">
-                {planText}
-              </pre>
-            </div>
+      {/* NEW: Full-width reader row below the grid (appears when enlarged) */}
+      {enlargedCard && (
+        <div className="rounded-lg border border-neutral-800 p-4 bg-neutral-950">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-lg font-semibold">Generated Trade Card — Full Width</h2>
+            <button
+              type="button"
+              className="inline-flex items-center justify-center whitespace-nowrap px-2 py-1 text-xs rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
+              onClick={() => setEnlargedCard(false)}
+              title="Close fullscreen"
+            >
+              Close
+            </button>
           </div>
+          {planText ? (
+            <pre className="whitespace-pre-wrap text-[20px] md:text-[22px] leading-9 opacity-95 p-4">
+              {planText}
+            </pre>
+          ) : (
+            <div className="text-base opacity-80 p-2">No plan yet.</div>
+          )}
         </div>
       )}
     </div>
