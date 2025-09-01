@@ -6,6 +6,7 @@
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
+import sharp from "sharp";
 
 // ---------- config ----------
 export const config = {
@@ -54,14 +55,78 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null {
   return Array.isArray(x) ? (x[0] ?? null) : (x as any);
 }
 
-async function fileToDataUrl(file: any): Promise<string | null> {
+// ---------- image processing (downscale/compress with sharp) ----------
+
+const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap for inputs
+const TARGET_MAX_WIDTH = 1280;
+const PREFERRED_MAX_BYTES = 600 * 1024; // aim for ~600KB when possible
+
+function toDataUrl(buf: Buffer, mime: string) {
+  return `data:${mime};base64,${buf.toString("base64")}`;
+}
+
+async function processImageBuffer(
+  input: Buffer,
+  inputMime: string | null
+): Promise<string> {
+  if (input.byteLength > IMG_MAX_BYTES) throw new Error("Image too large");
+
+  // Probe metadata once
+  const base = sharp(input, { limitInputPixels: false, sequentialRead: true });
+  const meta = await base.metadata();
+  const width = meta.width || 0;
+  const height = meta.height || 0;
+
+  // If already small enough and wide clarity likely fine, pass through
+  if (width <= TARGET_MAX_WIDTH && input.byteLength <= PREFERRED_MAX_BYTES) {
+    const mime = inputMime?.startsWith("image/") ? inputMime : "image/jpeg";
+    console.log(
+      `[vision-plan] passthrough ${width}x${height} ${(input.byteLength / 1024).toFixed(1)}KB`
+    );
+    return toDataUrl(input, mime);
+  }
+
+  // Two-step quality to balance speed vs clarity, with 4:4:4 to keep lines/text crisp
+  for (const q of [70, 60]) {
+    const { data, info } = await sharp(input, {
+      limitInputPixels: false,
+      sequentialRead: true,
+      fastShrinkOnLoad: true,
+    })
+      .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true })
+      .jpeg({
+        quality: q,
+        mozjpeg: true,
+        progressive: true,
+        chromaSubsampling: "4:4:4",
+        optimizeCoding: true,
+      })
+      .toBuffer({ resolveWithObject: true });
+
+    console.log(
+      `[vision-plan] processed -> ${info.width}x${info.height} ${(data.byteLength / 1024).toFixed(
+        1
+      )}KB, q=${q}`
+    );
+
+    // Prefer to keep clarity; accept slightly larger than 600KB if needed
+    if (data.byteLength <= PREFERRED_MAX_BYTES || q === 60) {
+      return toDataUrl(data, "image/jpeg");
+    }
+  }
+
+  // Fallback should never hit due to the loop above
+  return toDataUrl(input, inputMime || "image/jpeg");
+}
+
+async function fileToProcessedDataUrl(file: any): Promise<string | null> {
   if (!file) return null;
   const p =
     file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
   const buf = await fs.readFile(p);
   const mime = file.mimetype || "image/png";
-  return `data:${mime};base64,${buf.toString("base64")}`;
+  return processImageBuffer(buf, mime);
 }
 
 function originFromReq(req: NextApiRequest) {
@@ -69,6 +134,8 @@ function originFromReq(req: NextApiRequest) {
   const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
+
+// ---------- Headlines: fetch 12, embed ONLY 6 into the model ----------
 
 async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
   try {
@@ -80,7 +147,7 @@ async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
     const j = await r.json().catch(() => ({}));
     const items: any[] = Array.isArray(j?.items) ? j.items : [];
     const lines = items
-      .slice(0, 12)
+      .slice(0, 6) // <-- only 6 go to the model
       .map((it: any) => {
         const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
         const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
@@ -147,9 +214,7 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   return null;
 }
 
-// ---------- NEW: fetch TV link → image dataURL ----------
-
-const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap
+// ---------- fetch TV link → image dataURL (then process) ----------
 
 function withTimeout<T>(p: Promise<T>, ms: number) {
   return new Promise<T>((resolve, reject) => {
@@ -204,12 +269,12 @@ async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
   if (!link) return null;
   try {
     // First request: could be the image or an HTML page with og:image
-    const first = await withTimeout(fetchBuffer(link), 12000);
+    const first = await withTimeout(fetchBuffer(link), 8000);
     if (!first) return null;
 
     const ctype = first.mime.toLowerCase();
     if (ctype.startsWith("image/")) {
-      return `data:${first.mime};base64,${first.buf.toString("base64")}`;
+      return processImageBuffer(first.buf, first.mime);
     }
 
     // If HTML, try to resolve og:image
@@ -218,11 +283,11 @@ async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
     if (!og) return null;
 
     const resolved = absoluteUrl(link, og);
-    const second = await withTimeout(fetchBuffer(resolved), 12000);
+    const second = await withTimeout(fetchBuffer(resolved), 8000);
     if (!second) return null;
     if (!second.mime.toLowerCase().startsWith("image/")) return null;
 
-    return `data:${second.mime};base64,${second.buf.toString("base64")}`;
+    return processImageBuffer(second.buf, second.mime);
   } catch {
     return null;
   }
@@ -354,7 +419,7 @@ function tournamentMessages(params: {
   if (headlinesText) {
     userParts.push({
       type: "text",
-      text: `Recent headlines snapshot:\n${headlinesText}`,
+      text: `Recent headlines snapshot:\n${headlinesText}`, // unchanged wording
     });
   }
 
@@ -464,10 +529,10 @@ export default async function handler(
 
     // Build images: prefer file if present; otherwise use URL fetcher
     const [m15FromFile, h1FromFile, h4FromFile, calUrl] = await Promise.all([
-      fileToDataUrl(m15f),
-      fileToDataUrl(h1f),
-      fileToDataUrl(h4f),
-      calF ? fileToDataUrl(calF) : Promise.resolve(null),
+      fileToProcessedDataUrl(m15f),
+      fileToProcessedDataUrl(h1f),
+      fileToProcessedDataUrl(h4f),
+      calF ? fileToProcessedDataUrl(calF) : Promise.resolve(null),
     ]);
 
     const [m15FromUrl, h1FromUrl, h4FromUrl] = await Promise.all([
@@ -494,7 +559,7 @@ export default async function handler(
       instrument,
       dateStr,
       calendarDataUrl: calUrl || undefined,
-      headlinesText: headlinesText || undefined,
+      headlinesText: headlinesText || undefined, // exactly 6 now
       m15,
       h1,
       h4,
@@ -593,7 +658,7 @@ export default async function handler(
         meta: {
           instrument,
           hasCalendar: !!calUrl,
-          headlinesCount: headlinesText ? headlinesText.length : 0,
+          headlinesCount: headlinesText ? 6 : 0,
           strategySelection: false,
           rewritten: false,
           fallbackUsed: true,
@@ -609,7 +674,7 @@ export default async function handler(
       meta: {
         instrument,
         hasCalendar: !!calUrl,
-        headlinesCount: headlinesText ? headlinesText.length : 0,
+        headlinesCount: headlinesText ? 6 : 0,
         strategySelection: true,
         rewritten: false,
         fallbackUsed: false,
