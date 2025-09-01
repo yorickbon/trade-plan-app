@@ -6,7 +6,6 @@
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
-import sharp from "sharp";
 
 // ---------- config ----------
 export const config = {
@@ -55,102 +54,23 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null {
   return Array.isArray(x) ? (x[0] ?? null) : (x as any);
 }
 
-// ---- NEW: image processing (server-side downscale/compress with sharp) ----
-
-const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap for inputs
-const TARGET_MAX_WIDTH = 1280;
-const TARGET_MAX_BYTES = 600 * 1024; // ~600KB preferred cap
-
-function toDataUrl(buf: Buffer, mime: string) {
-  return `data:${mime};base64,${buf.toString("base64")}`;
-}
-
-async function processImageBuffer(
-  input: Buffer,
-  inputMime: string | null
-): Promise<{ dataUrl: string; width: number; height: number; bytes: number }> {
-  // Guard: reject huge inputs early
-  if (input.byteLength > IMG_MAX_BYTES) {
-    throw new Error("Image too large");
-  }
-
-  // Probe metadata
-  const img = sharp(input, { limitInputPixels: false });
-  const meta = await img.metadata();
-  const width = meta.width || 0;
-  const height = meta.height || 0;
-
-  // If already small (<=1280 and <=600KB), keep as is to preserve clarity
-  if (width <= TARGET_MAX_WIDTH && input.byteLength <= TARGET_MAX_BYTES) {
-    const mime = (inputMime && inputMime.startsWith("image/") ? inputMime : "image/jpeg");
-    console.log(
-      `[vision-plan] image passthrough ${width}x${height}, ${(input.byteLength / 1024).toFixed(
-        1
-      )}KB`
-    );
-    return { dataUrl: toDataUrl(input, mime), width, height, bytes: input.byteLength };
-  }
-
-  // Otherwise, resize to max 1280px width (no enlargement), convert to JPEG
-  let q = 70;
-  let out: Buffer | null = null;
-  let outMeta = { w: width, h: height };
-
-  for (const tryQ of [70, 60, 55, 50]) {
-    q = tryQ;
-    const pipeline = sharp(input, { limitInputPixels: false })
-      .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true })
-      // Do NOT embed metadata (EXIF stripped by default)
-      .jpeg({ quality: q, mozjpeg: true });
-
-    const buf = await pipeline.toBuffer();
-    const m = await sharp(buf).metadata();
-    out = buf;
-    outMeta = { w: m.width || 0, h: m.height || 0 };
-
-    if (buf.byteLength <= TARGET_MAX_BYTES) break; // good enough
-  }
-
-  if (!out) throw new Error("Failed to process image");
-
-  console.log(
-    `[vision-plan] image processed -> ${outMeta.w}x${outMeta.h}, ${(out.byteLength / 1024).toFixed(
-      1
-    )}KB, q=${q}`
-  );
-
-  return {
-    dataUrl: toDataUrl(out, "image/jpeg"),
-    width: outMeta.w,
-    height: outMeta.h,
-    bytes: out.byteLength,
-  };
-}
-
-async function fileToProcessedDataUrl(file: any): Promise<string | null> {
+async function fileToDataUrl(file: any): Promise<string | null> {
   if (!file) return null;
   const p =
     file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
   const buf = await fs.readFile(p);
   const mime = file.mimetype || "image/png";
-  const out = await processImageBuffer(buf, mime);
-  return out.dataUrl;
+  return `data:${mime};base64,${buf.toString("base64")}`;
 }
 
 function originFromReq(req: NextApiRequest) {
   const proto = (req.headers["x-forwarded-proto"] as string) || "https";
-  const host =
-    (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
+  const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 
-// ---- Headlines fetch: keep fetching 12, but only 6 go to the model ----
-
-async function fetchedHeadlines(
-  req: NextApiRequest,
-  instrument: string
-): Promise<{ full12: string | null; top6: string | null }> {
+async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
   try {
     const base = originFromReq(req);
     const url = `${base}/api/news?instrument=${encodeURIComponent(
@@ -159,31 +79,20 @@ async function fetchedHeadlines(
     const r = await fetch(url, { cache: "no-store" });
     const j = await r.json().catch(() => ({}));
     const items: any[] = Array.isArray(j?.items) ? j.items : [];
-
-    const mapItem = (it: any) => {
-      const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
-      const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
-      const t = String(it?.title || "").slice(0, 200);
-      const src = it?.source || "";
-      const when = it?.ago || "";
-      return `• ${t} — ${src}, ${when} — ${lab}`;
-    };
-
-    const full12 =
-      items
-        .slice(0, 12)
-        .map(mapItem)
-        .join("\n") || null;
-
-    const top6 =
-      items
-        .slice(0, 6)
-        .map(mapItem)
-        .join("\n") || null;
-
-    return { full12, top6 };
+    const lines = items
+      .slice(0, 12)
+      .map((it: any) => {
+        const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
+        const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
+        const t = String(it?.title || "").slice(0, 200);
+        const src = it?.source || "";
+        const when = it?.ago || "";
+        return `• ${t} — ${src}, ${when} — ${lab}`;
+      })
+      .join("\n");
+    return lines || null;
   } catch {
-    return { full12: null, top6: null };
+    return null;
   }
 }
 
@@ -213,10 +122,7 @@ function needsPendingLimit(aiMeta: any): boolean {
   const et = String(aiMeta?.entryType || "").toLowerCase(); // "market" | "pending"
   if (et !== "market") return false;
   const bp = aiMeta?.breakoutProof || {};
-  const ok = !!(
-    bp?.bodyCloseBeyond === true &&
-    (bp?.retestHolds === true || bp?.sfpReclaim === true)
-  );
+  const ok = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
   return !ok; // if not proven, require Pending
 }
 
@@ -241,7 +147,9 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   return null;
 }
 
-// ---------- fetch TV link → buffer or og:image, then process ----------
+// ---------- NEW: fetch TV link → image dataURL ----------
+
+const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap
 
 function withTimeout<T>(p: Promise<T>, ms: number) {
   return new Promise<T>((resolve, reject) => {
@@ -256,16 +164,13 @@ function withTimeout<T>(p: Promise<T>, ms: number) {
   });
 }
 
-async function fetchBuffer(
-  url: string
-): Promise<{ buf: Buffer; mime: string } | null> {
+async function fetchBuffer(url: string): Promise<{ buf: Buffer; mime: string } | null> {
   const r = await fetch(url, {
     redirect: "follow",
     headers: {
       "user-agent":
         "Mozilla/5.0 (compatible; TradePlanBot/1.0; +https://trade-plan-app.vercel.app)",
-      accept:
-        "text/html,application/xhtml+xml,application/xml,image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      accept: "text/html,application/xhtml+xml,application/xml,image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     },
   });
   if (!r.ok) return null;
@@ -286,12 +191,10 @@ function absoluteUrl(base: string, maybe: string) {
 }
 
 function htmlFindOgImage(html: string): string | null {
-  const re1 =
-    /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i;
+  const re1 = /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i;
   const m1 = html.match(re1);
   if (m1?.[1]) return m1[1];
-  const re2 =
-    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i;
+  const re2 = /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i;
   const m2 = html.match(re2);
   if (m2?.[1]) return m2[1];
   return null;
@@ -306,8 +209,7 @@ async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
 
     const ctype = first.mime.toLowerCase();
     if (ctype.startsWith("image/")) {
-      const processed = await processImageBuffer(first.buf, first.mime);
-      return processed.dataUrl;
+      return `data:${first.mime};base64,${first.buf.toString("base64")}`;
     }
 
     // If HTML, try to resolve og:image
@@ -320,8 +222,7 @@ async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
     if (!second) return null;
     if (!second.mime.toLowerCase().startsWith("image/")) return null;
 
-    const processed = await processImageBuffer(second.buf, second.mime);
-    return processed.dataUrl;
+    return `data:${second.mime};base64,${second.buf.toString("base64")}`;
   } catch {
     return null;
   }
@@ -355,13 +256,13 @@ async function callOpenAI(messages: any[]) {
   return String(out || "");
 }
 
-// ---------- prompt builders (unchanged from your base, except headlines param) ----------
+// ---------- prompt builders (unchanged from your base) ----------
 
 function tournamentMessages(params: {
   instrument: string;
   dateStr: string;
   calendarDataUrl?: string | null;
-  headlinesText?: string | null; // now expects TOP 6 only
+  headlinesText?: string | null;
   m15: string;
   h1: string;
   h4: string;
@@ -453,7 +354,7 @@ function tournamentMessages(params: {
   if (headlinesText) {
     userParts.push({
       type: "text",
-      text: `Recent headlines snapshot (top 6):\n${headlinesText}`,
+      text: `Recent headlines snapshot:\n${headlinesText}`,
     });
   }
 
@@ -535,12 +436,8 @@ export default async function handler(
   res: NextApiResponse<Ok | Err>
 ) {
   try {
-    if (req.method !== "POST")
-      return res.status(405).json({ ok: false, reason: "Method not allowed" });
-    if (!OPENAI_API_KEY)
-      return res
-        .status(400)
-        .json({ ok: false, reason: "Missing OPENAI_API_KEY" });
+    if (req.method !== "POST") return res.status(405).json({ ok: false, reason: "Method not allowed" });
+    if (!OPENAI_API_KEY) return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
     if (!isMultipart(req)) {
       return res.status(400).json({
         ok: false,
@@ -567,10 +464,10 @@ export default async function handler(
 
     // Build images: prefer file if present; otherwise use URL fetcher
     const [m15FromFile, h1FromFile, h4FromFile, calUrl] = await Promise.all([
-      fileToProcessedDataUrl(m15f),
-      fileToProcessedDataUrl(h1f),
-      fileToProcessedDataUrl(h4f),
-      calF ? fileToProcessedDataUrl(calF) : Promise.resolve(null),
+      fileToDataUrl(m15f),
+      fileToDataUrl(h1f),
+      fileToDataUrl(h4f),
+      calF ? fileToDataUrl(calF) : Promise.resolve(null),
     ]);
 
     const [m15FromUrl, h1FromUrl, h4FromUrl] = await Promise.all([
@@ -584,15 +481,12 @@ export default async function handler(
     const h4 = h4FromFile || h4FromUrl;
 
     if (!m15 || !h1 || !h4) {
-      return res.status(400).json({
-        ok: false,
-        reason:
-          "Provide all three charts: m15, h1, h4 — either as files or valid TradingView image links.",
-      });
+      return res
+        .status(400)
+        .json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either as files or valid TradingView image links." });
     }
 
-    // Fetch 12 headlines but only pass 6 to the model prompt
-    const headlines = await fetchedHeadlines(req, instrument);
+    const headlinesText = await fetchedHeadlines(req, instrument);
     const dateStr = new Date().toISOString().slice(0, 10);
 
     // 1) Tournament pass
@@ -600,7 +494,7 @@ export default async function handler(
       instrument,
       dateStr,
       calendarDataUrl: calUrl || undefined,
-      headlinesText: headlines.top6 || undefined, // <= only 6 go into the prompt
+      headlinesText: headlinesText || undefined,
       m15,
       h1,
       h4,
@@ -615,14 +509,8 @@ export default async function handler(
     // 3) Normalize mislabeled Breakout+Retest if no proof
     const bp = aiMeta?.breakoutProof || {};
     const hasProof =
-      !!(
-        bp?.bodyCloseBeyond === true &&
-        (bp?.retestHolds === true || bp?.sfpReclaim === true)
-      );
-    if (
-      String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") &&
-      !hasProof
-    ) {
+      !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+    if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
       text = await normalizeBreakoutLabel(text);
       aiMeta = extractAiMeta(text) || aiMeta;
     }
@@ -638,64 +526,65 @@ export default async function handler(
 
     // 5) Fallback if refusal/empty
     if (!text || refusalLike(text)) {
-      const fallback = [
-        "Quick Plan (Actionable)",
-        "",
-        "• Direction: Stay Flat (low conviction).",
-        "• Order Type: Pending",
-        "• Trigger: Confluence (OB/FVG/SR) after a clean trigger.",
-        "• Entry: zone below/above current (structure based).",
-        "• Stop Loss: beyond invalidation with small buffer.",
-        "• Take Profit(s): Prior swing/liquidity; then trail.",
-        "• Conviction: 30%",
-        "• Setup: Await valid trigger (images inconclusive).",
-        "",
-        "Full Breakdown",
-        "• Technical View: Indecisive; likely range.",
-        "• Fundamental View: Mixed; keep size conservative.",
-        "• Tech vs Fundy Alignment: Mixed.",
-        "• Conditional Scenarios: Break+retest for continuation; SFP & reclaim for reversal.",
-        "• Surprise Risk: Headlines; CB speakers.",
-        "• Invalidation: Opposite-side body close beyond range edge.",
-        "• One-liner Summary: Stand by for a clean trigger.",
-        "",
-        "Detected Structures (X-ray):",
-        "• 4H: –",
-        "• 1H: –",
-        "• 15m: –",
-        "",
-        "Candidate Scores (tournament):",
-        "–",
-        "",
-        "Final Table Summary:",
-        `| Instrument | Bias   | Entry Zone | SL  | TP1 | TP2 | Conviction % |`,
-        `| ${instrument} | Neutral | Wait for trigger | Structure-based | Prior swing | Next liquidity | 30% |`,
-        "",
-        "```ai_meta",
-        JSON.stringify(
-          {
-            selectedStrategy: "Await valid trigger",
-            entryType: "Pending",
-            entryOrder: "Pending",
-            direction: "Flat",
-            currentPrice: null,
-            zone: null,
-            stop: null,
-            tp1: null,
-            tp2: null,
-            breakoutProof: {
-              bodyCloseBeyond: false,
-              retestHolds: false,
-              sfpReclaim: false,
+      const fallback =
+        [
+          "Quick Plan (Actionable)",
+          "",
+          "• Direction: Stay Flat (low conviction).",
+          "• Order Type: Pending",
+          "• Trigger: Confluence (OB/FVG/SR) after a clean trigger.",
+          "• Entry: zone below/above current (structure based).",
+          "• Stop Loss: beyond invalidation with small buffer.",
+          "• Take Profit(s): Prior swing/liquidity; then trail.",
+          "• Conviction: 30%",
+          "• Setup: Await valid trigger (images inconclusive).",
+          "",
+          "Full Breakdown",
+          "• Technical View: Indecisive; likely range.",
+          "• Fundamental View: Mixed; keep size conservative.",
+          "• Tech vs Fundy Alignment: Mixed.",
+          "• Conditional Scenarios: Break+retest for continuation; SFP & reclaim for reversal.",
+          "• Surprise Risk: Headlines; CB speakers.",
+          "• Invalidation: Opposite-side body close beyond range edge.",
+          "• One-liner Summary: Stand by for a clean trigger.",
+          "",
+          "Detected Structures (X-ray):",
+          "• 4H: –",
+          "• 1H: –",
+          "• 15m: –",
+          "",
+          "Candidate Scores (tournament):",
+          "–",
+          "",
+          "Final Table Summary:",
+          `| Instrument | Bias   | Entry Zone | SL  | TP1 | TP2 | Conviction % |`,
+          `| ${instrument} | Neutral | Wait for trigger | Structure-based | Prior swing | Next liquidity | 30% |`,
+          "",
+          "```ai_meta",
+          JSON.stringify(
+            {
+              selectedStrategy: "Await valid trigger",
+              entryType: "Pending",
+              entryOrder: "Pending",
+              direction: "Flat",
+              currentPrice: null,
+              zone: null,
+              stop: null,
+              tp1: null,
+              tp2: null,
+              breakoutProof: {
+                bodyCloseBeyond: false,
+                retestHolds: false,
+                sfpReclaim: false,
+              },
+              candidateScores: [],
+              note: "Fallback used due to refusal/empty output.",
             },
-            candidateScores: [],
-            note: "Fallback used due to refusal/empty output.",
-          },
-          null,
-          2
-        ),
-        "```",
-      ].join("\n");
+            null,
+            2
+          ),
+          "```",
+        ].join("\n");
 
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
@@ -704,7 +593,7 @@ export default async function handler(
         meta: {
           instrument,
           hasCalendar: !!calUrl,
-          headlinesCount: headlines.top6 ? 6 : 0, // number embedded into prompt
+          headlinesCount: headlinesText ? headlinesText.length : 0,
           strategySelection: false,
           rewritten: false,
           fallbackUsed: true,
@@ -720,7 +609,7 @@ export default async function handler(
       meta: {
         instrument,
         hasCalendar: !!calUrl,
-        headlinesCount: headlines.top6 ? 6 : 0, // number embedded into prompt
+        headlinesCount: headlinesText ? headlinesText.length : 0,
         strategySelection: true,
         rewritten: false,
         fallbackUsed: false,
