@@ -2,15 +2,10 @@
 // Images-only planner with optional TradingView image URL fetch.
 // Uploads: m15 (execution), h1 (context), h4 (HTF), optional calendar.
 // You can also pass m15Url / h1Url / h4Url (TradingView "Copy link to image").
-// Updates in this version:
-//   A) Headlines: fetch up to 12 for UI, but pass only top 6 lines to GPT.
-//   B) Server-side downscale of images (uploads & TV links) to ~1200px wide, JPEG ~70 (sharp).
-//
-// NOTE: Install sharp:  npm i sharp
+// Keeps existing logic & headings intact.
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
-import sharp from "sharp";
 
 // ---------- config ----------
 export const config = {
@@ -59,24 +54,13 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null {
   return Array.isArray(x) ? (x[0] ?? null) : (x as any);
 }
 
-async function fileToBuffer(file: any): Promise<Buffer | null> {
+async function fileToDataUrl(file: any): Promise<string | null> {
   if (!file) return null;
   const p =
     file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
-  return fs.readFile(p);
-}
-
-async function resizeToJpeg(buf: Buffer, targetWidth = 1200, quality = 70): Promise<Buffer> {
-  // Convert everything to JPEG for consistent smaller payloads
-  return await sharp(buf)
-    .rotate() // respect EXIF
-    .jpeg({ quality, mozjpeg: true })
-    .resize({ width: targetWidth, withoutEnlargement: true })
-    .toBuffer();
-}
-
-function bufferToDataUrl(buf: Buffer, mime = "image/jpeg"): string {
+  const buf = await fs.readFile(p);
+  const mime = file.mimetype || "image/png";
   return `data:${mime};base64,${buf.toString("base64")}`;
 }
 
@@ -110,12 +94,6 @@ async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
   } catch {
     return null;
   }
-}
-
-function top6Headlines(lines: string | null | undefined) {
-  if (!lines) return null;
-  const arr = lines.split("\n").filter(Boolean);
-  return arr.slice(0, 6).join("\n") || null;
 }
 
 function refusalLike(s: string) {
@@ -169,7 +147,7 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   return null;
 }
 
-// ---------- NEW: fetch TV link → image buffer ----------
+// ---------- NEW: fetch TV link → image dataURL ----------
 
 const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap
 
@@ -222,7 +200,7 @@ function htmlFindOgImage(html: string): string | null {
   return null;
 }
 
-async function fetchImageBufferFromLink(link: string): Promise<Buffer | null> {
+async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
   if (!link) return null;
   try {
     // First request: could be the image or an HTML page with og:image
@@ -231,7 +209,7 @@ async function fetchImageBufferFromLink(link: string): Promise<Buffer | null> {
 
     const ctype = first.mime.toLowerCase();
     if (ctype.startsWith("image/")) {
-      return first.buf;
+      return `data:${first.mime};base64,${first.buf.toString("base64")}`;
     }
 
     // If HTML, try to resolve og:image
@@ -244,13 +222,13 @@ async function fetchImageBufferFromLink(link: string): Promise<Buffer | null> {
     if (!second) return null;
     if (!second.mime.toLowerCase().startsWith("image/")) return null;
 
-    return second.buf;
+    return `data:${second.mime};base64,${second.buf.toString("base64")}`;
   } catch {
     return null;
   }
 }
 
-// ---------- OpenAI call ----------
+// ---------- OpenAI call (unchanged) ----------
 
 async function callOpenAI(messages: any[]) {
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
@@ -278,7 +256,7 @@ async function callOpenAI(messages: any[]) {
   return String(out || "");
 }
 
-// ---------- prompt builders ----------
+// ---------- prompt builders (unchanged from your base) ----------
 
 function tournamentMessages(params: {
   instrument: string;
@@ -374,11 +352,10 @@ function tournamentMessages(params: {
     userParts.push({ type: "image_url", image_url: { url: calendarDataUrl } });
   }
   if (headlinesText) {
-    // A) pass only top 6 lines to GPT
-    const top6 = top6Headlines(headlinesText);
-    if (top6) {
-      userParts.push({ type: "text", text: `Recent headlines snapshot (top 6):\n${top6}` });
-    }
+    userParts.push({
+      type: "text",
+      text: `Recent headlines snapshot:\n${headlinesText}`,
+    });
   }
 
   return [
@@ -474,63 +451,50 @@ export default async function handler(
       .toUpperCase()
       .replace(/\s+/g, "");
 
-    // Files (if provided) → buffers
+    // Files (if provided)
     const m15f = pickFirst(files.m15);
     const h1f = pickFirst(files.h1);
     const h4f = pickFirst(files.h4);
     const calF = pickFirst(files.calendar);
 
-    const [m15BufRaw, h1BufRaw, h4BufRaw, calBufRaw] = await Promise.all([
-      fileToBuffer(m15f),
-      fileToBuffer(h1f),
-      fileToBuffer(h4f),
-      calF ? fileToBuffer(calF) : Promise.resolve(null),
-    ]);
-
-    // URLs (optional; TradingView "Copy link to image") → buffers
+    // URLs (optional; TradingView "Copy link to image")
     const m15Url = String(pickFirst(fields.m15Url) || "").trim();
     const h1Url = String(pickFirst(fields.h1Url) || "").trim();
     const h4Url = String(pickFirst(fields.h4Url) || "").trim();
 
-    const [m15UrlBuf, h1UrlBuf, h4UrlBuf] = await Promise.all([
-      m15BufRaw ? Promise.resolve(null) : fetchImageBufferFromLink(m15Url),
-      h1BufRaw ? Promise.resolve(null) : fetchImageBufferFromLink(h1Url),
-      h4BufRaw ? Promise.resolve(null) : fetchImageBufferFromLink(h4Url),
+    // Build images: prefer file if present; otherwise use URL fetcher
+    const [m15FromFile, h1FromFile, h4FromFile, calUrl] = await Promise.all([
+      fileToDataUrl(m15f),
+      fileToDataUrl(h1f),
+      fileToDataUrl(h4f),
+      calF ? fileToDataUrl(calF) : Promise.resolve(null),
     ]);
 
-    // Choose buffers: file first, else URL
-    const m15BufChosen = m15BufRaw || m15UrlBuf;
-    const h1BufChosen = h1BufRaw || h1UrlBuf;
-    const h4BufChosen = h4BufRaw || h4UrlBuf;
+    const [m15FromUrl, h1FromUrl, h4FromUrl] = await Promise.all([
+      m15FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(m15Url),
+      h1FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(h1Url),
+      h4FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(h4Url),
+    ]);
 
-    if (!m15BufChosen || !h1BufChosen || !h4BufChosen) {
+    const m15 = m15FromFile || m15FromUrl;
+    const h1 = h1FromFile || h1FromUrl;
+    const h4 = h4FromFile || h4FromUrl;
+
+    if (!m15 || !h1 || !h4) {
       return res
         .status(400)
         .json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either as files or valid TradingView image links." });
     }
 
-    // B) Downscale + convert to JPEG for smaller payloads
-    const [m15Jpg, h1Jpg, h4Jpg, calJpg] = await Promise.all([
-      resizeToJpeg(m15BufChosen, 1200, 70),
-      resizeToJpeg(h1BufChosen, 1200, 70),
-      resizeToJpeg(h4BufChosen, 1200, 70),
-      calBufRaw ? resizeToJpeg(calBufRaw, 1200, 70) : Promise.resolve<Buffer | null>(null),
-    ]);
-
-    const m15 = bufferToDataUrl(m15Jpg);
-    const h1 = bufferToDataUrl(h1Jpg);
-    const h4 = bufferToDataUrl(h4Jpg);
-    const calUrl = calJpg ? bufferToDataUrl(calJpg) : null;
-
-    const allHeadlines = await fetchedHeadlines(req, instrument); // up to 12 lines
+    const headlinesText = await fetchedHeadlines(req, instrument);
     const dateStr = new Date().toISOString().slice(0, 10);
 
-    // 1) Tournament pass (with top-6 headlines)
+    // 1) Tournament pass
     let { text, aiMeta } = await askTournament({
       instrument,
       dateStr,
       calendarDataUrl: calUrl || undefined,
-      headlinesText: allHeadlines || undefined,
+      headlinesText: headlinesText || undefined,
       m15,
       h1,
       h4,
@@ -629,7 +593,7 @@ export default async function handler(
         meta: {
           instrument,
           hasCalendar: !!calUrl,
-          headlinesCount: allHeadlines ? allHeadlines.length : 0,
+          headlinesCount: headlinesText ? headlinesText.length : 0,
           strategySelection: false,
           rewritten: false,
           fallbackUsed: true,
@@ -645,7 +609,7 @@ export default async function handler(
       meta: {
         instrument,
         hasCalendar: !!calUrl,
-        headlinesCount: allHeadlines ? allHeadlines.length : 0,
+        headlinesCount: headlinesText ? headlinesText.length : 0,
         strategySelection: true,
         rewritten: false,
         fallbackUsed: false,
