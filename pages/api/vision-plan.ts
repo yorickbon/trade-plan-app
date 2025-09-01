@@ -1,17 +1,13 @@
 // /pages/api/vision-plan.ts
-// Images-only planner: pick the best idea by scoring multiple strategies.
-// Upload: m15 (execution), h1 (context), h4 (HTF), optional calendar.
-// Keeps your existing style, fixes roles + image parts for chat/completions.
-//
-// UPDATE:
-// 1) Option 2 (Market) line is always visible under "Quick Plan (Actionable)"
-//    - Shows "Market entry..." if strategy has confirmation
-//    - Else "Not available (missing confirmation...)"
-// 2) After use, all uploaded temp images are deleted (fs.unlink)
+// Images-only planner with optional TradingView image URL fetch.
+// Uploads: m15 (execution), h1 (context), h4 (HTF), optional calendar.
+// You can also pass m15Url / h1Url / h4Url (TradingView "Copy link to image").
+// Keeps existing logic & headings intact.
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
 
+// ---------- config ----------
 export const config = {
   api: { bodyParser: false, sizeLimit: "25mb" },
 };
@@ -58,21 +54,10 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null {
   return Array.isArray(x) ? (x[0] ?? null) : (x as any);
 }
 
-// pull a best-effort temp file path from formidable's File object
-function filePathFromUpload(file: any): string | null {
-  if (!file) return null;
-  return (
-    file.filepath ||
-    file.path ||
-    file._writeStream?.path ||
-    file.originalFilepath ||
-    null
-  );
-}
-
 async function fileToDataUrl(file: any): Promise<string | null> {
   if (!file) return null;
-  const p = filePathFromUpload(file);
+  const p =
+    file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
   const buf = await fs.readFile(p);
   const mime = file.mimetype || "image/png";
@@ -90,7 +75,7 @@ async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
     const base = originFromReq(req);
     const url = `${base}/api/news?instrument=${encodeURIComponent(
       instrument
-    )}&hours=48&max=12`;
+    )}&hours=48&max=12&_t=${Date.now()}`;
     const r = await fetch(url, { cache: "no-store" });
     const j = await r.json().catch(() => ({}));
     const items: any[] = Array.isArray(j?.items) ? j.items : [];
@@ -120,7 +105,6 @@ function refusalLike(s: string) {
 // fenced JSON extractor for trailing ai_meta
 function extractAiMeta(text: string) {
   if (!text) return null;
-  // look for ```json ... ``` or ```ai_meta ... ```
   const fences = [/```ai_meta\s*({[\s\S]*?})\s*```/i, /```json\s*({[\s\S]*?})\s*```/i];
   for (const re of fences) {
     const m = text.match(re);
@@ -133,7 +117,119 @@ function extractAiMeta(text: string) {
   return null;
 }
 
-// OpenAI call (chat/completions, vision content parts)
+// Market entry allowed only if proof of breakout+retest (or SFP reclaim)
+function needsPendingLimit(aiMeta: any): boolean {
+  const et = String(aiMeta?.entryType || "").toLowerCase(); // "market" | "pending"
+  if (et !== "market") return false;
+  const bp = aiMeta?.breakoutProof || {};
+  const ok = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+  return !ok; // if not proven, require Pending
+}
+
+// invalid Buy/Sell Limit vs current price and zone
+function invalidOrderRelativeToPrice(aiMeta: any): string | null {
+  const o = String(aiMeta?.entryOrder || "").toLowerCase(); // buy limit / sell limit
+  const dir = String(aiMeta?.direction || "").toLowerCase(); // long / short / flat
+  const z = aiMeta?.zone || {};
+  const p = Number(aiMeta?.currentPrice);
+  const zmin = Number(z?.min);
+  const zmax = Number(z?.max);
+  if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return null;
+
+  if (o === "sell limit" && dir === "short") {
+    // zone must be ABOVE current price (pullback into supply)
+    if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price";
+  }
+  if (o === "buy limit" && dir === "long") {
+    // zone must be BELOW current price (pullback into demand)
+    if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price";
+  }
+  return null;
+}
+
+// ---------- NEW: fetch TV link → image dataURL ----------
+
+const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap
+
+function withTimeout<T>(p: Promise<T>, ms: number) {
+  return new Promise<T>((resolve, reject) => {
+    const id = setTimeout(() => reject(new Error("Image fetch timeout")), ms);
+    p.then((v) => {
+      clearTimeout(id);
+      resolve(v);
+    }).catch((e) => {
+      clearTimeout(id);
+      reject(e);
+    });
+  });
+}
+
+async function fetchBuffer(url: string): Promise<{ buf: Buffer; mime: string } | null> {
+  const r = await fetch(url, {
+    redirect: "follow",
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (compatible; TradePlanBot/1.0; +https://trade-plan-app.vercel.app)",
+      accept: "text/html,application/xhtml+xml,application/xml,image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    },
+  });
+  if (!r.ok) return null;
+  const ctype = String(r.headers.get("content-type") || "").toLowerCase();
+  const mime = ctype.split(";")[0].trim() || "image/png";
+  const ab = await r.arrayBuffer();
+  const buf = Buffer.from(ab);
+  if (buf.byteLength > IMG_MAX_BYTES) throw new Error("Image too large");
+  return { buf, mime };
+}
+
+function absoluteUrl(base: string, maybe: string) {
+  try {
+    return new URL(maybe, base).toString();
+  } catch {
+    return maybe;
+  }
+}
+
+function htmlFindOgImage(html: string): string | null {
+  const re1 = /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i;
+  const m1 = html.match(re1);
+  if (m1?.[1]) return m1[1];
+  const re2 = /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i;
+  const m2 = html.match(re2);
+  if (m2?.[1]) return m2[1];
+  return null;
+}
+
+async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
+  if (!link) return null;
+  try {
+    // First request: could be the image or an HTML page with og:image
+    const first = await withTimeout(fetchBuffer(link), 12000);
+    if (!first) return null;
+
+    const ctype = first.mime.toLowerCase();
+    if (ctype.startsWith("image/")) {
+      return `data:${first.mime};base64,${first.buf.toString("base64")}`;
+    }
+
+    // If HTML, try to resolve og:image
+    const html = first.buf.toString("utf8");
+    const og = htmlFindOgImage(html);
+    if (!og) return null;
+
+    const resolved = absoluteUrl(link, og);
+    const second = await withTimeout(fetchBuffer(resolved), 12000);
+    if (!second) return null;
+    if (!second.mime.toLowerCase().startsWith("image/")) return null;
+
+    return `data:${second.mime};base64,${second.buf.toString("base64")}`;
+  } catch {
+    return null;
+  }
+}
+
+// ---------- OpenAI call (unchanged) ----------
+
 async function callOpenAI(messages: any[]) {
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
@@ -160,7 +256,7 @@ async function callOpenAI(messages: any[]) {
   return String(out || "");
 }
 
-// ---------- prompt builders ----------
+// ---------- prompt builders (unchanged from your base) ----------
 
 function tournamentMessages(params: {
   instrument: string;
@@ -188,7 +284,7 @@ function tournamentMessages(params: {
     "Tournament mode: score candidates (Long/Short where valid):",
     "- Pullback to OB/FVG/SR confluence, Breakout+Retest, SFP/Liquidity grab+reclaim, Range reversion, TL/channel retest, double-tap when clean.",
     "Scoring rubric (0–100): Structure trend(25), 15m trigger quality(25), HTF context(15), Clean path to target(10), Stop validity(10), Fundamentals/Headlines(10), 'No chase' penalty(5).",
-    "Market entry allowed only when **explicit proof** per strategy; otherwise label EntryType: Pending and use Buy/Sell Limit zone.",
+    "Market entry allowed only when **explicit proof**: body close beyond level **and** retest holds (or SFP reclaim). Otherwise label EntryType: Pending and use Buy/Sell Limit zone.",
     "Stops just beyond invalidation (swing/zone) with small buffer. RR can be < 1.5R if structure says so.",
     "Use calendar/headlines as bias overlay if provided.",
     "",
@@ -199,11 +295,12 @@ function tournamentMessages(params: {
     "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
     "• Trigger: (ex: Limit pullback / zone touch)",
     "• Entry: <min–max> or specific level",
-    "• Stop Loss: <level>",
+    "• Stop Loss: <level> (based on PA: behind swing/OB/SR; step to next zone if too tight)",
     "• Take Profit(s): TP1 <level> / TP2 <level>",
     "• Conviction: <0–100>%",
     "• Setup: <Chosen Strategy>",
     "• Short Reasoning: <1–2 lines>",
+    "• Option 2 (Market): Show when allowed; else print 'Not available (missing confirmation)'.",
     "",
     "Full Breakdown",
     "• Technical View (HTF + Intraday): 4H/1H/15m structure",
@@ -235,16 +332,7 @@ function tournamentMessages(params: {
     `  "currentPrice": number | null,`,
     `  "zone": { "min": number, "max": number, "tf": "15m" | "1H" | "4H", "type": "OB" | "FVG" | "SR" | "Other" },`,
     `  "stop": number, "tp1": number, "tp2": number,`,
-    `  "prevSwingHigh": number | null, "prevSwingLow": number | null,`,
-    `  "srAbove": number[] | null, "srBelow": number[] | null,`,
-    `  "proof": {`,
-    `    "breakout": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
-    `    "pullback": { "rejectionCloseInZone": boolean, "impulseAway": boolean },`,
-    `    "range": { "sfpAtEdge": boolean, "acceptanceInRange": boolean },`,
-    `    "trendline": { "tlBreakClose": boolean, "tlRetestHold": boolean },`,
-    `    "sfp": { "sweepConfirmed": boolean, "reclaimClose": boolean },`,
-    `    "bos": { "htfBos": boolean, "ltfMomentumClose": boolean }`,
-    `  },`,
+    `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
     `  "candidateScores": [{ "name": string, "score": number, "reason": string }]}`,
     "```",
   ].join("\n");
@@ -291,84 +379,54 @@ async function askTournament(args: {
   return { text, aiMeta };
 }
 
-// ---------- local Option 2 helpers (no extra model calls) ----------
-
-// Check if strategy has enough confirmation to allow Market (Option 2)
-function strategyAllowsMarket(aiMeta: any): boolean {
-  if (!aiMeta) return false;
-  const name = String(aiMeta?.selectedStrategy || aiMeta?.setup || "").toLowerCase();
-
-  const proof = aiMeta?.proof || {};
-  const breakout = proof?.breakout || aiMeta?.breakoutProof || {};
-  const pullback = proof?.pullback || {};
-  const range = proof?.range || {};
-  const trendline = proof?.trendline || {};
-  const sfp = proof?.sfp || {};
-  const bos = proof?.bos || {};
-
-  if (name.includes("breakout")) {
-    return !!(breakout?.bodyCloseBeyond === true &&
-      (breakout?.retestHolds === true || breakout?.sfpReclaim === true));
-  }
-  if (name.includes("pullback") || name.includes("ob") || name.includes("fvg") || name.includes("sr")) {
-    return !!(pullback?.rejectionCloseInZone === true && pullback?.impulseAway === true);
-  }
-  if (name.includes("range")) {
-    return !!(range?.sfpAtEdge === true && range?.acceptanceInRange === true);
-  }
-  if (name.includes("trendline") || name.includes("channel")) {
-    return !!(trendline?.tlBreakClose === true && trendline?.tlRetestHold === true);
-  }
-  if (name.includes("sfp") || name.includes("liquidity")) {
-    return !!(sfp?.sweepConfirmed === true && sfp?.reclaimClose === true);
-  }
-  if (name.includes("bos") || name.includes("continuation")) {
-    return !!(bos?.htfBos === true && bos?.ltfMomentumClose === true);
-  }
-
-  // Fallback: breakout-style test if unknown
-  return !!(breakout?.bodyCloseBeyond === true &&
-    (breakout?.retestHolds === true || breakout?.sfpReclaim === true));
+// rewrite card -> Pending limit (no Market) when proof missing
+async function rewriteAsPending(instrument: string, text: string) {
+  const messages = [
+    {
+      role: "system",
+      content:
+        "Rewrite the trade card as PENDING (no Market) into a clean Buy/Sell LIMIT zone at OB/FVG/SR confluence if breakout proof is missing. Keep tournament section and X-ray.",
+    },
+    {
+      role: "user",
+      content: `Instrument: ${instrument}\n\n${text}\n\nRewrite strictly to Pending.`,
+    },
+  ];
+  return callOpenAI(messages);
 }
 
-// Insert Option 2 line under "Quick Plan (Actionable)" robustly
-function ensureOption2Line(text: string, allows: boolean, convMinus5: number): string {
-  if (!text) return text;
-  const lines = text.split(/\n/);
+// normalize mislabeled Breakout+Retest without proof -> Pullback
+async function normalizeBreakoutLabel(text: string) {
+  const messages = [
+    {
+      role: "system",
+      content:
+        "If 'Breakout + Retest' is claimed but proof is not shown (body close + retest hold or SFP reclaim), rename setup to 'Pullback (OB/FVG/SR)' and leave rest unchanged.",
+    },
+    { role: "user", content: text },
+  ];
+  return callOpenAI(messages);
+}
 
-  // find "Quick Plan (Actionable)" line
-  let qpIdx = lines.findIndex((l) => /quick plan\s*\(actionable\)/i.test(l));
-  if (qpIdx === -1) {
-    // no explicit header; append at top
-    const optLine = allows
-      ? `• Option 2 (Market): Market entry (post-confirmation). SL/TPs same as Option 1. Conviction ~${convMinus5}%`
-      : `• Option 2 (Market): Not available (missing confirmation for this setup).`;
-    return `${optLine}\n` + text;
-  }
+// fix Buy/Sell Limit level direction vs current price
+async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
+  const reason = invalidOrderRelativeToPrice(aiMeta);
+  if (!reason) return text;
 
-  // try to place after "Conviction:" if present, else after header or after Short Reasoning
-  let insertAt = -1;
-  for (let i = qpIdx + 1; i < Math.min(lines.length, qpIdx + 40); i++) {
-    const li = lines[i] || "";
-    if (/^\s*•\s*Conviction\s*:/i.test(li)) {
-      insertAt = i + 1;
-      break;
-    }
-    // stop if next major section
-    if (/^\s*Full Breakdown/i.test(li) || /^\s*##\s+/.test(li)) break;
-  }
-  if (insertAt === -1) insertAt = qpIdx + 1;
-
-  const opt2 = allows
-    ? `• Option 2 (Market): Market entry (post-confirmation). SL/TPs same as Option 1. Conviction ~${convMinus5}%`
-    : `• Option 2 (Market): Not available (missing confirmation for this setup).`;
-
-  // avoid duplicate insertions
-  const already = lines.some((l) => /option\s*2\s*\(market\)/i.test(l));
-  if (already) return text;
-
-  lines.splice(insertAt, 0, opt2);
-  return lines.join("\n");
+  const messages = [
+    {
+      role: "system",
+      content:
+        "Adjust the LIMIT zone so that: Sell Limit is an ABOVE-price pullback into supply; Buy Limit is a BELOW-price pullback into demand. Keep all other content & sections.",
+    },
+    {
+      role: "user",
+      content: `Instrument: ${instrument}\n\nCurrent Price: ${aiMeta?.currentPrice}\nProvided Zone: ${JSON.stringify(
+        aiMeta?.zone
+      )}\n\nCard:\n${text}\n\nFix only the LIMIT zone side and entry, keep format.`,
+    },
+  ];
+  return callOpenAI(messages);
 }
 
 // ---------- handler ----------
@@ -384,7 +442,7 @@ export default async function handler(
       return res.status(400).json({
         ok: false,
         reason:
-          "Use multipart/form-data with files: m15, h1, h4 (PNG/JPG) and optional 'calendar'. Also include 'instrument' field.",
+          "Use multipart/form-data with files: m15, h1, h4 (PNG/JPG) and optional 'calendar'. Or pass m15Url/h1Url/h4Url (TradingView links). Also include 'instrument' field.",
       });
     }
 
@@ -393,29 +451,39 @@ export default async function handler(
       .toUpperCase()
       .replace(/\s+/g, "");
 
+    // Files (if provided)
     const m15f = pickFirst(files.m15);
     const h1f = pickFirst(files.h1);
     const h4f = pickFirst(files.h4);
     const calF = pickFirst(files.calendar);
 
-    // Remember file paths for cleanup
-    const tempPaths = [m15f, h1f, h4f, calF].map((f) => filePathFromUpload(f)).filter(Boolean) as string[];
+    // URLs (optional; TradingView "Copy link to image")
+    const m15Url = String(pickFirst(fields.m15Url) || "").trim();
+    const h1Url = String(pickFirst(fields.h1Url) || "").trim();
+    const h4Url = String(pickFirst(fields.h4Url) || "").trim();
 
-    const [m15, h1, h4, calUrl] = await Promise.all([
+    // Build images: prefer file if present; otherwise use URL fetcher
+    const [m15FromFile, h1FromFile, h4FromFile, calUrl] = await Promise.all([
       fileToDataUrl(m15f),
       fileToDataUrl(h1f),
       fileToDataUrl(h4f),
       calF ? fileToDataUrl(calF) : Promise.resolve(null),
     ]);
 
+    const [m15FromUrl, h1FromUrl, h4FromUrl] = await Promise.all([
+      m15FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(m15Url),
+      h1FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(h1Url),
+      h4FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(h4Url),
+    ]);
+
+    const m15 = m15FromFile || m15FromUrl;
+    const h1 = h1FromFile || h1FromUrl;
+    const h4 = h4FromFile || h4FromUrl;
+
     if (!m15 || !h1 || !h4) {
-      // best-effort cleanup even on early return
-      await Promise.all(
-        tempPaths.map((p) => fs.unlink(p).catch(() => {}))
-      );
       return res
         .status(400)
-        .json({ ok: false, reason: "Upload all three charts: m15, h1, h4 (PNG/JPG)." });
+        .json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either as files or valid TradingView image links." });
     }
 
     const headlinesText = await fetchedHeadlines(req, instrument);
@@ -432,18 +500,31 @@ export default async function handler(
       h4,
     });
 
-    // 2) Always show Option 2 line (Market or Not available)
-    const allows = strategyAllowsMarket(aiMeta);
-    // try to read "Conviction: 64%" from the card; fall back to 60
-    let convPct = 60;
-    try {
-      const m = text.match(/Conviction:\s*([0-9]{1,3})\s*%/i);
-      if (m) convPct = Math.max(0, Math.min(100, parseInt(m[1], 10)));
-    } catch {}
-    const opt2Conv = Math.max(0, convPct - 5);
-    text = ensureOption2Line(text, allows, opt2Conv);
+    // 2) Force Pending if Market without proof
+    if (aiMeta && needsPendingLimit(aiMeta)) {
+      text = await rewriteAsPending(instrument, text);
+      aiMeta = extractAiMeta(text) || aiMeta;
+    }
 
-    // 3) Fallback if refusal/empty
+    // 3) Normalize mislabeled Breakout+Retest if no proof
+    const bp = aiMeta?.breakoutProof || {};
+    const hasProof =
+      !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+    if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
+      text = await normalizeBreakoutLabel(text);
+      aiMeta = extractAiMeta(text) || aiMeta;
+    }
+
+    // 4) Enforce order vs current price (Sell Limit above / Buy Limit below)
+    if (aiMeta) {
+      const bad = invalidOrderRelativeToPrice(aiMeta);
+      if (bad) {
+        text = await fixOrderVsPrice(instrument, text, aiMeta);
+        aiMeta = extractAiMeta(text) || aiMeta;
+      }
+    }
+
+    // 5) Fallback if refusal/empty
     if (!text || refusalLike(text)) {
       const fallback =
         [
@@ -457,7 +538,6 @@ export default async function handler(
           "• Take Profit(s): Prior swing/liquidity; then trail.",
           "• Conviction: 30%",
           "• Setup: Await valid trigger (images inconclusive).",
-          "• Option 2 (Market): Not available (missing confirmation for this setup).",
           "",
           "Full Breakdown",
           "• Technical View: Indecisive; likely range.",
@@ -492,7 +572,11 @@ export default async function handler(
               stop: null,
               tp1: null,
               tp2: null,
-              proof: {},
+              breakoutProof: {
+                bodyCloseBeyond: false,
+                retestHolds: false,
+                sfpReclaim: false,
+              },
               candidateScores: [],
               note: "Fallback used due to refusal/empty output.",
             },
@@ -501,9 +585,6 @@ export default async function handler(
           ),
           "```",
         ].join("\n");
-
-      // cleanup temp files before returning
-      await Promise.all(tempPaths.map((p) => fs.unlink(p).catch(() => {})));
 
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
@@ -520,9 +601,6 @@ export default async function handler(
         },
       });
     }
-
-    // cleanup temp files before final response
-    await Promise.all(tempPaths.map((p) => fs.unlink(p).catch(() => {})));
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
