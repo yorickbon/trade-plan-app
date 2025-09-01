@@ -2,11 +2,10 @@
 // Images-only planner with optional TradingView image URL fetch.
 // Uploads: m15 (execution), h1 (context), h4 (HTF), optional calendar.
 // You can also pass m15Url / h1Url / h4Url (TradingView "Copy link to image").
-// Keeps existing logic & headings intact. (Only: headlines→6, server-side image downscale.)
+// Keeps existing logic & headings intact.
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
-import sharp from "sharp";
 
 // ---------- config ----------
 export const config = {
@@ -20,12 +19,6 @@ const OPENAI_API_KEY =
   process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
 const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
-
-// ---------- image settings (balanced for speed + readability) ----------
-const CHART_MAX_W = 1280;   // m15/h1/h4
-const CAL_MAX_W = 1400;     // calendar gets a touch more width
-const JPG_QUALITY = 58;     // visually solid for charts + big byte savings
-const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap for fetched links
 
 // ---------- helpers ----------
 
@@ -61,13 +54,22 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null {
   return Array.isArray(x) ? (x[0] ?? null) : (x as any);
 }
 
+async function fileToDataUrl(file: any): Promise<string | null> {
+  if (!file) return null;
+  const p =
+    file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
+  if (!p) return null;
+  const buf = await fs.readFile(p);
+  const mime = file.mimetype || "image/png";
+  return `data:${mime};base64,${buf.toString("base64")}`;
+}
+
 function originFromReq(req: NextApiRequest) {
   const proto = (req.headers["x-forwarded-proto"] as string) || "https";
   const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 
-// ---------- headlines (fetch 12, pass 6 to GPT) ----------
 async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
   try {
     const base = originFromReq(req);
@@ -78,7 +80,7 @@ async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
     const j = await r.json().catch(() => ({}));
     const items: any[] = Array.isArray(j?.items) ? j.items : [];
     const lines = items
-      .slice(0, 6) // <— pass only 6 into GPT
+      .slice(0, 12)
       .map((it: any) => {
         const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
         const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
@@ -145,12 +147,20 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   return null;
 }
 
-// ---------- link fetching ----------
+// ---------- NEW: fetch TV link → image dataURL ----------
+
+const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap
+
 function withTimeout<T>(p: Promise<T>, ms: number) {
   return new Promise<T>((resolve, reject) => {
     const id = setTimeout(() => reject(new Error("Image fetch timeout")), ms);
-    p.then((v) => { clearTimeout(id); resolve(v); })
-     .catch((e) => { clearTimeout(id); reject(e); });
+    p.then((v) => {
+      clearTimeout(id);
+      resolve(v);
+    }).catch((e) => {
+      clearTimeout(id);
+      reject(e);
+    });
   });
 }
 
@@ -160,8 +170,7 @@ async function fetchBuffer(url: string): Promise<{ buf: Buffer; mime: string } |
     headers: {
       "user-agent":
         "Mozilla/5.0 (compatible; TradePlanBot/1.0; +https://trade-plan-app.vercel.app)",
-      accept:
-        "text/html,application/xhtml+xml,application/xml,image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      accept: "text/html,application/xhtml+xml,application/xml,image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     },
   });
   if (!r.ok) return null;
@@ -191,38 +200,19 @@ function htmlFindOgImage(html: string): string | null {
   return null;
 }
 
-// ---------- downscale + encode helpers ----------
-async function toJpegDataUrl(input: Buffer, maxWidth: number): Promise<string> {
-  const out = await sharp(input)
-    .rotate() // respect EXIF orientation if present
-    .resize({ width: maxWidth, withoutEnlargement: true })
-    .jpeg({ quality: JPG_QUALITY, progressive: true, chromaSubsampling: "4:2:0" })
-    .withMetadata({ exif: false }) // strip metadata
-    .toBuffer();
-  return `data:image/jpeg;base64,${out.toString("base64")}`;
-}
-
-async function fileToDataUrl(file: any, maxWidth: number): Promise<string | null> {
-  if (!file) return null;
-  const p =
-    file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
-  if (!p) return null;
-  const buf = await fs.readFile(p);
-  return toJpegDataUrl(buf, maxWidth);
-}
-
-async function fetchImageDataUrlFromLink(link: string, maxWidth: number): Promise<string | null> {
+async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
   if (!link) return null;
   try {
+    // First request: could be the image or an HTML page with og:image
     const first = await withTimeout(fetchBuffer(link), 12000);
     if (!first) return null;
 
     const ctype = first.mime.toLowerCase();
     if (ctype.startsWith("image/")) {
-      return toJpegDataUrl(first.buf, maxWidth);
+      return `data:${first.mime};base64,${first.buf.toString("base64")}`;
     }
 
-    // If HTML, resolve og:image then fetch that
+    // If HTML, try to resolve og:image
     const html = first.buf.toString("utf8");
     const og = htmlFindOgImage(html);
     if (!og) return null;
@@ -232,13 +222,14 @@ async function fetchImageDataUrlFromLink(link: string, maxWidth: number): Promis
     if (!second) return null;
     if (!second.mime.toLowerCase().startsWith("image/")) return null;
 
-    return toJpegDataUrl(second.buf, maxWidth);
+    return `data:${second.mime};base64,${second.buf.toString("base64")}`;
   } catch {
     return null;
   }
 }
 
 // ---------- OpenAI call (unchanged) ----------
+
 async function callOpenAI(messages: any[]) {
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
@@ -266,6 +257,7 @@ async function callOpenAI(messages: any[]) {
 }
 
 // ---------- prompt builders (unchanged from your base) ----------
+
 function tournamentMessages(params: {
   instrument: string;
   dateStr: string;
@@ -438,6 +430,7 @@ async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
 }
 
 // ---------- handler ----------
+
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<Ok | Err>
@@ -470,23 +463,22 @@ export default async function handler(
     const h4Url = String(pickFirst(fields.h4Url) || "").trim();
 
     // Build images: prefer file if present; otherwise use URL fetcher
-    const [m15FromFile, h1FromFile, h4FromFile, calFromFile] = await Promise.all([
-      fileToDataUrl(m15f, CHART_MAX_W),
-      fileToDataUrl(h1f, CHART_MAX_W),
-      fileToDataUrl(h4f, CHART_MAX_W),
-      calF ? fileToDataUrl(calF, CAL_MAX_W) : Promise.resolve(null),
+    const [m15FromFile, h1FromFile, h4FromFile, calUrl] = await Promise.all([
+      fileToDataUrl(m15f),
+      fileToDataUrl(h1f),
+      fileToDataUrl(h4f),
+      calF ? fileToDataUrl(calF) : Promise.resolve(null),
     ]);
 
     const [m15FromUrl, h1FromUrl, h4FromUrl] = await Promise.all([
-      m15FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(m15Url, CHART_MAX_W),
-      h1FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(h1Url, CHART_MAX_W),
-      h4FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(h4Url, CHART_MAX_W),
+      m15FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(m15Url),
+      h1FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(h1Url),
+      h4FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(h4Url),
     ]);
 
     const m15 = m15FromFile || m15FromUrl;
     const h1 = h1FromFile || h1FromUrl;
     const h4 = h4FromFile || h4FromUrl;
-    const calUrl = calFromFile || null;
 
     if (!m15 || !h1 || !h4) {
       return res
