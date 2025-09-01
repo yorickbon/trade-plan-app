@@ -1,126 +1,185 @@
 // components/ChatDock.tsx
 "use client";
 
-import { useState } from "react";
+import React from "react";
 
-type Msg = { role: "user" | "assistant" | "system"; text: string };
+type ChatDockProps = {
+  instrument?: string;
+  planText?: string;
+  headlines?: any[];
+  calendar?: any[];
+};
+
+type Msg = { role: "user" | "assistant"; content: string };
 
 export default function ChatDock({
+  instrument,
   planText,
   headlines,
   calendar,
-}: {
-  planText: string;
-  headlines: any[];
-  calendar: any[];
-}) {
-  const [q, setQ] = useState("");
-  const [log, setLog] = useState<Msg[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+}: ChatDockProps) {
+  const [messages, setMessages] = React.useState<Msg[]>([]);
+  const [input, setInput] = React.useState("");
+  const [loading, setLoading] = React.useState(false);
+  const abortRef = React.useRef<AbortController | null>(null);
 
-  async function ask() {
-    const question = q.trim();
-    if (!question) return;
-    setErr(null);
-    setQ("");
+  const addMsg = React.useCallback((m: Msg) => {
+    setMessages((prev) => [...prev, m]);
+  }, []);
 
-    // echo user in log
-    setLog((L) => [...L, { role: "user", text: question }]);
-    setBusy(true);
+  const updateLastAssistant = React.useCallback((chunk: string) => {
+    setMessages((prev) => {
+      if (!prev.length || prev[prev.length - 1].role !== "assistant") {
+        return [...prev, { role: "assistant", content: chunk }];
+        }
+      const copy = prev.slice();
+      copy[copy.length - 1] = {
+        role: "assistant",
+        content: copy[copy.length - 1].content + chunk,
+      };
+      return copy;
+    });
+  }, []);
+
+  const onStop = React.useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setLoading(false);
+  }, []);
+
+  async function send(e?: React.FormEvent) {
+    e?.preventDefault();
+    const question = input.trim();
+    if (!question || loading) return;
+
+    addMsg({ role: "user", content: question });
+    setInput("");
+    setLoading(true);
+
+    // Attempt streaming first
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     try {
-      // Send JSON to /api/ask (proxy to /api/chat)
-      const rsp = await fetch("/api/ask", {
+      const rsp = await fetch("/api/ask?stream=1", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          accept: "text/event-stream", // hint server to stream
+        },
         body: JSON.stringify({
           question,
-          planText,     // anchor to current plan
-          headlines,    // give macro context
-          calendar,     // give events context
+          instrument,
+          planText,
+          headlines,
+          calendar,
+          stream: true,
         }),
+        signal: controller.signal,
       });
 
-      const j = await rsp.json().catch(() => ({} as any));
-      const answer =
-        (j && (j.answer || j.text || j.message)) ||
-        (typeof j === "string" ? j : "") ||
-        "";
+      const ctype = rsp.headers.get("content-type") || "";
+      if (ctype.includes("text/event-stream") && rsp.body) {
+        const reader = rsp.body.getReader();
+        const decoder = new TextDecoder();
 
-      if (!rsp.ok) {
-        setErr(j?.error || j?.reason || "Chat request failed.");
-        setLog((L) => [...L, { role: "assistant", text: "Sorry — I couldn't reply just now." }]);
-      } else if (!answer) {
-        setLog((L) => [
-          ...L,
-          {
-            role: "assistant",
-            text:
-              "I didn’t get a response there. Try rephrasing, or ask something like “Was this a BOS?” or “Why is conviction only 40%?”",
-          },
-        ]);
-      } else {
-        setLog((L) => [...L, { role: "assistant", text: answer }]);
+        // seed assistant message
+        updateLastAssistant("");
+
+        let buf = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+
+          // Split SSE events by double newline
+          const events = buf.split("\n\n");
+          buf = events.pop() || "";
+          for (const ev of events) {
+            const line = ev.trim();
+            if (line.startsWith("event: error")) {
+              const dataLine = ev.split("\n").find((l) => l.startsWith("data:"));
+              if (dataLine) {
+                try {
+                  const payload = JSON.parse(dataLine.slice(5).trim());
+                  updateLastAssistant(`\n[error] ${payload?.error || "stream error"}`);
+                } catch {
+                  updateLastAssistant(`\n[error] stream error`);
+                }
+              }
+              continue;
+            }
+            if (!line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if (data === "[DONE]") continue;
+            updateLastAssistant(data); // append raw chunk
+          }
+        }
+
+        setLoading(false);
+        abortRef.current = null;
+        return;
       }
-    } catch (e: any) {
-      setErr(e?.message || "Network error.");
-      setLog((L) => [...L, { role: "assistant", text: "Network error." }]);
+
+      // Fallback: non-stream JSON
+      const json = await rsp.json().catch(() => ({} as any));
+      const answer = json?.answer || json?.text || json?.message || json?.error || "";
+      addMsg({ role: "assistant", content: String(answer || "(no answer)") });
+    } catch (err: any) {
+      addMsg({ role: "assistant", content: `[error] ${err?.message || "request failed"}` });
     } finally {
-      setBusy(false);
+      setLoading(false);
+      abortRef.current = null;
     }
   }
 
   return (
-    <div className="rounded-lg border border-neutral-800 p-3 space-y-3">
-      <div className="text-xs opacity-70">
-        Ask about this setup: “Why this stop?”, “What’s the BOS?”, “What headlines mattered?”,
-        “What would raise conviction above 60%?”, etc.
-      </div>
-
-      {/* transcript */}
-      <div className="bg-neutral-900 rounded p-2 max-h-64 overflow-auto text-sm space-y-2">
-        {log.length === 0 ? (
-          <div className="opacity-60">No messages yet.</div>
+    <div className="w-full max-w-2xl mx-auto border rounded-xl p-3 flex flex-col gap-3">
+      <div className="h-72 overflow-auto rounded border p-3 bg-white">
+        {messages.length === 0 ? (
+          <div className="opacity-60 text-sm">
+            Ask about the current trade plan, or request examples to learn concepts.
+          </div>
         ) : (
-          log.map((m, i) => (
-            <div key={i} className="leading-6">
-              <span
-                className={`mr-2 px-2 py-0.5 rounded text-[11px] ${
-                  m.role === "user"
-                    ? "bg-sky-700"
-                    : m.role === "assistant"
-                    ? "bg-emerald-700"
-                    : "bg-neutral-700"
+          messages.map((m, i) => (
+            <div key={i} className={`mb-3 ${m.role === "user" ? "text-right" : "text-left"}`}>
+              <div
+                className={`inline-block whitespace-pre-wrap rounded-lg px-3 py-2 ${
+                  m.role === "user" ? "bg-blue-50" : "bg-gray-50"
                 }`}
               >
-                {m.role === "user" ? "You" : m.role === "assistant" ? "Assistant" : "System"}
-              </span>
-              <span>{m.text}</span>
+                {m.content}
+              </div>
             </div>
           ))
         )}
       </div>
 
-      {err && <div className="text-rose-400 text-xs">{err}</div>}
-
-      <div className="flex gap-2">
+      <form onSubmit={send} className="flex gap-2">
         <input
-          className="flex-1 bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-sm"
-          placeholder="Ask about the plan…"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && !busy && ask()}
-          disabled={busy}
+          className="flex-1 border rounded-lg px-3 py-2"
+          placeholder="Ask anything about the plan or trading…"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          disabled={loading}
         />
         <button
-          onClick={ask}
-          disabled={busy}
-          className="bg-blue-600 hover:bg-blue-500 disabled:opacity-60 rounded px-3 text-sm"
+          type="submit"
+          className="px-3 py-2 rounded-lg bg-black text-white disabled:opacity-50"
+          disabled={loading || !input.trim()}
         >
-          {busy ? "…" : "Ask"}
+          Send
         </button>
-      </div>
+        <button
+          type="button"
+          className="px-3 py-2 rounded-lg border disabled:opacity-50"
+          onClick={onStop}
+          disabled={!loading}
+          title="Stop generating"
+        >
+          Stop
+        </button>
+      </form>
     </div>
   );
 }
