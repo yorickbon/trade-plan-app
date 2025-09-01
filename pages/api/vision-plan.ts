@@ -77,7 +77,7 @@ async function processImageBuffer(
   const width = meta.width || 0;
   const height = meta.height || 0;
 
-  // If already small enough and wide clarity likely fine, pass through
+  // If already small enough, pass through
   if (width <= TARGET_MAX_WIDTH && input.byteLength <= PREFERRED_MAX_BYTES) {
     const mime = inputMime?.startsWith("image/") ? inputMime : "image/jpeg";
     console.log(
@@ -86,14 +86,13 @@ async function processImageBuffer(
     return toDataUrl(input, mime);
   }
 
-  // Two-step quality to balance speed vs clarity, with 4:4:4 to keep lines/text crisp
+  // Two-step quality to balance speed vs clarity. NOTE: fastShrinkOnLoad is a RESIZE option.
   for (const q of [70, 60]) {
     const { data, info } = await sharp(input, {
       limitInputPixels: false,
       sequentialRead: true,
-      fastShrinkOnLoad: true,
     })
-      .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true })
+      .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true, fastShrinkOnLoad: true })
       .jpeg({
         quality: q,
         mozjpeg: true,
@@ -109,13 +108,13 @@ async function processImageBuffer(
       )}KB, q=${q}`
     );
 
-    // Prefer to keep clarity; accept slightly larger than 600KB if needed
+    // Prefer clarity; accept slightly >600KB if needed
     if (data.byteLength <= PREFERRED_MAX_BYTES || q === 60) {
       return toDataUrl(data, "image/jpeg");
     }
   }
 
-  // Fallback should never hit due to the loop above
+  // Fallback (shouldn't hit due to the loop)
   return toDataUrl(input, inputMime || "image/jpeg");
 }
 
@@ -147,7 +146,7 @@ async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
     const j = await r.json().catch(() => ({}));
     const items: any[] = Array.isArray(j?.items) ? j.items : [];
     const lines = items
-      .slice(0, 6) // <-- only 6 go to the model
+      .slice(0, 6) // <= only 6 go to the model
       .map((it: any) => {
         const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
         const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
@@ -214,7 +213,7 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   return null;
 }
 
-// ---------- fetch TV link → image dataURL (then process) ----------
+// ---------- NEW: fetch TV link → image dataURL (then process) ----------
 
 function withTimeout<T>(p: Promise<T>, ms: number) {
   return new Promise<T>((resolve, reject) => {
@@ -419,7 +418,7 @@ function tournamentMessages(params: {
   if (headlinesText) {
     userParts.push({
       type: "text",
-      text: `Recent headlines snapshot:\n${headlinesText}`, // unchanged wording
+      text: `Recent headlines snapshot:\n${headlinesText}`,
     });
   }
 
