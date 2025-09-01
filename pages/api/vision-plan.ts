@@ -2,7 +2,7 @@
 // Images-only planner with optional TradingView image URL fetch.
 // Uploads: m15 (execution), h1 (context), h4 (HTF), optional calendar.
 // You can also pass m15Url / h1Url / h4Url (TradingView "Copy link to image").
-// Keeps existing logic & headings intact.
+// Keeps existing logic & headings intact.  (Headlines: fetch 12, pass 6. Images: server-side downscale+JPEG.)
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -54,14 +54,38 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null {
   return Array.isArray(x) ? (x[0] ?? null) : (x as any);
 }
 
+// ---------- image downscale + JPEG (server-side) ----------
+const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap
+const TARGET_WIDTH = 1200; // good quality vs cost
+const JPEG_QUALITY = 72;
+
+async function resizeAndEncode(base: Buffer): Promise<string> {
+  try {
+    // lazy import
+    const sharpMod: any = await import("sharp");
+    const sharp = sharpMod?.default || sharpMod;
+
+    const outBuf: Buffer = await sharp(base)
+      .rotate() // respect EXIF
+      .resize({ width: TARGET_WIDTH, withoutEnlargement: true })
+      .jpeg({ quality: JPEG_QUALITY, mozjpeg: true })
+      .toBuffer();
+
+    return `data:image/jpeg;base64,${outBuf.toString("base64")}`;
+  } catch {
+    // Fallback: just return original as PNG-ish data URL
+    return `data:image/png;base64,${base.toString("base64")}`;
+  }
+}
+
 async function fileToDataUrl(file: any): Promise<string | null> {
   if (!file) return null;
   const p =
     file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
   const buf = await fs.readFile(p);
-  const mime = file.mimetype || "image/png";
-  return `data:${mime};base64,${buf.toString("base64")}`;
+  if (buf.byteLength > IMG_MAX_BYTES) throw new Error("Image too large");
+  return resizeAndEncode(buf);
 }
 
 function originFromReq(req: NextApiRequest) {
@@ -147,10 +171,7 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   return null;
 }
 
-// ---------- NEW: fetch TV link → image dataURL ----------
-
-const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap
-
+// ---------- TradingView link → image buffer ----------
 function withTimeout<T>(p: Promise<T>, ms: number) {
   return new Promise<T>((resolve, reject) => {
     const id = setTimeout(() => reject(new Error("Image fetch timeout")), ms);
@@ -203,13 +224,12 @@ function htmlFindOgImage(html: string): string | null {
 async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
   if (!link) return null;
   try {
-    // First request: could be the image or an HTML page with og:image
     const first = await withTimeout(fetchBuffer(link), 12000);
     if (!first) return null;
 
     const ctype = first.mime.toLowerCase();
     if (ctype.startsWith("image/")) {
-      return `data:${first.mime};base64,${first.buf.toString("base64")}`;
+      return resizeAndEncode(first.buf);
     }
 
     // If HTML, try to resolve og:image
@@ -222,14 +242,13 @@ async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
     if (!second) return null;
     if (!second.mime.toLowerCase().startsWith("image/")) return null;
 
-    return `data:${second.mime};base64,${second.buf.toString("base64")}`;
+    return resizeAndEncode(second.buf);
   } catch {
     return null;
   }
 }
 
-// ---------- OpenAI call (unchanged) ----------
-
+// ---------- OpenAI call ----------
 async function callOpenAI(messages: any[]) {
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
@@ -256,8 +275,7 @@ async function callOpenAI(messages: any[]) {
   return String(out || "");
 }
 
-// ---------- prompt builders (unchanged from your base) ----------
-
+// ---------- prompt builders ----------
 function tournamentMessages(params: {
   instrument: string;
   dateStr: string;
@@ -337,6 +355,10 @@ function tournamentMessages(params: {
     "```",
   ].join("\n");
 
+  // Limit to 6 headlines in the prompt (we still fetched up to 12)
+  const limitedHeadlines =
+    headlinesText ? headlinesText.split("\n").slice(0, 6).join("\n") : null;
+
   const userParts: any[] = [
     { type: "text", text: `Instrument: ${instrument}\nDate: ${dateStr}` },
     { type: "text", text: "HTF 4H Chart:" },
@@ -351,10 +373,10 @@ function tournamentMessages(params: {
     userParts.push({ type: "text", text: "Economic Calendar Image:" });
     userParts.push({ type: "image_url", image_url: { url: calendarDataUrl } });
   }
-  if (headlinesText) {
+  if (limitedHeadlines) {
     userParts.push({
       type: "text",
-      text: `Recent headlines snapshot:\n${headlinesText}`,
+      text: `Recent headlines snapshot:\n${limitedHeadlines}`,
     });
   }
 
@@ -430,7 +452,6 @@ async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
 }
 
 // ---------- handler ----------
-
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<Ok | Err>
@@ -494,7 +515,7 @@ export default async function handler(
       instrument,
       dateStr,
       calendarDataUrl: calUrl || undefined,
-      headlinesText: headlinesText || undefined,
+      headlinesText: headlinesText || undefined, // we limit to 6 inside builder
       m15,
       h1,
       h4,
