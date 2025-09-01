@@ -1,19 +1,26 @@
 // pages/api/chat.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 
+// --- ENV ---
 const OPENAI_API_KEY =
   process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
-const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
+// Prefer the alternate model (e.g., gpt-4o). Fall back to OPENAI_MODEL.
+const MODEL_PRIMARY =
+  process.env.OPENAI_MODEL_ALT || process.env.OPENAI_MODEL || "gpt-4o";
+const OPENAI_API_BASE =
+  process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
 
+// --- small utils ---
 function asString(x: any) {
   return typeof x === "string" ? x : x == null ? "" : JSON.stringify(x);
 }
+const isGpt5 = (m: string) => /^gpt-5/i.test(m);
 
-/* ---------- Fresh, instrument-aligned headlines (6 bullets max) ---------- */
+// ---------- fresh, instrument-aligned headlines (6 bullets) ----------
 function originFromReq(req: NextApiRequest) {
   const proto = (req.headers["x-forwarded-proto"] as string) || "https";
-  const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
+  const host =
+    (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 
@@ -24,17 +31,22 @@ function bulletsFromItems(items: any[], max = 6): string {
     if (!t) continue;
     const src = String(it?.source ?? "").trim();
     const when = String(it?.ago ?? "").trim();
-    const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
+    const s =
+      typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
     const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
     rows.push(`• ${t}${src ? ` — ${src}` : ""}${when ? `, ${when}` : ""} — ${lab}`);
   }
   return rows.join("\n");
 }
 
-async function fetchInstrumentHeadlines(req: NextApiRequest, instrument: string, max = 6) {
+async function fetchInstrumentHeadlines(
+  req: NextApiRequest,
+  instrument: string,
+  max = 6
+) {
   try {
     const base = originFromReq(req);
-    // fetch up to 12 but embed only 6
+    // fetch up to 12, embed 6
     const url = `${base}/api/news?instrument=${encodeURIComponent(
       instrument
     )}&hours=48&max=12&_t=${Date.now()}`;
@@ -47,7 +59,7 @@ async function fetchInstrumentHeadlines(req: NextApiRequest, instrument: string,
   }
 }
 
-/* --------------------------- Prompt helpers --------------------------- */
+// ---------- prompt & extraction ----------
 function buildMessages(system: string, userContent: string) {
   return [
     { role: "system", content: system },
@@ -55,8 +67,7 @@ function buildMessages(system: string, userContent: string) {
   ];
 }
 
-/* ------------------------ Chat output extraction ---------------------- */
-// GPT-5 can return string or array content. Handle the common shapes.
+// Robust extractor for Chat Completions (covers string/array shapes)
 function extractTextFromChat(json: any): string {
   try {
     const msg = json?.choices?.[0]?.message;
@@ -66,12 +77,14 @@ function extractTextFromChat(json: any): string {
     if (Array.isArray(msg?.content)) {
       const pieces: string[] = [];
       for (const part of msg.content) {
-        if (typeof part === "string") { pieces.push(part); continue; }
-        if (typeof (part as any)?.text === "string") { pieces.push((part as any).text); continue; }
-        if (typeof (part as any)?.content === "string") { pieces.push((part as any).content); continue; }
-        if (typeof (part as any)?.type === "string" && typeof (part as any)?.text === "string") {
-          pieces.push((part as any).text);
-        }
+        if (typeof part === "string") pieces.push(part);
+        else if (typeof part?.text === "string") pieces.push(part.text);
+        else if (typeof part?.content === "string") pieces.push(part.content);
+        else if (
+          typeof part?.type === "string" &&
+          typeof part?.text === "string"
+        )
+          pieces.push(part.text);
       }
       return pieces.join("").trim();
     }
@@ -85,33 +98,43 @@ function extractTextFromChat(json: any): string {
   }
 }
 
-/* ------------------------- OpenAI (non-stream) ------------------------ */
-async function chatCompletions(messages: any[]) {
+// ---------- OpenAI (non-stream) ----------
+async function chatCompletions(model: string, messages: any[]) {
+  // Use GPT-5 param only if model starts with gpt-5; else use classic max_tokens
+  const body: any = { model, messages };
+  if (isGpt5(model)) {
+    body.max_completion_tokens = 800;
+  } else {
+    body.max_tokens = 800;
+  }
+
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${OPENAI_API_KEY}`,
     },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      messages,
-      // GPT-5: use max_completion_tokens; do NOT send temperature
-      max_completion_tokens: 800,
-    }),
+    body: JSON.stringify(body),
   });
 
   const text = await rsp.text().catch(() => "");
   let json: any = {};
-  try { json = JSON.parse(text); } catch {}
+  try {
+    json = JSON.parse(text);
+  } catch {}
   return { ok: rsp.ok, status: rsp.status, json, text };
 }
 
-/* ------------------------------- Handler ------------------------------ */
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+// ---------- handler ----------
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
   try {
-    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
-    if (!OPENAI_API_KEY) return res.status(400).json({ error: "Missing OPENAI_API_KEY" });
+    if (req.method !== "POST")
+      return res.status(405).json({ error: "Method not allowed" });
+    if (!OPENAI_API_KEY)
+      return res.status(400).json({ error: "Missing OPENAI_API_KEY" });
 
     const {
       question = "",
@@ -133,16 +156,22 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     // Always align headlines to the active instrument (server-side), embed 6
     let headlinesText = "";
     if (instrument) {
-      headlinesText = await fetchInstrumentHeadlines(req, String(instrument).toUpperCase(), 6);
+      headlinesText = await fetchInstrumentHeadlines(
+        req,
+        String(instrument).toUpperCase(),
+        6
+      );
     }
     if (!headlinesText && Array.isArray(headlines) && headlines.length) {
       headlinesText = bulletsFromItems(headlines, 6);
     }
 
     const contextParts: string[] = [];
-    if (instrument) contextParts.push(`Instrument: ${String(instrument).toUpperCase()}`);
+    if (instrument)
+      contextParts.push(`Instrument: ${String(instrument).toUpperCase()}`);
     if (planText) contextParts.push(`Current Trade Plan:\n${asString(planText)}`);
-    if (headlinesText) contextParts.push(`Recent headlines snapshot:\n${headlinesText}`);
+    if (headlinesText)
+      contextParts.push(`Recent headlines snapshot:\n${headlinesText}`);
     if (Array.isArray(calendar) && calendar.length) {
       contextParts.push(`Calendar notes (raw):\n${asString(calendar)}`);
     }
@@ -156,12 +185,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     const messages = buildMessages(system, userContent);
 
-    // ALWAYS NON-STREAM: single chat/completions call
-    const cc = await chatCompletions(messages);
+    // ALWAYS NON-STREAM and ALWAYS use the ALT model first
+    const model = MODEL_PRIMARY;
+    const cc = await chatCompletions(model, messages);
+
     if (!cc.ok) {
       return res.status(200).json({
         error: `OpenAI error ${cc.status}`,
-        detail: cc.json?.error?.message || cc.text || "unknown",
+        detail: cc?.json?.error?.message || cc.text || "unknown",
       });
     }
 
