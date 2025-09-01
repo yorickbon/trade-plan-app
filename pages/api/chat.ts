@@ -36,6 +36,63 @@ function buildResponsesInput(system: string, userContent: string) {
   return `${system}\n\n${userContent}`;
 }
 
+/** Extract plain text from Chat Completions response (GPT-5 tolerant). */
+function extractTextFromChat(json: any): string {
+  try {
+    const choice = json?.choices?.[0];
+    const msg = choice?.message;
+
+    // 1) String content
+    if (typeof msg?.content === "string") return msg.content.trim();
+
+    // 2) Array content (newer models)
+    if (Array.isArray(msg?.content)) {
+      const pieces: string[] = [];
+      for (const part of msg.content) {
+        if (typeof part === "string") { pieces.push(part); continue; }
+        if (typeof part?.text === "string") { pieces.push(part.text); continue; }
+        if (typeof part?.content === "string") { pieces.push(part.content); continue; }
+        if (typeof part?.type === "string") {
+          // Common shapes: { type: "output_text", text: "..." } | { type:"text", text:"..." }
+          if (typeof part?.text === "string") pieces.push(part.text);
+        }
+      }
+      return pieces.join("").trim();
+    }
+
+    // 3) Some responses hide text in 'content[0].text'
+    const firstText = msg?.content?.[0]?.text;
+    if (typeof firstText === "string") return firstText.trim();
+
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+/** Extract plain text from Responses API response (GPT-5 tolerant). */
+function extractTextFromResponses(json: any, rawText: string): string {
+  try {
+    if (typeof json?.output_text === "string" && json.output_text.trim()) {
+      return json.output_text.trim();
+    }
+    // "output": [{ type:"message", content:[{ type:"output_text", text:"..." }, ...] }]
+    const out = Array.isArray(json?.output) ? json.output : [];
+    const pieces: string[] = [];
+    for (const item of out) {
+      const content = Array.isArray(item?.content) ? item.content : [];
+      for (const c of content) {
+        if (typeof c?.text === "string") pieces.push(c.text);
+        else if (typeof c?.content === "string") pieces.push(c.content);
+      }
+    }
+    if (pieces.length) return pieces.join("").trim();
+    return (rawText || "").trim();
+  } catch {
+    return (rawText || "").trim();
+  }
+}
+
 // ---- Try streaming first, but only send SSE headers if allowed ----
 async function tryStreamChatCompletions(
   req: NextApiRequest,
@@ -45,7 +102,7 @@ async function tryStreamChatCompletions(
   const controller = new AbortController();
   req.on("close", () => controller.abort());
 
-  // 1) Call OpenAI with stream=true, but don't set SSE headers yet.
+  // Call OpenAI with stream=true, but don't set SSE headers yet.
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
     headers: {
@@ -56,8 +113,7 @@ async function tryStreamChatCompletions(
       model: OPENAI_MODEL,
       stream: true,
       messages,
-      // GPT-5 uses max_completion_tokens; no temperature param
-      max_completion_tokens: 800,
+      max_completion_tokens: 800, // GPT-5 param
     }),
     signal: controller.signal,
   });
@@ -76,7 +132,7 @@ async function tryStreamChatCompletions(
     return { error: { status: rsp.status, body: bodyText } };
   }
 
-  // 2) Streaming is allowed — now we can switch to SSE headers and pipe.
+  // Streaming is allowed — now switch to SSE and pipe.
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
@@ -118,7 +174,7 @@ async function tryStreamChatCompletions(
             typeof delta?.content === "string"
               ? delta.content
               : Array.isArray(delta?.content)
-              ? delta.content.map((c: any) => c?.text || "").join("")
+              ? delta.content.map((c: any) => c?.text || c?.content || "").join("")
               : "";
           if (piece) flush(piece);
         } catch {
@@ -230,24 +286,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       if (r === "fallback-json") {
         const cc = await nonStreamChatCompletions(messages);
         if (cc.ok) {
-          const answer =
-            cc.json?.choices?.[0]?.message?.content?.trim?.() ||
-            (Array.isArray(cc.json?.choices?.[0]?.message?.content)
-              ? cc.json.choices[0].message.content.map((c: any) => c?.text || "").join("\n").trim()
-              : "") ||
-            "";
+          const answer = extractTextFromChat(cc.json) || "";
           res.setHeader("Cache-Control", "no-store");
           return res.status(200).json({ answer: answer || "(no answer)" });
         }
         if (cc.status === 400) {
           const rr = await nonStreamResponses(buildResponsesInput(system, userContent));
           if (rr.ok) {
-            const out =
-              rr.json?.output_text ??
-              rr.json?.content?.map?.((c: any) => c?.text ?? c?.content ?? "").join("") ??
-              rr.text;
+            const out = extractTextFromResponses(rr.json, rr.text);
             res.setHeader("Cache-Control", "no-store");
-            return res.status(200).json({ answer: String(out || "").trim() || "(no answer)" });
+            return res.status(200).json({ answer: out || "(no answer)" });
           }
           return res
             .status(200)
@@ -276,12 +324,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     // Non-stream path (client didn't request SSE)
     const cc = await nonStreamChatCompletions(messages);
     if (cc.ok) {
-      const answer =
-        cc.json?.choices?.[0]?.message?.content?.trim?.() ||
-        (Array.isArray(cc.json?.choices?.[0]?.message?.content)
-          ? cc.json.choices[0].message.content.map((c: any) => c?.text || "").join("\n").trim()
-          : "") ||
-        "";
+      const answer = extractTextFromChat(cc.json) || "";
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({ answer: answer || "(no answer)" });
     }
@@ -289,12 +332,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (cc.status === 400) {
       const rr = await nonStreamResponses(buildResponsesInput(system, userContent));
       if (rr.ok) {
-        const out =
-          rr.json?.output_text ??
-          rr.json?.content?.map?.((c: any) => c?.text ?? c?.content ?? "").join("") ??
-          rr.text;
+        const out = extractTextFromResponses(rr.json, rr.text);
         res.setHeader("Cache-Control", "no-store");
-        return res.status(200).json({ answer: String(out || "").trim() || "(no answer)" });
+        return res.status(200).json({ answer: out || "(no answer)" });
       }
       return res
         .status(200)
