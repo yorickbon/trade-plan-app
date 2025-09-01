@@ -10,10 +10,16 @@ function asString(x: any) {
   return typeof x === "string" ? x : x == null ? "" : JSON.stringify(x);
 }
 
-function headlinesToBullets(headlines: any[]): string {
-  if (!Array.isArray(headlines)) return "";
+// ---- origin + instrument-aligned headlines (server-fetched) ----
+function originFromReq(req: NextApiRequest) {
+  const proto = (req.headers["x-forwarded-proto"] as string) || "https";
+  const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
+  return host.startsWith("http") ? host : `${proto}://${host}`;
+}
+
+function bulletsFromItems(items: any[], max = 6): string {
   const rows: string[] = [];
-  for (const it of headlines.slice(0, 12)) {
+  for (const it of (items || []).slice(0, max)) {
     const t = String(it?.title ?? it?.text ?? "").trim();
     if (!t) continue;
     const src = String(it?.source ?? "").trim();
@@ -25,18 +31,34 @@ function headlinesToBullets(headlines: any[]): string {
   return rows.join("\n");
 }
 
+async function fetchInstrumentHeadlines(req: NextApiRequest, instrument: string, max = 6) {
+  try {
+    const base = originFromReq(req);
+    // fetch up to 12 but embed only 6 (fresh & aligned)
+    const url = `${base}/api/news?instrument=${encodeURIComponent(
+      instrument
+    )}&hours=48&max=12&_t=${Date.now()}`;
+    const r = await fetch(url, { cache: "no-store" });
+    const j = await r.json().catch(() => ({}));
+    const items = Array.isArray(j?.items) ? j.items : Array.isArray(j) ? j : [];
+    return bulletsFromItems(items, max);
+  } catch {
+    return "";
+  }
+}
+
+// ---- prompt helpers ----
 function buildMessages(system: string, userContent: string) {
   return [
     { role: "system", content: system },
     { role: "user", content: userContent },
   ];
 }
-
 function buildResponsesInput(system: string, userContent: string) {
   return `${system}\n\n${userContent}`;
 }
 
-/** Robust extractor for Chat Completions (GPT-5 tolerant) */
+/** Extract plain text from Chat Completions (GPT-5 tolerant). */
 function extractTextFromChat(json: any): string {
   try {
     const choice = json?.choices?.[0];
@@ -64,12 +86,13 @@ function extractTextFromChat(json: any): string {
   }
 }
 
-/** Robust extractor for Responses API (GPT-5 tolerant) */
-function extractTextFromResponses(json: any, rawText: string): string {
+/** Extract plain text from Responses API (GPT-5 tolerant). */
+function extractTextFromResponses(json: any): string {
   try {
     if (typeof json?.output_text === "string" && json.output_text.trim()) {
       return json.output_text.trim();
     }
+    // Newer shapes: output: [{ type:"message", content:[{ type:"text"|"...", text:"..." }, ...] }, ...]
     const out = Array.isArray(json?.output) ? json.output : [];
     const pieces: string[] = [];
     for (const item of out) {
@@ -79,10 +102,9 @@ function extractTextFromResponses(json: any, rawText: string): string {
         else if (typeof c?.content === "string") pieces.push(c.content);
       }
     }
-    if (pieces.length) return pieces.join("").trim();
-    return (rawText || "").trim();
+    return pieces.join("").trim();
   } catch {
-    return (rawText || "").trim();
+    return "";
   }
 }
 
@@ -95,25 +117,21 @@ async function tryStreamChatCompletions(
   const controller = new AbortController();
   req.on("close", () => controller.abort());
 
+  // Call OpenAI with stream=true, but don't set SSE headers yet.
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
+    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
     body: JSON.stringify({
       model: OPENAI_MODEL,
       stream: true,
       messages,
-      // GPT-5 param (no temperature)
-      max_completion_tokens: 800,
+      max_completion_tokens: 800, // GPT-5 param
     }),
     signal: controller.signal,
   });
 
   if (!rsp.ok) {
     const bodyText = await rsp.text().catch(() => "");
-    // If streaming isn’t allowed, degrade to JSON
     try {
       const j = JSON.parse(bodyText);
       if (rsp.status === 400 && j?.error?.param === "stream" && j?.error?.code === "unsupported_value") {
@@ -185,10 +203,7 @@ async function tryStreamChatCompletions(
 async function nonStreamChatCompletions(messages: any[]) {
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
+    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
     body: JSON.stringify({
       model: OPENAI_MODEL,
       messages,
@@ -205,10 +220,7 @@ async function nonStreamChatCompletions(messages: any[]) {
 async function nonStreamResponses(input: string) {
   const rsp = await fetch(`${OPENAI_API_BASE}/responses`, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
+    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
     body: JSON.stringify({
       model: OPENAI_MODEL,
       input,
@@ -229,7 +241,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const {
       question = "",
       planText = "",
-      headlines = [],
+      headlines = [], // kept for compatibility, but we prefer fresh per-instrument
       calendar = [],
       instrument = "",
       stream = false,
@@ -245,11 +257,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const q = String(question || "").trim();
     if (!q) return res.status(200).json({ answer: "(empty question)" });
 
+    // Always align headlines to the active instrument server-side (6 bullets)
+    let headlinesText = "";
+    if (instrument) {
+      headlinesText = await fetchInstrumentHeadlines(req, String(instrument).toUpperCase(), 6);
+    }
+    // If fetch failed, fall back to client-provided headlines (also slice to 6)
+    if (!headlinesText && Array.isArray(headlines) && headlines.length) {
+      headlinesText = bulletsFromItems(headlines, 6);
+    }
+
     const contextParts: string[] = [];
     if (instrument) contextParts.push(`Instrument: ${String(instrument).toUpperCase()}`);
     if (planText) contextParts.push(`Current Trade Plan:\n${asString(planText)}`);
-    const hl = headlinesToBullets(headlines);
-    if (hl) contextParts.push(`Recent headlines snapshot:\n${hl}`);
+    if (headlinesText) contextParts.push(`Recent headlines snapshot:\n${headlinesText}`);
     if (Array.isArray(calendar) && calendar.length) {
       contextParts.push(`Calendar notes (raw):\n${asString(calendar)}`);
     }
@@ -272,10 +293,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         const cc = await nonStreamChatCompletions(messages);
         if (cc.ok) {
           let answer = extractTextFromChat(cc.json);
-          // NEW: if chat returns empty, try Responses
           if (!answer) {
             const rr = await nonStreamResponses(buildResponsesInput(system, userContent));
-            if (rr.ok) answer = extractTextFromResponses(rr.json, rr.text);
+            if (rr.ok) answer = extractTextFromResponses(rr.json);
           }
           res.setHeader("Cache-Control", "no-store");
           return res.status(200).json({ answer: answer || "(no answer)" });
@@ -283,7 +303,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         if (cc.status === 400) {
           const rr = await nonStreamResponses(buildResponsesInput(system, userContent));
           if (rr.ok) {
-            const out = extractTextFromResponses(rr.json, rr.text);
+            const out = extractTextFromResponses(rr.json);
             res.setHeader("Cache-Control", "no-store");
             return res.status(200).json({ answer: out || "(no answer)" });
           }
@@ -310,7 +330,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       let answer = extractTextFromChat(cc.json);
       if (!answer) {
         const rr = await nonStreamResponses(buildResponsesInput(system, userContent));
-        if (rr.ok) answer = extractTextFromResponses(rr.json, rr.text);
+        if (rr.ok) answer = extractTextFromResponses(rr.json);
       }
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({ answer: answer || "(no answer)" });
@@ -319,7 +339,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (cc.status === 400) {
       const rr = await nonStreamResponses(buildResponsesInput(system, userContent));
       if (rr.ok) {
-        const out = extractTextFromResponses(rr.json, rr.text);
+        const out = extractTextFromResponses(rr.json);
         res.setHeader("Cache-Control", "no-store");
         return res.status(200).json({ answer: out || "(no answer)" });
       }
