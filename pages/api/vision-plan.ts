@@ -2,11 +2,11 @@
 // Images-only planner with optional TradingView image URL fetch.
 // Uploads: m15 (execution), h1 (context), h4 (HTF), optional calendar.
 // You can also pass m15Url / h1Url / h4Url (TradingView "Copy link to image").
-// Keeps existing logic & headings intact.
+// Keeps existing logic & headings intact. Adds: image downscale + 6 headlines to GPT.
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
-import sharp from "sharp"; // <<< ADDED: for downscale/compress
+import sharp from "sharp";
 
 // ---------- config ----------
 export const config = {
@@ -20,6 +20,9 @@ const OPENAI_API_KEY =
   process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
 const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
+
+// headline lines to pass to GPT
+const HEADLINES_TO_GPT = 6;
 
 // ---------- helpers ----------
 
@@ -55,19 +58,14 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null {
   return Array.isArray(x) ? (x[0] ?? null) : (x as any);
 }
 
-// ---- NEW: common image downscale/compress → data URL (JPEG) ----
-const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap when fetching TV
-const RESIZE_WIDTH = 1400; // good balance for vision models
-const JPEG_QUALITY = 70;
-
+// ---- NEW: downscale & recompress ----
 async function bufferToJpegDataUrl(buf: Buffer): Promise<string> {
-  // Convert anything to JPEG, resize down if wider than RESIZE_WIDTH
-  const jpg = await sharp(buf)
-    .rotate() // respect EXIF orientation
-    .resize({ width: RESIZE_WIDTH, withoutEnlargement: true })
-    .jpeg({ quality: JPEG_QUALITY })
+  const out = await sharp(buf)
+    .rotate() // respect EXIF
+    .resize({ width: 1200, withoutEnlargement: true })
+    .jpeg({ quality: 68, mozjpeg: true })
     .toBuffer();
-  return `data:image/jpeg;base64,${jpg.toString("base64")}`;
+  return `data:image/jpeg;base64,${out.toString("base64")}`;
 }
 
 async function fileToDataUrl(file: any): Promise<string | null> {
@@ -76,7 +74,8 @@ async function fileToDataUrl(file: any): Promise<string | null> {
     file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
   const buf = await fs.readFile(p);
-  return bufferToJpegDataUrl(buf); // <<< CHANGED: downscale + compress
+  // always convert to compressed JPEG
+  return bufferToJpegDataUrl(buf);
 }
 
 function originFromReq(req: NextApiRequest) {
@@ -85,7 +84,6 @@ function originFromReq(req: NextApiRequest) {
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 
-// ---- CHANGED: fetch 12 but only pass 6 into the prompt ----
 async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
   try {
     const base = originFromReq(req);
@@ -96,7 +94,7 @@ async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
     const j = await r.json().catch(() => ({}));
     const items: any[] = Array.isArray(j?.items) ? j.items : [];
     const lines = items
-      .slice(0, 6) // <<< ONLY 6 go to GPT
+      .slice(0, 12)
       .map((it: any) => {
         const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
         const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
@@ -153,28 +151,23 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return null;
 
   if (o === "sell limit" && dir === "short") {
-    // zone must be ABOVE current price (pullback into supply)
     if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price";
   }
   if (o === "buy limit" && dir === "long") {
-    // zone must be BELOW current price (pullback into demand)
     if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price";
   }
   return null;
 }
 
-// ---------- NEW: fetch TV link → image dataURL (with downscale) ----------
+// ---------- NEW: fetch TV link → image dataURL (then downscale) ----------
+
+const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap
 
 function withTimeout<T>(p: Promise<T>, ms: number) {
   return new Promise<T>((resolve, reject) => {
     const id = setTimeout(() => reject(new Error("Image fetch timeout")), ms);
-    p.then((v) => {
-      clearTimeout(id);
-      resolve(v);
-    }).catch((e) => {
-      clearTimeout(id);
-      reject(e);
-    });
+    p.then((v) => { clearTimeout(id); resolve(v); })
+     .catch((e) => { clearTimeout(id); reject(e); });
   });
 }
 
@@ -182,8 +175,7 @@ async function fetchBuffer(url: string): Promise<{ buf: Buffer; mime: string } |
   const r = await fetch(url, {
     redirect: "follow",
     headers: {
-      "user-agent":
-        "Mozilla/5.0 (compatible; TradePlanBot/1.0; +https://trade-plan-app.vercel.app)",
+      "user-agent": "Mozilla/5.0 (compatible; TradePlanBot/1.0)",
       accept: "text/html,application/xhtml+xml,application/xml,image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     },
   });
@@ -197,11 +189,8 @@ async function fetchBuffer(url: string): Promise<{ buf: Buffer; mime: string } |
 }
 
 function absoluteUrl(base: string, maybe: string) {
-  try {
-    return new URL(maybe, base).toString();
-  } catch {
-    return maybe;
-  }
+  try { return new URL(maybe, base).toString(); }
+  catch { return maybe; }
 }
 
 function htmlFindOgImage(html: string): string | null {
@@ -218,12 +207,11 @@ async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
   if (!link) return null;
   try {
     // First request: could be the image or an HTML page with og:image
-    const first = await withTimeout(fetchBuffer(link), 12000);
+    const first = await withTimeout(fetchBuffer(link), 10000);
     if (!first) return null;
 
-    const ctype = first.mime.toLowerCase();
-    if (ctype.startsWith("image/")) {
-      return bufferToJpegDataUrl(first.buf); // <<< CHANGED: compress
+    if (first.mime.toLowerCase().startsWith("image/")) {
+      return bufferToJpegDataUrl(first.buf);
     }
 
     // If HTML, try to resolve og:image
@@ -232,11 +220,11 @@ async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
     if (!og) return null;
 
     const resolved = absoluteUrl(link, og);
-    const second = await withTimeout(fetchBuffer(resolved), 12000);
+    const second = await withTimeout(fetchBuffer(resolved), 10000);
     if (!second) return null;
     if (!second.mime.toLowerCase().startsWith("image/")) return null;
 
-    return bufferToJpegDataUrl(second.buf); // <<< CHANGED: compress
+    return bufferToJpegDataUrl(second.buf);
   } catch {
     return null;
   }
@@ -251,10 +239,7 @@ async function callOpenAI(messages: any[]) {
       "content-type": "application/json",
       authorization: `Bearer ${OPENAI_API_KEY}`,
     },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      messages,
-    }),
+    body: JSON.stringify({ model: OPENAI_MODEL, messages }),
   });
   const json = await rsp.json().catch(() => ({} as any));
   if (!rsp.ok) {
@@ -270,7 +255,7 @@ async function callOpenAI(messages: any[]) {
   return String(out || "");
 }
 
-// ---------- prompt builders (unchanged from your base) ----------
+// ---------- prompt builders (unchanged structure; only headlines trimmed) ----------
 
 function tournamentMessages(params: {
   instrument: string;
@@ -281,15 +266,7 @@ function tournamentMessages(params: {
   h1: string;
   h4: string;
 }) {
-  const {
-    instrument,
-    dateStr,
-    calendarDataUrl,
-    headlinesText,
-    m15,
-    h1,
-    h4,
-  } = params;
+  const { instrument, dateStr, calendarDataUrl, headlinesText, m15, h1, h4 } = params;
 
   const system = [
     "You are a professional discretionary trader.",
@@ -366,10 +343,12 @@ function tournamentMessages(params: {
     userParts.push({ type: "image_url", image_url: { url: calendarDataUrl } });
   }
   if (headlinesText) {
-    userParts.push({
-      type: "text",
-      text: `Recent headlines snapshot:\n${headlinesText}`,
-    });
+    const trimmed = headlinesText
+      .split("\n")
+      .filter(Boolean)
+      .slice(0, HEADLINES_TO_GPT)
+      .join("\n");
+    userParts.push({ type: "text", text: `Recent headlines snapshot (top ${HEADLINES_TO_GPT}):\n${trimmed}` });
   }
 
   return [
@@ -456,7 +435,7 @@ export default async function handler(
       return res.status(400).json({
         ok: false,
         reason:
-          "Use multipart/form-data with files: m15, h1, h4 (PNG/JPG) and optional 'calendar'. Or pass m15Url/h1Url/h4Url (TradingView links). Also include 'instrument' field.",
+          "Use multipart/form-data with files: m15, h1, h4 and optional 'calendar'. Or pass m15Url/h1Url/h4Url (TradingView links). Also include 'instrument' field.",
       });
     }
 
