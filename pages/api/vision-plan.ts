@@ -6,6 +6,7 @@
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
+import sharp from "sharp"; // <-- B) server-side image downscale
 
 // ---------- config ----------
 export const config = {
@@ -19,6 +20,12 @@ const OPENAI_API_KEY =
   process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
 const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
+
+// ---------- speed knobs ----------
+const HEADLINES_INTO_GPT = 6;               // <-- A) 12 fetched, 6 sent to GPT
+const IMG_MAX_BYTES = 12 * 1024 * 1024;     // 12MB fetch safety cap
+const IMG_MAX_SIDE = 1000;                  // resize box (inside)
+const IMG_JPEG_QUALITY = 72;                // jpeg quality
 
 // ---------- helpers ----------
 
@@ -54,14 +61,33 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null {
   return Array.isArray(x) ? (x[0] ?? null) : (x as any);
 }
 
+// ---- image optimization (B) ----
+async function bufferToJpegDataUrl(buf: Buffer): Promise<string> {
+  try {
+    const out = await sharp(buf)
+      .rotate() // auto-orient
+      .resize({
+        width: IMG_MAX_SIDE,
+        height: IMG_MAX_SIDE,
+        fit: "inside",
+        withoutEnlargement: true,
+      })
+      .jpeg({ quality: IMG_JPEG_QUALITY, mozjpeg: true })
+      .toBuffer();
+    return `data:image/jpeg;base64,${out.toString("base64")}`;
+  } catch {
+    // Fallback to original buffer (still encode as JPEG data URL best-effort)
+    return `data:image/jpeg;base64,${buf.toString("base64")}`;
+  }
+}
+
 async function fileToDataUrl(file: any): Promise<string | null> {
   if (!file) return null;
   const p =
     file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
   const buf = await fs.readFile(p);
-  const mime = file.mimetype || "image/png";
-  return `data:${mime};base64,${buf.toString("base64")}`;
+  return bufferToJpegDataUrl(buf); // downscale + jpeg
 }
 
 function originFromReq(req: NextApiRequest) {
@@ -80,7 +106,7 @@ async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
     const j = await r.json().catch(() => ({}));
     const items: any[] = Array.isArray(j?.items) ? j.items : [];
     const lines = items
-      .slice(0, 12)
+      .slice(0, HEADLINES_INTO_GPT) // <-- A) only 6 go into GPT
       .map((it: any) => {
         const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
         const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
@@ -137,19 +163,15 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return null;
 
   if (o === "sell limit" && dir === "short") {
-    // zone must be ABOVE current price (pullback into supply)
-    if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price";
+    if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price"; // must be above
   }
   if (o === "buy limit" && dir === "long") {
-    // zone must be BELOW current price (pullback into demand)
-    if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price";
+    if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price"; // must be below
   }
   return null;
 }
 
 // ---------- NEW: fetch TV link → image dataURL ----------
-
-const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap
 
 function withTimeout<T>(p: Promise<T>, ms: number) {
   return new Promise<T>((resolve, reject) => {
@@ -207,9 +229,8 @@ async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
     const first = await withTimeout(fetchBuffer(link), 12000);
     if (!first) return null;
 
-    const ctype = first.mime.toLowerCase();
-    if (ctype.startsWith("image/")) {
-      return `data:${first.mime};base64,${first.buf.toString("base64")}`;
+    if (first.mime.toLowerCase().startsWith("image/")) {
+      return bufferToJpegDataUrl(first.buf); // downscale + jpeg
     }
 
     // If HTML, try to resolve og:image
@@ -222,7 +243,7 @@ async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
     if (!second) return null;
     if (!second.mime.toLowerCase().startsWith("image/")) return null;
 
-    return `data:${second.mime};base64,${second.buf.toString("base64")}`;
+    return bufferToJpegDataUrl(second.buf); // downscale + jpeg
   } catch {
     return null;
   }
@@ -436,8 +457,10 @@ export default async function handler(
   res: NextApiResponse<Ok | Err>
 ) {
   try {
-    if (req.method !== "POST") return res.status(405).json({ ok: false, reason: "Method not allowed" });
-    if (!OPENAI_API_KEY) return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
+    if (req.method !== "POST")
+      return res.status(405).json({ ok: false, reason: "Method not allowed" });
+    if (!OPENAI_API_KEY)
+      return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
     if (!isMultipart(req)) {
       return res.status(400).json({
         ok: false,
@@ -483,7 +506,11 @@ export default async function handler(
     if (!m15 || !h1 || !h4) {
       return res
         .status(400)
-        .json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either as files or valid TradingView image links." });
+        .json({
+          ok: false,
+          reason:
+            "Provide all three charts: m15, h1, h4 — either as files or valid TradingView image links.",
+        });
     }
 
     const headlinesText = await fetchedHeadlines(req, instrument);
@@ -509,7 +536,10 @@ export default async function handler(
     // 3) Normalize mislabeled Breakout+Retest if no proof
     const bp = aiMeta?.breakoutProof || {};
     const hasProof =
-      !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+      !!(
+        bp?.bodyCloseBeyond === true &&
+        (bp?.retestHolds === true || bp?.sfpReclaim === true)
+      );
     if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
       text = await normalizeBreakoutLabel(text);
       aiMeta = extractAiMeta(text) || aiMeta;
@@ -526,65 +556,64 @@ export default async function handler(
 
     // 5) Fallback if refusal/empty
     if (!text || refusalLike(text)) {
-      const fallback =
-        [
-          "Quick Plan (Actionable)",
-          "",
-          "• Direction: Stay Flat (low conviction).",
-          "• Order Type: Pending",
-          "• Trigger: Confluence (OB/FVG/SR) after a clean trigger.",
-          "• Entry: zone below/above current (structure based).",
-          "• Stop Loss: beyond invalidation with small buffer.",
-          "• Take Profit(s): Prior swing/liquidity; then trail.",
-          "• Conviction: 30%",
-          "• Setup: Await valid trigger (images inconclusive).",
-          "",
-          "Full Breakdown",
-          "• Technical View: Indecisive; likely range.",
-          "• Fundamental View: Mixed; keep size conservative.",
-          "• Tech vs Fundy Alignment: Mixed.",
-          "• Conditional Scenarios: Break+retest for continuation; SFP & reclaim for reversal.",
-          "• Surprise Risk: Headlines; CB speakers.",
-          "• Invalidation: Opposite-side body close beyond range edge.",
-          "• One-liner Summary: Stand by for a clean trigger.",
-          "",
-          "Detected Structures (X-ray):",
-          "• 4H: –",
-          "• 1H: –",
-          "• 15m: –",
-          "",
-          "Candidate Scores (tournament):",
-          "–",
-          "",
-          "Final Table Summary:",
-          `| Instrument | Bias   | Entry Zone | SL  | TP1 | TP2 | Conviction % |`,
-          `| ${instrument} | Neutral | Wait for trigger | Structure-based | Prior swing | Next liquidity | 30% |`,
-          "",
-          "```ai_meta",
-          JSON.stringify(
-            {
-              selectedStrategy: "Await valid trigger",
-              entryType: "Pending",
-              entryOrder: "Pending",
-              direction: "Flat",
-              currentPrice: null,
-              zone: null,
-              stop: null,
-              tp1: null,
-              tp2: null,
-              breakoutProof: {
-                bodyCloseBeyond: false,
-                retestHolds: false,
-                sfpReclaim: false,
-              },
-              candidateScores: [],
-              note: "Fallback used due to refusal/empty output.",
+      const fallback = [
+        "Quick Plan (Actionable)",
+        "",
+        "• Direction: Stay Flat (low conviction).",
+        "• Order Type: Pending",
+        "• Trigger: Confluence (OB/FVG/SR) after a clean trigger.",
+        "• Entry: zone below/above current (structure based).",
+        "• Stop Loss: beyond invalidation with small buffer.",
+        "• Take Profit(s): Prior swing/liquidity; then trail.",
+        "• Conviction: 30%",
+        "• Setup: Await valid trigger (images inconclusive).",
+        "",
+        "Full Breakdown",
+        "• Technical View: Indecisive; likely range.",
+        "• Fundamental View: Mixed; keep size conservative.",
+        "• Tech vs Fundy Alignment: Mixed.",
+        "• Conditional Scenarios: Break+retest for continuation; SFP & reclaim for reversal.",
+        "• Surprise Risk: Headlines; CB speakers.",
+        "• Invalidation: Opposite-side body close beyond range edge.",
+        "• One-liner Summary: Stand by for a clean trigger.",
+        "",
+        "Detected Structures (X-ray):",
+        "• 4H: –",
+        "• 1H: –",
+        "• 15m: –",
+        "",
+        "Candidate Scores (tournament):",
+        "–",
+        "",
+        "Final Table Summary:",
+        `| Instrument | Bias   | Entry Zone | SL  | TP1 | TP2 | Conviction % |`,
+        `| ${instrument} | Neutral | Wait for trigger | Structure-based | Prior swing | Next liquidity | 30% |`,
+        "",
+        "```ai_meta",
+        JSON.stringify(
+          {
+            selectedStrategy: "Await valid trigger",
+            entryType: "Pending",
+            entryOrder: "Pending",
+            direction: "Flat",
+            currentPrice: null,
+            zone: null,
+            stop: null,
+            tp1: null,
+            tp2: null,
+            breakoutProof: {
+              bodyCloseBeyond: false,
+              retestHolds: false,
+              sfpReclaim: false,
             },
-            null,
-            2
-          ),
-          "```",
-        ].join("\n");
+            candidateScores: [],
+            note: "Fallback used due to refusal/empty output.",
+          },
+          null,
+          2
+        ),
+        "```",
+      ].join("\n");
 
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
