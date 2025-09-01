@@ -208,4 +208,72 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const hl = headlinesToBullets(headlines);
     if (hl) contextParts.push(`Recent headlines snapshot:\n${hl}`);
     if (Array.isArray(calendar) && calendar.length) {
-      contextParts.push(`
+      contextParts.push(`Calendar notes (raw):\n${asString(calendar)}`);
+    }
+
+    const system =
+      "You are a helpful trading assistant. Discuss trades thoughtfully, but you can also teach with examples when asked. Keep answers concise and practical.";
+    const userContent = [contextParts.join("\n\n"), "", `User question: ${q}`]
+      .filter(Boolean)
+      .join("\n");
+
+    const messages = buildMessages(system, userContent);
+
+    const wantsSSE =
+      stream === true || String(req.headers.accept || "").includes("text/event-stream");
+
+    if (wantsSSE) {
+      // try streaming chat/completions first
+      const result = await streamChatCompletions(req, res, messages);
+      // If streaming failed with a 400, the client already received the detailed error.
+      // We end the response in streamChatCompletions.
+      return;
+    }
+
+    // Non-stream path
+    const cc = await nonStreamChatCompletions(messages);
+    if (cc.ok) {
+      const answer =
+        cc.json?.choices?.[0]?.message?.content?.trim?.() ||
+        (Array.isArray(cc.json?.choices?.[0]?.message?.content)
+          ? cc.json.choices[0].message.content.map((c: any) => c?.text || "").join("\n").trim()
+          : "") ||
+        "";
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).json({ answer: answer || "(no answer)" });
+    }
+
+    // If it's 400, auto-fallback to /responses for gpt-5 accounts that require it
+    if (cc.status === 400) {
+      const responsesInput = buildResponsesInput(system, userContent);
+      const rr = await nonStreamResponses(responsesInput);
+      if (rr.ok) {
+        // Responses API can return different shapes; try to extract text safely.
+        const out =
+          rr.json?.output_text ??
+          rr.json?.content?.map?.((c: any) => c?.text ?? c?.content ?? "").join("") ??
+          rr.text;
+        res.setHeader("Cache-Control", "no-store");
+        return res.status(200).json({ answer: String(out || "").trim() || "(no answer)" });
+      }
+      // If fallback also failed, show detailed reason
+      return res
+        .status(200)
+        .json({
+          error: `OpenAI error ${rr.status}`,
+          detail: rr.text || rr.json?.error?.message || "unknown",
+        });
+    }
+
+    // Other errors: show detailed reason
+    return res
+      .status(200)
+      .json({
+        error: `OpenAI error ${cc.status}`,
+        detail: cc.text || cc.json?.error?.message || "unknown",
+      });
+  } catch (err: any) {
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).json({ error: err?.message || "chat failed" });
+  }
+}
