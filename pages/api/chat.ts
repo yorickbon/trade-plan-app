@@ -33,6 +33,7 @@ function buildMessages(system: string, userContent: string) {
 }
 
 function buildResponsesInput(system: string, userContent: string) {
+  // Simple input for /v1/responses fallback
   return `${system}\n\n${userContent}`;
 }
 
@@ -62,8 +63,7 @@ async function streamChatCompletions(
       model: OPENAI_MODEL,
       stream: true,
       messages,
-      temperature: 0.2,
-      // IMPORTANT: gpt-5 expects max_completion_tokens
+      // IMPORTANT for GPT-5: use max_completion_tokens, no temperature param
       max_completion_tokens: 800,
     }),
     signal: controller.signal,
@@ -142,8 +142,7 @@ async function nonStreamChatCompletions(messages: any[]) {
     body: JSON.stringify({
       model: OPENAI_MODEL,
       messages,
-      temperature: 0.2,
-      // IMPORTANT: gpt-5 expects max_completion_tokens
+      // IMPORTANT for GPT-5: use max_completion_tokens, no temperature param
       max_completion_tokens: 800,
     }),
   });
@@ -166,7 +165,7 @@ async function nonStreamResponses(input: string) {
     body: JSON.stringify({
       model: OPENAI_MODEL,
       input,
-      temperature: 0.2,
+      // For Responses API on GPT-5: use max_output_tokens, no temperature param
       max_output_tokens: 800,
     }),
   });
@@ -240,7 +239,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(200).json({ answer: answer || "(no answer)" });
     }
 
-    // 400 fallback to Responses API (for tenants routed to Responses)
+    // 400 fallback to /responses
     if (cc.status === 400) {
       const responsesInput = buildResponsesInput(system, userContent);
       const rr = await nonStreamResponses(responsesInput);
