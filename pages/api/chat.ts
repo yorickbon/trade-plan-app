@@ -36,33 +36,27 @@ function buildResponsesInput(system: string, userContent: string) {
   return `${system}\n\n${userContent}`;
 }
 
-/** Extract plain text from Chat Completions response (GPT-5 tolerant). */
+/** Robust extractor for Chat Completions (GPT-5 tolerant) */
 function extractTextFromChat(json: any): string {
   try {
     const choice = json?.choices?.[0];
     const msg = choice?.message;
 
-    // 1) String content
     if (typeof msg?.content === "string") return msg.content.trim();
 
-    // 2) Array content (newer models)
     if (Array.isArray(msg?.content)) {
       const pieces: string[] = [];
       for (const part of msg.content) {
-        if (typeof part === "string") { pieces.push(part); continue; }
-        if (typeof part?.text === "string") { pieces.push(part.text); continue; }
-        if (typeof part?.content === "string") { pieces.push(part.content); continue; }
-        if (typeof part?.type === "string") {
-          // Common shapes: { type: "output_text", text: "..." } | { type:"text", text:"..." }
-          if (typeof part?.text === "string") pieces.push(part.text);
-        }
+        if (typeof part === "string") pieces.push(part);
+        else if (typeof part?.text === "string") pieces.push(part.text);
+        else if (typeof part?.content === "string") pieces.push(part.content);
+        else if (typeof part?.type === "string" && typeof part?.text === "string") pieces.push(part.text);
       }
       return pieces.join("").trim();
     }
 
-    // 3) Some responses hide text in 'content[0].text'
-    const firstText = msg?.content?.[0]?.text;
-    if (typeof firstText === "string") return firstText.trim();
+    const alt = msg?.content?.[0]?.text;
+    if (typeof alt === "string") return alt.trim();
 
     return "";
   } catch {
@@ -70,13 +64,12 @@ function extractTextFromChat(json: any): string {
   }
 }
 
-/** Extract plain text from Responses API response (GPT-5 tolerant). */
+/** Robust extractor for Responses API (GPT-5 tolerant) */
 function extractTextFromResponses(json: any, rawText: string): string {
   try {
     if (typeof json?.output_text === "string" && json.output_text.trim()) {
       return json.output_text.trim();
     }
-    // "output": [{ type:"message", content:[{ type:"output_text", text:"..." }, ...] }]
     const out = Array.isArray(json?.output) ? json.output : [];
     const pieces: string[] = [];
     for (const item of out) {
@@ -102,7 +95,6 @@ async function tryStreamChatCompletions(
   const controller = new AbortController();
   req.on("close", () => controller.abort());
 
-  // Call OpenAI with stream=true, but don't set SSE headers yet.
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
     headers: {
@@ -113,26 +105,25 @@ async function tryStreamChatCompletions(
       model: OPENAI_MODEL,
       stream: true,
       messages,
-      max_completion_tokens: 800, // GPT-5 param
+      // GPT-5 param (no temperature)
+      max_completion_tokens: 800,
     }),
     signal: controller.signal,
   });
 
   if (!rsp.ok) {
     const bodyText = await rsp.text().catch(() => "");
-    // If streaming isn’t allowed for this org/model, fall back to JSON mode.
+    // If streaming isn’t allowed, degrade to JSON
     try {
       const j = JSON.parse(bodyText);
-      const param = j?.error?.param;
-      const code = j?.error?.code;
-      if (rsp.status === 400 && param === "stream" && code === "unsupported_value") {
+      if (rsp.status === 400 && j?.error?.param === "stream" && j?.error?.code === "unsupported_value") {
         return "fallback-json";
       }
     } catch {}
     return { error: { status: rsp.status, body: bodyText } };
   }
 
-  // Streaming is allowed — now switch to SSE and pipe.
+  // Streaming confirmed; switch to SSE headers and pipe
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
@@ -206,13 +197,11 @@ async function nonStreamChatCompletions(messages: any[]) {
   });
   const text = await rsp.text().catch(() => "");
   let json: any = {};
-  try {
-    json = JSON.parse(text);
-  } catch {}
+  try { json = JSON.parse(text); } catch {}
   return { ok: rsp.ok, status: rsp.status, json, text };
 }
 
-// ---- Non-stream Responses API fallback (for other 400s) ----
+// ---- Non-stream Responses API fallback ----
 async function nonStreamResponses(input: string) {
   const rsp = await fetch(`${OPENAI_API_BASE}/responses`, {
     method: "POST",
@@ -228,9 +217,7 @@ async function nonStreamResponses(input: string) {
   });
   const text = await rsp.text().catch(() => "");
   let json: any = {};
-  try {
-    json = JSON.parse(text);
-  } catch {}
+  try { json = JSON.parse(text); } catch {}
   return { ok: rsp.ok, status: rsp.status, json, text };
 }
 
@@ -274,7 +261,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       .join("\n");
 
     const messages = buildMessages(system, userContent);
-
     const wantsSSE =
       stream === true || String(req.headers.accept || "").includes("text/event-stream");
 
@@ -282,11 +268,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       const r = await tryStreamChatCompletions(req, res, messages);
       if (r === "streamed") return;
 
-      // If streaming not allowed, fall back to JSON:
       if (r === "fallback-json") {
         const cc = await nonStreamChatCompletions(messages);
         if (cc.ok) {
-          const answer = extractTextFromChat(cc.json) || "";
+          let answer = extractTextFromChat(cc.json);
+          // NEW: if chat returns empty, try Responses
+          if (!answer) {
+            const rr = await nonStreamResponses(buildResponsesInput(system, userContent));
+            if (rr.ok) answer = extractTextFromResponses(rr.json, rr.text);
+          }
           res.setHeader("Cache-Control", "no-store");
           return res.status(200).json({ answer: answer || "(no answer)" });
         }
@@ -297,34 +287,31 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             res.setHeader("Cache-Control", "no-store");
             return res.status(200).json({ answer: out || "(no answer)" });
           }
-          return res
-            .status(200)
-            .json({
-              error: `OpenAI error ${rr.status}`,
-              detail: rr.text || rr.json?.error?.message || "unknown",
-            });
-        }
-        return res
-          .status(200)
-          .json({
-            error: `OpenAI error ${cc.status}`,
-            detail: cc.text || cc.json?.error?.message || "unknown",
+          return res.status(200).json({
+            error: `OpenAI error ${rr.status}`,
+            detail: rr.text || rr.json?.error?.message || "unknown",
           });
+        }
+        return res.status(200).json({
+          error: `OpenAI error ${cc.status}`,
+          detail: cc.text || cc.json?.error?.message || "unknown",
+        });
       }
 
-      // Other streaming error -> return JSON error
-      return res
-        .status(200)
-        .json({
-          error: `OpenAI error ${r.error.status}`,
-          detail: r.error.body || "unknown",
-        });
+      return res.status(200).json({
+        error: `OpenAI error ${r.error.status}`,
+        detail: r.error.body || "unknown",
+      });
     }
 
-    // Non-stream path (client didn't request SSE)
+    // Non-stream path
     const cc = await nonStreamChatCompletions(messages);
     if (cc.ok) {
-      const answer = extractTextFromChat(cc.json) || "";
+      let answer = extractTextFromChat(cc.json);
+      if (!answer) {
+        const rr = await nonStreamResponses(buildResponsesInput(system, userContent));
+        if (rr.ok) answer = extractTextFromResponses(rr.json, rr.text);
+      }
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({ answer: answer || "(no answer)" });
     }
@@ -336,20 +323,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         res.setHeader("Cache-Control", "no-store");
         return res.status(200).json({ answer: out || "(no answer)" });
       }
-      return res
-        .status(200)
-        .json({
-          error: `OpenAI error ${rr.status}`,
-          detail: rr.text || rr.json?.error?.message || "unknown",
-        });
+      return res.status(200).json({
+        error: `OpenAI error ${rr.status}`,
+        detail: rr.text || rr.json?.error?.message || "unknown",
+      });
     }
 
-    return res
-      .status(200)
-      .json({
-        error: `OpenAI error ${cc.status}`,
-        detail: cc.text || cc.json?.error?.message || "unknown",
-      });
+    return res.status(200).json({
+      error: `OpenAI error ${cc.status}`,
+      detail: cc.text || cc.json?.error?.message || "unknown",
+    });
   } catch (err: any) {
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({ error: err?.message || "chat failed" });
