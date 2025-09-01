@@ -54,14 +54,47 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null {
   return Array.isArray(x) ? (x[0] ?? null) : (x as any);
 }
 
-async function fileToDataUrl(file: any): Promise<string | null> {
+// ---------- image downscale (uploads + TV links) ----------
+
+const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap
+const MAX_WIDTH = 1400; // reasonable cap for speed/quality
+const JPEG_QUALITY = 72;
+
+async function sharpOrNull() {
+  try {
+    const m: any = await import("sharp");
+    return m.default || m;
+  } catch {
+    return null;
+  }
+}
+
+async function shrinkToJpegDataUrl(buf: Buffer): Promise<string> {
+  const sharp = await sharpOrNull();
+  if (!sharp) {
+    // Fallback: return original buffer as PNG/JPEG dataURL (no resize)
+    // (still works, just not accelerated)
+    return `data:image/png;base64,${buf.toString("base64")}`;
+  }
+  const img = sharp(buf).rotate(); // auto-orient
+  const meta = await img.metadata().catch(() => ({} as any));
+  const needResize = meta?.width && meta.width > MAX_WIDTH;
+
+  const pipeline = needResize ? img.resize({ width: MAX_WIDTH }) : img;
+  const out = await pipeline
+    .jpeg({ quality: JPEG_QUALITY, mozjpeg: true })
+    .toBuffer();
+
+  return `data:image/jpeg;base64,${out.toString("base64")}`;
+}
+
+async function fileToSmallDataUrl(file: any): Promise<string | null> {
   if (!file) return null;
   const p =
     file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
   const buf = await fs.readFile(p);
-  const mime = file.mimetype || "image/png";
-  return `data:${mime};base64,${buf.toString("base64")}`;
+  return shrinkToJpegDataUrl(buf);
 }
 
 function originFromReq(req: NextApiRequest) {
@@ -79,8 +112,9 @@ async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
     const r = await fetch(url, { cache: "no-store" });
     const j = await r.json().catch(() => ({}));
     const items: any[] = Array.isArray(j?.items) ? j.items : [];
+    // fetch 12, but ONLY PASS 6 to GPT (speed)
     const lines = items
-      .slice(0, 12)
+      .slice(0, 6)
       .map((it: any) => {
         const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
         const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
@@ -129,7 +163,7 @@ function needsPendingLimit(aiMeta: any): boolean {
 // invalid Buy/Sell Limit vs current price and zone
 function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   const o = String(aiMeta?.entryOrder || "").toLowerCase(); // buy limit / sell limit
-  const dir = String(aiMeta?.direction || "").toLowerCase(); // long / short / flat
+  the const dir = String(aiMeta?.direction || "").toLowerCase(); // long / short / flat
   const z = aiMeta?.zone || {};
   const p = Number(aiMeta?.currentPrice);
   const zmin = Number(z?.min);
@@ -147,9 +181,7 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   return null;
 }
 
-// ---------- NEW: fetch TV link → image dataURL ----------
-
-const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap
+// ---------- fetch TV link → (buffer) → downscale → dataURL ----------
 
 function withTimeout<T>(p: Promise<T>, ms: number) {
   return new Promise<T>((resolve, reject) => {
@@ -200,16 +232,15 @@ function htmlFindOgImage(html: string): string | null {
   return null;
 }
 
-async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
+async function fetchImageSmallDataUrlFromLink(link: string): Promise<string | null> {
   if (!link) return null;
   try {
     // First request: could be the image or an HTML page with og:image
     const first = await withTimeout(fetchBuffer(link), 12000);
     if (!first) return null;
 
-    const ctype = first.mime.toLowerCase();
-    if (ctype.startsWith("image/")) {
-      return `data:${first.mime};base64,${first.buf.toString("base64")}`;
+    if (first.mime.toLowerCase().startsWith("image/")) {
+      return shrinkToJpegDataUrl(first.buf);
     }
 
     // If HTML, try to resolve og:image
@@ -222,7 +253,7 @@ async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
     if (!second) return null;
     if (!second.mime.toLowerCase().startsWith("image/")) return null;
 
-    return `data:${second.mime};base64,${second.buf.toString("base64")}`;
+    return shrinkToJpegDataUrl(second.buf);
   } catch {
     return null;
   }
@@ -463,22 +494,23 @@ export default async function handler(
     const h4Url = String(pickFirst(fields.h4Url) || "").trim();
 
     // Build images: prefer file if present; otherwise use URL fetcher
-    const [m15FromFile, h1FromFile, h4FromFile, calUrl] = await Promise.all([
-      fileToDataUrl(m15f),
-      fileToDataUrl(h1f),
-      fileToDataUrl(h4f),
-      calF ? fileToDataUrl(calF) : Promise.resolve(null),
+    const [m15FromFile, h1FromFile, h4FromFile, calFromFile] = await Promise.all([
+      fileToSmallDataUrl(m15f),
+      fileToSmallDataUrl(h1f),
+      fileToSmallDataUrl(h4f),
+      calF ? fileToSmallDataUrl(calF) : Promise.resolve(null),
     ]);
 
     const [m15FromUrl, h1FromUrl, h4FromUrl] = await Promise.all([
-      m15FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(m15Url),
-      h1FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(h1Url),
-      h4FromFile ? Promise.resolve(null) : fetchImageDataUrlFromLink(h4Url),
+      m15FromFile ? Promise.resolve(null) : fetchImageSmallDataUrlFromLink(m15Url),
+      h1FromFile ? Promise.resolve(null) : fetchImageSmallDataUrlFromLink(h1Url),
+      h4FromFile ? Promise.resolve(null) : fetchImageSmallDataUrlFromLink(h4Url),
     ]);
 
     const m15 = m15FromFile || m15FromUrl;
     const h1 = h1FromFile || h1FromUrl;
     const h4 = h4FromFile || h4FromUrl;
+    const calUrl = calFromFile || null;
 
     if (!m15 || !h1 || !h4) {
       return res
