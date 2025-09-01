@@ -31,7 +31,7 @@ export default function ChatDock({
     setMessages((prev) => {
       if (!prev.length || prev[prev.length - 1].role !== "assistant") {
         return [...prev, { role: "assistant", content: chunk }];
-        }
+      }
       const copy = prev.slice();
       copy[copy.length - 1] = {
         role: "assistant",
@@ -56,7 +56,6 @@ export default function ChatDock({
     setInput("");
     setLoading(true);
 
-    // Attempt streaming first
     const controller = new AbortController();
     abortRef.current = controller;
 
@@ -65,7 +64,7 @@ export default function ChatDock({
         method: "POST",
         headers: {
           "content-type": "application/json",
-          accept: "text/event-stream", // hint server to stream
+          accept: "text/event-stream",
         },
         body: JSON.stringify({
           question,
@@ -79,6 +78,7 @@ export default function ChatDock({
       });
 
       const ctype = rsp.headers.get("content-type") || "";
+
       if (ctype.includes("text/event-stream") && rsp.body) {
         const reader = rsp.body.getReader();
         const decoder = new TextDecoder();
@@ -92,27 +92,32 @@ export default function ChatDock({
           if (done) break;
           buf += decoder.decode(value, { stream: true });
 
-          // Split SSE events by double newline
           const events = buf.split("\n\n");
           buf = events.pop() || "";
           for (const ev of events) {
-            const line = ev.trim();
-            if (line.startsWith("event: error")) {
-              const dataLine = ev.split("\n").find((l) => l.startsWith("data:"));
+            const lines = ev.split("\n");
+            const first = (lines[0] || "").trim();
+
+            if (first.startsWith("event: error")) {
+              const dataLine = lines.find((l) => l.startsWith("data:"));
               if (dataLine) {
                 try {
                   const payload = JSON.parse(dataLine.slice(5).trim());
-                  updateLastAssistant(`\n[error] ${payload?.error || "stream error"}`);
+                  const msg = payload?.error
+                    ? `[error] ${payload.error}${payload.body ? ` — ${payload.body}` : ""}`
+                    : "[error] stream error";
+                  updateLastAssistant(`\n${msg}`);
                 } catch {
                   updateLastAssistant(`\n[error] stream error`);
                 }
               }
               continue;
             }
-            if (!line.startsWith("data:")) continue;
-            const data = line.slice(5).trim();
+
+            if (!first.startsWith("data:")) continue;
+            const data = first.slice(5).trim();
             if (data === "[DONE]") continue;
-            updateLastAssistant(data); // append raw chunk
+            updateLastAssistant(data);
           }
         }
 
@@ -121,9 +126,13 @@ export default function ChatDock({
         return;
       }
 
-      // Fallback: non-stream JSON
+      // JSON fallback
       const json = await rsp.json().catch(() => ({} as any));
-      const answer = json?.answer || json?.text || json?.message || json?.error || "";
+      const answer =
+        json?.answer ||
+        json?.text ||
+        json?.message ||
+        (json?.error ? `[error] ${json.error}${json?.detail ? ` — ${json.detail}` : ""}` : "");
       addMsg({ role: "assistant", content: String(answer || "(no answer)") });
     } catch (err: any) {
       addMsg({ role: "assistant", content: `[error] ${err?.message || "request failed"}` });
@@ -158,7 +167,7 @@ export default function ChatDock({
       <form onSubmit={send} className="flex gap-2">
         <input
           className="flex-1 border rounded-lg px-3 py-2"
-          placeholder="Ask anything about the plan or trading…"
+          placeholder="Ask anything about the plan…"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           disabled={loading}
