@@ -33,7 +33,6 @@ function buildMessages(system: string, userContent: string) {
 }
 
 function buildResponsesInput(system: string, userContent: string) {
-  // Simple, reliable input for /v1/responses
   return `${system}\n\n${userContent}`;
 }
 
@@ -64,14 +63,14 @@ async function streamChatCompletions(
       stream: true,
       messages,
       temperature: 0.2,
-      max_tokens: 800,
+      // IMPORTANT: gpt-5 expects max_completion_tokens
+      max_completion_tokens: 800,
     }),
     signal: controller.signal,
   });
 
   if (!rsp.ok || !rsp.body) {
     const bodyText = await rsp.text().catch(() => "");
-    // send the detailed error to the client so you can see why
     res.write(
       `event: error\ndata: ${JSON.stringify({
         error: `OpenAI error ${rsp.status}`,
@@ -144,7 +143,8 @@ async function nonStreamChatCompletions(messages: any[]) {
       model: OPENAI_MODEL,
       messages,
       temperature: 0.2,
-      max_tokens: 800,
+      // IMPORTANT: gpt-5 expects max_completion_tokens
+      max_completion_tokens: 800,
     }),
   });
   const text = await rsp.text().catch(() => "");
@@ -223,10 +223,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       stream === true || String(req.headers.accept || "").includes("text/event-stream");
 
     if (wantsSSE) {
-      // try streaming chat/completions first
-      const result = await streamChatCompletions(req, res, messages);
-      // If streaming failed with a 400, the client already received the detailed error.
-      // We end the response in streamChatCompletions.
+      await streamChatCompletions(req, res, messages);
       return;
     }
 
@@ -243,12 +240,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(200).json({ answer: answer || "(no answer)" });
     }
 
-    // If it's 400, auto-fallback to /responses for gpt-5 accounts that require it
+    // 400 fallback to Responses API (for tenants routed to Responses)
     if (cc.status === 400) {
       const responsesInput = buildResponsesInput(system, userContent);
       const rr = await nonStreamResponses(responsesInput);
       if (rr.ok) {
-        // Responses API can return different shapes; try to extract text safely.
         const out =
           rr.json?.output_text ??
           rr.json?.content?.map?.((c: any) => c?.text ?? c?.content ?? "").join("") ??
@@ -256,7 +252,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         res.setHeader("Cache-Control", "no-store");
         return res.status(200).json({ answer: String(out || "").trim() || "(no answer)" });
       }
-      // If fallback also failed, show detailed reason
       return res
         .status(200)
         .json({
@@ -265,7 +260,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         });
     }
 
-    // Other errors: show detailed reason
     return res
       .status(200)
       .json({
