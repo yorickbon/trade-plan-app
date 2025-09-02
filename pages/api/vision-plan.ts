@@ -1,9 +1,14 @@
 // /pages/api/vision-plan.ts
-// Images-only planner with TradingView link support.
-// Charts: prefer direct image URLs (.png/.jpg/.jpeg/.webp). If a page URL is provided (e.g., tradingview.com/x/XXXX/),
-// we auto-resolve og:image with a fast 3s fallback and compress it. Calendar uploads are always downscaled.
-// Headlines: fetch 12, embed 6. Sentiment (CSM/COT) kept with ~600ms budget.
-// Output sections/logic unchanged.
+// Images-only planner with robust, FAST chart handling.
+// You can upload a calendar image and/or pass TradingView/Gyazo chart links for m15/h1/h4.
+// This version ALWAYS sends **downscaled JPEGs** to the model for ALL charts (files or links).
+// - Direct image links (.png/.jpg/.webp/.gif): we fetch (3s cap), downscale to ≤1280px, JPEG ~70%, strip EXIF, aim ≤600KB.
+// - TradingView page links (/x/…/): we resolve og:image (3s), fetch the image (3s), then downscale as above.
+// - 2-minute in-memory cache for processed chart URLs to avoid reprocessing when you retry.
+// Calendar uploads are downscaled the same way.
+// Headlines: fetch 12, embed only 6 into the model prompt.
+// Sentiment (CSM/COT): included with a ~600ms total budget (skipped if slow).
+// Output sections & logic remain EXACTLY the same (Quick Plan, Full Breakdown, X-ray, Candidate Scores, Final Table, trailing ai_meta).
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -30,11 +35,14 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
 const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
 
 // ---------- small utils ----------
-
 function now() { return Date.now(); }
 function dt(from: number) { return `${Date.now() - from}ms`; }
 
-const IMG_MAX_BYTES = 12 * 1024 * 1024; // safety cap from remote fetch
+const IMG_MAX_BYTES = 12 * 1024 * 1024; // safety cap when fetching remote images
+const TARGET_MAX_WIDTH = 1280;
+const TARGET_QUALITY_START = 72; // ~70%
+const TARGET_MIN_QUALITY = 55;
+const TARGET_MAX_BYTES = 600 * 1024; // ~≤600 KB best-effort
 
 function looksLikeImageUrl(u: string) {
   const s = String(u || "").split("?")[0] || "";
@@ -79,7 +87,6 @@ function originFromReq(req: NextApiRequest) {
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 
-// fetch with timeout helper
 async function fetchWithTimeout(url: string, ms: number, init?: RequestInit): Promise<Response> {
   const ac = new AbortController();
   const id = setTimeout(() => ac.abort(), ms);
@@ -98,8 +105,7 @@ async function fetchWithTimeout(url: string, ms: number, init?: RequestInit): Pr
   }
 }
 
-// ---------- Headlines (fetch 12; embed 6) ----------
-
+// ---------- Headlines (fetch 12; embed 6 into prompt) ----------
 function formatHeadlines(items: any[], max = 6): string {
   const rows: string[] = [];
   for (const it of (items || []).slice(0, max)) {
@@ -128,14 +134,9 @@ async function fetchedHeadlinesItems(req: NextApiRequest, instrument: string) {
   }
 }
 
-// ---------- Calendar image downscale (fast) ----------
-const TARGET_MAX_WIDTH = 1280;
-const TARGET_QUALITY_START = 72; // ~70%
-const TARGET_MIN_QUALITY = 55;
-const TARGET_MAX_BYTES = 600 * 1024; // ~≤600 KB best-effort
-
+// ---------- JPEG downscale helpers ----------
 async function bufferToJpegTight(buf: Buffer): Promise<Buffer> {
-  // single pass at ~70%, optional second pass if still >600KB
+  // single pass ~70%, optional second pass if still >600KB
   let out = await sharp(buf)
     .rotate()
     .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true })
@@ -160,13 +161,12 @@ async function fileToProcessedDataUrl(file: any): Promise<string | null> {
   const raw = await fs.readFile(p);
   const jpeg = await bufferToJpegTight(raw);
   if (process.env.NODE_ENV !== "production") {
-    console.log(`[vision-plan] calendar processed size=${jpeg.byteLength}B`);
+    console.log(`[vision-plan] calendar/file processed size=${jpeg.byteLength}B`);
   }
   return `data:image/jpeg;base64,${jpeg.toString("base64")}`;
 }
 
-// ---------- TradingView page-link fallback (3s + 3s) ----------
-
+// ---------- TV page → og:image resolver ----------
 function htmlFindOgImage(html: string): string | null {
   const re1 = /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i;
   const m1 = html.match(re1);
@@ -176,74 +176,92 @@ function htmlFindOgImage(html: string): string | null {
   if (m2?.[1]) return m2[1];
   return null;
 }
-
 function absoluteUrl(base: string, maybe: string) {
   try { return new URL(maybe, base).toString(); } catch { return maybe; }
 }
 
-// Returns either a direct URL (pass-through) or a data URL (fallback). Null if failed.
-async function resolveChartLink(link: string): Promise<{ value: string | null; mode: "pass" | "fallback" | "fail" }> {
-  if (!link) return { value: null, mode: "fail" };
+// ---------- 2-minute in-memory cache for processed chart URLs ----------
+type ImgCacheEntry = { exp: number; dataUrl: string };
+const imgCache = new Map<string, ImgCacheEntry>();
+function getCachedDataUrl(key: string): string | null {
+  const e = imgCache.get(key);
+  if (!e) return null;
+  if (Date.now() > e.exp) { imgCache.delete(key); return null; }
+  return e.dataUrl;
+}
+function setCachedDataUrl(key: string, dataUrl: string, ttlMs = 120_000) {
+  imgCache.set(key, { exp: Date.now() + ttlMs, dataUrl });
+}
+
+// Download remote image and convert to data URL (3s timeout, size capped)
+async function downloadImageAsDataUrl(url: string): Promise<string | null> {
+  const r = await fetchWithTimeout(url, 3000, {
+    headers: { accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8" },
+  });
+  if (!r.ok) return null;
+  const ab = await r.arrayBuffer();
+  const raw = Buffer.from(ab);
+  if (raw.byteLength > IMG_MAX_BYTES) return null;
+  const jpeg = await bufferToJpegTight(raw);
+  return `data:image/jpeg;base64,${jpeg.toString("base64")}`;
+}
+
+// Resolve any chart link (direct image or TV page) into a processed data URL.
+// Uses 2-min cache to avoid re-fetching the same URL repeatedly.
+async function chartLinkToDataUrl(link: string): Promise<{ dataUrl: string | null; mode: "direct" | "page-fallback" | "fail" }> {
+  if (!link) return { dataUrl: null, mode: "fail" };
+  const cached = getCachedDataUrl(link);
+  if (cached) return { dataUrl: cached, mode: "direct" };
+
   if (looksLikeImageUrl(link)) {
-    if (process.env.NODE_ENV !== "production") console.log(`[vision-plan] chart pass-through: ${link}`);
-    return { value: link, mode: "pass" };
+    const data = await downloadImageAsDataUrl(link);
+    if (data) { setCachedDataUrl(link, data); return { dataUrl: data, mode: "direct" }; }
+    return { dataUrl: null, mode: "fail" };
   }
-  // Fallback: fetch page (3s), extract og:image, fetch image (3s), compress.
+
+  // TV page fallback: fetch page (3s) → og:image → fetch image (3s) → downscale
   try {
     const page = await fetchWithTimeout(link, 3000);
-    if (!page.ok) return { value: null, mode: "fail" };
+    if (!page.ok) return { dataUrl: null, mode: "fail" };
     const html = await page.text();
     const og = htmlFindOgImage(html);
-    if (!og) return { value: null, mode: "fail" };
+    if (!og) return { dataUrl: null, mode: "fail" };
     const imgUrl = absoluteUrl(link, og);
-    const r = await fetchWithTimeout(imgUrl, 3000, {
-      headers: { accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8" },
-    });
-    if (!r.ok) return { value: null, mode: "fail" };
-    const ab = await r.arrayBuffer();
-    const buf = Buffer.from(ab);
-    if (buf.byteLength > IMG_MAX_BYTES) return { value: null, mode: "fail" };
-    const jpeg = await bufferToJpegTight(buf);
-    if (process.env.NODE_ENV !== "production") console.log(`[vision-plan] chart fallback downscale -> ${jpeg.byteLength}B`);
-    return { value: `data:image/jpeg;base64,${jpeg.toString("base64")}`, mode: "fallback" };
+    const data = await downloadImageAsDataUrl(imgUrl);
+    if (data) { setCachedDataUrl(link, data); return { dataUrl: data, mode: "page-fallback" }; }
+    return { dataUrl: null, mode: "fail" };
   } catch {
-    return { value: null, mode: "fail" };
+    return { dataUrl: null, mode: "fail" };
   }
 }
 
-// ---------- refusal / ai_meta helpers (unchanged) ----------
-
+// ---------- refusal & ai_meta helpers ----------
 function refusalLike(s: string) {
   const t = (s || "").toLowerCase();
   if (!t) return false;
   return /\b(can'?t|cannot)\s+assist\b|\bnot able to comply\b|\brefuse/i.test(t);
 }
-
 function extractAiMeta(text: string) {
   if (!text) return null;
   const fences = [/```ai_meta\s*({[\s\S]*?})\s*```/i, /```json\s*({[\s\S]*?})\s*```/i];
   for (const re of fences) {
     const m = text.match(re);
     if (m && m[1]) {
-      try {
-        return JSON.parse(m[1]);
-      } catch {}
+      try { return JSON.parse(m[1]); } catch {}
     }
   }
   return null;
 }
-
 function needsPendingLimit(aiMeta: any): boolean {
-  const et = String(aiMeta?.entryType || "").toLowerCase(); // "market" | "pending"
+  const et = String(aiMeta?.entryType || "").toLowerCase();
   if (et !== "market") return false;
   const bp = aiMeta?.breakoutProof || {};
   const ok = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
   return !ok;
 }
-
 function invalidOrderRelativeToPrice(aiMeta: any): string | null {
-  const o = String(aiMeta?.entryOrder || "").toLowerCase(); // buy limit / sell limit
-  const dir = String(aiMeta?.direction || "").toLowerCase(); // long / short / flat
+  const o = String(aiMeta?.entryOrder || "").toLowerCase();
+  const dir = String(aiMeta?.direction || "").toLowerCase();
   const z = aiMeta?.zone || {};
   const p = Number(aiMeta?.currentPrice);
   const zmin = Number(z?.min);
@@ -255,7 +273,6 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
 }
 
 // ---------- OpenAI call (unchanged) ----------
-
 async function callOpenAI(messages: any[]) {
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
@@ -263,17 +280,10 @@ async function callOpenAI(messages: any[]) {
       "content-type": "application/json",
       authorization: `Bearer ${OPENAI_API_KEY}`,
     },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      messages,
-    }),
+    body: JSON.stringify({ model: OPENAI_MODEL, messages }),
   });
   const json = await rsp.json().catch(() => ({} as any));
-  if (!rsp.ok) {
-    throw new Error(
-      `OpenAI vision request failed: ${rsp.status} ${JSON.stringify(json)}`
-    );
-  }
+  if (!rsp.ok) throw new Error(`OpenAI vision request failed: ${rsp.status} ${JSON.stringify(json)}`);
   const out =
     json?.choices?.[0]?.message?.content ??
     (Array.isArray(json?.choices?.[0]?.message?.content)
@@ -283,7 +293,6 @@ async function callOpenAI(messages: any[]) {
 }
 
 // ---------- prompt builders (unchanged structure) ----------
-
 function tournamentMessages(params: {
   instrument: string;
   dateStr: string;
@@ -294,16 +303,7 @@ function tournamentMessages(params: {
   h1: string;
   h4: string;
 }) {
-  const {
-    instrument,
-    dateStr,
-    calendarDataUrl,
-    headlinesText,
-    sentimentText,
-    m15,
-    h1,
-    h4,
-  } = params;
+  const { instrument, dateStr, calendarDataUrl, headlinesText, sentimentText, m15, h1, h4 } = params;
 
   const system = [
     "You are a professional discretionary trader.",
@@ -323,7 +323,7 @@ function tournamentMessages(params: {
     "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
     "• Trigger: (ex: Limit pullback / zone touch)",
     "• Entry: <min–max> or specific level",
-    "• Stop Loss: <level> (based on PA: behind swing/OB/SR; step to next zone if too tight)",
+    "• Stop Loss: <level> (based on PA: behind swing/OB/SR; step to the next zone if too tight)",
     "• Take Profit(s): TP1 <level> / TP2 <level>",
     "• Conviction: <0–100>%",
     "• Setup: <Chosen Strategy>",
@@ -473,8 +473,8 @@ async function buildSentimentTextWithBudget(instrument: string, budgetMs = 600):
   })();
 
   const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), budgetMs));
-
   const result = await Promise.race([task, timeout]);
+
   if (process.env.NODE_ENV !== "production") {
     console.log(`[vision-plan] sentiment ${result ? "ok" : "skipped"} in ${dt(start)}`);
   }
@@ -482,7 +482,6 @@ async function buildSentimentTextWithBudget(instrument: string, budgetMs = 600):
 }
 
 // ---------- handler ----------
-
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<Ok | Err>
@@ -495,7 +494,7 @@ export default async function handler(
       return res.status(400).json({
         ok: false,
         reason:
-          "Use multipart/form-data with files: m15, h1, h4 (PNG/JPG) and optional 'calendar'. Or pass m15Url/h1Url/h4Url (chart image links). Include 'instrument'.",
+          "Use multipart/form-data with files: m15, h1, h4 (PNG/JPG) and optional 'calendar'. Or pass m15Url/h1Url/h4Url (chart links). Include 'instrument'.",
       });
     }
 
@@ -515,16 +514,12 @@ export default async function handler(
     const h4f = pickFirst(files.h4);
     const calF = pickFirst(files.calendar);
 
-    // URLs (optional; TradingView page links or direct image links)
+    // URLs (optional)
     const m15UrlRaw = String(pickFirst(fields.m15Url) || "").trim();
     const h1UrlRaw  = String(pickFirst(fields.h1Url)  || "").trim();
     const h4UrlRaw  = String(pickFirst(fields.h4Url)  || "").trim();
 
-    // Build images:
-    // - Chart files (rare) → compress
-    // - Otherwise resolve chart URLs:
-    //      direct image → pass-through
-    //      page link → fallback resolve og:image (3s + 3s), compress
+    // Build images: ALWAYS produce processed JPEG data URLs for charts (files or links)
     const tImages = now();
     const [m15FromFile, h1FromFile, h4FromFile, calUrl] = await Promise.all([
       m15f ? fileToProcessedDataUrl(m15f) : Promise.resolve(null),
@@ -533,22 +528,26 @@ export default async function handler(
       calF ? fileToProcessedDataUrl(calF) : Promise.resolve(null),
     ]);
 
-    const [m15Resolved, h1Resolved, h4Resolved] = await Promise.all([
-      m15FromFile ? Promise.resolve({ value: m15FromFile, mode: "pass" as const }) : resolveChartLink(m15UrlRaw),
-      h1FromFile  ? Promise.resolve({ value: h1FromFile,  mode: "pass" as const }) : resolveChartLink(h1UrlRaw),
-      h4FromFile  ? Promise.resolve({ value: h4FromFile,  mode: "pass" as const }) : resolveChartLink(h4UrlRaw),
+    const [m15FromLink, h1FromLink, h4FromLink] = await Promise.all([
+      m15FromFile ? Promise.resolve({ dataUrl: m15FromFile, mode: "direct" as const }) : chartLinkToDataUrl(m15UrlRaw),
+      h1FromFile  ? Promise.resolve({ dataUrl: h1FromFile,  mode: "direct" as const }) : chartLinkToDataUrl(h1UrlRaw),
+      h4FromFile  ? Promise.resolve({ dataUrl: h4FromFile,  mode: "direct" as const }) : chartLinkToDataUrl(h4UrlRaw),
     ]);
 
-    const m15 = m15Resolved.value;
-    const h1  = h1Resolved.value;
-    const h4  = h4Resolved.value;
+    const m15 = m15FromFile || m15FromLink.dataUrl;
+    const h1  = h1FromFile  || h1FromLink.dataUrl;
+    const h4  = h4FromFile  || h4FromLink.dataUrl;
 
     if (process.env.NODE_ENV !== "production") {
-      console.log(`[vision-plan] images prepared in ${dt(tImages)} (m15=${m15Resolved.mode}, h1=${h1Resolved.mode}, h4=${h4Resolved.mode}; calendar ${calUrl ? "compressed" : "none"})`);
+      console.log(
+        `[vision-plan] images prepared ${dt(tImages)} ` +
+        `(m15=${m15FromFile ? "file" : m15FromLink.mode}, ` +
+        `h1=${h1FromFile ? "file" : h1FromLink.mode}, ` +
+        `h4=${h4FromFile ? "file" : h4FromLink.mode}; calendar ${calUrl ? "compressed" : "none"})`
+      );
     }
 
     if (!m15 || !h1 || !h4) {
-      // Helpful message if fallback failed for page links
       const missing: string[] = [];
       if (!m15) missing.push("m15");
       if (!h1)  missing.push("h1");
@@ -556,11 +555,11 @@ export default async function handler(
       return res.status(400).json({
         ok: false,
         reason:
-          `Could not resolve ${missing.join(", ")} chart link(s). Use a direct image URL (.png/.jpg/.webp like Gyazo) or upload the snapshot. If pasting TradingView, use a page with 'Copy image' > save & upload.`,
+          `Could not resolve ${missing.join(", ")} chart link(s). Use a direct image URL (.png/.jpg/.webp like Gyazo) or upload the snapshot.`,
       });
     }
 
-    // Headlines: fetch up to 12 but embed only 6 into the prompt
+    // Headlines: fetch 12; embed only 6
     const tNews = now();
     const items = await fetchedHeadlinesItems(req, instrument);
     const headlinesPromptText = items.length ? formatHeadlines(items, 6) : null;
@@ -568,7 +567,7 @@ export default async function handler(
       console.log(`[vision-plan] news fetched in ${dt(tNews)} (items=${items.length})`);
     }
 
-    // Sentiment: strict total budget (~600ms). If it doesn't return in time, skip.
+    // Sentiment: strict ~600ms budget; skip if slow
     const tSent = now();
     const sentimentText = await buildSentimentTextWithBudget(instrument, 600);
     if (process.env.NODE_ENV !== "production") {
@@ -577,7 +576,7 @@ export default async function handler(
 
     const dateStr = new Date().toISOString().slice(0, 10);
 
-    // 1) Tournament pass
+    // 1) Tournament pass (all sections/format unchanged)
     const tAI = now();
     let { text, aiMeta } = await askTournament({
       instrument,
@@ -585,9 +584,7 @@ export default async function handler(
       calendarDataUrl: calUrl || undefined,
       headlinesText: headlinesPromptText || undefined, // <= only 6 in prompt
       sentimentText: sentimentText || undefined,        // <= compact, optional
-      m15,
-      h1,
-      h4,
+      m15, h1, h4,
     });
     if (process.env.NODE_ENV !== "production") {
       console.log(`[vision-plan] openai completed in ${dt(tAI)}`);
@@ -605,8 +602,7 @@ export default async function handler(
 
     // 3) Normalize mislabeled Breakout+Retest when no proof
     const bp = aiMeta?.breakoutProof || {};
-    const hasProof =
-      !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+    const hasProof = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
     if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
       const tNorm = now();
       text = await normalizeBreakoutLabel(text);
@@ -616,7 +612,7 @@ export default async function handler(
       }
     }
 
-    // 4) Enforce order vs current price (Sell Limit above / Buy Limit below)
+    // 4) Enforce order sanity (Sell Limit above / Buy Limit below current price)
     if (aiMeta) {
       const bad = invalidOrderRelativeToPrice(aiMeta);
       if (bad) {
@@ -629,7 +625,7 @@ export default async function handler(
       }
     }
 
-    // 5) Fallback if refusal/empty (unchanged)
+    // 5) Fallback if refusal/empty
     if (!text || refusalLike(text)) {
       const fallback =
         [
@@ -677,11 +673,7 @@ export default async function handler(
               stop: null,
               tp1: null,
               tp2: null,
-              breakoutProof: {
-                bodyCloseBeyond: false,
-                retestHolds: false,
-                sfpReclaim: false,
-              },
+              breakoutProof: { bodyCloseBeyond: false, retestHolds: false, sfpReclaim: false },
               candidateScores: [],
               note: "Fallback used due to refusal/empty output.",
             },
