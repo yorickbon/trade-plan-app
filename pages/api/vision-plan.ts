@@ -2,11 +2,17 @@
 // Images-only planner with optional TradingView image URL fetch.
 // Uploads: m15 (execution), h1 (context), h4 (HTF), optional calendar.
 // You can also pass m15Url / h1Url / h4Url (TradingView "Copy link to image").
-// Keeps existing logic & headings intact.
+// Keeps existing logic & headings intact. Injects small sentiment bullets (intraday CSM + COT) if available.
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
-import sharp from "sharp";
+import {
+  getCurrencyStrengthIntraday,
+  getCotBiasBrief,
+  formatStrengthLine,
+  formatCotLine,
+  parseInstrumentCurrencies,
+} from "../../lib/sentiment-lite";
 
 // ---------- config ----------
 export const config = {
@@ -55,77 +61,14 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null {
   return Array.isArray(x) ? (x[0] ?? null) : (x as any);
 }
 
-// ---------- image processing (downscale/compress with sharp) ----------
-
-const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap for inputs
-const TARGET_MAX_WIDTH = 1280;
-const PREFERRED_MAX_BYTES = 600 * 1024; // aim for ~600KB when possible
-
-function toDataUrl(buf: Buffer, mime: string) {
-  return `data:${mime};base64,${buf.toString("base64")}`;
-}
-
-async function processImageBuffer(
-  input: Buffer,
-  inputMime: string | null
-): Promise<string> {
-  if (input.byteLength > IMG_MAX_BYTES) throw new Error("Image too large");
-
-  // Probe metadata once
-  const base = sharp(input, { limitInputPixels: false, sequentialRead: true });
-  const meta = await base.metadata();
-  const width = meta.width || 0;
-  const height = meta.height || 0;
-
-  // If already small enough, pass through
-  if (width <= TARGET_MAX_WIDTH && input.byteLength <= PREFERRED_MAX_BYTES) {
-    const mime = inputMime?.startsWith("image/") ? inputMime : "image/jpeg";
-    console.log(
-      `[vision-plan] passthrough ${width}x${height} ${(input.byteLength / 1024).toFixed(1)}KB`
-    );
-    return toDataUrl(input, mime);
-  }
-
-  // Two-step quality to balance speed vs clarity. NOTE: fastShrinkOnLoad is a RESIZE option.
-  for (const q of [70, 60]) {
-    const { data, info } = await sharp(input, {
-      limitInputPixels: false,
-      sequentialRead: true,
-    })
-      .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true, fastShrinkOnLoad: true })
-      .jpeg({
-        quality: q,
-        mozjpeg: true,
-        progressive: true,
-        chromaSubsampling: "4:4:4",
-        optimizeCoding: true,
-      })
-      .toBuffer({ resolveWithObject: true });
-
-    console.log(
-      `[vision-plan] processed -> ${info.width}x${info.height} ${(data.byteLength / 1024).toFixed(
-        1
-      )}KB, q=${q}`
-    );
-
-    // Prefer clarity; accept slightly >600KB if needed
-    if (data.byteLength <= PREFERRED_MAX_BYTES || q === 60) {
-      return toDataUrl(data, "image/jpeg");
-    }
-  }
-
-  // Fallback (shouldn't hit due to the loop)
-  return toDataUrl(input, inputMime || "image/jpeg");
-}
-
-async function fileToProcessedDataUrl(file: any): Promise<string | null> {
+async function fileToDataUrl(file: any): Promise<string | null> {
   if (!file) return null;
   const p =
     file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
   const buf = await fs.readFile(p);
   const mime = file.mimetype || "image/png";
-  return processImageBuffer(buf, mime);
+  return `data:${mime};base64,${buf.toString("base64")}`;
 }
 
 function originFromReq(req: NextApiRequest) {
@@ -134,9 +77,21 @@ function originFromReq(req: NextApiRequest) {
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 
-// ---------- Headlines: fetch 12, embed ONLY 6 into the model ----------
+// Format headlines bullets (limit controls prompt size)
+function formatHeadlines(items: any[], max = 6): string {
+  const rows: string[] = [];
+  for (const it of (items || []).slice(0, max)) {
+    const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
+    const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
+    const t = String(it?.title || "").slice(0, 200);
+    const src = it?.source || "";
+    const when = it?.ago || "";
+    rows.push(`• ${t} — ${src}, ${when} — ${lab}`);
+  }
+  return rows.join("\n");
+}
 
-async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
+async function fetchedHeadlinesItems(req: NextApiRequest, instrument: string) {
   try {
     const base = originFromReq(req);
     const url = `${base}/api/news?instrument=${encodeURIComponent(
@@ -145,20 +100,9 @@ async function fetchedHeadlines(req: NextApiRequest, instrument: string) {
     const r = await fetch(url, { cache: "no-store" });
     const j = await r.json().catch(() => ({}));
     const items: any[] = Array.isArray(j?.items) ? j.items : [];
-    const lines = items
-      .slice(0, 6) // <= only 6 go to the model
-      .map((it: any) => {
-        const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
-        const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
-        const t = String(it?.title || "").slice(0, 200);
-        const src = it?.source || "";
-        const when = it?.ago || "";
-        return `• ${t} — ${src}, ${when} — ${lab}`;
-      })
-      .join("\n");
-    return lines || null;
+    return items;
   } catch {
-    return null;
+    return [];
   }
 }
 
@@ -203,17 +147,17 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return null;
 
   if (o === "sell limit" && dir === "short") {
-    // zone must be ABOVE current price (pullback into supply)
     if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price";
   }
   if (o === "buy limit" && dir === "long") {
-    // zone must be BELOW current price (pullback into demand)
     if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price";
   }
   return null;
 }
 
-// ---------- NEW: fetch TV link → image dataURL (then process) ----------
+// ---------- NEW: fetch TV link → image dataURL ----------
+
+const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB safety cap
 
 function withTimeout<T>(p: Promise<T>, ms: number) {
   return new Promise<T>((resolve, reject) => {
@@ -267,29 +211,35 @@ function htmlFindOgImage(html: string): string | null {
 async function fetchImageDataUrlFromLink(link: string): Promise<string | null> {
   if (!link) return null;
   try {
-    // First request: could be the image or an HTML page with og:image
-    const first = await withTimeout(fetchBuffer(link), 8000);
+    const first = await withTimeout(fetchBuffer(link), 12000);
     if (!first) return null;
 
     const ctype = first.mime.toLowerCase();
     if (ctype.startsWith("image/")) {
-      return processImageBuffer(first.buf, first.mime);
+      return `data:${first.mime};base64,${first.buf.toString("base64")}`;
     }
 
-    // If HTML, try to resolve og:image
     const html = first.buf.toString("utf8");
     const og = htmlFindOgImage(html);
     if (!og) return null;
 
     const resolved = absoluteUrl(link, og);
-    const second = await withTimeout(fetchBuffer(resolved), 8000);
+    const second = await withTimeout(fetchBuffer(resolved), 12000);
     if (!second) return null;
     if (!second.mime.toLowerCase().startsWith("image/")) return null;
 
-    return processImageBuffer(second.buf, second.mime);
+    return `data:${second.mime};base64,${second.buf.toString("base64")}`;
   } catch {
     return null;
   }
+}
+
+// ---------- Sentiment text builder (auto, small and fast) ----------
+
+function buildSentimentTextAuto(instrument: string, strengthLine: string, cotLine: string): string | null {
+  const parts = [strengthLine, cotLine].filter(Boolean);
+  if (!parts.length) return null;
+  return `Sentiment Snapshot:\n${parts.map(p => `• ${p}`).join("\n")}`;
 }
 
 // ---------- OpenAI call (unchanged) ----------
@@ -320,13 +270,14 @@ async function callOpenAI(messages: any[]) {
   return String(out || "");
 }
 
-// ---------- prompt builders (unchanged from your base) ----------
+// ---------- prompt builders (unchanged structure) ----------
 
 function tournamentMessages(params: {
   instrument: string;
   dateStr: string;
   calendarDataUrl?: string | null;
   headlinesText?: string | null;
+  sentimentText?: string | null;
   m15: string;
   h1: string;
   h4: string;
@@ -336,6 +287,7 @@ function tournamentMessages(params: {
     dateStr,
     calendarDataUrl,
     headlinesText,
+    sentimentText,
     m15,
     h1,
     h4,
@@ -416,10 +368,10 @@ function tournamentMessages(params: {
     userParts.push({ type: "image_url", image_url: { url: calendarDataUrl } });
   }
   if (headlinesText) {
-    userParts.push({
-      type: "text",
-      text: `Recent headlines snapshot:\n${headlinesText}`,
-    });
+    userParts.push({ type: "text", text: `Recent headlines snapshot:\n${headlinesText}` });
+  }
+  if (sentimentText) {
+    userParts.push({ type: "text", text: sentimentText });
   }
 
   return [
@@ -433,6 +385,7 @@ async function askTournament(args: {
   dateStr: string;
   calendarDataUrl?: string | null;
   headlinesText?: string | null;
+  sentimentText?: string | null;
   m15: string;
   h1: string;
   h4: string;
@@ -528,10 +481,10 @@ export default async function handler(
 
     // Build images: prefer file if present; otherwise use URL fetcher
     const [m15FromFile, h1FromFile, h4FromFile, calUrl] = await Promise.all([
-      fileToProcessedDataUrl(m15f),
-      fileToProcessedDataUrl(h1f),
-      fileToProcessedDataUrl(h4f),
-      calF ? fileToProcessedDataUrl(calF) : Promise.resolve(null),
+      fileToDataUrl(m15f),
+      fileToDataUrl(h1f),
+      fileToDataUrl(h4f),
+      calF ? fileToDataUrl(calF) : Promise.resolve(null),
     ]);
 
     const [m15FromUrl, h1FromUrl, h4FromUrl] = await Promise.all([
@@ -550,7 +503,25 @@ export default async function handler(
         .json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either as files or valid TradingView image links." });
     }
 
-    const headlinesText = await fetchedHeadlines(req, instrument);
+    // Fetch up to 12 headlines but embed only 6 into the prompt
+    const items = await fetchedHeadlinesItems(req, instrument);
+    const headlinesPromptText = items.length ? formatHeadlines(items, 6) : null;
+
+    // Auto sentiment: intraday strength + COT (fast, cached)
+    let sentimentText: string | null = null;
+    try {
+      const [csm, cot] = await Promise.all([
+        getCurrencyStrengthIntraday({ range: "1d", interval: "15m", ttlSec: 120, timeoutMs: 1200 }),
+        getCotBiasBrief({ ttlSec: 86400, timeoutMs: 1200 }),
+      ]);
+      const csmLine = formatStrengthLine(csm);
+      const { base, quote } = parseInstrumentCurrencies(instrument);
+      const cotLine = formatCotLine(cot, [base || "", quote || ""].filter(Boolean));
+      sentimentText = buildSentimentTextAuto(instrument, csmLine, cotLine);
+    } catch {
+      sentimentText = null;
+    }
+
     const dateStr = new Date().toISOString().slice(0, 10);
 
     // 1) Tournament pass
@@ -558,7 +529,8 @@ export default async function handler(
       instrument,
       dateStr,
       calendarDataUrl: calUrl || undefined,
-      headlinesText: headlinesText || undefined, // exactly 6 now
+      headlinesText: headlinesPromptText || undefined, // <= only 6 into prompt
+      sentimentText: sentimentText || undefined,        // <= compact sentiment bullet(s)
       m15,
       h1,
       h4,
@@ -657,7 +629,7 @@ export default async function handler(
         meta: {
           instrument,
           hasCalendar: !!calUrl,
-          headlinesCount: headlinesText ? 6 : 0,
+          headlinesCount: items.length,
           strategySelection: false,
           rewritten: false,
           fallbackUsed: true,
@@ -673,7 +645,7 @@ export default async function handler(
       meta: {
         instrument,
         hasCalendar: !!calUrl,
-        headlinesCount: headlinesText ? 6 : 0,
+        headlinesCount: items.length,
         strategySelection: true,
         rewritten: false,
         fallbackUsed: false,
