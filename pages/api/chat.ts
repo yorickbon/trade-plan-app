@@ -1,5 +1,12 @@
 // pages/api/chat.ts
 import type { NextApiRequest, NextApiResponse } from "next";
+import {
+  getCurrencyStrengthIntraday,
+  getCotBiasBrief,
+  formatStrengthLine,
+  formatCotLine,
+  parseInstrumentCurrencies,
+} from "../../lib/sentiment-lite";
 
 // --- ENV ---
 const OPENAI_API_KEY =
@@ -10,11 +17,12 @@ const MODEL_PRIMARY =
 const OPENAI_API_BASE =
   process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
 
-// --- small utils ---
+// --- utils ---
 function asString(x: any) {
   return typeof x === "string" ? x : x == null ? "" : JSON.stringify(x);
 }
 const isGpt5 = (m: string) => /^gpt-5/i.test(m);
+const toUpper = (s: any) => String(s || "").toUpperCase().trim();
 
 // ---------- fresh, instrument-aligned headlines (6 bullets) ----------
 function originFromReq(req: NextApiRequest) {
@@ -59,6 +67,125 @@ async function fetchInstrumentHeadlines(
   }
 }
 
+/* ---------------- Calendar tightening (Option A: no external fetch) ---------------- */
+
+type CalNorm = {
+  ts: number; // ms epoch
+  ccy: string; // currency code like USD/JPY
+  title: string;
+  impact: "high" | "medium" | "low" | "unknown";
+  expected?: string;
+  prior?: string;
+};
+
+function toImpact(v: any): CalNorm["impact"] {
+  const s = String(v || "").toLowerCase();
+  if (/(high|red|3)/.test(s)) return "high";
+  if (/(medium|med|orange|2)/.test(s)) return "medium";
+  if (/(low|yellow|1)/.test(s)) return "low";
+  return "unknown";
+}
+
+function parseTimestamp(vDate: any, vTime?: any): number | null {
+  if (vDate == null && vTime == null) return null;
+  const tryNum = Number(vDate);
+  if (isFinite(tryNum) && tryNum > 0) {
+    return tryNum < 10_000_000_000 ? tryNum * 1000 : tryNum;
+  }
+  const dateStr = String(vDate || "").trim();
+  const timeStr = String(vTime || "").trim();
+  const guess = dateStr && timeStr ? `${dateStr} ${timeStr}` : dateStr || timeStr;
+  const d = new Date(guess);
+  return isFinite(d.getTime()) ? d.getTime() : null;
+}
+
+function normalizeCalendarArray(calendar: any[]): CalNorm[] {
+  const out: CalNorm[] = [];
+  for (const it of Array.isArray(calendar) ? calendar : []) {
+    const title = String(it?.event ?? it?.title ?? it?.name ?? "").trim();
+    if (!title) continue;
+
+    const ccy =
+      toUpper(it?.currency ?? it?.ccy ?? it?.country ?? it?.fx ?? "");
+
+    let ts =
+      parseTimestamp(it?.timestamp) ??
+      parseTimestamp(it?.time) ??
+      parseTimestamp(it?.date, it?.time) ??
+      parseTimestamp(it?.datetime) ??
+      null;
+
+    if (ts == null && it?.when) {
+      const d = new Date(String(it.when));
+      if (isFinite(d.getTime())) ts = d.getTime();
+    }
+    if (ts == null) continue;
+
+    const impact = toImpact(it?.impact ?? it?.importance ?? it?.priority);
+    const expected = String(it?.expected ?? it?.forecast ?? it?.consensus ?? "").trim() || undefined;
+    const prior = String(it?.previous ?? it?.prior ?? "").trim() || undefined;
+
+    out.push({ ts, ccy, title, impact, expected, prior });
+  }
+  return out;
+}
+
+function tightenCalendarForInstrument(
+  calendar: any[],
+  instrument: string,
+  nowMs: number,
+  horizonHours = 48,
+  maxBullets = 5
+) {
+  const { base, quote } = parseInstrumentCurrencies(instrument);
+  const whitelist = new Set([toUpper(base), toUpper(quote)].filter(Boolean));
+  const minTs = nowMs;
+  const maxTs = nowMs + horizonHours * 3600 * 1000;
+
+  const norm = normalizeCalendarArray(calendar);
+  const filtered = norm.filter((e) => {
+    if (!(e.ts >= minTs && e.ts <= maxTs)) return false;
+    if (!(e.impact === "high" || e.impact === "medium")) return false;
+    if (whitelist.size > 0 && e.ccy) return whitelist.has(e.ccy);
+    return true;
+  });
+
+  const map = new Map<string, CalNorm>();
+  for (const e of filtered) {
+    const key = `${e.title}|${e.ts}`;
+    if (!map.has(key)) map.set(key, e);
+  }
+
+  const arr = Array.from(map.values()).sort((a, b) => a.ts - b.ts);
+  const top = arr.slice(0, maxBullets);
+
+  const bullets: string[] = [];
+  const hiTimes: string[] = [];
+
+  for (const e of top) {
+    const dt = new Date(e.ts);
+    const hh = String(dt.getUTCHours()).padStart(2, "0");
+    const mm = String(dt.getUTCMinutes()).padStart(2, "0");
+    const timeUTC = `${hh}:${mm} UTC`;
+
+    if (e.impact === "high") hiTimes.push(`${timeUTC} ${e.ccy || ""}`.trim());
+
+    const exp = e.expected ? ` — exp ${e.expected}` : "";
+    const prior = e.prior ? ` (prior ${e.prior})` : "";
+    const imp = e.impact !== "unknown" ? ` — ${e.impact}` : "";
+    const ccy = e.ccy ? ` — ${e.ccy}` : "";
+
+    bullets.push(`• ${timeUTC} — ${e.title}${ccy}${exp}${prior}${imp}`);
+  }
+
+  const risk =
+    hiTimes.length > 0
+      ? `Risk windows (high impact): ${hiTimes.join(" · ")}`
+      : "";
+
+  return { bullets: bullets.join("\n"), risk };
+}
+
 // ---------- prompt & extraction ----------
 function buildMessages(system: string, userContent: string) {
   return [
@@ -67,7 +194,6 @@ function buildMessages(system: string, userContent: string) {
   ];
 }
 
-// Robust extractor for Chat Completions (covers string/array shapes)
 function extractTextFromChat(json: any): string {
   try {
     const msg = json?.choices?.[0]?.message;
@@ -78,13 +204,14 @@ function extractTextFromChat(json: any): string {
       const pieces: string[] = [];
       for (const part of msg.content) {
         if (typeof part === "string") pieces.push(part);
-        else if (typeof part?.text === "string") pieces.push(part.text);
-        else if (typeof part?.content === "string") pieces.push(part.content);
+        else if (typeof (part as any)?.text === "string") pieces.push((part as any).text);
+        else if (typeof (part as any)?.content === "string") pieces.push((part as any).content);
         else if (
-          typeof part?.type === "string" &&
-          typeof part?.text === "string"
-        )
-          pieces.push(part.text);
+          typeof (part as any)?.type === "string" &&
+          typeof (part as any)?.text === "string"
+        ) {
+          pieces.push((part as any).text);
+        }
       }
       return pieces.join("").trim();
     }
@@ -100,13 +227,9 @@ function extractTextFromChat(json: any): string {
 
 // ---------- OpenAI (non-stream) ----------
 async function chatCompletions(model: string, messages: any[]) {
-  // Use GPT-5 param only if model starts with gpt-5; else use classic max_tokens
   const body: any = { model, messages };
-  if (isGpt5(model)) {
-    body.max_completion_tokens = 800;
-  } else {
-    body.max_tokens = 800;
-  }
+  if (isGpt5(model)) body.max_completion_tokens = 800;
+  else body.max_tokens = 800;
 
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
@@ -119,9 +242,7 @@ async function chatCompletions(model: string, messages: any[]) {
 
   const text = await rsp.text().catch(() => "");
   let json: any = {};
-  try {
-    json = JSON.parse(text);
-  } catch {}
+  try { json = JSON.parse(text); } catch {}
   return { ok: rsp.ok, status: rsp.status, json, text };
 }
 
@@ -140,7 +261,7 @@ export default async function handler(
       question = "",
       planText = "",
       headlines = [], // kept for compatibility; server fetch takes priority
-      calendar = [],
+      calendar = [],  // optional
       instrument = "",
     } = (req.body || {}) as {
       question?: string;
@@ -166,15 +287,40 @@ export default async function handler(
       headlinesText = bulletsFromItems(headlines, 6);
     }
 
-    const contextParts: string[] = [];
-    if (instrument)
-      contextParts.push(`Instrument: ${String(instrument).toUpperCase()}`);
-    if (planText) contextParts.push(`Current Trade Plan:\n${asString(planText)}`);
-    if (headlinesText)
-      contextParts.push(`Recent headlines snapshot:\n${headlinesText}`);
+    // Tighten calendar (Option A) if provided
+    let calendarBlock = "";
     if (Array.isArray(calendar) && calendar.length) {
-      contextParts.push(`Calendar notes (raw):\n${asString(calendar)}`);
+      const nowMs = Date.now();
+      const tight = tightenCalendarForInstrument(calendar, String(instrument || ""), nowMs, 48, 5);
+      if (tight.bullets) {
+        calendarBlock = `Calendar (next 48h):\n${tight.bullets}`;
+        if (tight.risk) calendarBlock += `\n${tight.risk}`;
+      }
     }
+
+    // Sentiment (intraday CSM + COT) with short timeouts and cache
+    let sentimentLine = "";
+    try {
+      const [csm, cot] = await Promise.all([
+        getCurrencyStrengthIntraday({ range: "1d", interval: "15m", ttlSec: 120, timeoutMs: 1200 }),
+        getCotBiasBrief({ ttlSec: 86400, timeoutMs: 1200 }),
+      ]);
+      const csmLine = formatStrengthLine(csm);
+      const { base, quote } = parseInstrumentCurrencies(String(instrument || ""));
+      const cotLine = formatCotLine(cot, [base || "", quote || ""].filter(Boolean));
+      const parts = [csmLine, cotLine].filter(Boolean);
+      if (parts.length) sentimentLine = `Sentiment (intraday): ${parts.join(" | ")}`;
+    } catch {
+      // swallow sentiment failures
+      sentimentLine = "";
+    }
+
+    const contextParts: string[] = [];
+    if (instrument) contextParts.push(`Instrument: ${toUpper(instrument)}`);
+    if (planText) contextParts.push(`Current Trade Plan:\n${asString(planText)}`);
+    if (headlinesText) contextParts.push(`Recent headlines snapshot:\n${headlinesText}`);
+    if (calendarBlock) contextParts.push(calendarBlock);
+    if (sentimentLine) contextParts.push(sentimentLine);
 
     const system =
       "You are a helpful trading assistant. Discuss trades thoughtfully, but you can also teach with examples when asked. Keep answers concise and practical.";
