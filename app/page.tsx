@@ -1,4 +1,4 @@
-
+// app/page.tsx
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -8,6 +8,7 @@ import CalendarPanel from "../components/CalendarPanel";
 import HeadlinesPanel from "../components/HeadlinesPanel";
 import ChatDock from "../components/ChatDock";
 import VisionUpload from "../components/VisionUpload";
+import { INSTRUMENTS } from "../lib/symbols";
 
 // client-only chart import
 const TradingViewTriple = dynamic(() => import("../components/TradingViewTriple"), {
@@ -64,6 +65,15 @@ function normalizePlanText(v: any): string {
   }
 }
 
+// Extract trailing ```ai_meta { ... } ``` JSON block
+function extractAiMetaFromText(text: string): any | null {
+  if (!text) return null;
+  const re = /```ai_meta\s*({[\s\S]*?})\s*```/i;
+  const m = text.match(re);
+  if (!m || !m[1]) return null;
+  try { return JSON.parse(m[1]); } catch { return null; }
+}
+
 // ---------- page ----------
 export default function Page() {
   // controls
@@ -91,19 +101,24 @@ export default function Page() {
   const headlinesSeqRef = useRef(0);
   const headlinesAbortRef = useRef<AbortController | null>(null);
 
+  // ----- derive A→Z instrument list from lib/symbols.ts -----
+  const instrumentsAZ = useMemo(
+    () =>
+      [...INSTRUMENTS].sort((a, b) =>
+        (a.label || a.code).localeCompare(b.label || b.code, "en", {
+          sensitivity: "base",
+        })
+      ),
+    []
+  );
+
   // ----- load headlines for currencies / instrument -----
   const loadHeadlinesForSymbols = useCallback(async (symbols: string[]) => {
-    // Immediate clear (so old instrument doesn't linger)
     setHeadlines([]);
-    if (!symbols.length) {
-      return;
-    }
+    if (!symbols.length) return;
 
-    // Cancel any in-flight request
     if (headlinesAbortRef.current) {
-      try {
-        headlinesAbortRef.current.abort();
-      } catch {}
+      try { headlinesAbortRef.current.abort(); } catch {}
     }
 
     const controller = new AbortController();
@@ -117,13 +132,10 @@ export default function Page() {
         signal: controller.signal,
       });
       const nj: NewsResp = await nr.json();
-
-      // Apply only if this is the latest request and not aborted
       if (reqId === headlinesSeqRef.current) {
         setHeadlines(nj?.ok ? nj.items || [] : []);
       }
-    } catch (e: any) {
-      // Ignore abort errors; only clear if this was the latest request
+    } catch {
       if (reqId === headlinesSeqRef.current) setHeadlines([]);
     } finally {
       if (reqId === headlinesSeqRef.current) setLoadingNews(false);
@@ -160,9 +172,7 @@ export default function Page() {
     }
   }, [dateStr, instrument, loadHeadlinesForSymbols]);
 
-  useEffect(() => {
-    loadCalendar();
-  }, [loadCalendar]);
+  useEffect(() => { loadCalendar(); }, [loadCalendar]);
 
   // reset
   const resetAll = useCallback(() => {
@@ -171,15 +181,8 @@ export default function Page() {
     setCalendar(null);
     setDateStr(todayISO());
     setEnlargedCard(false);
-    // cancel any in-flight headlines request
-    if (headlinesAbortRef.current) {
-      try {
-        headlinesAbortRef.current.abort();
-      } catch {}
-    }
-    // hard reset the uploader
+    if (headlinesAbortRef.current) { try { headlinesAbortRef.current.abort(); } catch {} }
     setResetTick((t) => t + 1);
-    // re-pull with fresh date/instrument
     setTimeout(() => loadCalendar(), 0);
   }, [loadCalendar]);
 
@@ -189,17 +192,9 @@ export default function Page() {
       setInstrument(next.toUpperCase());
       setPlanText("");
       setEnlargedCard(false);
-
-      // cancel any in-flight headlines request and clear immediately
-      if (headlinesAbortRef.current) {
-        try {
-          headlinesAbortRef.current.abort();
-        } catch {}
-      }
+      if (headlinesAbortRef.current) { try { headlinesAbortRef.current.abort(); } catch {} }
       setHeadlines([]);
-
       setResetTick((t) => t + 1);
-      // calendar will reload via useEffect (dependency = instrument)
       setTimeout(() => loadCalendar(), 0);
     },
     [loadCalendar]
@@ -208,9 +203,7 @@ export default function Page() {
   // ESC closes fullscreen
   useEffect(() => {
     if (!enlargedCard) return;
-    const onEsc = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setEnlargedCard(false);
-    };
+    const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") setEnlargedCard(false); };
     window.addEventListener("keydown", onEsc);
     return () => window.removeEventListener("keydown", onEsc);
   }, [enlargedCard]);
@@ -219,6 +212,13 @@ export default function Page() {
     () => currenciesFromBias((calendar as any)?.bias),
     [calendar]
   );
+
+  // ---- Derive model-read price (from ai_meta) for a tiny sanity line ----
+  const modelReadPrice = useMemo(() => {
+    const meta = extractAiMetaFromText(planText);
+    const p = Number(meta?.currentPrice);
+    return Number.isFinite(p) ? p : null;
+  }, [planText]);
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 space-y-4">
@@ -231,26 +231,11 @@ export default function Page() {
             onChange={(e) => onInstrumentChange(e.target.value)}
             className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm inline-block w-auto"
           >
-            {/* Forex */}
-            <option>AUDUSD</option>
-            <option>EURUSD</option>
-            <option>GBPUSD</option>
-            <option>USDJPY</option>
-            <option>USDCAD</option>
-            <option>EURGBP</option>
-            <option>EURJPY</option>
-            <option>GBPJPY</option>
-            <option>EURAUD</option>
-            <option>NZDUSD</option>
-            {/* Indices */}
-            <option>SPX500</option>
-            <option>NAS100</option>
-            <option>US30</option>
-            <option>GER40</option>
-            {/* Metals/Crypto */}
-            <option>XAUUSD</option>
-            <option>BTCUSD</option>
-            <option>ETHUSD</option>
+            {instrumentsAZ.map((it) => (
+              <option key={it.code} value={it.code}>
+                {it.label || it.code}
+              </option>
+            ))}
           </select>
         </div>
 
@@ -272,7 +257,7 @@ export default function Page() {
           Reset
         </button>
 
-        {/* (future) monitoring hooks */}
+        {/* (future) monitoring hooks) */}
         <button className="inline-flex items-center justify-center whitespace-nowrap w-auto px-3 py-1 text-sm rounded bg-sky-700 hover:bg-sky-600">
           Start monitoring
         </button>
@@ -343,7 +328,14 @@ export default function Page() {
         {/* RIGHT: Trade Card (normal) + Chat */}
         <div className="rounded-lg border border-neutral-800 p-4 flex flex-col gap-4 max-h-[80vh]">
           <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold mb-2">Generated Trade Card</h2>
+            <div>
+              <h2 className="text-lg font-semibold mb-1">Generated Trade Card</h2>
+              {modelReadPrice != null && (
+                <div className="text-xs opacity-70">
+                  Model read price: <b>{modelReadPrice}</b>
+                </div>
+              )}
+            </div>
 
             {/* Fullscreen toggle now expands to a full-width reader below */}
             <button
@@ -422,10 +414,10 @@ export default function Page() {
                 {planText}
                 <style jsx>{`
                   .card-enlarged-pre {
-                    font-size: 24px !important;        /* Preset A */
+                    font-size: 24px !important;
                     line-height: 2.0rem !important;
                     letter-spacing: 0.005em;
-                    white-space: pre-wrap !important;   /* preserve line breaks */
+                    white-space: pre-wrap !important;
                     tab-size: 2;
                   }
                   @media (min-width: 768px) {
