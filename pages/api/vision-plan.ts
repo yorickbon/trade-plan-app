@@ -1,13 +1,13 @@
 // /pages/api/vision-plan.ts
 // Images-only planner with robust, FAST chart handling + single-pass enforcement.
+// This version further reduces image payload (speed) without changing any trade logic:
+// - Max width: 1100px (was 1280)
+// - JPEG quality: 68 (was 72)
+// - Target size: ≤ 450 KB each (best-effort; up to 3 compression passes)
 // Always sends downscaled JPEGs for ALL charts (files or links).
-// - Direct image links (.png/.jpg/.webp/.gif): fetch (3s cap), downscale ≤1280px, JPEG ~70%, strip EXIF, aim ≤600KB.
-// - TradingView page links (/x/…/): resolve og:image (3s), fetch (3s), then downscale.
-// - 2-minute in-memory cache for processed chart URLs.
 // Headlines: fetch 12, embed only 6 into the model prompt.
-// Sentiment (CSM/COT): included with a ~600ms total budget (skipped if slow).
+// Sentiment (CSM/COT): ~600ms total budget (skips if slow).
 // Output sections & logic remain EXACTLY the same (Quick Plan, Full Breakdown, X-ray, Candidate Scores, Final Table, ai_meta).
-// NEW: Single-pass enforcement replaces up to 3 sequential post-fixes to reduce total latency.
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -38,10 +38,12 @@ function now() { return Date.now(); }
 function dt(from: number) { return `${Date.now() - from}ms`; }
 
 const IMG_MAX_BYTES = 12 * 1024 * 1024; // safety cap when fetching remote images
-const TARGET_MAX_WIDTH = 1280;
-const TARGET_QUALITY_START = 72; // ~70%
-const TARGET_MIN_QUALITY = 55;
-const TARGET_MAX_BYTES = 600 * 1024; // ~≤600 KB best-effort
+
+// ↓ Tweaked for speed (per your request)
+const TARGET_MAX_WIDTH = 1100;
+const TARGET_QUALITY_START = 68;
+const TARGET_MIN_QUALITY = 50;
+const TARGET_MAX_BYTES = 450 * 1024; // ~≤450 KB best-effort
 
 function looksLikeImageUrl(u: string) {
   const s = String(u || "").split("?")[0] || "";
@@ -104,6 +106,16 @@ async function fetchWithTimeout(url: string, ms: number, init?: RequestInit): Pr
   }
 }
 
+// Estimate raw bytes from a data URL (for logging only)
+function dataUrlSizeBytes(s: string | null | undefined): number {
+  if (!s) return 0;
+  const i = s.indexOf(",");
+  if (i < 0) return 0;
+  const b64 = s.slice(i + 1);
+  const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
+  return Math.floor((b64.length * 3) / 4) - padding;
+}
+
 // ---------- Headlines (fetch 12; embed 6 into prompt) ----------
 function formatHeadlines(items: any[], max = 6): string {
   const rows: string[] = [];
@@ -135,21 +147,34 @@ async function fetchedHeadlinesItems(req: NextApiRequest, instrument: string) {
 
 // ---------- JPEG downscale helpers ----------
 async function bufferToJpegTight(buf: Buffer): Promise<Buffer> {
-  // single pass ~70%, optional second pass if still >600KB
+  // pass 1
+  let quality = TARGET_QUALITY_START;
   let out = await sharp(buf)
     .rotate()
     .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true })
-    .jpeg({ quality: TARGET_QUALITY_START, progressive: true, mozjpeg: true })
+    .jpeg({ quality, progressive: true, mozjpeg: true })
     .toBuffer();
 
-  if (out.byteLength > TARGET_MAX_BYTES) {
-    const q2 = Math.max(TARGET_MIN_QUALITY, TARGET_QUALITY_START - 10);
+  // pass 2 if needed
+  if (out.byteLength > TARGET_MAX_BYTES && quality > TARGET_MIN_QUALITY + 10) {
+    quality = Math.max(TARGET_MIN_QUALITY + 10, TARGET_QUALITY_START - 10); // e.g., 58
     out = await sharp(buf)
       .rotate()
       .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true })
-      .jpeg({ quality: q2, progressive: true, mozjpeg: true })
+      .jpeg({ quality, progressive: true, mozjpeg: true })
       .toBuffer();
   }
+
+  // pass 3 if still heavy
+  if (out.byteLength > TARGET_MAX_BYTES && quality > TARGET_MIN_QUALITY) {
+    quality = TARGET_MIN_QUALITY; // e.g., 50
+    out = await sharp(buf)
+      .rotate()
+      .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true })
+      .jpeg({ quality, progressive: true, mozjpeg: true })
+      .toBuffer();
+  }
+
   return out;
 }
 
@@ -160,7 +185,7 @@ async function fileToProcessedDataUrl(file: any): Promise<string | null> {
   const raw = await fs.readFile(p);
   const jpeg = await bufferToJpegTight(raw);
   if (process.env.NODE_ENV !== "production") {
-    console.log(`[vision-plan] calendar/file processed size=${jpeg.byteLength}B`);
+    console.log(`[vision-plan] file processed size=${jpeg.byteLength}B`);
   }
   return `data:image/jpeg;base64,${jpeg.toString("base64")}`;
 }
@@ -202,6 +227,9 @@ async function downloadImageAsDataUrl(url: string): Promise<string | null> {
   const raw = Buffer.from(ab);
   if (raw.byteLength > IMG_MAX_BYTES) return null;
   const jpeg = await bufferToJpegTight(raw);
+  if (process.env.NODE_ENV !== "production") {
+    console.log(`[vision-plan] chart jpeg size=${jpeg.byteLength}B from ${url}`);
+  }
   return `data:image/jpeg;base64,${jpeg.toString("base64")}`;
 }
 
@@ -407,7 +435,7 @@ async function askTournament(args: {
   return { text, aiMeta };
 }
 
-// ---------- SINGLE-PASS ENFORCEMENT (new) ----------
+// ---------- SINGLE-PASS ENFORCEMENT ----------
 async function enforceCardConstraints(instrument: string, text: string, aiMeta: any) {
   const system =
     "Enforce the following constraints on the provided trade card while preserving format and ALL sections (Quick Plan, Full Breakdown, X-ray, Candidate Scores, Final Table). " +
@@ -427,52 +455,6 @@ async function enforceCardConstraints(instrument: string, text: string, aiMeta: 
   const messages = [
     { role: "system", content: system },
     { role: "user", content: user },
-  ];
-  return callOpenAI(messages);
-}
-
-// --- (kept but unused now) Legacy fix helpers (not called anymore) ---
-// rewrite card -> Pending limit (no Market) when proof missing
-async function rewriteAsPending(instrument: string, text: string) {
-  const messages = [
-    {
-      role: "system",
-      content:
-        "Rewrite the trade card as PENDING (no Market) into a clean Buy/Sell LIMIT zone at OB/FVG/SR confluence if breakout proof is missing. Keep tournament section and X-ray.",
-    },
-    {
-      role: "user",
-      content: `Instrument: ${instrument}\n\n${text}\n\nRewrite strictly to Pending.`,
-    },
-  ];
-  return callOpenAI(messages);
-}
-// normalize mislabeled Breakout+Retest without proof -> Pullback
-async function normalizeBreakoutLabel(text: string) {
-  const messages = [
-    {
-      role: "system",
-      content:
-        "If 'Breakout + Retest' is claimed but proof is not shown (body close + retest hold or SFP reclaim), rename setup to 'Pullback (OB/FVG/SR)' and leave rest unchanged.",
-    },
-    { role: "user", content: text },
-  ];
-  return callOpenAI(messages);
-}
-// fix Buy/Sell Limit level direction vs current price
-async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
-  const messages = [
-    {
-      role: "system",
-      content:
-        "Adjust the LIMIT zone so that: Sell Limit is an ABOVE-price pullback into supply; Buy Limit is a BELOW-price pullback into demand. Keep all other content & sections.",
-    },
-    {
-      role: "user",
-      content: `Instrument: ${instrument}\n\nCurrent Price: ${aiMeta?.currentPrice}\nProvided Zone: ${JSON.stringify(
-        aiMeta?.zone
-      )}\n\nCard:\n${text}\n\nFix only the LIMIT zone side and entry, keep format.`,
-    },
   ];
   return callOpenAI(messages);
 }
@@ -561,11 +543,16 @@ export default async function handler(
     const h4  = h4FromFile  || h4FromLink.dataUrl;
 
     if (process.env.NODE_ENV !== "production") {
+      const m15Size = dataUrlSizeBytes(m15);
+      const h1Size  = dataUrlSizeBytes(h1);
+      const h4Size  = dataUrlSizeBytes(h4);
+      const calSize = dataUrlSizeBytes(calUrl || "");
       console.log(
         `[vision-plan] images prepared ${dt(tImages)} ` +
-        `(m15=${m15FromFile ? "file" : m15FromLink.mode}, ` +
-        `h1=${h1FromFile ? "file" : h1FromLink.mode}, ` +
-        `h4=${h4FromFile ? "file" : h4FromLink.mode}; calendar ${calUrl ? "compressed" : "none"})`
+        `(m15=${m15FromFile ? "file" : m15FromLink.mode}:${m15Size}B, ` +
+        `h1=${h1FromFile ? "file" : h1FromLink.mode}:${h1Size}B, ` +
+        `h4=${h4FromFile ? "file" : h4FromLink.mode}:${h4Size}B; ` +
+        `calendar=${calUrl ? calSize + "B" : "none"})`
       );
     }
 
