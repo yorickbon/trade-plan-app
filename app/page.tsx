@@ -1,4 +1,4 @@
-// app/page.tsx
+
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -8,7 +8,6 @@ import CalendarPanel from "../components/CalendarPanel";
 import HeadlinesPanel from "../components/HeadlinesPanel";
 import ChatDock from "../components/ChatDock";
 import VisionUpload from "../components/VisionUpload";
-import { INSTRUMENTS } from "../lib/symbols"; // ← Option A: single source of truth
 
 // client-only chart import
 const TradingViewTriple = dynamic(() => import("../components/TradingViewTriple"), {
@@ -91,17 +90,6 @@ export default function Page() {
   // headlines request coordination
   const headlinesSeqRef = useRef(0);
   const headlinesAbortRef = useRef<AbortController | null>(null);
-
-  // ----- derive A→Z instrument list from lib/symbols.ts -----
-  const instrumentsAZ = useMemo(
-    () =>
-      [...INSTRUMENTS].sort((a, b) =>
-        (a.label || a.code).localeCompare(b.label || b.code, "en", {
-          sensitivity: "base",
-        })
-      ),
-    []
-  );
 
   // ----- load headlines for currencies / instrument -----
   const loadHeadlinesForSymbols = useCallback(async (symbols: string[]) => {
@@ -243,11 +231,26 @@ export default function Page() {
             onChange={(e) => onInstrumentChange(e.target.value)}
             className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm inline-block w-auto"
           >
-            {instrumentsAZ.map((it) => (
-              <option key={it.code} value={it.code}>
-                {it.label || it.code}
-              </option>
-            ))}
+            {/* Forex */}
+            <option>AUDUSD</option>
+            <option>EURUSD</option>
+            <option>GBPUSD</option>
+            <option>USDJPY</option>
+            <option>USDCAD</option>
+            <option>EURGBP</option>
+            <option>EURJPY</option>
+            <option>GBPJPY</option>
+            <option>EURAUD</option>
+            <option>NZDUSD</option>
+            {/* Indices */}
+            <option>SPX500</option>
+            <option>NAS100</option>
+            <option>US30</option>
+            <option>GER40</option>
+            {/* Metals/Crypto */}
+            <option>XAUUSD</option>
+            <option>BTCUSD</option>
+            <option>ETHUSD</option>
           </select>
         </div>
 
@@ -269,7 +272,7 @@ export default function Page() {
           Reset
         </button>
 
-        {/* (future) monitoring hooks) */}
+        {/* (future) monitoring hooks */}
         <button className="inline-flex items-center justify-center whitespace-nowrap w-auto px-3 py-1 text-sm rounded bg-sky-700 hover:bg-sky-600">
           Start monitoring
         </button>
@@ -419,10 +422,10 @@ export default function Page() {
                 {planText}
                 <style jsx>{`
                   .card-enlarged-pre {
-                    font-size: 24px !important;
+                    font-size: 24px !important;        /* Preset A */
                     line-height: 2.0rem !important;
                     letter-spacing: 0.005em;
-                    white-space: pre-wrap !important;
+                    white-space: pre-wrap !important;   /* preserve line breaks */
                     tab-size: 2;
                   }
                   @media (min-width: 768px) {
