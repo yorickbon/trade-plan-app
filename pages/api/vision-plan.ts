@@ -47,7 +47,7 @@ const POLY_KEY = process.env.POLYGON_API_KEY || "";
 const IMG_MAX_BYTES = 12 * 1024 * 1024; // safety cap
 
 const MAX_W = 1280; // downscale target
-the const JPEG_Q = 70; // ~70%
+const JPEG_Q = 70; // ~70%
 const TARGET_MAX = 600 * 1024; // best-effort clamp
 
 const now = () => Date.now();
