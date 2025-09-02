@@ -3,18 +3,20 @@
 // Uploads: m15 (execution), h1 (context), h4 (HTF), optional calendar.
 // You can also pass m15Url / h1Url / h4Url (TV/Gyazo direct image or page link).
 // -----------------------------------------------------------------------------
-// NEW:
-//   • Two-stage support (without breaking existing callers)
-//       - mode=full (default): full card as before
-//       - mode=fast: use full analysis (images + calendar + headlines (6 of 12)), but
-//                    OUTPUT ONLY: Quick Plan (+ Option 2) + Management + trailing ai_meta
-//       - mode=expand&cache=<id>: reuse cached images from the prior fast call and return
-//                    ONLY the remaining sections (Full Breakdown, X-ray, Candidate Scores,
-//                    Final Table). Final card = identical to legacy full card.
-//   • Headlines: fetch 12; embed 6 into model prompt (fetch behavior unchanged).
-//   • Image downscale (uploads + links): sharp @ max 1280px, JPEG ~70%, strip metadata,
-//     best-effort ≤ ~600 KB each, preserve readability (OHLC/levels/text).
-//   • Keep your original enforcement micro-passes & output structure.
+// Two-stage support (non-breaking):
+//   • mode=full (default): full card (legacy).
+//   • mode=fast: full analysis (images + calendar + headlines + **mandatory CSM + mandatory COT**),
+//                OUTPUT ONLY: Quick Plan (+Option 2) + Management + trailing ai_meta.
+//   • mode=expand&cache=<id>: reuse processed images/headlines/sentiment from Stage-1 and return
+//                ONLY the remaining sections (Full Breakdown, X-ray, Candidate Scores, Final Table).
+//
+// Headlines: fetch 12; embed 6 into model prompt (fetch behavior unchanged).
+// Image downscale: sharp @ max 1280px, JPEG ~70%, strip EXIF, ≤ ~600 KB best-effort.
+// Strategy playbook: expanded (no “default”) incl. **Fibonacci retracement confluence (38.2–61.8%)**.
+// Enforcement: same three micro-passes (Pending proof, Breakout rename, Limit sanity).
+// CSM (intraday) and COT (weekly) are **MANDATORY** for Stage-1 and Full. Fresh-or-cache logic:
+//    - CSM cache TTL: 15 minutes (global); COT cache TTL: 7 days. If no fresh and no cache → 503.
+// Provenance: model asked to include a `sources` field inside ai_meta; API also returns meta.sources.
 // -----------------------------------------------------------------------------
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -34,12 +36,18 @@ const OPENAI_API_KEY =
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
 const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
 
+// Market data keys (free tiers ok)
+const TD_KEY = process.env.TWELVEDATA_API_KEY || "";
+const FH_KEY =
+  process.env.FINNHUB_API_KEY || process.env.FINNHUB_APT_KEY || "";
+const POLY_KEY = process.env.POLYGON_API_KEY || "";
+
 // ---------- small utils ----------
 const IMG_MAX_BYTES = 12 * 1024 * 1024; // safety cap
 
-const MAX_W = 1280;          // as requested
-const JPEG_Q = 70;           // ~70%
-const TARGET_MAX = 600 * 1024; // ~≤600 KB best-effort
+const MAX_W = 1280; // downscale target
+const JPEG_Q = 70; // ~70%
+const TARGET_MAX = 600 * 1024; // best-effort clamp
 
 const now = () => Date.now();
 const dt = (t: number) => `${Date.now() - t}ms`;
@@ -57,13 +65,14 @@ function dataUrlSizeBytes(s: string | null | undefined): number {
   return Math.floor((b64.length * 3) / 4) - padding;
 }
 
-// in-memory cache (processed images) for Stage-2 expand; TTL ~3 minutes
+// in-memory caches
 type CacheEntry = {
   exp: number;
   instrument: string;
   m15: string; h1: string; h4: string;
   calendar?: string | null;
-  headlinesText?: string | null; // 6-line prompt text already formatted
+  headlinesText?: string | null;
+  sentimentText?: string | null;
 };
 const CACHE = new Map<string, CacheEntry>();
 
@@ -76,9 +85,29 @@ function getCache(key: string | undefined | null): CacheEntry | null {
   if (!key) return null;
   const e = CACHE.get(key);
   if (!e) return null;
-  if (Date.now() > e.exp) { CACHE.delete(key); return null; }
+  if (Date.now() > e.exp) {
+    CACHE.delete(key);
+    return null;
+  }
   return e;
 }
+
+// ---------- CSM cache (15 min) ----------
+type CsmSnapshot = {
+  tsISO: string;
+  ranks: string[];            // e.g. ["USD","JPY","CHF",...]
+  scores: Record<string, number>; // z-scored strength per currency
+  ttl: number;                // expiry epoch ms
+};
+let CSM_CACHE: CsmSnapshot | null = null;
+
+// ---------- COT cache (7 days) ----------
+type CotSnapshot = {
+  reportDate: string;             // ISO date of report
+  net: Record<string, number>;    // currency -> net (non-commercial long - short)
+  ttl: number;                    // expiry epoch ms
+};
+let COT_CACHE: CotSnapshot | null = null;
 
 // ---------- formidable helpers ----------
 async function getFormidable() {
@@ -120,14 +149,12 @@ async function toJpeg(buf: Buffer, width = MAX_W, quality = JPEG_Q): Promise<Buf
 }
 
 async function processToDataUrl(buf: Buffer): Promise<string> {
-  // try JPEG @ 70 first, then slightly lower if still heavy
   let q = JPEG_Q;
   let out = await sharp(buf)
     .rotate()
     .resize({ width: MAX_W, withoutEnlargement: true })
     .jpeg({ quality: q, progressive: true, mozjpeg: true })
     .toBuffer();
-
   if (out.byteLength > TARGET_MAX) {
     q = 64;
     out = await toJpeg(buf, MAX_W, q);
@@ -136,7 +163,6 @@ async function processToDataUrl(buf: Buffer): Promise<string> {
     q = 58;
     out = await toJpeg(buf, MAX_W, q);
   }
-
   return `data:image/jpeg;base64,${out.toString("base64")}`;
 }
 
@@ -159,7 +185,11 @@ function originFromReq(req: NextApiRequest) {
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 function absoluteUrl(base: string, maybe: string) {
-  try { return new URL(maybe, base).toString(); } catch { return maybe; }
+  try {
+    return new URL(maybe, base).toString();
+  } catch {
+    return maybe;
+  }
 }
 function htmlFindOgImage(html: string): string | null {
   const re1 = /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i;
@@ -239,18 +269,24 @@ async function linkToDataUrl(link: string): Promise<string | null> {
 async function fetchedHeadlines(req: NextApiRequest, instrument: string): Promise<{ items: any[]; promptText: string | null }> {
   try {
     const base = originFromReq(req);
-    const url = `${base}/api/news?instrument=${encodeURIComponent(instrument)}&hours=48&max=12&_t=${Date.now()}`;
+    const url = `${base}/api/news?instrument=${encodeURIComponent(
+      instrument
+    )}&hours=48&max=12&_t=${Date.now()}`;
     const r = await fetch(url, { cache: "no-store" });
     const j = await r.json().catch(() => ({}));
     const items: any[] = Array.isArray(j?.items) ? j.items : [];
-    const lines = items.slice(0, 6).map((it: any) => {
-      const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
-      const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
-      const t = String(it?.title || "").slice(0, 200);
-      const src = it?.source || "";
-      const when = it?.ago || "";
-      return `• ${t} — ${src}, ${when} — ${lab}`;
-    }).join("\n");
+    const lines = items
+      .slice(0, 6)
+      .map((it: any) => {
+        const s =
+          typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
+        const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
+        const t = String(it?.title || "").slice(0, 200);
+        const src = it?.source || "";
+        const when = it?.ago || "";
+        return `• ${t} — ${src}, ${when} — ${lab}`;
+      })
+      .join("\n");
     return { items, promptText: lines || null };
   } catch {
     return { items: [], promptText: null };
@@ -269,7 +305,9 @@ function extractAiMeta(text: string) {
   for (const re of fences) {
     const m = text.match(re);
     if (m && m[1]) {
-      try { return JSON.parse(m[1]); } catch {}
+      try {
+        return JSON.parse(m[1]);
+      } catch {}
     }
   }
   return null;
@@ -278,7 +316,10 @@ function needsPendingLimit(aiMeta: any): boolean {
   const et = String(aiMeta?.entryType || "").toLowerCase();
   if (et !== "market") return false;
   const bp = aiMeta?.breakoutProof || {};
-  const ok = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+  const ok = !!(
+    bp?.bodyCloseBeyond === true &&
+    (bp?.retestHolds === true || bp?.sfpReclaim === true)
+  );
   return !ok;
 }
 function invalidOrderRelativeToPrice(aiMeta: any): string | null {
@@ -289,29 +330,281 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   const zmin = Number(z?.min);
   const zmax = Number(z?.max);
   if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return null;
-  if (o === "sell limit" && dir === "short") { if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price"; }
-  if (o === "buy limit" && dir === "long")  { if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price"; }
+  if (o === "sell limit" && dir === "short") {
+    if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price";
+  }
+  if (o === "buy limit" && dir === "long") {
+    if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price";
+  }
   return null;
 }
 
-// ---------- OpenAI call ----------
-async function callOpenAI(messages: any[]) {
-  const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${OPENAI_API_KEY}`,
+// ---------- CSM (intraday) mandatory ----------
+const G8 = ["USD", "EUR", "JPY", "GBP", "CHF", "CAD", "AUD", "NZD"];
+const USD_PAIRS = [
+  "EURUSD",
+  "GBPUSD",
+  "AUDUSD",
+  "NZDUSD",
+  "USDJPY",
+  "USDCHF",
+  "USDCAD",
+];
+
+// helper: compute log return over k bars (series ascending by time)
+function kbarReturn(closes: number[], k: number): number | null {
+  if (!closes || closes.length <= k) return null;
+  const a = closes[closes.length - 1];
+  const b = closes[closes.length - 1 - k];
+  if (!(a > 0) || !(b > 0)) return null;
+  return Math.log(a / b);
+}
+
+type Series = { t: number[]; c: number[] }; // ascending
+
+async function tdSeries15(pair: string): Promise<Series | null> {
+  if (!TD_KEY) return null;
+  try {
+    // Twelve Data uses "EUR/USD" etc; newest first
+    const sym = `${pair.slice(0, 3)}/${pair.slice(3)}`;
+    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(
+      sym
+    )}&interval=15min&outputsize=30&apikey=${TD_KEY}&dp=6`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(1800) });
+    if (!r.ok) return null;
+    const j: any = await r.json();
+    if (!Array.isArray(j?.values)) return null;
+    const vals = [...j.values].reverse(); // ascending
+    const t = vals.map((v: any) => new Date(v.datetime).getTime() / 1000);
+    const c = vals.map((v: any) => Number(v.close));
+    if (!c.every((x) => isFinite(x))) return null;
+    return { t, c };
+  } catch {
+    return null;
+  }
+}
+
+async function fhSeries15(pair: string): Promise<Series | null> {
+  if (!FH_KEY) return null;
+  try {
+    // Finnhub uses OANDA:EUR_USD; resolution 15; unix seconds
+    const sym = `OANDA:${pair.slice(0, 3)}_${pair.slice(3)}`;
+    const to = Math.floor(Date.now() / 1000);
+    const from = to - 60 * 60 * 6; // 6h
+    const url = `https://finnhub.io/api/v1/forex/candle?symbol=${encodeURIComponent(
+      sym
+    )}&resolution=15&from=${from}&to=${to}&token=${FH_KEY}`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(1800) });
+    if (!r.ok) return null;
+    const j: any = await r.json();
+    if (j?.s !== "ok" || !Array.isArray(j?.c)) return null;
+    return { t: j.t, c: j.c };
+  } catch {
+    return null;
+  }
+}
+
+async function polySeries15(pair: string): Promise<Series | null> {
+  if (!POLY_KEY) return null;
+  try {
+    // Polygon aggregates: C:EURUSD; 15/minute range for last ~6h
+    const ticker = `C:${pair}`;
+    const to = new Date();
+    const from = new Date(to.getTime() - 6 * 60 * 60 * 1000);
+    const fmt = (d: Date) =>
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+        d.getDate()
+      ).padStart(2, "0")}`;
+    const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(
+      ticker
+    )}/range/15/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=asc&apiKey=${POLY_KEY}`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(2000) });
+    if (!r.ok) return null;
+    const j: any = await r.json();
+    if (!Array.isArray(j?.results)) return null;
+    const t = j.results.map((x: any) => Math.floor(x.t / 1000));
+    const c = j.results.map((x: any) => Number(x.c));
+    if (!c.every((x) => isFinite(x))) return null;
+    return { t, c };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchSeries15(pair: string): Promise<Series | null> {
+  // Try TwelveData → Finnhub → Polygon
+  const td = await tdSeries15(pair);
+  if (td) return td;
+  const fh = await fhSeries15(pair);
+  if (fh) return fh;
+  const pg = await polySeries15(pair);
+  if (pg) return pg;
+  return null;
+}
+
+function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnapshot | null {
+  // For each pair, compute 60m (4 bars) & 240m (16 bars) log returns on 15m bars
+  const weights = { r60: 0.6, r240: 0.4 };
+  const curScore: Record<string, number> = Object.fromEntries(G8.map((c) => [c, 0]));
+
+  for (const pair of USD_PAIRS) {
+    const S = seriesMap[pair];
+    if (!S || !Array.isArray(S.c) || S.c.length < 17) continue;
+    const r60 = kbarReturn(S.c, 4) ?? 0;
+    const r240 = kbarReturn(S.c, 16) ?? 0;
+    const r = r60 * weights.r60 + r240 * weights.r240;
+
+    const base = pair.slice(0, 3);
+    const quote = pair.slice(3);
+    // pair is BASE/QUOTE; +r => BASE strengthens, QUOTE weakens
+    curScore[base] += r;
+    curScore[quote] -= r;
+  }
+
+  // z-score normalize
+  const vals = G8.map((c) => curScore[c]);
+  const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+  const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length) || 1;
+  const z: Record<string, number> = {};
+  for (const c of G8) z[c] = (curScore[c] - mean) / sd;
+
+  const ranks = [...G8].sort((a, b) => z[b] - z[a]);
+
+  return {
+    tsISO: new Date().toISOString(),
+    ranks,
+    scores: z,
+    ttl: Date.now() + 15 * 60 * 1000,
+  };
+}
+
+async function getCSM(): Promise<CsmSnapshot> {
+  if (CSM_CACHE && Date.now() < CSM_CACHE.ttl) return CSM_CACHE;
+
+  const seriesMap: Record<string, Series | null> = {};
+  // 7 requests max (free-tier friendly)
+  await Promise.all(
+    USD_PAIRS.map(async (p) => {
+      seriesMap[p] = await fetchSeries15(p);
+    })
+  );
+
+  const snap = computeCSMFromPairs(seriesMap);
+  if (!snap) {
+    if (CSM_CACHE) return CSM_CACHE; // stale but available (never fabricate)
+    throw new Error("CSM unavailable (fetch failed and no cache).");
+  }
+  CSM_CACHE = snap;
+  return snap;
+}
+
+// ---------- COT (weekly) mandatory ----------
+const CFTC_URL = "https://www.cftc.gov/dea/newcot/f_disagg.txt";
+
+const CFTC_MAP: Record<string, { name: string }> = {
+  EUR: { name: "EURO FX - CHICAGO MERCANTILE EXCHANGE" },
+  JPY: { name: "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE" },
+  GBP: { name: "BRITISH POUND STERLING - CHICAGO MERCANTILE EXCHANGE" },
+  CAD: { name: "CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE" },
+  AUD: { name: "AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE" },
+  CHF: { name: "SWISS FRANC - CHICAGO MERCANTILE EXCHANGE" },
+  NZD: { name: "NEW ZEALAND DOLLAR - CHICAGO MERCANTILE EXCHANGE" },
+  USD: { name: "U.S. DOLLAR INDEX - ICE FUTURES U.S." },
+};
+
+function parseCFTC(text: string): CotSnapshot | null {
+  // CSV with header; some fields have commas within names — CFTC uses pure CSV with quotes.
+  // We'll do a light CSV parse that handles quotes.
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length < 5) return null;
+  const header = csvSplit(lines[0]).map((s) => s.trim());
+  const idxLong = header.findIndex((h) => /noncommercial/i.test(h) && /long/i.test(h));
+  const idxShort = header.findIndex((h) => /noncommercial/i.test(h) && /short/i.test(h));
+  const idxMarket = header.findIndex((h) => /market\s+and\s+exchange\s+names?/i.test(h));
+  const idxDate = header.findIndex((h) => /report\s+date/i.test(h));
+  if (idxLong < 0 || idxShort < 0 || idxMarket < 0 || idxDate < 0) return null;
+
+  const net: Record<string, number> = {};
+  let latestDate = "";
+
+  for (let i = 1; i < lines.length; i++) {
+    const cols = csvSplit(lines[i]);
+    const name = (cols[idxMarket] || "").toUpperCase().trim();
+    const longV = Number(String(cols[idxLong] || "").replace(/[^0-9.-]/g, ""));
+    const shortV = Number(String(cols[idxShort] || "").replace(/[^0-9.-]/g, ""));
+    const d = (cols[idxDate] || "").trim();
+    if (d) latestDate = latestDate || d;
+
+    for (const cur of Object.keys(CFTC_MAP)) {
+      if (name === CFTC_MAP[cur].name.toUpperCase()) {
+        net[cur] = (isFinite(longV) ? longV : 0) - (isFinite(shortV) ? shortV : 0);
+      }
+    }
+  }
+  if (!latestDate || Object.keys(net).length < 3) return null;
+  const reportDateISO = new Date(latestDate).toISOString().slice(0, 10);
+  return {
+    reportDate: reportDateISO,
+    net,
+    ttl: Date.now() + 7 * 24 * 60 * 60 * 1000,
+  };
+}
+
+function csvSplit(line: string): string[] {
+  // minimal CSV splitter with quotes
+  const out: string[] = [];
+  let buf = "";
+  let q = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      q = !q;
+      continue;
+    }
+    if (ch === "," && !q) {
+      out.push(buf);
+      buf = "";
+    } else {
+      buf += ch;
+    }
+  }
+  out.push(buf);
+  return out;
+}
+
+async function getCOT(): Promise<CotSnapshot> {
+  if (COT_CACHE && Date.now() < COT_CACHE.ttl) return COT_CACHE;
+  try {
+    const r = await fetch(CFTC_URL, { cache: "no-store", signal: AbortSignal.timeout(2500) });
+    if (!r.ok) throw new Error(`CFTC ${r.status}`);
+    const txt = await r.text();
+    const snap = parseCFTC(txt);
+    if (!snap) throw new Error("CFTC parse failed");
+    COT_CACHE = snap;
+    return snap;
+  } catch (e) {
+    if (COT_CACHE) return COT_CACHE; // stale but available (never fabricate)
+    throw new Error("COT unavailable (fetch failed and no cache).");
+  }
+}
+
+// ---------- sentiment text from CSM + COT ----------
+function sentimentSummary(csm: CsmSnapshot, cot: CotSnapshot): { text: string; provenance: { csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string } } {
+  const ranksLine = `CSM (60–240m): ${csm.ranks.slice(0, 4).join(" > ")} ... ${csm.ranks.slice(-3).join(" < ")}`;
+  // condense COT: list top 3 net long, 2 net short
+  const entries = Object.entries(cot.net);
+  const longers = entries.filter(([, v]) => (v as number) > 0).sort((a, b) => (b[1] as number) - (a[1] as number)).map(([k]) => k);
+  const shorters = entries.filter(([, v]) => (v as number) < 0).sort((a, b) => (a[1] as number) - (b[1] as number)).map(([k]) => k);
+  const cotLine = `COT: Long ${longers.slice(0, 3).join("/")} | Short ${shorters.slice(0, 2).join("/")}`;
+  return {
+    text: `${ranksLine}\n${cotLine}`,
+    provenance: {
+      csm_used: true,
+      csm_time: csm.tsISO,
+      cot_used: true,
+      cot_report_date: cot.reportDate,
     },
-    body: JSON.stringify({ model: OPENAI_MODEL, messages }),
-  });
-  const json = await rsp.json().catch(() => ({} as any));
-  if (!rsp.ok) throw new Error(`OpenAI vision request failed: ${rsp.status} ${JSON.stringify(json)}`);
-  const out =
-    json?.choices?.[0]?.message?.content ??
-    (Array.isArray(json?.choices?.[0]?.message?.content)
-      ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
-      : "");
-  return String(out || "");
+  };
 }
 
 // ---------- prompts ----------
@@ -320,14 +613,28 @@ function systemCore(instrument: string) {
     "You are a professional discretionary trader.",
     "Perform **visual** price-action market analysis from the images (no numeric candles).",
     "Multi-timeframe alignment: 15m execution, 1H context, 4H HTF.",
-    "Tournament mode: score candidates (Long/Short where valid):",
-    "- Pullback to OB/FVG/SR confluence, Breakout+Retest, SFP/Liquidity grab+reclaim, Range reversion, TL/channel retest, double-tap when clean.",
-    "Scoring rubric (0–100): Structure trend(25), 15m trigger quality(25), HTF context(15), Clean path to target(10), Stop validity(10), Fundamentals/Headlines(10), 'No chase' penalty(5).",
-    "Market entry allowed only when **explicit proof**: body close beyond level **and** retest holds (or SFP reclaim). Otherwise label EntryType: Pending and use Buy/Sell Limit zone.",
-    "Stops just beyond invalidation (swing/zone) with small buffer. RR can be < 1.5R if structure says so.",
-    "Use calendar/headlines as bias overlay if provided.",
+    "Tournament mode: evaluate and pick the **single best** candidate (no defaults):",
+    "- Pullback to OB/FVG/SR confluence",
+    "- Breakout + Retest (proof: body close beyond + retest holds or SFP reclaim)",
+    "- SFP / Liquidity grab + reclaim",
+    "- Range reversion at extremes",
+    "- Trendline / Channel retest",
+    "- Double-tap / retest of origin",
+    "- Breaker Block retest (failed OB flips)",
+    "- Imbalance / FVG mitigation with structure hold",
+    "- Quasimodo (QM) / CHOCH reversal",
+    "- Trend exhaustion + divergence at HTF zone",
+    "- Session plays (Asia→London/NYO): sweep → continuation/fade",
+    "- Equal Highs/Lows liquidity run",
+    "- (Anchored) VWAP reversion/break",
+    "- **Fibonacci retracement confluence (38.2–61.8% / golden pocket)**",
+    "- Correlation confirmation (DXY vs EUR, UST yields vs USDJPY, SPX/NAS vs risk FX/crypto)",
     "",
-    "Instrument is " + instrument + ". Keep instrument alignment.",
+    "Scoring rubric (0–100): Structure trend(25), 15m trigger quality(25), HTF context(15), Clean path to target(10), Stop validity(10), Fundamentals/Headlines/Sentiment(10), 'No chase' penalty(5).",
+    "Market entry allowed only when **explicit proof**; otherwise EntryType: Pending and use Buy/Sell Limit zone.",
+    "Stops are price-action based (behind swing/OB/SR); if too tight, step to the next valid zone.",
+    "Only reference **Headlines / Calendar / CSM / COT** if their respective blocks are present below. Otherwise omit them.",
+    "Keep instrument alignment with " + instrument + ".",
   ].join("\n");
 }
 
@@ -336,6 +643,7 @@ function buildUserPartsBase(args: {
   m15: string; h1: string; h4: string;
   calendarDataUrl?: string | null;
   headlinesText?: string | null;
+  sentimentText?: string | null;
 }) {
   const parts: any[] = [
     { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}` },
@@ -351,7 +659,16 @@ function buildUserPartsBase(args: {
     parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } });
   }
   if (args.headlinesText) {
-    parts.push({ type: "text", text: `Recent headlines snapshot (used for bias, list hidden in stage 1):\n${args.headlinesText}` });
+    parts.push({
+      type: "text",
+      text: `Recent headlines snapshot (used for bias; list shown in Stage-2):\n${args.headlinesText}`,
+    });
+  }
+  if (args.sentimentText) {
+    parts.push({
+      type: "text",
+      text: `Sentiment snapshot (CSM + COT; used for bias):\n${args.sentimentText}`,
+    });
   }
   return parts;
 }
@@ -362,6 +679,7 @@ function messagesFull(args: {
   m15: string; h1: string; h4: string;
   calendarDataUrl?: string | null;
   headlinesText?: string | null;
+  sentimentText?: string | null;
 }) {
   const system = [
     systemCore(args.instrument),
@@ -411,7 +729,8 @@ function messagesFull(args: {
     `  "zone": { "min": number, "max": number, "tf": "15m" | "1H" | "4H", "type": "OB" | "FVG" | "SR" | "Other" },`,
     `  "stop": number, "tp1": number, "tp2": number,`,
     `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
-    `  "candidateScores": [{ "name": string, "score": number, "reason": string }]}`,
+    `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
+    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string } }`,
     "```",
   ].join("\n");
 
@@ -421,12 +740,14 @@ function messagesFull(args: {
   ];
 }
 
-// FAST Stage-1: Quick Plan (+Option 2) + Management + ai_meta (headlines/calendar USED)
+// FAST Stage-1: Quick Plan (+Option 2) + Management + ai_meta (headlines/calendar/sentiment USED)
 function messagesFastStage1(args: {
   instrument: string; dateStr: string;
   m15: string; h1: string; h4: string;
   calendarDataUrl?: string | null;
   headlinesText?: string | null;
+  sentimentText?: string | null;
+  provenance?: { headlines_used: number; headlines_instrument: string; calendar_used: boolean; csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string };
 }) {
   const system = [
     systemCore(args.instrument),
@@ -458,13 +779,18 @@ function messagesFastStage1(args: {
     `  "zone": { "min": number, "max": number, "tf": "15m" | "1H" | "4H", "type": "OB" | "FVG" | "SR" | "Other" },`,
     `  "stop": number, "tp1": number, "tp2": number,`,
     `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
-    `  "candidateScores": [{ "name": string, "score": number, "reason": string }]}`,
+    `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
+    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string } }`,
     "```",
   ].join("\n");
 
+  const parts = buildUserPartsBase(args);
+  if (args.provenance) {
+    parts.push({ type: "text", text: `provenance:\n${JSON.stringify(args.provenance)}` });
+  }
   return [
     { role: "system", content: system },
-    { role: "user", content: buildUserPartsBase(args) },
+    { role: "user", content: parts },
   ];
 }
 
@@ -474,6 +800,7 @@ function messagesExpandStage2(args: {
   m15: string; h1: string; h4: string;
   calendarDataUrl?: string | null;
   headlinesText?: string | null;
+  sentimentText?: string | null;
   aiMetaHint?: any;
 }) {
   const system = [
@@ -509,7 +836,10 @@ function messagesExpandStage2(args: {
 
   const userParts = buildUserPartsBase(args);
   if (args.aiMetaHint) {
-    userParts.push({ type: "text", text: `ai_meta_hint:\n${JSON.stringify(args.aiMetaHint, null, 2)}` });
+    userParts.push({
+      type: "text",
+      text: `ai_meta_hint:\n${JSON.stringify(args.aiMetaHint, null, 2)}`,
+    });
   }
   return [
     { role: "system", content: system },
@@ -517,7 +847,30 @@ function messagesExpandStage2(args: {
   ];
 }
 
-// ---------- enforcement (original micro-passes) ----------
+// ---------- OpenAI call ----------
+async function callOpenAI(messages: any[]) {
+  const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({ model: OPENAI_MODEL, messages }),
+  });
+  const json = await rsp.json().catch(() => ({} as any));
+  if (!rsp.ok)
+    throw new Error(
+      `OpenAI vision request failed: ${rsp.status} ${JSON.stringify(json)}`
+    );
+  const out =
+    json?.choices?.[0]?.message?.content ??
+    (Array.isArray(json?.choices?.[0]?.message?.content)
+      ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
+      : "");
+  return String(out || "");
+}
+
+// ---------- enforcement passes ----------
 async function rewriteAsPending(instrument: string, text: string) {
   const messages = [
     {
@@ -566,32 +919,52 @@ export default async function handler(
   res: NextApiResponse<Ok | Err>
 ) {
   try {
-    if (req.method !== "POST") return res.status(405).json({ ok: false, reason: "Method not allowed" });
-    if (!OPENAI_API_KEY) return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
+    if (req.method !== "POST")
+      return res.status(405).json({ ok: false, reason: "Method not allowed" });
+    if (!OPENAI_API_KEY)
+      return res
+        .status(400)
+        .json({ ok: false, reason: "Missing OPENAI_API_KEY" });
 
-    // mode selection (default FULL to avoid breaking existing callers)
+    // mode selection
     const urlMode = String((req.query.mode as string) || "").toLowerCase();
-    let mode: "full" | "fast" | "expand" = urlMode === "fast" ? "fast" : urlMode === "expand" ? "expand" : "full";
+    let mode: "full" | "fast" | "expand" =
+      urlMode === "fast" ? "fast" : urlMode === "expand" ? "expand" : "full";
 
     // expand path: reuse cached images; no need for multipart
     if (mode === "expand") {
       const cacheKey = String(req.query.cache || "").trim();
       const c = getCache(cacheKey);
       if (!c) {
-        return res.status(400).json({ ok: false, reason: "Expand failed: cache expired or not found." });
+        return res
+          .status(400)
+          .json({ ok: false, reason: "Expand failed: cache expired or not found." });
+      }
+      // Mandatory: ensure sentiment blocks exist in cache (CSM+COT were required in Stage-1)
+      if (!c.sentimentText) {
+        return res
+          .status(503)
+          .json({ ok: false, reason: "Missing sentiment snapshot for expand." });
       }
       const dateStr = new Date().toISOString().slice(0, 10);
       const messages = messagesExpandStage2({
         instrument: c.instrument,
         dateStr,
-        m15: c.m15, h1: c.h1, h4: c.h4,
+        m15: c.m15,
+        h1: c.h1,
+        h4: c.h4,
         calendarDataUrl: c.calendar || undefined,
         headlinesText: c.headlinesText || undefined,
-        aiMetaHint: null, // we could accept a posted ai_meta hint later if you want
+        sentimentText: c.sentimentText || undefined,
+        aiMetaHint: null,
       });
       const text = await callOpenAI(messages);
       res.setHeader("Cache-Control", "no-store");
-      return res.status(200).json({ ok: true, text, meta: { instrument: c.instrument, cacheKey } });
+      return res.status(200).json({
+        ok: true,
+        text,
+        meta: { instrument: c.instrument, cacheKey },
+      });
     }
 
     if (!isMultipart(req)) {
@@ -609,10 +982,11 @@ export default async function handler(
       console.log(`[vision-plan] parsed in ${dt(tParse)}`);
     }
 
-    const instrument = String(fields.instrument || fields.code || "EURUSD").toUpperCase().replace(/\s+/g, "");
+    const instrument = String(fields.instrument || fields.code || "EURUSD")
+      .toUpperCase()
+      .replace(/\s+/g, "");
     const requestedMode = String(fields.mode || "").toLowerCase();
     if (requestedMode === "fast") mode = "fast";
-    if (requestedMode === "expand") mode = "expand"; // ignored here (expand needs cache key path above)
 
     // Files (if provided)
     const m15f = pickFirst(files.m15);
@@ -622,8 +996,8 @@ export default async function handler(
 
     // URLs (optional)
     const m15Url = String(pickFirst(fields.m15Url) || "").trim();
-    const h1Url  = String(pickFirst(fields.h1Url)  || "").trim();
-    const h4Url  = String(pickFirst(fields.h4Url)  || "").trim();
+    const h1Url = String(pickFirst(fields.h1Url) || "").trim();
+    const h4Url = String(pickFirst(fields.h4Url) || "").trim();
 
     // Build images (prefer file; else fetch link) and process with sharp
     const tImg = now();
@@ -639,26 +1013,51 @@ export default async function handler(
       h4FromFile ? Promise.resolve(null) : linkToDataUrl(h4Url),
     ]);
     const m15 = m15FromFile || m15FromUrl;
-    const h1  = h1FromFile  || h1FromUrl;
-    const h4  = h4FromFile  || h4FromUrl;
+    const h1 = h1FromFile || h1FromUrl;
+    const h4 = h4FromFile || h4FromUrl;
 
     if (process.env.NODE_ENV !== "production") {
-      console.log(`[vision-plan] images ready ${dt(tImg)} (m15=${dataUrlSizeBytes(m15)}B, h1=${dataUrlSizeBytes(h1)}B, h4=${dataUrlSizeBytes(h4)}B, cal=${dataUrlSizeBytes(calUrl)}B)`);
+      console.log(
+        `[vision-plan] images ready ${dt(tImg)} (m15=${dataUrlSizeBytes(
+          m15
+        )}B, h1=${dataUrlSizeBytes(h1)}B, h4=${dataUrlSizeBytes(
+          h4
+        )}B, cal=${dataUrlSizeBytes(calUrl)}B)`
+      );
     }
 
     if (!m15 || !h1 || !h4) {
       return res.status(400).json({
         ok: false,
-        reason: "Provide all three charts: m15, h1, h4 — either as files or valid TradingView/Gyazo direct image links.",
+        reason:
+          "Provide all three charts: m15, h1, h4 — either as files or valid TradingView/Gyazo direct image links.",
       });
     }
 
-    // Headlines: fetch 12; embed 6 into prompt (fetch behavior unchanged)
+    // Headlines: fetch 12; embed 6 into prompt
     const tNews = now();
-    const { items: headlineItems, promptText: headlinesText } = await fetchedHeadlines(req, instrument);
+    const { items: headlineItems, promptText: headlinesText } =
+      await fetchedHeadlines(req, instrument);
     if (process.env.NODE_ENV !== "production") {
-      console.log(`[vision-plan] news fetched ${dt(tNews)} (items=${headlineItems.length})`);
+      console.log(
+        `[vision-plan] news fetched ${dt(tNews)} (items=${headlineItems.length})`
+      );
     }
+
+    // ----- Mandatory CSM + COT -----
+    let csm: CsmSnapshot | null = null;
+    let cot: CotSnapshot | null = null;
+    try {
+      csm = await getCSM();
+      cot = await getCOT();
+    } catch (e: any) {
+      return res.status(503).json({
+        ok: false,
+        reason:
+          `Sentiment required: ${e?.message || "CSM/COT unavailable"}. Check API keys/quotas.`,
+      });
+    }
+    const { text: sentimentText, provenance } = sentimentSummary(csm!, cot!);
 
     const dateStr = new Date().toISOString().slice(0, 10);
 
@@ -666,25 +1065,48 @@ export default async function handler(
     let text = "";
     let aiMeta: any = null;
 
+    // provenance for model (so it mirrors inside ai_meta.sources)
+    const provForModel = {
+      headlines_used: Math.min(6, headlineItems.length),
+      headlines_instrument: instrument,
+      calendar_used: !!calUrl,
+      csm_used: true,
+      csm_time: csm!.tsISO,
+      cot_used: true,
+      cot_report_date: cot!.reportDate,
+    };
+
     if (mode === "fast") {
-      // Ask ONLY for Quick Plan + Management + ai_meta, but USING headlines/calendar/images.
       const messages = messagesFastStage1({
-        instrument, dateStr,
-        m15, h1, h4,
+        instrument,
+        dateStr,
+        m15,
+        h1,
+        h4,
         calendarDataUrl: calUrl || undefined,
         headlinesText: headlinesText || undefined,
+        sentimentText,
+        provenance: provForModel,
       });
       text = await callOpenAI(messages);
       aiMeta = extractAiMeta(text);
 
-      // enforcement passes (same as base)
+      // enforcement passes
       if (aiMeta && needsPendingLimit(aiMeta)) {
         text = await rewriteAsPending(instrument, text);
         aiMeta = extractAiMeta(text) || aiMeta;
       }
       const bp = aiMeta?.breakoutProof || {};
-      const hasProof = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
-      if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
+      const hasProof = !!(
+        bp?.bodyCloseBeyond === true &&
+        (bp?.retestHolds === true || bp?.sfpReclaim === true)
+      );
+      if (
+        String(aiMeta?.selectedStrategy || "")
+          .toLowerCase()
+          .includes("breakout") &&
+        !hasProof
+      ) {
         text = await normalizeBreakoutLabel(text);
         aiMeta = extractAiMeta(text) || aiMeta;
       }
@@ -696,19 +1118,30 @@ export default async function handler(
         }
       }
 
-      // Prepare cache for Stage-2 expand (reuse processed images + headlines text)
       const cacheKey = setCache({
         instrument,
-        m15, h1, h4,
+        m15,
+        h1,
+        h4,
         calendar: calUrl || null,
         headlinesText: headlinesText || null,
+        sentimentText,
       });
 
       if (!text || refusalLike(text)) {
+        const fb = fallbackCard(instrument, provForModel);
         return res.status(200).json({
           ok: true,
-          text: fallbackCard(instrument),
-          meta: { instrument, mode, cacheKey, headlinesCount: headlineItems.length, fallbackUsed: true, aiMeta: extractAiMeta(fallbackCard(instrument)) },
+          text: fb,
+          meta: {
+            instrument,
+            mode,
+            cacheKey,
+            headlinesCount: headlineItems.length,
+            fallbackUsed: true,
+            aiMeta: extractAiMeta(fb),
+            sources: provForModel,
+          },
         });
       }
 
@@ -716,28 +1149,48 @@ export default async function handler(
       return res.status(200).json({
         ok: true,
         text,
-        meta: { instrument, mode, cacheKey, headlinesCount: headlineItems.length, fallbackUsed: false, aiMeta },
+        meta: {
+          instrument,
+          mode,
+          cacheKey,
+          headlinesCount: headlineItems.length,
+          fallbackUsed: false,
+          aiMeta,
+          sources: provForModel,
+        },
       });
     }
 
     // FULL (legacy)
     const messages = messagesFull({
-      instrument, dateStr,
-      m15, h1, h4,
+      instrument,
+      dateStr,
+      m15,
+      h1,
+      h4,
       calendarDataUrl: calUrl || undefined,
       headlinesText: headlinesText || undefined,
+      sentimentText,
     });
     text = await callOpenAI(messages);
     aiMeta = extractAiMeta(text);
 
-    // enforcement passes (same as base)
+    // enforcement passes
     if (aiMeta && needsPendingLimit(aiMeta)) {
       text = await rewriteAsPending(instrument, text);
       aiMeta = extractAiMeta(text) || aiMeta;
     }
     const bp = aiMeta?.breakoutProof || {};
-    const hasProof = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
-    if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
+    const hasProof = !!(
+      bp?.bodyCloseBeyond === true &&
+      (bp?.retestHolds === true || bp?.sfpReclaim === true)
+    );
+    if (
+      String(aiMeta?.selectedStrategy || "")
+        .toLowerCase()
+        .includes("breakout") &&
+      !hasProof
+    ) {
       text = await normalizeBreakoutLabel(text);
       aiMeta = extractAiMeta(text) || aiMeta;
     }
@@ -750,10 +1203,26 @@ export default async function handler(
     }
 
     if (!text || refusalLike(text)) {
+      const fb = fallbackCard(instrument, {
+        headlines_used: Math.min(6, headlineItems.length),
+        headlines_instrument: instrument,
+        calendar_used: !!calUrl,
+        csm_used: true,
+        csm_time: csm!.tsISO,
+        cot_used: true,
+        cot_report_date: cot!.reportDate,
+      });
       return res.status(200).json({
         ok: true,
-        text: fallbackCard(instrument),
-        meta: { instrument, mode, headlinesCount: headlineItems.length, fallbackUsed: true, aiMeta: extractAiMeta(fallbackCard(instrument)) },
+        text: fb,
+        meta: {
+          instrument,
+          mode,
+          headlinesCount: headlineItems.length,
+          fallbackUsed: true,
+          aiMeta: extractAiMeta(fb),
+          sources: provForModel,
+        },
       });
     }
 
@@ -761,15 +1230,36 @@ export default async function handler(
     return res.status(200).json({
       ok: true,
       text,
-      meta: { instrument, mode, headlinesCount: headlineItems.length, fallbackUsed: false, aiMeta },
+      meta: {
+        instrument,
+        mode,
+        headlinesCount: headlineItems.length,
+        fallbackUsed: false,
+        aiMeta,
+        sources: provForModel,
+      },
     });
   } catch (err: any) {
-    return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
+    return res.status(500).json({
+      ok: false,
+      reason: err?.message || "vision-plan failed",
+    });
   }
 }
 
-// ---------- fallback (unchanged style) ----------
-function fallbackCard(instrument: string) {
+// ---------- fallback (keeps structure + sources) ----------
+function fallbackCard(
+  instrument: string,
+  sources: {
+    headlines_used: number;
+    headlines_instrument: string;
+    calendar_used: boolean;
+    csm_used: boolean;
+    csm_time: string;
+    cot_used: boolean;
+    cot_report_date: string;
+  }
+) {
   return [
     "Quick Plan (Actionable)",
     "",
@@ -816,8 +1306,13 @@ function fallbackCard(instrument: string) {
         stop: null,
         tp1: null,
         tp2: null,
-        breakoutProof: { bodyCloseBeyond: false, retestHolds: false, sfpReclaim: false },
+        breakoutProof: {
+          bodyCloseBeyond: false,
+          retestHolds: false,
+          sfpReclaim: false,
+        },
         candidateScores: [],
+        sources,
         note: "Fallback used due to refusal/empty output.",
       },
       null,
