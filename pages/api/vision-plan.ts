@@ -1,12 +1,12 @@
 // /pages/api/vision-plan.ts
-// Images-only planner with robust, FAST chart handling + single-pass enforcement.
-// This version further reduces image payload (speed) without changing any trade logic:
-// - Max width: 1100px (was 1280)
-// - JPEG quality: 68 (was 72)
-// - Target size: ≤ 450 KB each (best-effort; up to 3 compression passes)
-// Always sends downscaled JPEGs for ALL charts (files or links).
-// Headlines: fetch 12, embed only 6 into the model prompt.
-// Sentiment (CSM/COT): ~600ms total budget (skips if slow).
+// Images-only planner with accuracy-first image handling + single-pass enforcement.
+// HQ mode (default ON) preserves digit/axis clarity for the vision model:
+// - Width: 1280px, mild sharpen()
+// - JPEG q≈82; if large, try WebP q≈90/82 (OpenAI supports webp)
+// - Best-effort cap ~≤900 KB per image (keeps numerals crisp)
+// Fast mode (VISION_HQ=0) keeps the previous 1100px/q≈68/≤450 KB pipeline.
+//
+// Headlines: fetch 12; embed only 6 into the model prompt.
 // Output sections & logic remain EXACTLY the same (Quick Plan, Full Breakdown, X-ray, Candidate Scores, Final Table, ai_meta).
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -32,6 +32,7 @@ const OPENAI_API_KEY =
   process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
 const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
+const VISION_HQ = process.env.VISION_HQ === "0" ? false : true; // default ON
 
 // ---------- small utils ----------
 function now() { return Date.now(); }
@@ -39,11 +40,18 @@ function dt(from: number) { return `${Date.now() - from}ms`; }
 
 const IMG_MAX_BYTES = 12 * 1024 * 1024; // safety cap when fetching remote images
 
-// ↓ Tweaked for speed (per your request)
-const TARGET_MAX_WIDTH = 1100;
-const TARGET_QUALITY_START = 68;
-const TARGET_MIN_QUALITY = 50;
-const TARGET_MAX_BYTES = 450 * 1024; // ~≤450 KB best-effort
+// HQ (accuracy-first)
+const HQ_MAX_WIDTH = 1280;
+const HQ_JPEG_Q = 82;
+const HQ_WEBP_Q1 = 90;
+const HQ_WEBP_Q2 = 82;
+const HQ_TARGET_MAX = 900 * 1024; // ~≤900 KB best-effort
+
+// Fast (previous)
+const FAST_MAX_WIDTH = 1100;
+const FAST_JPEG_Q = 68;
+const FAST_MIN_Q = 50;
+const FAST_TARGET_MAX = 450 * 1024; // ~≤450 KB
 
 function looksLikeImageUrl(u: string) {
   const s = String(u || "").split("?")[0] || "";
@@ -106,7 +114,7 @@ async function fetchWithTimeout(url: string, ms: number, init?: RequestInit): Pr
   }
 }
 
-// Estimate raw bytes from a data URL (for logging only)
+// Estimate bytes of a data URL (for logging)
 function dataUrlSizeBytes(s: string | null | undefined): number {
   if (!s) return 0;
   const i = s.indexOf(",");
@@ -145,37 +153,57 @@ async function fetchedHeadlinesItems(req: NextApiRequest, instrument: string) {
   }
 }
 
-// ---------- JPEG downscale helpers ----------
-async function bufferToJpegTight(buf: Buffer): Promise<Buffer> {
+// ---------- Accuracy-first and Fast pipelines ----------
+type ImgOut = { buffer: Buffer; mime: "image/jpeg" | "image/webp" };
+
+async function toJpeg(buf: Buffer, width: number, quality: number): Promise<Buffer> {
+  return sharp(buf).rotate().resize({ width, withoutEnlargement: true }).sharpen()
+    .jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
+}
+async function toWebp(buf: Buffer, width: number, quality: number): Promise<Buffer> {
+  return sharp(buf).rotate().resize({ width, withoutEnlargement: true }).sharpen()
+    .webp({ quality, effort: 4 }).toBuffer();
+}
+
+async function processAccurate(buf: Buffer): Promise<ImgOut> {
+  // Try JPEG q≈82 first
+  let out = await toJpeg(buf, HQ_MAX_WIDTH, HQ_JPEG_Q);
+  let mime: ImgOut["mime"] = "image/jpeg";
+
+  if (out.byteLength > HQ_TARGET_MAX) {
+    // Try WebP high quality
+    const webp1 = await toWebp(buf, HQ_MAX_WIDTH, HQ_WEBP_Q1);
+    if (webp1.byteLength <= HQ_TARGET_MAX) {
+      out = webp1; mime = "image/webp";
+    } else {
+      const webp2 = await toWebp(buf, HQ_MAX_WIDTH, HQ_WEBP_Q2);
+      // choose smallest among candidates; prefer webp if smaller
+      const best = [ {b: out, m: "image/jpeg" as const}, {b: webp1, m: "image/webp" as const}, {b: webp2, m: "image/webp" as const} ]
+        .sort((x,y)=>x.b.byteLength - y.b.byteLength)[0];
+      out = best.b; mime = best.m;
+    }
+  }
+  return { buffer: out, mime };
+}
+
+async function processFast(buf: Buffer): Promise<ImgOut> {
   // pass 1
-  let quality = TARGET_QUALITY_START;
-  let out = await sharp(buf)
-    .rotate()
-    .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true })
-    .jpeg({ quality, progressive: true, mozjpeg: true })
-    .toBuffer();
-
-  // pass 2 if needed
-  if (out.byteLength > TARGET_MAX_BYTES && quality > TARGET_MIN_QUALITY + 10) {
-    quality = Math.max(TARGET_MIN_QUALITY + 10, TARGET_QUALITY_START - 10); // e.g., 58
-    out = await sharp(buf)
-      .rotate()
-      .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true })
-      .jpeg({ quality, progressive: true, mozjpeg: true })
-      .toBuffer();
+  let q = FAST_JPEG_Q;
+  let out = await toJpeg(buf, FAST_MAX_WIDTH, q);
+  if (out.byteLength > FAST_TARGET_MAX && q > FAST_MIN_Q + 10) {
+    q = Math.max(FAST_MIN_Q + 10, FAST_JPEG_Q - 10);
+    out = await toJpeg(buf, FAST_MAX_WIDTH, q);
   }
-
-  // pass 3 if still heavy
-  if (out.byteLength > TARGET_MAX_BYTES && quality > TARGET_MIN_QUALITY) {
-    quality = TARGET_MIN_QUALITY; // e.g., 50
-    out = await sharp(buf)
-      .rotate()
-      .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true })
-      .jpeg({ quality, progressive: true, mozjpeg: true })
-      .toBuffer();
+  if (out.byteLength > FAST_TARGET_MAX && q > FAST_MIN_Q) {
+    q = FAST_MIN_Q;
+    out = await toJpeg(buf, FAST_MAX_WIDTH, q);
   }
+  return { buffer: out, mime: "image/jpeg" };
+}
 
-  return out;
+async function processBufferToDataUrl(buf: Buffer): Promise<string> {
+  const { buffer, mime } = VISION_HQ ? await processAccurate(buf) : await processFast(buf);
+  return `data:${mime};base64,${buffer.toString("base64")}`;
 }
 
 async function fileToProcessedDataUrl(file: any): Promise<string | null> {
@@ -183,11 +211,11 @@ async function fileToProcessedDataUrl(file: any): Promise<string | null> {
   const p = file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
   const raw = await fs.readFile(p);
-  const jpeg = await bufferToJpegTight(raw);
+  const dataUrl = await processBufferToDataUrl(raw);
   if (process.env.NODE_ENV !== "production") {
-    console.log(`[vision-plan] file processed size=${jpeg.byteLength}B`);
+    console.log(`[vision-plan] file processed size=${dataUrlSizeBytes(dataUrl)}B (hq=${VISION_HQ})`);
   }
-  return `data:image/jpeg;base64,${jpeg.toString("base64")}`;
+  return dataUrl;
 }
 
 // ---------- TV page → og:image resolver ----------
@@ -226,15 +254,14 @@ async function downloadImageAsDataUrl(url: string): Promise<string | null> {
   const ab = await r.arrayBuffer();
   const raw = Buffer.from(ab);
   if (raw.byteLength > IMG_MAX_BYTES) return null;
-  const jpeg = await bufferToJpegTight(raw);
+  const dataUrl = await processBufferToDataUrl(raw);
   if (process.env.NODE_ENV !== "production") {
-    console.log(`[vision-plan] chart jpeg size=${jpeg.byteLength}B from ${url}`);
+    console.log(`[vision-plan] chart processed size=${dataUrlSizeBytes(dataUrl)}B from ${url} (hq=${VISION_HQ})`);
   }
-  return `data:image/jpeg;base64,${jpeg.toString("base64")}`;
+  return dataUrl;
 }
 
 // Resolve any chart link (direct image or TV page) into a processed data URL.
-// Uses 2-min cache to avoid re-fetching the same URL repeatedly.
 async function chartLinkToDataUrl(link: string): Promise<{ dataUrl: string | null; mode: "direct" | "page-fallback" | "fail" }> {
   if (!link) return { dataUrl: null, mode: "fail" };
   const cached = getCachedDataUrl(link);
@@ -498,14 +525,14 @@ export default async function handler(
       return res.status(400).json({
         ok: false,
         reason:
-          "Use multipart/form-data with files: m15, h1, h4 (PNG/JPG) and optional 'calendar'. Or pass m15Url/h1Url/h4Url (chart links). Include 'instrument'.",
+          "Use multipart/form-data with files: m15, h1, h4 (PNG/JPG/WEBP) and optional 'calendar'. Or pass m15Url/h1Url/h4Url (chart links). Include 'instrument'.",
       });
     }
 
     const tParse = now();
     const { fields, files } = await parseMultipart(req);
     if (process.env.NODE_ENV !== "production") {
-      console.log(`[vision-plan] parse ${dt(tParse)}`);
+      console.log(`[vision-plan] parse ${dt(tParse)} (hq=${VISION_HQ})`);
     }
 
     const instrument = String(fields.instrument || fields.code || "EURUSD")
@@ -523,7 +550,7 @@ export default async function handler(
     const h1UrlRaw  = String(pickFirst(fields.h1Url)  || "").trim();
     const h4UrlRaw  = String(pickFirst(fields.h4Url)  || "").trim();
 
-    // Build images: ALWAYS produce processed JPEG data URLs for charts (files or links)
+    // Build images: ALWAYS produce processed data URLs for charts (files or links)
     const tImages = now();
     const [m15FromFile, h1FromFile, h4FromFile, calUrl] = await Promise.all([
       m15f ? fileToProcessedDataUrl(m15f) : Promise.resolve(null),
@@ -564,7 +591,7 @@ export default async function handler(
       return res.status(400).json({
         ok: false,
         reason:
-          `Could not resolve ${missing.join(", ")} chart link(s). Use a direct image URL (.png/.jpg/.webp like Gyazo) or upload the snapshot.`,
+          `Could not resolve ${missing.join(", ")} chart link(s). Use a direct image URL (.png/.jpg/.webp like Gyazo/TV export) or upload the snapshot.`,
       });
     }
 
