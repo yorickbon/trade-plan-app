@@ -1,17 +1,9 @@
 // /pages/api/vision-plan.ts
-// Images-only planner with optional TradingView image URL pass-through.
-// Uploads: m15 (execution), h1 (context), h4 (HTF) are usually TradingView links;
-// optional 'calendar' is typically an uploaded image.
-// Changes in this patch:
-//   1) Headlines: fetch 12, embed only 6 in the prompt (unchanged behavior from your last base).
-//   2) Charts (TV links): ZERO-FETCH mode — pass image URLs directly to OpenAI (no HEAD, no download, no sharp).
-//      If a user pastes a non-image URL, we still pass it as-is (fast). The model will try to fetch it.
-//   3) Calendar (uploaded): keep server-side downscale to JPEG (~70%), ≤1280px, strip EXIF; one pass,
-//      with a single optional second pass only if > ~600KB.
-//   4) Sentiment (CSM/COT): kept for card, but hard-capped to ~600ms total budget (parallel, cached in helper).
-//   5) Dev timings: logs per-step when NODE_ENV !== "production".
-// All output sections and rubric remain unchanged (Quick Plan, Full Breakdown, X-ray,
-// Candidate Scores, Final Table, trailing ai_meta). No prompt/section rewrites.
+// Images-only planner with TradingView link support.
+// Charts: prefer direct image URLs (.png/.jpg/.jpeg/.webp). If a page URL is provided (e.g., tradingview.com/x/XXXX/),
+// we auto-resolve og:image with a fast 3s fallback and compress it. Calendar uploads are always downscaled.
+// Headlines: fetch 12, embed 6. Sentiment (CSM/COT) kept with ~600ms budget.
+// Output sections/logic unchanged.
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -42,9 +34,11 @@ const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v
 function now() { return Date.now(); }
 function dt(from: number) { return `${Date.now() - from}ms`; }
 
+const IMG_MAX_BYTES = 12 * 1024 * 1024; // safety cap from remote fetch
+
 function looksLikeImageUrl(u: string) {
   const s = String(u || "").split("?")[0] || "";
-  return /\.(png|jpe?g|webp)$/i.test(s);
+  return /\.(png|jpe?g|webp|gif)$/i.test(s);
 }
 
 async function getFormidable() {
@@ -85,6 +79,25 @@ function originFromReq(req: NextApiRequest) {
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 
+// fetch with timeout helper
+async function fetchWithTimeout(url: string, ms: number, init?: RequestInit): Promise<Response> {
+  const ac = new AbortController();
+  const id = setTimeout(() => ac.abort(), ms);
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: ac.signal,
+      redirect: "follow",
+      headers: {
+        "user-agent": "TradePlanApp/1.0",
+        ...(init?.headers || {}),
+      },
+    });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
 // ---------- Headlines (fetch 12; embed 6) ----------
 
 function formatHeadlines(items: any[], max = 6): string {
@@ -122,7 +135,7 @@ const TARGET_MIN_QUALITY = 55;
 const TARGET_MAX_BYTES = 600 * 1024; // ~≤600 KB best-effort
 
 async function bufferToJpegTight(buf: Buffer): Promise<Buffer> {
-  // single pass at ~70%, one optional second pass only if still >600KB
+  // single pass at ~70%, optional second pass if still >600KB
   let out = await sharp(buf)
     .rotate()
     .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true })
@@ -152,6 +165,52 @@ async function fileToProcessedDataUrl(file: any): Promise<string | null> {
   return `data:image/jpeg;base64,${jpeg.toString("base64")}`;
 }
 
+// ---------- TradingView page-link fallback (3s + 3s) ----------
+
+function htmlFindOgImage(html: string): string | null {
+  const re1 = /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i;
+  const m1 = html.match(re1);
+  if (m1?.[1]) return m1[1];
+  const re2 = /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i;
+  const m2 = html.match(re2);
+  if (m2?.[1]) return m2[1];
+  return null;
+}
+
+function absoluteUrl(base: string, maybe: string) {
+  try { return new URL(maybe, base).toString(); } catch { return maybe; }
+}
+
+// Returns either a direct URL (pass-through) or a data URL (fallback). Null if failed.
+async function resolveChartLink(link: string): Promise<{ value: string | null; mode: "pass" | "fallback" | "fail" }> {
+  if (!link) return { value: null, mode: "fail" };
+  if (looksLikeImageUrl(link)) {
+    if (process.env.NODE_ENV !== "production") console.log(`[vision-plan] chart pass-through: ${link}`);
+    return { value: link, mode: "pass" };
+  }
+  // Fallback: fetch page (3s), extract og:image, fetch image (3s), compress.
+  try {
+    const page = await fetchWithTimeout(link, 3000);
+    if (!page.ok) return { value: null, mode: "fail" };
+    const html = await page.text();
+    const og = htmlFindOgImage(html);
+    if (!og) return { value: null, mode: "fail" };
+    const imgUrl = absoluteUrl(link, og);
+    const r = await fetchWithTimeout(imgUrl, 3000, {
+      headers: { accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8" },
+    });
+    if (!r.ok) return { value: null, mode: "fail" };
+    const ab = await r.arrayBuffer();
+    const buf = Buffer.from(ab);
+    if (buf.byteLength > IMG_MAX_BYTES) return { value: null, mode: "fail" };
+    const jpeg = await bufferToJpegTight(buf);
+    if (process.env.NODE_ENV !== "production") console.log(`[vision-plan] chart fallback downscale -> ${jpeg.byteLength}B`);
+    return { value: `data:image/jpeg;base64,${jpeg.toString("base64")}`, mode: "fallback" };
+  } catch {
+    return { value: null, mode: "fail" };
+  }
+}
+
 // ---------- refusal / ai_meta helpers (unchanged) ----------
 
 function refusalLike(s: string) {
@@ -160,7 +219,6 @@ function refusalLike(s: string) {
   return /\b(can'?t|cannot)\s+assist\b|\bnot able to comply\b|\brefuse/i.test(t);
 }
 
-// fenced JSON extractor for trailing ai_meta
 function extractAiMeta(text: string) {
   if (!text) return null;
   const fences = [/```ai_meta\s*({[\s\S]*?})\s*```/i, /```json\s*({[\s\S]*?})\s*```/i];
@@ -175,16 +233,14 @@ function extractAiMeta(text: string) {
   return null;
 }
 
-// Market entry allowed only if proof of breakout+retest (or SFP reclaim)
 function needsPendingLimit(aiMeta: any): boolean {
   const et = String(aiMeta?.entryType || "").toLowerCase(); // "market" | "pending"
   if (et !== "market") return false;
   const bp = aiMeta?.breakoutProof || {};
   const ok = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
-  return !ok; // if not proven, require Pending
+  return !ok;
 }
 
-// invalid Buy/Sell Limit vs current price and zone
 function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   const o = String(aiMeta?.entryOrder || "").toLowerCase(); // buy limit / sell limit
   const dir = String(aiMeta?.direction || "").toLowerCase(); // long / short / flat
@@ -193,15 +249,8 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   const zmin = Number(z?.min);
   const zmax = Number(z?.max);
   if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return null;
-
-  if (o === "sell limit" && dir === "short") {
-    // zone must be ABOVE current price (pullback into supply)
-    if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price";
-  }
-  if (o === "buy limit" && dir === "long") {
-    // zone must be BELOW current price (pullback into demand)
-    if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price";
-  }
+  if (o === "sell limit" && dir === "short") { if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price"; }
+  if (o === "buy limit" && dir === "long")  { if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price"; }
   return null;
 }
 
@@ -331,10 +380,7 @@ function tournamentMessages(params: {
     userParts.push({ type: "image_url", image_url: { url: calendarDataUrl } });
   }
   if (headlinesText) {
-    userParts.push({
-      type: "text",
-      text: `Recent headlines snapshot:\n${headlinesText}`,
-    });
+    userParts.push({ type: "text", text: `Recent headlines snapshot:\n${headlinesText}` });
   }
   if (sentimentText) {
     userParts.push({ type: "text", text: sentimentText });
@@ -393,9 +439,6 @@ async function normalizeBreakoutLabel(text: string) {
 
 // fix Buy/Sell Limit level direction vs current price
 async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
-  const reason = invalidOrderRelativeToPrice(aiMeta);
-  if (!reason) return text;
-
   const messages = [
     {
       role: "system",
@@ -418,7 +461,7 @@ async function buildSentimentTextWithBudget(instrument: string, budgetMs = 600):
 
   const task = (async () => {
     const [csm, cot] = await Promise.all([
-      getCurrencyStrengthIntraday({ range: "1d", interval: "15m", ttlSec: 120, timeoutMs: budgetMs }), // short per-call
+      getCurrencyStrengthIntraday({ range: "1d", interval: "15m", ttlSec: 120, timeoutMs: budgetMs }),
       getCotBiasBrief({ ttlSec: 86400, timeoutMs: budgetMs }),
     ]);
     const csmLine = formatStrengthLine(csm);
@@ -452,7 +495,7 @@ export default async function handler(
       return res.status(400).json({
         ok: false,
         reason:
-          "Use multipart/form-data with files: m15, h1, h4 (PNG/JPG) and optional 'calendar'. Or pass m15Url/h1Url/h4Url (TradingView image links). Also include 'instrument' field.",
+          "Use multipart/form-data with files: m15, h1, h4 (PNG/JPG) and optional 'calendar'. Or pass m15Url/h1Url/h4Url (chart image links). Include 'instrument'.",
       });
     }
 
@@ -472,14 +515,16 @@ export default async function handler(
     const h4f = pickFirst(files.h4);
     const calF = pickFirst(files.calendar);
 
-    // URLs (optional; TradingView "Copy link to image")
-    const m15Url = String(pickFirst(fields.m15Url) || "").trim();
-    const h1Url = String(pickFirst(fields.h1Url) || "").trim();
-    const h4Url = String(pickFirst(fields.h4Url) || "").trim();
+    // URLs (optional; TradingView page links or direct image links)
+    const m15UrlRaw = String(pickFirst(fields.m15Url) || "").trim();
+    const h1UrlRaw  = String(pickFirst(fields.h1Url)  || "").trim();
+    const h4UrlRaw  = String(pickFirst(fields.h4Url)  || "").trim();
 
     // Build images:
-    // - Charts (TV links): ZERO-FETCH pass-through of URLs (no HEAD, no download, no sharp).
-    //   If user uploaded chart files, we compress them (rare case).
+    // - Chart files (rare) → compress
+    // - Otherwise resolve chart URLs:
+    //      direct image → pass-through
+    //      page link → fallback resolve og:image (3s + 3s), compress
     const tImages = now();
     const [m15FromFile, h1FromFile, h4FromFile, calUrl] = await Promise.all([
       m15f ? fileToProcessedDataUrl(m15f) : Promise.resolve(null),
@@ -488,18 +533,31 @@ export default async function handler(
       calF ? fileToProcessedDataUrl(calF) : Promise.resolve(null),
     ]);
 
-    const m15 = m15FromFile || (m15Url ? (looksLikeImageUrl(m15Url) ? m15Url : m15Url) : null);
-    const h1  = h1FromFile  || (h1Url  ? (looksLikeImageUrl(h1Url)  ? h1Url  : h1Url)  : null);
-    const h4  = h4FromFile  || (h4Url  ? (looksLikeImageUrl(h4Url)  ? h4Url  : h4Url)  : null);
+    const [m15Resolved, h1Resolved, h4Resolved] = await Promise.all([
+      m15FromFile ? Promise.resolve({ value: m15FromFile, mode: "pass" as const }) : resolveChartLink(m15UrlRaw),
+      h1FromFile  ? Promise.resolve({ value: h1FromFile,  mode: "pass" as const }) : resolveChartLink(h1UrlRaw),
+      h4FromFile  ? Promise.resolve({ value: h4FromFile,  mode: "pass" as const }) : resolveChartLink(h4UrlRaw),
+    ]);
+
+    const m15 = m15Resolved.value;
+    const h1  = h1Resolved.value;
+    const h4  = h4Resolved.value;
 
     if (process.env.NODE_ENV !== "production") {
-      console.log(`[vision-plan] images prepared in ${dt(tImages)} (tv pass-through; calendar ${calUrl ? "compressed" : "none"})`);
+      console.log(`[vision-plan] images prepared in ${dt(tImages)} (m15=${m15Resolved.mode}, h1=${h1Resolved.mode}, h4=${h4Resolved.mode}; calendar ${calUrl ? "compressed" : "none"})`);
     }
 
     if (!m15 || !h1 || !h4) {
-      return res
-        .status(400)
-        .json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either as files or valid TradingView image links." });
+      // Helpful message if fallback failed for page links
+      const missing: string[] = [];
+      if (!m15) missing.push("m15");
+      if (!h1)  missing.push("h1");
+      if (!h4)  missing.push("h4");
+      return res.status(400).json({
+        ok: false,
+        reason:
+          `Could not resolve ${missing.join(", ")} chart link(s). Use a direct image URL (.png/.jpg/.webp like Gyazo) or upload the snapshot. If pasting TradingView, use a page with 'Copy image' > save & upload.`,
+      });
     }
 
     // Headlines: fetch up to 12 but embed only 6 into the prompt
@@ -545,7 +603,7 @@ export default async function handler(
       }
     }
 
-    // 3) Normalize mislabeled Breakout+Retest if no proof
+    // 3) Normalize mislabeled Breakout+Retest when no proof
     const bp = aiMeta?.breakoutProof || {};
     const hasProof =
       !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
