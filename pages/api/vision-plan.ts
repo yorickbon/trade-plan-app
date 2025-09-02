@@ -1,9 +1,17 @@
 // /pages/api/vision-plan.ts
-// Images-only planner with optional TradingView image URL fetch.
-// Uploads: m15 (execution), h1 (context), h4 (HTF), optional calendar image.
-// Or pass m15Url / h1Url / h4Url (TradingView “Copy link to image”).
-// Changes: (1) Headlines: fetch 12, embed 6. (2) Hybrid-fast image handling: pass-through small direct image URLs; downscale otherwise. (3) Inject compact CSM/COT with strict timeouts & caching.
-// All output sections & logic remain unchanged.
+// Images-only planner with optional TradingView image URL pass-through.
+// Uploads: m15 (execution), h1 (context), h4 (HTF) are usually TradingView links;
+// optional 'calendar' is typically an uploaded image.
+// Changes in this patch:
+//   1) Headlines: fetch 12, embed only 6 in the prompt (unchanged behavior from your last base).
+//   2) Charts (TV links): ZERO-FETCH mode — pass image URLs directly to OpenAI (no HEAD, no download, no sharp).
+//      If a user pastes a non-image URL, we still pass it as-is (fast). The model will try to fetch it.
+//   3) Calendar (uploaded): keep server-side downscale to JPEG (~70%), ≤1280px, strip EXIF; one pass,
+//      with a single optional second pass only if > ~600KB.
+//   4) Sentiment (CSM/COT): kept for card, but hard-capped to ~600ms total budget (parallel, cached in helper).
+//   5) Dev timings: logs per-step when NODE_ENV !== "production".
+// All output sections and rubric remain unchanged (Quick Plan, Full Breakdown, X-ray,
+// Candidate Scores, Final Table, trailing ai_meta). No prompt/section rewrites.
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -29,7 +37,15 @@ const OPENAI_API_KEY =
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
 const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
 
-// ---------- helpers ----------
+// ---------- small utils ----------
+
+function now() { return Date.now(); }
+function dt(from: number) { return `${Date.now() - from}ms`; }
+
+function looksLikeImageUrl(u: string) {
+  const s = String(u || "").split("?")[0] || "";
+  return /\.(png|jpe?g|webp)$/i.test(s);
+}
 
 async function getFormidable() {
   const mod: any = await import("formidable");
@@ -69,7 +85,8 @@ function originFromReq(req: NextApiRequest) {
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 
-// ---------- Headlines (fetch 12; embed 6 into prompt) ----------
+// ---------- Headlines (fetch 12; embed 6) ----------
+
 function formatHeadlines(items: any[], max = 6): string {
   const rows: string[] = [];
   for (const it of (items || []).slice(0, max)) {
@@ -98,84 +115,26 @@ async function fetchedHeadlinesItems(req: NextApiRequest, instrument: string) {
   }
 }
 
-// ---------- Image handling (hybrid fast path) ----------
-const IMG_MAX_BYTES = 12 * 1024 * 1024; // 12MB route safety cap
-const PASS_THROUGH_MAX = 1_200_000;     // if remote image is <= ~1.2MB, pass URL directly
+// ---------- Calendar image downscale (fast) ----------
 const TARGET_MAX_WIDTH = 1280;
 const TARGET_QUALITY_START = 72; // ~70%
-const TARGET_MIN_QUALITY = 50;
-const TARGET_MAX_BYTES = 600 * 1024; // target ~≤600 KB best-effort
+const TARGET_MIN_QUALITY = 55;
+const TARGET_MAX_BYTES = 600 * 1024; // ~≤600 KB best-effort
 
-function isLikelyImageUrl(url: string) {
-  return /\.(png|jpe?g|webp)$/i.test(url.split("?")[0] || "");
-}
-
-async function headInfo(url: string): Promise<{ isImage: boolean; length: number | null; ctype: string }> {
-  try {
-    const r = await fetch(url, { method: "HEAD", redirect: "follow" });
-    if (!r.ok) return { isImage: false, length: null, ctype: "" };
-    const ctype = String(r.headers.get("content-type") || "").toLowerCase();
-    const clen = r.headers.get("content-length");
-    const length = clen ? parseInt(clen, 10) : null;
-    return { isImage: ctype.startsWith("image/"), length: isFinite(length as any) ? (length as number) : null, ctype };
-  } catch {
-    return { isImage: isLikelyImageUrl(url), length: null, ctype: "" };
-  }
-}
-
-function withTimeout<T>(p: Promise<T>, ms: number) {
-  return new Promise<T>((resolve, reject) => {
-    const id = setTimeout(() => reject(new Error("Image fetch timeout")), ms);
-    p.then((v) => { clearTimeout(id); resolve(v); }).catch((e) => { clearTimeout(id); reject(e); });
-  });
-}
-
-async function fetchBuffer(url: string): Promise<{ buf: Buffer; mime: string } | null> {
-  const r = await fetch(url, {
-    redirect: "follow",
-    headers: {
-      "user-agent": "Mozilla/5.0 (compatible; TradePlanBot/1.0; +https://trade-plan-app.vercel.app)",
-      accept: "text/html,application/xhtml+xml,application/xml,image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-    },
-  });
-  if (!r.ok) return null;
-  const ctype = String(r.headers.get("content-type") || "").toLowerCase();
-  const mime = ctype.split(";")[0].trim() || "image/png";
-  const ab = await r.arrayBuffer();
-  const buf = Buffer.from(ab);
-  if (buf.byteLength > IMG_MAX_BYTES) throw new Error("Image too large");
-  return { buf, mime };
-}
-
-function htmlFindOgImage(html: string): string | null {
-  const re1 = /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i;
-  const m1 = html.match(re1);
-  if (m1?.[1]) return m1[1];
-  const re2 = /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i;
-  const m2 = html.match(re2);
-  if (m2?.[1]) return m2[1];
-  return null;
-}
-
-function absoluteUrl(base: string, maybe: string) {
-  try { return new URL(maybe, base).toString(); } catch { return maybe; }
-}
-
-async function bufferToJpeg(buf: Buffer): Promise<Buffer> {
-  // Convert to JPEG, strip metadata, progressive encode, limit width
-  let quality = TARGET_QUALITY_START;
+async function bufferToJpegTight(buf: Buffer): Promise<Buffer> {
+  // single pass at ~70%, one optional second pass only if still >600KB
   let out = await sharp(buf)
     .rotate()
     .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true })
-    .jpeg({ quality, progressive: true, mozjpeg: true })
+    .jpeg({ quality: TARGET_QUALITY_START, progressive: true, mozjpeg: true })
     .toBuffer();
 
-  while (out.byteLength > TARGET_MAX_BYTES && quality > TARGET_MIN_QUALITY) {
-    quality -= 5;
+  if (out.byteLength > TARGET_MAX_BYTES) {
+    const q2 = Math.max(TARGET_MIN_QUALITY, TARGET_QUALITY_START - 10);
     out = await sharp(buf)
       .rotate()
       .resize({ width: TARGET_MAX_WIDTH, withoutEnlargement: true })
-      .jpeg({ quality, progressive: true, mozjpeg: true })
+      .jpeg({ quality: q2, progressive: true, mozjpeg: true })
       .toBuffer();
   }
   return out;
@@ -186,95 +145,68 @@ async function fileToProcessedDataUrl(file: any): Promise<string | null> {
   const p = file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
   const raw = await fs.readFile(p);
-  const jpeg = await bufferToJpeg(raw);
-  const data = `data:image/jpeg;base64,${jpeg.toString("base64")}`;
+  const jpeg = await bufferToJpegTight(raw);
   if (process.env.NODE_ENV !== "production") {
     console.log(`[vision-plan] calendar processed size=${jpeg.byteLength}B`);
   }
-  return data;
+  return `data:image/jpeg;base64,${jpeg.toString("base64")}`;
 }
 
-async function tvLinkToImageUrlOrDataUrl(link: string): Promise<{ url: string | null; mode: "pass" | "downscale" | "html-fallback" | "unknown" }> {
-  if (!link) return { url: null, mode: "unknown" };
-  try {
-    const head = await headInfo(link);
-    if (head.isImage && (head.length == null || head.length <= PASS_THROUGH_MAX)) {
-      if (process.env.NODE_ENV !== "production") {
-        console.log(`[vision-plan] TV link pass-through (${head.length ?? "?"} bytes): ${link}`);
-      }
-      return { url: link, mode: "pass" };
-    }
+// ---------- refusal / ai_meta helpers (unchanged) ----------
 
-    // Not a direct/acceptable image → fetch and try to convert
-    const first = await withTimeout(fetchBuffer(link), 12000);
-    if (!first) return { url: null, mode: "unknown" };
-
-    if (first.mime.toLowerCase().startsWith("image/")) {
-      const jpeg = await bufferToJpeg(first.buf);
-      if (process.env.NODE_ENV !== "production") {
-        console.log(`[vision-plan] TV link downscale -> ${jpeg.byteLength}B: ${link}`);
-      }
-      return { url: `data:image/jpeg;base64,${jpeg.toString("base64")}`, mode: "downscale" };
-    }
-
-    // HTML page: extract og:image
-    const html = first.buf.toString("utf8");
-    const og = htmlFindOgImage(html);
-    if (!og) return { url: null, mode: "unknown" };
-    const resolved = absoluteUrl(link, og);
-    const second = await withTimeout(fetchBuffer(resolved), 12000);
-    if (!second || !second.mime.toLowerCase().startsWith("image/")) return { url: null, mode: "unknown" };
-    const jpeg2 = await bufferToJpeg(second.buf);
-    if (process.env.NODE_ENV !== "production") {
-      console.log(`[vision-plan] TV link html→image downscale -> ${jpeg2.byteLength}B: ${link}`);
-    }
-    return { url: `data:image/jpeg;base64,${jpeg2.toString("base64")}`, mode: "html-fallback" };
-  } catch {
-    return { url: null, mode: "unknown" };
-  }
-}
-
-// ---------- refusal & ai_meta helpers ----------
 function refusalLike(s: string) {
   const t = (s || "").toLowerCase();
   if (!t) return false;
   return /\b(can'?t|cannot)\s+assist\b|\bnot able to comply\b|\brefuse/i.test(t);
 }
 
+// fenced JSON extractor for trailing ai_meta
 function extractAiMeta(text: string) {
   if (!text) return null;
   const fences = [/```ai_meta\s*({[\s\S]*?})\s*```/i, /```json\s*({[\s\S]*?})\s*```/i];
   for (const re of fences) {
     const m = text.match(re);
     if (m && m[1]) {
-      try { return JSON.parse(m[1]); } catch {}
+      try {
+        return JSON.parse(m[1]);
+      } catch {}
     }
   }
   return null;
 }
 
+// Market entry allowed only if proof of breakout+retest (or SFP reclaim)
 function needsPendingLimit(aiMeta: any): boolean {
-  const et = String(aiMeta?.entryType || "").toLowerCase();
+  const et = String(aiMeta?.entryType || "").toLowerCase(); // "market" | "pending"
   if (et !== "market") return false;
   const bp = aiMeta?.breakoutProof || {};
   const ok = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
-  return !ok;
+  return !ok; // if not proven, require Pending
 }
 
+// invalid Buy/Sell Limit vs current price and zone
 function invalidOrderRelativeToPrice(aiMeta: any): string | null {
-  const o = String(aiMeta?.entryOrder || "").toLowerCase();
-  const dir = String(aiMeta?.direction || "").toLowerCase();
+  const o = String(aiMeta?.entryOrder || "").toLowerCase(); // buy limit / sell limit
+  const dir = String(aiMeta?.direction || "").toLowerCase(); // long / short / flat
   const z = aiMeta?.zone || {};
   const p = Number(aiMeta?.currentPrice);
   const zmin = Number(z?.min);
   const zmax = Number(z?.max);
   if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return null;
-  if (o === "sell limit" && dir === "short") { if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price"; }
-  if (o === "buy limit" && dir === "long")  { if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price"; }
+
+  if (o === "sell limit" && dir === "short") {
+    // zone must be ABOVE current price (pullback into supply)
+    if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price";
+  }
+  if (o === "buy limit" && dir === "long") {
+    // zone must be BELOW current price (pullback into demand)
+    if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price";
+  }
   return null;
 }
 
-// ---------- OpenAI ----------
+// ---------- OpenAI call (unchanged) ----------
+
 async function callOpenAI(messages: any[]) {
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
@@ -282,10 +214,17 @@ async function callOpenAI(messages: any[]) {
       "content-type": "application/json",
       authorization: `Bearer ${OPENAI_API_KEY}`,
     },
-    body: JSON.stringify({ model: OPENAI_MODEL, messages }),
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      messages,
+    }),
   });
   const json = await rsp.json().catch(() => ({} as any));
-  if (!rsp.ok) throw new Error(`OpenAI vision request failed: ${rsp.status} ${JSON.stringify(json)}`);
+  if (!rsp.ok) {
+    throw new Error(
+      `OpenAI vision request failed: ${rsp.status} ${JSON.stringify(json)}`
+    );
+  }
   const out =
     json?.choices?.[0]?.message?.content ??
     (Array.isArray(json?.choices?.[0]?.message?.content)
@@ -294,7 +233,8 @@ async function callOpenAI(messages: any[]) {
   return String(out || "");
 }
 
-// ---------- prompt builders (structure unchanged) ----------
+// ---------- prompt builders (unchanged structure) ----------
+
 function tournamentMessages(params: {
   instrument: string;
   dateStr: string;
@@ -305,7 +245,16 @@ function tournamentMessages(params: {
   h1: string;
   h4: string;
 }) {
-  const { instrument, dateStr, calendarDataUrl, headlinesText, sentimentText, m15, h1, h4 } = params;
+  const {
+    instrument,
+    dateStr,
+    calendarDataUrl,
+    headlinesText,
+    sentimentText,
+    m15,
+    h1,
+    h4,
+  } = params;
 
   const system = [
     "You are a professional discretionary trader.",
@@ -325,7 +274,7 @@ function tournamentMessages(params: {
     "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
     "• Trigger: (ex: Limit pullback / zone touch)",
     "• Entry: <min–max> or specific level",
-    "• Stop Loss: <level> (based on PA: behind swing/OB/SR; step to the next zone if too tight)",
+    "• Stop Loss: <level> (based on PA: behind swing/OB/SR; step to next zone if too tight)",
     "• Take Profit(s): TP1 <level> / TP2 <level>",
     "• Conviction: <0–100>%",
     "• Setup: <Chosen Strategy>",
@@ -382,7 +331,10 @@ function tournamentMessages(params: {
     userParts.push({ type: "image_url", image_url: { url: calendarDataUrl } });
   }
   if (headlinesText) {
-    userParts.push({ type: "text", text: `Recent headlines snapshot:\n${headlinesText}` });
+    userParts.push({
+      type: "text",
+      text: `Recent headlines snapshot:\n${headlinesText}`,
+    });
   }
   if (sentimentText) {
     userParts.push({ type: "text", text: sentimentText });
@@ -410,36 +362,89 @@ async function askTournament(args: {
   return { text, aiMeta };
 }
 
-// --- label corrections / guard-rails (unchanged) ---
+// rewrite card -> Pending limit (no Market) when proof missing
 async function rewriteAsPending(instrument: string, text: string) {
   const messages = [
-    { role: "system", content: "Rewrite the trade card as PENDING (no Market) into a clean Buy/Sell LIMIT zone at OB/FVG/SR confluence if breakout proof is missing. Keep tournament section and X-ray." },
-    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nRewrite strictly to Pending.` },
+    {
+      role: "system",
+      content:
+        "Rewrite the trade card as PENDING (no Market) into a clean Buy/Sell LIMIT zone at OB/FVG/SR confluence if breakout proof is missing. Keep tournament section and X-ray.",
+    },
+    {
+      role: "user",
+      content: `Instrument: ${instrument}\n\n${text}\n\nRewrite strictly to Pending.`,
+    },
   ];
   return callOpenAI(messages);
 }
 
+// normalize mislabeled Breakout+Retest without proof -> Pullback
 async function normalizeBreakoutLabel(text: string) {
   const messages = [
-    { role: "system", content: "If 'Breakout + Retest' is claimed but proof is not shown (body close + retest hold or SFP reclaim), rename setup to 'Pullback (OB/FVG/SR)' and leave rest unchanged." },
+    {
+      role: "system",
+      content:
+        "If 'Breakout + Retest' is claimed but proof is not shown (body close + retest hold or SFP reclaim), rename setup to 'Pullback (OB/FVG/SR)' and leave rest unchanged.",
+    },
     { role: "user", content: text },
   ];
   return callOpenAI(messages);
 }
 
+// fix Buy/Sell Limit level direction vs current price
 async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
+  const reason = invalidOrderRelativeToPrice(aiMeta);
+  if (!reason) return text;
+
   const messages = [
-    { role: "system", content: "Adjust the LIMIT zone so that: Sell Limit is an ABOVE-price pullback into supply; Buy Limit is a BELOW-price pullback into demand. Keep all other content & sections." },
-    { role: "user", content: `Instrument: ${instrument}\n\nCurrent Price: ${aiMeta?.currentPrice}\nProvided Zone: ${JSON.stringify(aiMeta?.zone)}\n\nCard:\n${text}\n\nFix only the LIMIT zone side and entry, keep format.` },
+    {
+      role: "system",
+      content:
+        "Adjust the LIMIT zone so that: Sell Limit is an ABOVE-price pullback into supply; Buy Limit is a BELOW-price pullback into demand. Keep all other content & sections.",
+    },
+    {
+      role: "user",
+      content: `Instrument: ${instrument}\n\nCurrent Price: ${aiMeta?.currentPrice}\nProvided Zone: ${JSON.stringify(
+        aiMeta?.zone
+      )}\n\nCard:\n${text}\n\nFix only the LIMIT zone side and entry, keep format.`,
+    },
   ];
   return callOpenAI(messages);
 }
 
+// ---------- sentiment with strict global budget ----------
+async function buildSentimentTextWithBudget(instrument: string, budgetMs = 600): Promise<string | null> {
+  const start = now();
+
+  const task = (async () => {
+    const [csm, cot] = await Promise.all([
+      getCurrencyStrengthIntraday({ range: "1d", interval: "15m", ttlSec: 120, timeoutMs: budgetMs }), // short per-call
+      getCotBiasBrief({ ttlSec: 86400, timeoutMs: budgetMs }),
+    ]);
+    const csmLine = formatStrengthLine(csm);
+    const { base, quote } = parseInstrumentCurrencies(instrument);
+    const cotLine = formatCotLine(cot, [base || "", quote || ""].filter(Boolean));
+    const parts = [csmLine, cotLine].filter(Boolean);
+    if (!parts.length) return null;
+    return `Sentiment Snapshot:\n${parts.map((p) => `• ${p}`).join("\n")}`;
+  })();
+
+  const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), budgetMs));
+
+  const result = await Promise.race([task, timeout]);
+  if (process.env.NODE_ENV !== "production") {
+    console.log(`[vision-plan] sentiment ${result ? "ok" : "skipped"} in ${dt(start)}`);
+  }
+  return (result as string) || null;
+}
+
 // ---------- handler ----------
+
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<Ok | Err>
 ) {
+  const tAll = now();
   try {
     if (req.method !== "POST") return res.status(405).json({ ok: false, reason: "Method not allowed" });
     if (!OPENAI_API_KEY) return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
@@ -447,12 +452,19 @@ export default async function handler(
       return res.status(400).json({
         ok: false,
         reason:
-          "Use multipart/form-data with files: m15, h1, h4 (optional) and 'calendar' (optional). Or pass m15Url/h1Url/h4Url (TradingView image links). Include 'instrument'.",
+          "Use multipart/form-data with files: m15, h1, h4 (PNG/JPG) and optional 'calendar'. Or pass m15Url/h1Url/h4Url (TradingView image links). Also include 'instrument' field.",
       });
     }
 
+    const tParse = now();
     const { fields, files } = await parseMultipart(req);
-    const instrument = String(fields.instrument || fields.code || "EURUSD").toUpperCase().replace(/\s+/g, "");
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[vision-plan] parse ${dt(tParse)}`);
+    }
+
+    const instrument = String(fields.instrument || fields.code || "EURUSD")
+      .toUpperCase()
+      .replace(/\s+/g, "");
 
     // Files (if provided)
     const m15f = pickFirst(files.m15);
@@ -465,86 +477,97 @@ export default async function handler(
     const h1Url = String(pickFirst(fields.h1Url) || "").trim();
     const h4Url = String(pickFirst(fields.h4Url) || "").trim();
 
-    // Build chart images:
-    // - prefer file if given → downscale
-    // - else TV link with hybrid fast path: HEAD→pass-through small images; else fetch+downscale (HTML og:image handled)
-    const [m15FromFile, h1FromFile, h4FromFile] = await Promise.all([
+    // Build images:
+    // - Charts (TV links): ZERO-FETCH pass-through of URLs (no HEAD, no download, no sharp).
+    //   If user uploaded chart files, we compress them (rare case).
+    const tImages = now();
+    const [m15FromFile, h1FromFile, h4FromFile, calUrl] = await Promise.all([
       m15f ? fileToProcessedDataUrl(m15f) : Promise.resolve(null),
       h1f ? fileToProcessedDataUrl(h1f) : Promise.resolve(null),
       h4f ? fileToProcessedDataUrl(h4f) : Promise.resolve(null),
+      calF ? fileToProcessedDataUrl(calF) : Promise.resolve(null),
     ]);
 
-    const [m15FromUrl, h1FromUrl, h4FromUrl] = await Promise.all([
-      m15FromFile ? Promise.resolve({ url: null, mode: "unknown" as const }) : tvLinkToImageUrlOrDataUrl(m15Url),
-      h1FromFile ? Promise.resolve({ url: null, mode: "unknown" as const }) : tvLinkToImageUrlOrDataUrl(h1Url),
-      h4FromFile ? Promise.resolve({ url: null, mode: "unknown" as const }) : tvLinkToImageUrlOrDataUrl(h4Url),
-    ]);
+    const m15 = m15FromFile || (m15Url ? (looksLikeImageUrl(m15Url) ? m15Url : m15Url) : null);
+    const h1  = h1FromFile  || (h1Url  ? (looksLikeImageUrl(h1Url)  ? h1Url  : h1Url)  : null);
+    const h4  = h4FromFile  || (h4Url  ? (looksLikeImageUrl(h4Url)  ? h4Url  : h4Url)  : null);
 
-    const m15 = m15FromFile || m15FromUrl.url;
-    const h1  = h1FromFile  || h1FromUrl.url;
-    const h4  = h4FromFile  || h4FromUrl.url;
-
-    // Calendar: if provided, always downscale
-    const calUrl = calF ? await fileToProcessedDataUrl(calF) : null;
-
-    if (!m15 || !h1 || !h4) {
-      return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either as files or valid TradingView image links." });
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[vision-plan] images prepared in ${dt(tImages)} (tv pass-through; calendar ${calUrl ? "compressed" : "none"})`);
     }
 
-    // Headlines: fetch 12 for UI, embed only 6 into prompt
+    if (!m15 || !h1 || !h4) {
+      return res
+        .status(400)
+        .json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either as files or valid TradingView image links." });
+    }
+
+    // Headlines: fetch up to 12 but embed only 6 into the prompt
+    const tNews = now();
     const items = await fetchedHeadlinesItems(req, instrument);
     const headlinesPromptText = items.length ? formatHeadlines(items, 6) : null;
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[vision-plan] news fetched in ${dt(tNews)} (items=${items.length})`);
+    }
 
-    // Sentiment: strict budget (fast-fail & cache)
-    let sentimentText: string | null = null;
-    try {
-      const [csm, cot] = await Promise.all([
-        getCurrencyStrengthIntraday({ range: "1d", interval: "15m", ttlSec: 120, timeoutMs: 1200 }),
-        getCotBiasBrief({ ttlSec: 86400, timeoutMs: 1200 }),
-      ]);
-      const csmLine = formatStrengthLine(csm);
-      const { base, quote } = parseInstrumentCurrencies(instrument);
-      const cotLine = formatCotLine(cot, [base || "", quote || ""].filter(Boolean));
-      const parts = [csmLine, cotLine].filter(Boolean);
-      if (parts.length) {
-        sentimentText = `Sentiment Snapshot:\n${parts.map(p => `• ${p}`).join("\n")}`;
-      }
-    } catch {
-      sentimentText = null;
+    // Sentiment: strict total budget (~600ms). If it doesn't return in time, skip.
+    const tSent = now();
+    const sentimentText = await buildSentimentTextWithBudget(instrument, 600);
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[vision-plan] sentiment stage ${dt(tSent)} (included=${!!sentimentText})`);
     }
 
     const dateStr = new Date().toISOString().slice(0, 10);
 
-    // 1) Tournament pass (unchanged structure)
+    // 1) Tournament pass
+    const tAI = now();
     let { text, aiMeta } = await askTournament({
       instrument,
       dateStr,
       calendarDataUrl: calUrl || undefined,
-      headlinesText: headlinesPromptText || undefined,
-      sentimentText: sentimentText || undefined,
-      m15, h1, h4,
+      headlinesText: headlinesPromptText || undefined, // <= only 6 in prompt
+      sentimentText: sentimentText || undefined,        // <= compact, optional
+      m15,
+      h1,
+      h4,
     });
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[vision-plan] openai completed in ${dt(tAI)}`);
+    }
 
     // 2) Force Pending if Market without proof
     if (aiMeta && needsPendingLimit(aiMeta)) {
+      const tPend = now();
       text = await rewriteAsPending(instrument, text);
       aiMeta = extractAiMeta(text) || aiMeta;
+      if (process.env.NODE_ENV !== "production") {
+        console.log(`[vision-plan] rewrite->Pending in ${dt(tPend)}`);
+      }
     }
 
-    // 3) Normalize mislabeled Breakout+Retest when no proof
+    // 3) Normalize mislabeled Breakout+Retest if no proof
     const bp = aiMeta?.breakoutProof || {};
-    const hasProof = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+    const hasProof =
+      !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
     if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
+      const tNorm = now();
       text = await normalizeBreakoutLabel(text);
       aiMeta = extractAiMeta(text) || aiMeta;
+      if (process.env.NODE_ENV !== "production") {
+        console.log(`[vision-plan] normalize breakout label in ${dt(tNorm)}`);
+      }
     }
 
-    // 4) Enforce order sanity (Sell Limit above / Buy Limit below current price)
+    // 4) Enforce order vs current price (Sell Limit above / Buy Limit below)
     if (aiMeta) {
       const bad = invalidOrderRelativeToPrice(aiMeta);
       if (bad) {
+        const tFix = now();
         text = await fixOrderVsPrice(instrument, text, aiMeta);
         aiMeta = extractAiMeta(text) || aiMeta;
+        if (process.env.NODE_ENV !== "production") {
+          console.log(`[vision-plan] fix order vs price in ${dt(tFix)}`);
+        }
       }
     }
 
@@ -596,7 +619,11 @@ export default async function handler(
               stop: null,
               tp1: null,
               tp2: null,
-              breakoutProof: { bodyCloseBeyond: false, retestHolds: false, sfpReclaim: false },
+              breakoutProof: {
+                bodyCloseBeyond: false,
+                retestHolds: false,
+                sfpReclaim: false,
+              },
               candidateScores: [],
               note: "Fallback used due to refusal/empty output.",
             },
@@ -605,6 +632,10 @@ export default async function handler(
           ),
           "```",
         ].join("\n");
+
+      if (process.env.NODE_ENV !== "production") {
+        console.log(`[vision-plan] TOTAL ${dt(tAll)} (fallback)`);
+      }
 
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
@@ -622,6 +653,10 @@ export default async function handler(
       });
     }
 
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[vision-plan] TOTAL ${dt(tAll)} (success)`);
+    }
+
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
       ok: true,
@@ -634,14 +669,15 @@ export default async function handler(
         rewritten: false,
         fallbackUsed: false,
         aiMeta,
-        debug: (process.env.NODE_ENV !== "production") ? {
-          m15Mode: m15FromFile ? "file-downscale" : (m15FromUrl?.mode || "pass?"),
-          h1Mode:  h1FromFile  ? "file-downscale" : (h1FromUrl?.mode  || "pass?"),
-          h4Mode:  h4FromFile  ? "file-downscale" : (h4FromUrl?.mode  || "pass?"),
-        } : undefined,
       },
     });
   } catch (err: any) {
-    return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[vision-plan] TOTAL ${dt(tAll)} (error): ${err?.message || err}`);
+    }
+    return res.status(500).json({
+      ok: false,
+      reason: err?.message || "vision-plan failed",
+    });
   }
 }
