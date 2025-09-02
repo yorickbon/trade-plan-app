@@ -34,7 +34,8 @@ type Err = { ok: false; reason: string };
 const OPENAI_API_KEY =
   process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
-const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
+const OPENAI_API_BASE =
+  process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
 
 // Market data keys (free tiers ok)
 const TD_KEY = process.env.TWELVEDATA_API_KEY || "";
@@ -46,7 +47,7 @@ const POLY_KEY = process.env.POLYGON_API_KEY || "";
 const IMG_MAX_BYTES = 12 * 1024 * 1024; // safety cap
 
 const MAX_W = 1280; // downscale target
-const JPEG_Q = 70; // ~70%
+the const JPEG_Q = 70; // ~70%
 const TARGET_MAX = 600 * 1024; // best-effort clamp
 
 const now = () => Date.now();
@@ -69,7 +70,9 @@ function dataUrlSizeBytes(s: string | null | undefined): number {
 type CacheEntry = {
   exp: number;
   instrument: string;
-  m15: string; h1: string; h4: string;
+  m15: string;
+  h1: string;
+  h4: string;
   calendar?: string | null;
   headlinesText?: string | null;
   sentimentText?: string | null;
@@ -95,17 +98,17 @@ function getCache(key: string | undefined | null): CacheEntry | null {
 // ---------- CSM cache (15 min) ----------
 type CsmSnapshot = {
   tsISO: string;
-  ranks: string[];            // e.g. ["USD","JPY","CHF",...]
+  ranks: string[]; // e.g. ["USD","JPY","CHF",...]
   scores: Record<string, number>; // z-scored strength per currency
-  ttl: number;                // expiry epoch ms
+  ttl: number; // expiry epoch ms
 };
 let CSM_CACHE: CsmSnapshot | null = null;
 
 // ---------- COT cache (7 days) ----------
 type CotSnapshot = {
-  reportDate: string;             // ISO date of report
-  net: Record<string, number>;    // currency -> net (non-commercial long - short)
-  ttl: number;                    // expiry epoch ms
+  reportDate: string; // ISO date of report
+  net: Record<string, number>; // currency -> net (non-commercial long - short)
+  ttl: number; // expiry epoch ms
 };
 let COT_CACHE: CotSnapshot | null = null;
 
@@ -140,7 +143,11 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null {
 }
 
 // ---------- image processing ----------
-async function toJpeg(buf: Buffer, width = MAX_W, quality = JPEG_Q): Promise<Buffer> {
+async function toJpeg(
+  buf: Buffer,
+  width = MAX_W,
+  quality = JPEG_Q
+): Promise<Buffer> {
   return sharp(buf)
     .rotate()
     .resize({ width, withoutEnlargement: true })
@@ -168,7 +175,8 @@ async function processToDataUrl(buf: Buffer): Promise<string> {
 
 async function fileToDataUrl(file: any): Promise<string | null> {
   if (!file) return null;
-  const p = file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
+  const p =
+    file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
   const raw = await fs.readFile(p);
   const out = await processToDataUrl(raw);
@@ -181,7 +189,8 @@ async function fileToDataUrl(file: any): Promise<string | null> {
 // ---------- tradingview/gyazo link → dataURL ----------
 function originFromReq(req: NextApiRequest) {
   const proto = (req.headers["x-forwarded-proto"] as string) || "https";
-  const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
+  const host =
+    (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 function absoluteUrl(base: string, maybe: string) {
@@ -192,10 +201,12 @@ function absoluteUrl(base: string, maybe: string) {
   }
 }
 function htmlFindOgImage(html: string): string | null {
-  const re1 = /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i;
+  const re1 =
+    /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i;
   const m1 = html.match(re1);
   if (m1?.[1]) return m1[1];
-  const re2 = /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i;
+  const re2 =
+    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i;
   const m2 = html.match(re2);
   if (m2?.[1]) return m2[1];
   return null;
@@ -213,7 +224,8 @@ async function fetchWithTimeout(url: string, ms: number) {
       redirect: "follow",
       headers: {
         "user-agent": "TradePlanApp/1.0",
-        accept: "text/html,application/xhtml+xml,application/xml,image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        accept:
+          "text/html,application/xhtml+xml,application/xml,image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
       },
     });
     return r;
@@ -233,7 +245,9 @@ async function downloadAndProcess(url: string): Promise<string | null> {
   if (mime.startsWith("image/")) {
     const out = await processToDataUrl(raw);
     if (process.env.NODE_ENV !== "production") {
-      console.log(`[vision-plan] link processed size=${dataUrlSizeBytes(out)}B from ${url}`);
+      console.log(
+        `[vision-plan] link processed size=${dataUrlSizeBytes(out)}B from ${url}`
+      );
     }
     return out;
   }
@@ -250,7 +264,9 @@ async function downloadAndProcess(url: string): Promise<string | null> {
   if (raw2.byteLength > IMG_MAX_BYTES) return null;
   const out2 = await processToDataUrl(raw2);
   if (process.env.NODE_ENV !== "production") {
-    console.log(`[vision-plan] og:image processed size=${dataUrlSizeBytes(out2)}B from ${resolved}`);
+    console.log(
+      `[vision-plan] og:image processed size=${dataUrlSizeBytes(out2)}B from ${resolved}`
+    );
   }
   return out2;
 }
@@ -266,7 +282,10 @@ async function linkToDataUrl(link: string): Promise<string | null> {
 }
 
 // ---------- headlines: fetch 12; embed 6 ----------
-async function fetchedHeadlines(req: NextApiRequest, instrument: string): Promise<{ items: any[]; promptText: string | null }> {
+async function fetchedHeadlines(
+  req: NextApiRequest,
+  instrument: string
+): Promise<{ items: any[]; promptText: string | null }> {
   try {
     const base = originFromReq(req);
     const url = `${base}/api/news?instrument=${encodeURIComponent(
@@ -351,6 +370,8 @@ const USD_PAIRS = [
   "USDCAD",
 ];
 
+type Series = { t: number[]; c: number[] }; // ascending
+
 // helper: compute log return over k bars (series ascending by time)
 function kbarReturn(closes: number[], k: number): number | null {
   if (!closes || closes.length <= k) return null;
@@ -360,8 +381,6 @@ function kbarReturn(closes: number[], k: number): number | null {
   return Math.log(a / b);
 }
 
-type Series = { t: number[]; c: number[] }; // ascending
-
 async function tdSeries15(pair: string): Promise<Series | null> {
   if (!TD_KEY) return null;
   try {
@@ -370,14 +389,17 @@ async function tdSeries15(pair: string): Promise<Series | null> {
     const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(
       sym
     )}&interval=15min&outputsize=30&apikey=${TD_KEY}&dp=6`;
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(1800) });
+    const r = await fetch(url, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(1800),
+    });
     if (!r.ok) return null;
     const j: any = await r.json();
     if (!Array.isArray(j?.values)) return null;
     const vals = [...j.values].reverse(); // ascending
     const t = vals.map((v: any) => new Date(v.datetime).getTime() / 1000);
     const c = vals.map((v: any) => Number(v.close));
-    if (!c.every((x) => isFinite(x))) return null;
+    if (!c.every((x: number) => isFinite(x))) return null;
     return { t, c };
   } catch {
     return null;
@@ -394,11 +416,17 @@ async function fhSeries15(pair: string): Promise<Series | null> {
     const url = `https://finnhub.io/api/v1/forex/candle?symbol=${encodeURIComponent(
       sym
     )}&resolution=15&from=${from}&to=${to}&token=${FH_KEY}`;
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(1800) });
+    const r = await fetch(url, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(1800),
+    });
     if (!r.ok) return null;
     const j: any = await r.json();
     if (j?.s !== "ok" || !Array.isArray(j?.c)) return null;
-    return { t: j.t, c: j.c };
+    const t: number[] = (j.t as number[]).map((x: number) => x);
+    const c: number[] = (j.c as number[]).map((x: number) => Number(x));
+    if (!c.every((x: number) => isFinite(x))) return null;
+    return { t, c };
   } catch {
     return null;
   }
@@ -418,13 +446,16 @@ async function polySeries15(pair: string): Promise<Series | null> {
     const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(
       ticker
     )}/range/15/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=asc&apiKey=${POLY_KEY}`;
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(2000) });
+    const r = await fetch(url, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(2000),
+    });
     if (!r.ok) return null;
     const j: any = await r.json();
     if (!Array.isArray(j?.results)) return null;
-    const t = j.results.map((x: any) => Math.floor(x.t / 1000));
-    const c = j.results.map((x: any) => Number(x.c));
-    if (!c.every((x) => isFinite(x))) return null;
+    const t: number[] = j.results.map((x: any) => Math.floor(x.t / 1000));
+    const c: number[] = j.results.map((x: any) => Number(x.c));
+    if (!c.every((x: number) => isFinite(x))) return null;
     return { t, c };
   } catch {
     return null;
@@ -442,10 +473,14 @@ async function fetchSeries15(pair: string): Promise<Series | null> {
   return null;
 }
 
-function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnapshot | null {
+function computeCSMFromPairs(
+  seriesMap: Record<string, Series | null>
+): CsmSnapshot | null {
   // For each pair, compute 60m (4 bars) & 240m (16 bars) log returns on 15m bars
   const weights = { r60: 0.6, r240: 0.4 };
-  const curScore: Record<string, number> = Object.fromEntries(G8.map((c) => [c, 0]));
+  const curScore: Record<string, number> = Object.fromEntries(
+    G8.map((c) => [c, 0])
+  );
 
   for (const pair of USD_PAIRS) {
     const S = seriesMap[pair];
@@ -464,7 +499,8 @@ function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnaps
   // z-score normalize
   const vals = G8.map((c) => curScore[c]);
   const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-  const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length) || 1;
+  const sd =
+    Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length) || 1;
   const z: Record<string, number> = {};
   for (const c of G8) z[c] = (curScore[c] - mean) / sd;
 
@@ -512,44 +548,6 @@ const CFTC_MAP: Record<string, { name: string }> = {
   USD: { name: "U.S. DOLLAR INDEX - ICE FUTURES U.S." },
 };
 
-function parseCFTC(text: string): CotSnapshot | null {
-  // CSV with header; some fields have commas within names — CFTC uses pure CSV with quotes.
-  // We'll do a light CSV parse that handles quotes.
-  const lines = text.trim().split(/\r?\n/);
-  if (lines.length < 5) return null;
-  const header = csvSplit(lines[0]).map((s) => s.trim());
-  const idxLong = header.findIndex((h) => /noncommercial/i.test(h) && /long/i.test(h));
-  const idxShort = header.findIndex((h) => /noncommercial/i.test(h) && /short/i.test(h));
-  const idxMarket = header.findIndex((h) => /market\s+and\s+exchange\s+names?/i.test(h));
-  const idxDate = header.findIndex((h) => /report\s+date/i.test(h));
-  if (idxLong < 0 || idxShort < 0 || idxMarket < 0 || idxDate < 0) return null;
-
-  const net: Record<string, number> = {};
-  let latestDate = "";
-
-  for (let i = 1; i < lines.length; i++) {
-    const cols = csvSplit(lines[i]);
-    const name = (cols[idxMarket] || "").toUpperCase().trim();
-    const longV = Number(String(cols[idxLong] || "").replace(/[^0-9.-]/g, ""));
-    const shortV = Number(String(cols[idxShort] || "").replace(/[^0-9.-]/g, ""));
-    const d = (cols[idxDate] || "").trim();
-    if (d) latestDate = latestDate || d;
-
-    for (const cur of Object.keys(CFTC_MAP)) {
-      if (name === CFTC_MAP[cur].name.toUpperCase()) {
-        net[cur] = (isFinite(longV) ? longV : 0) - (isFinite(shortV) ? shortV : 0);
-      }
-    }
-  }
-  if (!latestDate || Object.keys(net).length < 3) return null;
-  const reportDateISO = new Date(latestDate).toISOString().slice(0, 10);
-  return {
-    reportDate: reportDateISO,
-    net,
-    ttl: Date.now() + 7 * 24 * 60 * 60 * 1000,
-  };
-}
-
 function csvSplit(line: string): string[] {
   // minimal CSV splitter with quotes
   const out: string[] = [];
@@ -572,10 +570,62 @@ function csvSplit(line: string): string[] {
   return out;
 }
 
+type CotParsed = {
+  reportDate: string;
+  net: Record<string, number>;
+};
+
+function parseCFTC(text: string): CotSnapshot | null {
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length < 5) return null;
+  const header = csvSplit(lines[0]).map((s) => s.trim());
+  const idxLong = header.findIndex(
+    (h) => /noncommercial/i.test(h) && /long/i.test(h)
+  );
+  const idxShort = header.findIndex(
+    (h) => /noncommercial/i.test(h) && /short/i.test(h)
+  );
+  const idxMarket = header.findIndex(
+    (h) => /market\s+and\s+exchange\s+names?/i.test(h)
+  );
+  const idxDate = header.findIndex((h) => /report\s+date/i.test(h));
+  if (idxLong < 0 || idxShort < 0 || idxMarket < 0 || idxDate < 0) return null;
+
+  const net: Record<string, number> = {};
+  let latestDate = "";
+
+  for (let i = 1; i < lines.length; i++) {
+    const cols = csvSplit(lines[i]);
+    const name = (cols[idxMarket] || "").toUpperCase().trim();
+    const longV = Number(String(cols[idxLong] || "").replace(/[^0-9.-]/g, ""));
+    const shortV = Number(
+      String(cols[idxShort] || "").replace(/[^0-9.-]/g, "")
+    );
+    const d = (cols[idxDate] || "").trim();
+    if (d) latestDate = latestDate || d;
+
+    for (const cur of Object.keys(CFTC_MAP)) {
+      if (name === CFTC_MAP[cur].name.toUpperCase()) {
+        net[cur] = (isFinite(longV) ? longV : 0) - (isFinite(shortV) ? shortV : 0);
+      }
+    }
+  }
+  if (!latestDate || Object.keys(net).length < 3) return null;
+  const reportDateISO = new Date(latestDate).toISOString().slice(0, 10);
+  return {
+    reportDate: reportDateISO,
+    net,
+    ttl: Date.now() + 7 * 24 * 60 * 60 * 1000,
+  };
+}
+
 async function getCOT(): Promise<CotSnapshot> {
   if (COT_CACHE && Date.now() < COT_CACHE.ttl) return COT_CACHE;
   try {
-    const r = await fetch(CFTC_URL, { cache: "no-store", signal: AbortSignal.timeout(2500) });
+    const r = await fetch(CFTC_URL, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(2500),
+    });
     if (!r.ok) throw new Error(`CFTC ${r.status}`);
     const txt = await r.text();
     const snap = parseCFTC(txt);
@@ -589,13 +639,34 @@ async function getCOT(): Promise<CotSnapshot> {
 }
 
 // ---------- sentiment text from CSM + COT ----------
-function sentimentSummary(csm: CsmSnapshot, cot: CotSnapshot): { text: string; provenance: { csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string } } {
-  const ranksLine = `CSM (60–240m): ${csm.ranks.slice(0, 4).join(" > ")} ... ${csm.ranks.slice(-3).join(" < ")}`;
+function sentimentSummary(
+  csm: CsmSnapshot,
+  cot: CotSnapshot
+): {
+  text: string;
+  provenance: {
+    csm_used: boolean;
+    csm_time: string;
+    cot_used: boolean;
+    cot_report_date: string;
+  };
+} {
+  const ranksLine = `CSM (60–240m): ${csm.ranks
+    .slice(0, 4)
+    .join(" > ")} ... ${csm.ranks.slice(-3).join(" < ")}`;
   // condense COT: list top 3 net long, 2 net short
   const entries = Object.entries(cot.net);
-  const longers = entries.filter(([, v]) => (v as number) > 0).sort((a, b) => (b[1] as number) - (a[1] as number)).map(([k]) => k);
-  const shorters = entries.filter(([, v]) => (v as number) < 0).sort((a, b) => (a[1] as number) - (b[1] as number)).map(([k]) => k);
-  const cotLine = `COT: Long ${longers.slice(0, 3).join("/")} | Short ${shorters.slice(0, 2).join("/")}`;
+  const longers = entries
+    .filter(([, v]) => (v as number) > 0)
+    .sort((a, b) => (b[1] as number) - (a[1] as number))
+    .map(([k]) => k);
+  const shorters = entries
+    .filter(([, v]) => (v as number) < 0)
+    .sort((a, b) => (a[1] as number) - (b[1] as number))
+    .map(([k]) => k);
+  const cotLine = `COT: Long ${longers.slice(0, 3).join("/")} | Short ${shorters
+    .slice(0, 2)
+    .join("/")}`;
   return {
     text: `${ranksLine}\n${cotLine}`,
     provenance: {
@@ -639,8 +710,11 @@ function systemCore(instrument: string) {
 }
 
 function buildUserPartsBase(args: {
-  instrument: string; dateStr: string;
-  m15: string; h1: string; h4: string;
+  instrument: string;
+  dateStr: string;
+  m15: string;
+  h1: string;
+  h4: string;
   calendarDataUrl?: string | null;
   headlinesText?: string | null;
   sentimentText?: string | null;
@@ -675,8 +749,11 @@ function buildUserPartsBase(args: {
 
 // FULL card (legacy)
 function messagesFull(args: {
-  instrument: string; dateStr: string;
-  m15: string; h1: string; h4: string;
+  instrument: string;
+  dateStr: string;
+  m15: string;
+  h1: string;
+  h4: string;
   calendarDataUrl?: string | null;
   headlinesText?: string | null;
   sentimentText?: string | null;
@@ -742,12 +819,23 @@ function messagesFull(args: {
 
 // FAST Stage-1: Quick Plan (+Option 2) + Management + ai_meta (headlines/calendar/sentiment USED)
 function messagesFastStage1(args: {
-  instrument: string; dateStr: string;
-  m15: string; h1: string; h4: string;
+  instrument: string;
+  dateStr: string;
+  m15: string;
+  h1: string;
+  h4: string;
   calendarDataUrl?: string | null;
   headlinesText?: string | null;
   sentimentText?: string | null;
-  provenance?: { headlines_used: number; headlines_instrument: string; calendar_used: boolean; csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string };
+  provenance?: {
+    headlines_used: number;
+    headlines_instrument: string;
+    calendar_used: boolean;
+    csm_used: boolean;
+    csm_time: string;
+    cot_used: boolean;
+    cot_report_date: string;
+  };
 }) {
   const system = [
     systemCore(args.instrument),
@@ -786,7 +874,10 @@ function messagesFastStage1(args: {
 
   const parts = buildUserPartsBase(args);
   if (args.provenance) {
-    parts.push({ type: "text", text: `provenance:\n${JSON.stringify(args.provenance)}` });
+    parts.push({
+      type: "text",
+      text: `provenance:\n${JSON.stringify(args.provenance)}`,
+    });
   }
   return [
     { role: "system", content: system },
@@ -796,8 +887,11 @@ function messagesFastStage1(args: {
 
 // Stage-2 Expand: ONLY the remaining sections (no Quick Plan), keep levels consistent
 function messagesExpandStage2(args: {
-  instrument: string; dateStr: string;
-  m15: string; h1: string; h4: string;
+  instrument: string;
+  dateStr: string;
+  m15: string;
+  h1: string;
+  h4: string;
   calendarDataUrl?: string | null;
   headlinesText?: string | null;
   sentimentText?: string | null;
@@ -865,7 +959,9 @@ async function callOpenAI(messages: any[]) {
   const out =
     json?.choices?.[0]?.message?.content ??
     (Array.isArray(json?.choices?.[0]?.message?.content)
-      ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
+      ? json.choices[0].message.content
+          .map((c: any) => c?.text || "")
+          .join("\n")
       : "");
   return String(out || "");
 }
@@ -936,9 +1032,10 @@ export default async function handler(
       const cacheKey = String(req.query.cache || "").trim();
       const c = getCache(cacheKey);
       if (!c) {
-        return res
-          .status(400)
-          .json({ ok: false, reason: "Expand failed: cache expired or not found." });
+        return res.status(400).json({
+          ok: false,
+          reason: "Expand failed: cache expired or not found.",
+        });
       }
       // Mandatory: ensure sentiment blocks exist in cache (CSM+COT were required in Stage-1)
       if (!c.sentimentText) {
@@ -1053,8 +1150,7 @@ export default async function handler(
     } catch (e: any) {
       return res.status(503).json({
         ok: false,
-        reason:
-          `Sentiment required: ${e?.message || "CSM/COT unavailable"}. Check API keys/quotas.`,
+        reason: `Sentiment required: ${e?.message || "CSM/COT unavailable"}. Check API keys/quotas.`,
       });
     }
     const { text: sentimentText, provenance } = sentimentSummary(csm!, cot!);
@@ -1221,7 +1317,15 @@ export default async function handler(
           headlinesCount: headlineItems.length,
           fallbackUsed: true,
           aiMeta: extractAiMeta(fb),
-          sources: provForModel,
+          sources: {
+            headlines_used: Math.min(6, headlineItems.length),
+            headlines_instrument: instrument,
+            calendar_used: !!calUrl,
+            csm_used: true,
+            csm_time: csm!.tsISO,
+            cot_used: true,
+            cot_report_date: cot!.reportDate,
+          },
         },
       });
     }
