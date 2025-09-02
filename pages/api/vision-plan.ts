@@ -1,14 +1,13 @@
 // /pages/api/vision-plan.ts
-// Images-only planner with robust, FAST chart handling.
-// You can upload a calendar image and/or pass TradingView/Gyazo chart links for m15/h1/h4.
-// This version ALWAYS sends **downscaled JPEGs** to the model for ALL charts (files or links).
-// - Direct image links (.png/.jpg/.webp/.gif): we fetch (3s cap), downscale to ≤1280px, JPEG ~70%, strip EXIF, aim ≤600KB.
-// - TradingView page links (/x/…/): we resolve og:image (3s), fetch the image (3s), then downscale as above.
-// - 2-minute in-memory cache for processed chart URLs to avoid reprocessing when you retry.
-// Calendar uploads are downscaled the same way.
+// Images-only planner with robust, FAST chart handling + single-pass enforcement.
+// Always sends downscaled JPEGs for ALL charts (files or links).
+// - Direct image links (.png/.jpg/.webp/.gif): fetch (3s cap), downscale ≤1280px, JPEG ~70%, strip EXIF, aim ≤600KB.
+// - TradingView page links (/x/…/): resolve og:image (3s), fetch (3s), then downscale.
+// - 2-minute in-memory cache for processed chart URLs.
 // Headlines: fetch 12, embed only 6 into the model prompt.
 // Sentiment (CSM/COT): included with a ~600ms total budget (skipped if slow).
-// Output sections & logic remain EXACTLY the same (Quick Plan, Full Breakdown, X-ray, Candidate Scores, Final Table, trailing ai_meta).
+// Output sections & logic remain EXACTLY the same (Quick Plan, Full Breakdown, X-ray, Candidate Scores, Final Table, ai_meta).
+// NEW: Single-pass enforcement replaces up to 3 sequential post-fixes to reduce total latency.
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -408,6 +407,31 @@ async function askTournament(args: {
   return { text, aiMeta };
 }
 
+// ---------- SINGLE-PASS ENFORCEMENT (new) ----------
+async function enforceCardConstraints(instrument: string, text: string, aiMeta: any) {
+  const system =
+    "Enforce the following constraints on the provided trade card while preserving format and ALL sections (Quick Plan, Full Breakdown, X-ray, Candidate Scores, Final Table). " +
+    "Only adjust what the rules require; keep bullets, tables, and wording otherwise stable. Update the trailing ai_meta to match any changes.\n\n" +
+    "Constraints:\n" +
+    "1) Market entry allowed ONLY when breakoutProof.bodyCloseBeyond=true AND (retestHolds=true OR sfpReclaim=true). If missing, rewrite to Pending with a Buy/Sell Limit zone at OB/FVG/SR confluence.\n" +
+    "2) If the setup claims 'Breakout + Retest' but the above proof is missing, rename the setup to 'Pullback (OB/FVG/SR)'.\n" +
+    "3) Order sanity: Sell Limit must be ABOVE current price (pullback into supply). Buy Limit must be BELOW current price (pullback into demand). If violated, adjust only the LIMIT zone and entry (do not change the whole thesis).\n" +
+    "Do NOT remove sections. Do NOT change the instrument. Keep Option 2 (Market) visibility rule. Preserve numbers unless a change is required by these constraints.";
+
+  const user =
+    `Instrument: ${instrument}\n` +
+    `ai_meta (as parsed):\n${JSON.stringify(aiMeta || {}, null, 2)}\n\n` +
+    `Card:\n${text}\n\n` +
+    `Apply the constraints above and return the FULL corrected card with the same section headers and a final \`\`\`ai_meta\`\`\` block.`;
+
+  const messages = [
+    { role: "system", content: system },
+    { role: "user", content: user },
+  ];
+  return callOpenAI(messages);
+}
+
+// --- (kept but unused now) Legacy fix helpers (not called anymore) ---
 // rewrite card -> Pending limit (no Market) when proof missing
 async function rewriteAsPending(instrument: string, text: string) {
   const messages = [
@@ -423,7 +447,6 @@ async function rewriteAsPending(instrument: string, text: string) {
   ];
   return callOpenAI(messages);
 }
-
 // normalize mislabeled Breakout+Retest without proof -> Pullback
 async function normalizeBreakoutLabel(text: string) {
   const messages = [
@@ -436,7 +459,6 @@ async function normalizeBreakoutLabel(text: string) {
   ];
   return callOpenAI(messages);
 }
-
 // fix Buy/Sell Limit level direction vs current price
 async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
   const messages = [
@@ -587,45 +609,26 @@ export default async function handler(
       m15, h1, h4,
     });
     if (process.env.NODE_ENV !== "production") {
-      console.log(`[vision-plan] openai completed in ${dt(tAI)}`);
+      console.log(`[vision-plan] openai main completed in ${dt(tAI)}`);
     }
 
-    // 2) Force Pending if Market without proof
-    if (aiMeta && needsPendingLimit(aiMeta)) {
-      const tPend = now();
-      text = await rewriteAsPending(instrument, text);
-      aiMeta = extractAiMeta(text) || aiMeta;
-      if (process.env.NODE_ENV !== "production") {
-        console.log(`[vision-plan] rewrite->Pending in ${dt(tPend)}`);
-      }
-    }
-
-    // 3) Normalize mislabeled Breakout+Retest when no proof
+    // 2) Single-pass enforcement (only if needed)
     const bp = aiMeta?.breakoutProof || {};
     const hasProof = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
-    if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
-      const tNorm = now();
-      text = await normalizeBreakoutLabel(text);
+    const breakoutNamed = String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout");
+    const pendingNeeded = needsPendingLimit(aiMeta);
+    const badOrder = invalidOrderRelativeToPrice(aiMeta);
+
+    if (pendingNeeded || (breakoutNamed && !hasProof) || badOrder) {
+      const tFix = now();
+      text = await enforceCardConstraints(instrument, text, aiMeta);
       aiMeta = extractAiMeta(text) || aiMeta;
       if (process.env.NODE_ENV !== "production") {
-        console.log(`[vision-plan] normalize breakout label in ${dt(tNorm)}`);
+        console.log(`[vision-plan] enforcement pass in ${dt(tFix)} (pendingNeeded=${pendingNeeded}, breakoutNoProof=${breakoutNamed && !hasProof}, badOrder=${!!badOrder})`);
       }
     }
 
-    // 4) Enforce order sanity (Sell Limit above / Buy Limit below current price)
-    if (aiMeta) {
-      const bad = invalidOrderRelativeToPrice(aiMeta);
-      if (bad) {
-        const tFix = now();
-        text = await fixOrderVsPrice(instrument, text, aiMeta);
-        aiMeta = extractAiMeta(text) || aiMeta;
-        if (process.env.NODE_ENV !== "production") {
-          console.log(`[vision-plan] fix order vs price in ${dt(tFix)}`);
-        }
-      }
-    }
-
-    // 5) Fallback if refusal/empty
+    // 3) Fallback if refusal/empty
     if (!text || refusalLike(text)) {
       const fallback =
         [
