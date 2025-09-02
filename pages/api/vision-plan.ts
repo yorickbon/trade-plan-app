@@ -5,18 +5,17 @@
 // -----------------------------------------------------------------------------
 // Two-stage support (non-breaking):
 //   • mode=full (default): full card (legacy).
-//   • mode=fast: full analysis (images + calendar + headlines + **mandatory CSM + mandatory COT**),
+//   • mode=fast: full analysis (images + calendar + headlines + **CSM mandatory + COT soft-required**),
 //                OUTPUT ONLY: Quick Plan (+Option 2) + Management + trailing ai_meta.
 //   • mode=expand&cache=<id>: reuse processed images/headlines/sentiment from Stage-1 and return
 //                ONLY the remaining sections (Full Breakdown, X-ray, Candidate Scores, Final Table).
 //
-// Headlines: fetch 12; embed 6 into model prompt (fetch behavior unchanged).
-// Image downscale: sharp @ max 1280px, JPEG ~70%, strip EXIF, ≤ ~600 KB best-effort.
+// Headlines: fetch 12; embed **6** into model prompt (fetch behavior unchanged).
+// Image downscale: sharp @ max 1280px, JPEG ~70%, strip EXIF, ≤ ~600 KB (best-effort).
 // Strategy playbook: expanded (no “default”) incl. **Fibonacci retracement confluence (38.2–61.8%)**.
-// Enforcement: same three micro-passes (Pending proof, Breakout rename, Limit sanity).
-// CSM (intraday) and COT (weekly) are **MANDATORY** for Stage-1 and Full. Fresh-or-cache logic:
-//    - CSM cache TTL: 15 minutes (global); COT cache TTL: 7 days. If no fresh and no cache → 503.
-// Provenance: model asked to include a `sources` field inside ai_meta; API also returns meta.sources.
+// Enforcement: same micro-passes (Pending proof, Breakout rename, Limit sanity).
+// CSM (intraday) is **mandatory**. COT is **soft-required** (use if available; otherwise proceed and mark unavailable).
+// Provenance: model is asked to include a `sources` field inside ai_meta; API always returns meta.sources.
 // -----------------------------------------------------------------------------
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -39,13 +38,11 @@ const OPENAI_API_BASE =
 
 // Market data keys (free tiers ok)
 const TD_KEY = process.env.TWELVEDATA_API_KEY || "";
-const FH_KEY =
-  process.env.FINNHUB_API_KEY || process.env.FINNHUB_APT_KEY || "";
+const FH_KEY = process.env.FINNHUB_API_KEY || process.env.FINNHUB_APT_KEY || "";
 const POLY_KEY = process.env.POLYGON_API_KEY || "";
 
 // ---------- small utils ----------
 const IMG_MAX_BYTES = 12 * 1024 * 1024; // safety cap
-
 const MAX_W = 1280; // downscale target
 const JPEG_Q = 70; // ~70%
 const TARGET_MAX = 600 * 1024; // best-effort clamp
@@ -98,17 +95,17 @@ function getCache(key: string | undefined | null): CacheEntry | null {
 // ---------- CSM cache (15 min) ----------
 type CsmSnapshot = {
   tsISO: string;
-  ranks: string[]; // e.g. ["USD","JPY","CHF",...]
-  scores: Record<string, number>; // z-scored strength per currency
-  ttl: number; // expiry epoch ms
+  ranks: string[];
+  scores: Record<string, number>;
+  ttl: number;
 };
 let CSM_CACHE: CsmSnapshot | null = null;
 
 // ---------- COT cache (7 days) ----------
 type CotSnapshot = {
-  reportDate: string; // ISO date of report
-  net: Record<string, number>; // currency -> net (non-commercial long - short)
-  ttl: number; // expiry epoch ms
+  reportDate: string; // ISO date
+  net: Record<string, number>;
+  ttl: number;
 };
 let COT_CACHE: CotSnapshot | null = null;
 
@@ -143,40 +140,19 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null {
 }
 
 // ---------- image processing ----------
-async function toJpeg(
-  buf: Buffer,
-  width = MAX_W,
-  quality = JPEG_Q
-): Promise<Buffer> {
-  return sharp(buf)
-    .rotate()
-    .resize({ width, withoutEnlargement: true })
-    .jpeg({ quality, progressive: true, mozjpeg: true })
-    .toBuffer();
+async function toJpeg(buf: Buffer, width = MAX_W, quality = JPEG_Q): Promise<Buffer> {
+  return sharp(buf).rotate().resize({ width, withoutEnlargement: true }).jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
 }
-
 async function processToDataUrl(buf: Buffer): Promise<string> {
   let q = JPEG_Q;
-  let out = await sharp(buf)
-    .rotate()
-    .resize({ width: MAX_W, withoutEnlargement: true })
-    .jpeg({ quality: q, progressive: true, mozjpeg: true })
-    .toBuffer();
-  if (out.byteLength > TARGET_MAX) {
-    q = 64;
-    out = await toJpeg(buf, MAX_W, q);
-  }
-  if (out.byteLength > TARGET_MAX) {
-    q = 58;
-    out = await toJpeg(buf, MAX_W, q);
-  }
+  let out = await sharp(buf).rotate().resize({ width: MAX_W, withoutEnlargement: true }).jpeg({ quality: q, progressive: true, mozjpeg: true }).toBuffer();
+  if (out.byteLength > TARGET_MAX) { q = 64; out = await toJpeg(buf, MAX_W, q); }
+  if (out.byteLength > TARGET_MAX) { q = 58; out = await toJpeg(buf, MAX_W, q); }
   return `data:image/jpeg;base64,${out.toString("base64")}`;
 }
-
 async function fileToDataUrl(file: any): Promise<string | null> {
   if (!file) return null;
-  const p =
-    file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
+  const p = file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
   const raw = await fs.readFile(p);
   const out = await processToDataUrl(raw);
@@ -189,26 +165,17 @@ async function fileToDataUrl(file: any): Promise<string | null> {
 // ---------- tradingview/gyazo link → dataURL ----------
 function originFromReq(req: NextApiRequest) {
   const proto = (req.headers["x-forwarded-proto"] as string) || "https";
-  const host =
-    (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
+  const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
   return host.startsWith("http") ? host : `${proto}://${host}`;
 }
 function absoluteUrl(base: string, maybe: string) {
-  try {
-    return new URL(maybe, base).toString();
-  } catch {
-    return maybe;
-  }
+  try { return new URL(maybe, base).toString(); } catch { return maybe; }
 }
 function htmlFindOgImage(html: string): string | null {
-  const re1 =
-    /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i;
-  const m1 = html.match(re1);
-  if (m1?.[1]) return m1[1];
-  const re2 =
-    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i;
-  const m2 = html.match(re2);
-  if (m2?.[1]) return m2[1];
+  const re1 = /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i;
+  const m1 = html.match(re1); if (m1?.[1]) return m1[1];
+  const re2 = /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i;
+  const m2 = html.match(re2); if (m2?.[1]) return m2[1];
   return null;
 }
 function looksLikeImageUrl(u: string) {
@@ -220,18 +187,11 @@ async function fetchWithTimeout(url: string, ms: number) {
   const id = setTimeout(() => ac.abort(), ms);
   try {
     const r = await fetch(url, {
-      signal: ac.signal,
-      redirect: "follow",
-      headers: {
-        "user-agent": "TradePlanApp/1.0",
-        accept:
-          "text/html,application/xhtml+xml,application/xml,image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-      },
+      signal: ac.signal, redirect: "follow",
+      headers: { "user-agent": "TradePlanApp/1.0", accept: "text/html,application/xhtml+xml,application/xml,image/avif,image/webp,image/apng,image/*,*/*;q=0.8" },
     });
     return r;
-  } finally {
-    clearTimeout(id);
-  }
+  } finally { clearTimeout(id); }
 }
 async function downloadAndProcess(url: string): Promise<string | null> {
   const r = await fetchWithTimeout(url, 8000);
@@ -245,9 +205,7 @@ async function downloadAndProcess(url: string): Promise<string | null> {
   if (mime.startsWith("image/")) {
     const out = await processToDataUrl(raw);
     if (process.env.NODE_ENV !== "production") {
-      console.log(
-        `[vision-plan] link processed size=${dataUrlSizeBytes(out)}B from ${url}`
-      );
+      console.log(`[vision-plan] link processed size=${dataUrlSizeBytes(out)}B from ${url}`);
     }
     return out;
   }
@@ -264,41 +222,30 @@ async function downloadAndProcess(url: string): Promise<string | null> {
   if (raw2.byteLength > IMG_MAX_BYTES) return null;
   const out2 = await processToDataUrl(raw2);
   if (process.env.NODE_ENV !== "production") {
-    console.log(
-      `[vision-plan] og:image processed size=${dataUrlSizeBytes(out2)}B from ${resolved}`
-    );
+    console.log(`[vision-plan] og:image processed size=${dataUrlSizeBytes(out2)}B from ${resolved}`);
   }
   return out2;
 }
-
 async function linkToDataUrl(link: string): Promise<string | null> {
   if (!link) return null;
   try {
     if (looksLikeImageUrl(link)) return await downloadAndProcess(link);
     return await downloadAndProcess(link); // page → og:image
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-// ---------- headlines: fetch 12; embed 6 ----------
-async function fetchedHeadlines(
-  req: NextApiRequest,
-  instrument: string
-): Promise<{ items: any[]; promptText: string | null }> {
+// ---------- headlines: fetch 12; embed **6** ----------
+async function fetchedHeadlines(req: NextApiRequest, instrument: string): Promise<{ items: any[]; promptText: string | null }> {
   try {
     const base = originFromReq(req);
-    const url = `${base}/api/news?instrument=${encodeURIComponent(
-      instrument
-    )}&hours=48&max=12&_t=${Date.now()}`;
+    const url = `${base}/api/news?instrument=${encodeURIComponent(instrument)}&hours=48&max=12&_t=${Date.now()}`;
     const r = await fetch(url, { cache: "no-store" });
     const j = await r.json().catch(() => ({}));
     const items: any[] = Array.isArray(j?.items) ? j.items : [];
     const lines = items
       .slice(0, 6)
       .map((it: any) => {
-        const s =
-          typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
+        const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
         const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
         const t = String(it?.title || "").slice(0, 200);
         const src = it?.source || "";
@@ -324,9 +271,7 @@ function extractAiMeta(text: string) {
   for (const re of fences) {
     const m = text.match(re);
     if (m && m[1]) {
-      try {
-        return JSON.parse(m[1]);
-      } catch {}
+      try { return JSON.parse(m[1]); } catch {}
     }
   }
   return null;
@@ -335,10 +280,7 @@ function needsPendingLimit(aiMeta: any): boolean {
   const et = String(aiMeta?.entryType || "").toLowerCase();
   if (et !== "market") return false;
   const bp = aiMeta?.breakoutProof || {};
-  const ok = !!(
-    bp?.bodyCloseBeyond === true &&
-    (bp?.retestHolds === true || bp?.sfpReclaim === true)
-  );
+  const ok = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
   return !ok;
 }
 function invalidOrderRelativeToPrice(aiMeta: any): string | null {
@@ -349,30 +291,16 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   const zmin = Number(z?.min);
   const zmax = Number(z?.max);
   if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return null;
-  if (o === "sell limit" && dir === "short") {
-    if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price";
-  }
-  if (o === "buy limit" && dir === "long") {
-    if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price";
-  }
+  if (o === "sell limit" && dir === "short") { if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price"; }
+  if (o === "buy limit" && dir === "long") { if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price"; }
   return null;
 }
 
 // ---------- CSM (intraday) mandatory ----------
 const G8 = ["USD", "EUR", "JPY", "GBP", "CHF", "CAD", "AUD", "NZD"];
-const USD_PAIRS = [
-  "EURUSD",
-  "GBPUSD",
-  "AUDUSD",
-  "NZDUSD",
-  "USDJPY",
-  "USDCHF",
-  "USDCAD",
-];
+const USD_PAIRS = ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDJPY", "USDCHF", "USDCAD"];
 
-type Series = { t: number[]; c: number[] }; // ascending
-
-// helper: compute log return over k bars (series ascending by time)
+type Series = { t: number[]; c: number[] }; // ascending by time
 function kbarReturn(closes: number[], k: number): number | null {
   if (!closes || closes.length <= k) return null;
   const a = closes[closes.length - 1];
@@ -384,15 +312,10 @@ function kbarReturn(closes: number[], k: number): number | null {
 async function tdSeries15(pair: string): Promise<Series | null> {
   if (!TD_KEY) return null;
   try {
-    // Twelve Data uses "EUR/USD" etc; newest first
     const sym = `${pair.slice(0, 3)}/${pair.slice(3)}`;
-    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(
-      sym
-    )}&interval=15min&outputsize=30&apikey=${TD_KEY}&dp=6`;
-    const r = await fetch(url, {
-      cache: "no-store",
-      signal: AbortSignal.timeout(1800),
-    });
+    const url =
+      `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=15min&outputsize=30&apikey=${TD_KEY}&dp=6`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(1800) });
     if (!r.ok) return null;
     const j: any = await r.json();
     if (!Array.isArray(j?.values)) return null;
@@ -401,25 +324,17 @@ async function tdSeries15(pair: string): Promise<Series | null> {
     const c = vals.map((v: any) => Number(v.close));
     if (!c.every((x: number) => isFinite(x))) return null;
     return { t, c };
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
-
 async function fhSeries15(pair: string): Promise<Series | null> {
   if (!FH_KEY) return null;
   try {
-    // Finnhub uses OANDA:EUR_USD; resolution 15; unix seconds
     const sym = `OANDA:${pair.slice(0, 3)}_${pair.slice(3)}`;
     const to = Math.floor(Date.now() / 1000);
     const from = to - 60 * 60 * 6; // 6h
-    const url = `https://finnhub.io/api/v1/forex/candle?symbol=${encodeURIComponent(
-      sym
-    )}&resolution=15&from=${from}&to=${to}&token=${FH_KEY}`;
-    const r = await fetch(url, {
-      cache: "no-store",
-      signal: AbortSignal.timeout(1800),
-    });
+    const url =
+      `https://finnhub.io/api/v1/forex/candle?symbol=${encodeURIComponent(sym)}&resolution=15&from=${from}&to=${to}&token=${FH_KEY}`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(1800) });
     if (!r.ok) return null;
     const j: any = await r.json();
     if (j?.s !== "ok" || !Array.isArray(j?.c)) return null;
@@ -427,29 +342,19 @@ async function fhSeries15(pair: string): Promise<Series | null> {
     const c: number[] = (j.c as number[]).map((x: number) => Number(x));
     if (!c.every((x: number) => isFinite(x))) return null;
     return { t, c };
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
-
 async function polySeries15(pair: string): Promise<Series | null> {
   if (!POLY_KEY) return null;
   try {
-    // Polygon aggregates: C:EURUSD; 15/minute range for last ~6h
     const ticker = `C:${pair}`;
     const to = new Date();
     const from = new Date(to.getTime() - 6 * 60 * 60 * 1000);
     const fmt = (d: Date) =>
-      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
-        d.getDate()
-      ).padStart(2, "0")}`;
-    const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(
-      ticker
-    )}/range/15/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=asc&apiKey=${POLY_KEY}`;
-    const r = await fetch(url, {
-      cache: "no-store",
-      signal: AbortSignal.timeout(2000),
-    });
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    const url =
+      `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}/range/15/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=asc&apiKey=${POLY_KEY}`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(2000) });
     if (!r.ok) return null;
     const j: any = await r.json();
     if (!Array.isArray(j?.results)) return null;
@@ -457,86 +362,51 @@ async function polySeries15(pair: string): Promise<Series | null> {
     const c: number[] = j.results.map((x: any) => Number(x.c));
     if (!c.every((x: number) => isFinite(x))) return null;
     return { t, c };
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
-
 async function fetchSeries15(pair: string): Promise<Series | null> {
-  // Try TwelveData → Finnhub → Polygon
-  const td = await tdSeries15(pair);
-  if (td) return td;
-  const fh = await fhSeries15(pair);
-  if (fh) return fh;
-  const pg = await polySeries15(pair);
-  if (pg) return pg;
+  const td = await tdSeries15(pair); if (td) return td;
+  const fh = await fhSeries15(pair); if (fh) return fh;
+  const pg = await polySeries15(pair); if (pg) return pg;
   return null;
 }
-
-function computeCSMFromPairs(
-  seriesMap: Record<string, Series | null>
-): CsmSnapshot | null {
-  // For each pair, compute 60m (4 bars) & 240m (16 bars) log returns on 15m bars
+function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnapshot | null {
   const weights = { r60: 0.6, r240: 0.4 };
-  const curScore: Record<string, number> = Object.fromEntries(
-    G8.map((c) => [c, 0])
-  );
-
+  const curScore: Record<string, number> = Object.fromEntries(G8.map((c) => [c, 0]));
   for (const pair of USD_PAIRS) {
     const S = seriesMap[pair];
     if (!S || !Array.isArray(S.c) || S.c.length < 17) continue;
     const r60 = kbarReturn(S.c, 4) ?? 0;
     const r240 = kbarReturn(S.c, 16) ?? 0;
     const r = r60 * weights.r60 + r240 * weights.r240;
-
     const base = pair.slice(0, 3);
     const quote = pair.slice(3);
-    // pair is BASE/QUOTE; +r => BASE strengthens, QUOTE weakens
-    curScore[base] += r;
-    curScore[quote] -= r;
+    curScore[base] += r; // BASE strengthens
+    curScore[quote] -= r; // QUOTE weakens
   }
-
-  // z-score normalize
   const vals = G8.map((c) => curScore[c]);
   const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-  const sd =
-    Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length) || 1;
+  const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length) || 1;
   const z: Record<string, number> = {};
   for (const c of G8) z[c] = (curScore[c] - mean) / sd;
-
   const ranks = [...G8].sort((a, b) => z[b] - z[a]);
-
-  return {
-    tsISO: new Date().toISOString(),
-    ranks,
-    scores: z,
-    ttl: Date.now() + 15 * 60 * 1000,
-  };
+  return { tsISO: new Date().toISOString(), ranks, scores: z, ttl: Date.now() + 15 * 60 * 1000 };
 }
-
 async function getCSM(): Promise<CsmSnapshot> {
   if (CSM_CACHE && Date.now() < CSM_CACHE.ttl) return CSM_CACHE;
-
   const seriesMap: Record<string, Series | null> = {};
-  // 7 requests max (free-tier friendly)
-  await Promise.all(
-    USD_PAIRS.map(async (p) => {
-      seriesMap[p] = await fetchSeries15(p);
-    })
-  );
-
+  await Promise.all(USD_PAIRS.map(async (p) => { seriesMap[p] = await fetchSeries15(p); }));
   const snap = computeCSMFromPairs(seriesMap);
   if (!snap) {
-    if (CSM_CACHE) return CSM_CACHE; // stale but available (never fabricate)
+    if (CSM_CACHE) return CSM_CACHE; // stale ok
     throw new Error("CSM unavailable (fetch failed and no cache).");
   }
   CSM_CACHE = snap;
   return snap;
 }
 
-// ---------- COT (weekly) mandatory ----------
+// ---------- COT (weekly) SOFT-REQUIRED ----------
 const CFTC_URL = "https://www.cftc.gov/dea/newcot/f_disagg.txt";
-
 const CFTC_MAP: Record<string, { name: string }> = {
   EUR: { name: "EURO FX - CHICAGO MERCANTILE EXCHANGE" },
   JPY: { name: "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE" },
@@ -547,47 +417,22 @@ const CFTC_MAP: Record<string, { name: string }> = {
   NZD: { name: "NEW ZEALAND DOLLAR - CHICAGO MERCANTILE EXCHANGE" },
   USD: { name: "U.S. DOLLAR INDEX - ICE FUTURES U.S." },
 };
-
 function csvSplit(line: string): string[] {
-  // minimal CSV splitter with quotes
-  const out: string[] = [];
-  let buf = "";
-  let q = false;
+  const out: string[] = []; let buf = ""; let q = false;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
-    if (ch === '"') {
-      q = !q;
-      continue;
-    }
-    if (ch === "," && !q) {
-      out.push(buf);
-      buf = "";
-    } else {
-      buf += ch;
-    }
+    if (ch === '"') { q = !q; continue; }
+    if (ch === "," && !q) { out.push(buf); buf = ""; } else { buf += ch; }
   }
-  out.push(buf);
-  return out;
+  out.push(buf); return out;
 }
-
-type CotParsed = {
-  reportDate: string;
-  net: Record<string, number>;
-};
-
 function parseCFTC(text: string): CotSnapshot | null {
   const lines = text.trim().split(/\r?\n/);
   if (lines.length < 5) return null;
   const header = csvSplit(lines[0]).map((s) => s.trim());
-  const idxLong = header.findIndex(
-    (h) => /noncommercial/i.test(h) && /long/i.test(h)
-  );
-  const idxShort = header.findIndex(
-    (h) => /noncommercial/i.test(h) && /short/i.test(h)
-  );
-  const idxMarket = header.findIndex(
-    (h) => /market\s+and\s+exchange\s+names?/i.test(h)
-  );
+  const idxLong = header.findIndex((h) => /noncommercial/i.test(h) && /long/i.test(h));
+  const idxShort = header.findIndex((h) => /noncommercial/i.test(h) && /short/i.test(h));
+  const idxMarket = header.findIndex((h) => /market\s+and\s+exchange\s+names?/i.test(h));
   const idxDate = header.findIndex((h) => /report\s+date/i.test(h));
   if (idxLong < 0 || idxShort < 0 || idxMarket < 0 || idxDate < 0) return null;
 
@@ -598,9 +443,7 @@ function parseCFTC(text: string): CotSnapshot | null {
     const cols = csvSplit(lines[i]);
     const name = (cols[idxMarket] || "").toUpperCase().trim();
     const longV = Number(String(cols[idxLong] || "").replace(/[^0-9.-]/g, ""));
-    const shortV = Number(
-      String(cols[idxShort] || "").replace(/[^0-9.-]/g, "")
-    );
+    const shortV = Number(String(cols[idxShort] || "").replace(/[^0-9.-]/g, ""));
     const d = (cols[idxDate] || "").trim();
     if (d) latestDate = latestDate || d;
 
@@ -612,70 +455,58 @@ function parseCFTC(text: string): CotSnapshot | null {
   }
   if (!latestDate || Object.keys(net).length < 3) return null;
   const reportDateISO = new Date(latestDate).toISOString().slice(0, 10);
-  return {
-    reportDate: reportDateISO,
-    net,
-    ttl: Date.now() + 7 * 24 * 60 * 60 * 1000,
-  };
+  return { reportDate: reportDateISO, net, ttl: Date.now() + 7 * 24 * 60 * 60 * 1000 };
 }
-
+async function fetchCFTCOnce(timeoutMs: number): Promise<string> {
+  const r = await fetch(CFTC_URL, { cache: "no-store", signal: AbortSignal.timeout(timeoutMs) });
+  if (!r.ok) throw new Error(`CFTC ${r.status}`);
+  return r.text();
+}
 async function getCOT(): Promise<CotSnapshot> {
   if (COT_CACHE && Date.now() < COT_CACHE.ttl) return COT_CACHE;
-  try {
-    const r = await fetch(CFTC_URL, {
-      cache: "no-store",
-      signal: AbortSignal.timeout(2500),
-    });
-    if (!r.ok) throw new Error(`CFTC ${r.status}`);
-    const txt = await r.text();
-    const snap = parseCFTC(txt);
-    if (!snap) throw new Error("CFTC parse failed");
-    COT_CACHE = snap;
-    return snap;
-  } catch (e) {
-    if (COT_CACHE) return COT_CACHE; // stale but available (never fabricate)
-    throw new Error("COT unavailable (fetch failed and no cache).");
+
+  let txt: string | null = null;
+  try { txt = await fetchCFTCOnce(10_000); }
+  catch {
+    await new Promise((r) => setTimeout(r, 600)); // small backoff
+    txt = await fetchCFTCOnce(10_000);
   }
+  const snap = parseCFTC(txt);
+  if (!snap) throw new Error("CFTC parse failed");
+  COT_CACHE = snap;
+  return snap;
 }
 
-// ---------- sentiment text from CSM + COT ----------
+// ---------- sentiment text from CSM + (optional) COT ----------
 function sentimentSummary(
   csm: CsmSnapshot,
-  cot: CotSnapshot
+  cot: CotSnapshot | null,
+  cotError: string | null
 ): {
   text: string;
   provenance: {
     csm_used: boolean;
     csm_time: string;
     cot_used: boolean;
-    cot_report_date: string;
+    cot_report_date: string | null;
+    cot_error?: string | null;
   };
 } {
-  const ranksLine = `CSM (60–240m): ${csm.ranks
-    .slice(0, 4)
-    .join(" > ")} ... ${csm.ranks.slice(-3).join(" < ")}`;
-  // condense COT: list top 3 net long, 2 net short
-  const entries = Object.entries(cot.net);
-  const longers = entries
-    .filter(([, v]) => (v as number) > 0)
-    .sort((a, b) => (b[1] as number) - (a[1] as number))
-    .map(([k]) => k);
-  const shorters = entries
-    .filter(([, v]) => (v as number) < 0)
-    .sort((a, b) => (a[1] as number) - (b[1] as number))
-    .map(([k]) => k);
-  const cotLine = `COT: Long ${longers.slice(0, 3).join("/")} | Short ${shorters
-    .slice(0, 2)
-    .join("/")}`;
-  return {
-    text: `${ranksLine}\n${cotLine}`,
-    provenance: {
-      csm_used: true,
-      csm_time: csm.tsISO,
-      cot_used: true,
-      cot_report_date: cot.reportDate,
-    },
-  };
+  const ranksLine = `CSM (60–240m): ${csm.ranks.slice(0, 4).join(" > ")} ... ${csm.ranks.slice(-3).join(" < ")}`;
+  const prov: {
+    csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string | null; cot_error?: string | null;
+  } = { csm_used: true, csm_time: csm.tsISO, cot_used: !!cot, cot_report_date: cot ? cot.reportDate : null };
+  let cotLine = "";
+  if (cot) {
+    const entries = Object.entries(cot.net);
+    const longers = entries.filter(([, v]) => (v as number) > 0).sort((a, b) => (b[1] as number) - (a[1] as number)).map(([k]) => k);
+    const shorters = entries.filter(([, v]) => (v as number) < 0).sort((a, b) => (a[1] as number) - (b[1] as number)).map(([k]) => k);
+    cotLine = `COT ${cot.reportDate}: Long ${longers.slice(0, 3).join("/")} | Short ${shorters.slice(0, 2).join("/")}`;
+  } else {
+    cotLine = `COT: unavailable (${cotError || "service timeout"})`;
+    prov.cot_error = cotError || "unavailable";
+  }
+  return { text: `${ranksLine}\n${cotLine}`, provenance: prov };
 }
 
 // ---------- prompts ----------
@@ -708,55 +539,26 @@ function systemCore(instrument: string) {
     "Keep instrument alignment with " + instrument + ".",
   ].join("\n");
 }
-
 function buildUserPartsBase(args: {
-  instrument: string;
-  dateStr: string;
-  m15: string;
-  h1: string;
-  h4: string;
-  calendarDataUrl?: string | null;
-  headlinesText?: string | null;
-  sentimentText?: string | null;
+  instrument: string; dateStr: string; m15: string; h1: string; h4: string;
+  calendarDataUrl?: string | null; headlinesText?: string | null; sentimentText?: string | null;
 }) {
   const parts: any[] = [
     { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}` },
-    { type: "text", text: "HTF 4H Chart:" },
-    { type: "image_url", image_url: { url: args.h4 } },
-    { type: "text", text: "Context 1H Chart:" },
-    { type: "image_url", image_url: { url: args.h1 } },
-    { type: "text", text: "Execution 15M Chart:" },
-    { type: "image_url", image_url: { url: args.m15 } },
+    { type: "text", text: "HTF 4H Chart:" }, { type: "image_url", image_url: { url: args.h4 } },
+    { type: "text", text: "Context 1H Chart:" }, { type: "image_url", image_url: { url: args.h1 } },
+    { type: "text", text: "Execution 15M Chart:" }, { type: "image_url", image_url: { url: args.m15 } },
   ];
-  if (args.calendarDataUrl) {
-    parts.push({ type: "text", text: "Economic Calendar Image:" });
-    parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } });
-  }
-  if (args.headlinesText) {
-    parts.push({
-      type: "text",
-      text: `Recent headlines snapshot (used for bias; list shown in Stage-2):\n${args.headlinesText}`,
-    });
-  }
-  if (args.sentimentText) {
-    parts.push({
-      type: "text",
-      text: `Sentiment snapshot (CSM + COT; used for bias):\n${args.sentimentText}`,
-    });
-  }
+  if (args.calendarDataUrl) { parts.push({ type: "text", text: "Economic Calendar Image:" }); parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } }); }
+  if (args.headlinesText) { parts.push({ type: "text", text: `Recent headlines snapshot (used for bias; list shown in Stage-2):\n${args.headlinesText}` }); }
+  if (args.sentimentText) { parts.push({ type: "text", text: `Sentiment snapshot (CSM + COT; used for bias):\n${args.sentimentText}` }); }
   return parts;
 }
 
 // FULL card (legacy)
 function messagesFull(args: {
-  instrument: string;
-  dateStr: string;
-  m15: string;
-  h1: string;
-  h4: string;
-  calendarDataUrl?: string | null;
-  headlinesText?: string | null;
-  sentimentText?: string | null;
+  instrument: string; dateStr: string; m15: string; h1: string; h4: string;
+  calendarDataUrl?: string | null; headlinesText?: string | null; sentimentText?: string | null;
 }) {
   const system = [
     systemCore(args.instrument),
@@ -807,7 +609,7 @@ function messagesFull(args: {
     `  "stop": number, "tp1": number, "tp2": number,`,
     `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
     `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
-    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string } }`,
+    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null } }`,
     "```",
   ].join("\n");
 
@@ -817,25 +619,11 @@ function messagesFull(args: {
   ];
 }
 
-// FAST Stage-1: Quick Plan (+Option 2) + Management + ai_meta (headlines/calendar/sentiment USED)
+// FAST Stage-1: Quick Plan + Management + ai_meta
 function messagesFastStage1(args: {
-  instrument: string;
-  dateStr: string;
-  m15: string;
-  h1: string;
-  h4: string;
-  calendarDataUrl?: string | null;
-  headlinesText?: string | null;
-  sentimentText?: string | null;
-  provenance?: {
-    headlines_used: number;
-    headlines_instrument: string;
-    calendar_used: boolean;
-    csm_used: boolean;
-    csm_time: string;
-    cot_used: boolean;
-    cot_report_date: string;
-  };
+  instrument: string; dateStr: string; m15: string; h1: string; h4: string;
+  calendarDataUrl?: string | null; headlinesText?: string | null; sentimentText?: string | null;
+  provenance?: { headlines_used: number; headlines_instrument: string; calendar_used: boolean; csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string | null; cot_error?: string | null; };
 }) {
   const system = [
     systemCore(args.instrument),
@@ -868,34 +656,21 @@ function messagesFastStage1(args: {
     `  "stop": number, "tp1": number, "tp2": number,`,
     `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
     `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
-    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string } }`,
+    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null } }`,
     "```",
   ].join("\n");
 
   const parts = buildUserPartsBase(args);
   if (args.provenance) {
-    parts.push({
-      type: "text",
-      text: `provenance:\n${JSON.stringify(args.provenance)}`,
-    });
+    parts.push({ type: "text", text: `provenance:\n${JSON.stringify(args.provenance)}` });
   }
-  return [
-    { role: "system", content: system },
-    { role: "user", content: parts },
-  ];
+  return [{ role: "system", content: system }, { role: "user", content: parts }];
 }
 
-// Stage-2 Expand: ONLY the remaining sections (no Quick Plan), keep levels consistent
+// Stage-2 Expand: ONLY the remaining sections
 function messagesExpandStage2(args: {
-  instrument: string;
-  dateStr: string;
-  m15: string;
-  h1: string;
-  h4: string;
-  calendarDataUrl?: string | null;
-  headlinesText?: string | null;
-  sentimentText?: string | null;
-  aiMetaHint?: any;
+  instrument: string; dateStr: string; m15: string; h1: string; h4: string;
+  calendarDataUrl?: string | null; headlinesText?: string | null; sentimentText?: string | null; aiMetaHint?: any;
 }) {
   const system = [
     systemCore(args.instrument),
@@ -929,39 +704,23 @@ function messagesExpandStage2(args: {
   ].join("\n");
 
   const userParts = buildUserPartsBase(args);
-  if (args.aiMetaHint) {
-    userParts.push({
-      type: "text",
-      text: `ai_meta_hint:\n${JSON.stringify(args.aiMetaHint, null, 2)}`,
-    });
-  }
-  return [
-    { role: "system", content: system },
-    { role: "user", content: userParts },
-  ];
+  if (args.aiMetaHint) userParts.push({ type: "text", text: `ai_meta_hint:\n${JSON.stringify(args.aiMetaHint, null, 2)}` });
+  return [{ role: "system", content: system }, { role: "user", content: userParts }];
 }
 
 // ---------- OpenAI call ----------
 async function callOpenAI(messages: any[]) {
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
+    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
     body: JSON.stringify({ model: OPENAI_MODEL, messages }),
   });
   const json = await rsp.json().catch(() => ({} as any));
-  if (!rsp.ok)
-    throw new Error(
-      `OpenAI vision request failed: ${rsp.status} ${JSON.stringify(json)}`
-    );
+  if (!rsp.ok) throw new Error(`OpenAI vision request failed: ${rsp.status} ${JSON.stringify(json)}`);
   const out =
     json?.choices?.[0]?.message?.content ??
     (Array.isArray(json?.choices?.[0]?.message?.content)
-      ? json.choices[0].message.content
-          .map((c: any) => c?.text || "")
-          .join("\n")
+      ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
       : "");
   return String(out || "");
 }
@@ -969,99 +728,51 @@ async function callOpenAI(messages: any[]) {
 // ---------- enforcement passes ----------
 async function rewriteAsPending(instrument: string, text: string) {
   const messages = [
-    {
-      role: "system",
-      content:
-        "Rewrite the trade card as PENDING (no Market) into a clean Buy/Sell LIMIT zone at OB/FVG/SR confluence if breakout proof is missing. Keep tournament section and X-ray.",
-    },
-    {
-      role: "user",
-      content: `Instrument: ${instrument}\n\n${text}\n\nRewrite strictly to Pending.`,
-    },
+    { role: "system", content: "Rewrite the trade card as PENDING (no Market) into a clean Buy/Sell LIMIT zone at OB/FVG/SR confluence if breakout proof is missing. Keep tournament section and X-ray." },
+    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nRewrite strictly to Pending.` },
   ];
   return callOpenAI(messages);
 }
 async function normalizeBreakoutLabel(text: string) {
   const messages = [
-    {
-      role: "system",
-      content:
-        "If 'Breakout + Retest' is claimed but proof is not shown (body close + retest hold or SFP reclaim), rename setup to 'Pullback (OB/FVG/SR)' and leave rest unchanged.",
-    },
+    { role: "system", content: "If 'Breakout + Retest' is claimed but proof is not shown (body close + retest hold or SFP reclaim), rename setup to 'Pullback (OB/FVG/SR)' and leave rest unchanged." },
     { role: "user", content: text },
   ];
   return callOpenAI(messages);
 }
 async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
   const messages = [
-    {
-      role: "system",
-      content:
-        "Adjust the LIMIT zone so that: Sell Limit is an ABOVE-price pullback into supply; Buy Limit is a BELOW-price pullback into demand. Keep all other content & sections.",
-    },
-    {
-      role: "user",
-      content: `Instrument: ${instrument}\n\nCurrent Price: ${aiMeta?.currentPrice}\nProvided Zone: ${JSON.stringify(
-        aiMeta?.zone
-      )}\n\nCard:\n${text}\n\nFix only the LIMIT zone side and entry, keep format.`,
-    },
+    { role: "system", content: "Adjust the LIMIT zone so that: Sell Limit is an ABOVE-price pullback into supply; Buy Limit is a BELOW-price pullback into demand. Keep all other content & sections." },
+    { role: "user", content: `Instrument: ${instrument}\n\nCurrent Price: ${aiMeta?.currentPrice}\nProvided Zone: ${JSON.stringify(aiMeta?.zone)}\n\nCard:\n${text}\n\nFix only the LIMIT zone side and entry, keep format.` },
   ];
   return callOpenAI(messages);
 }
 
 // ---------- handler ----------
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse<Ok | Err>
-) {
+export default async function handler(req: NextApiRequest, res: NextApiResponse<Ok | Err>) {
   try {
-    if (req.method !== "POST")
-      return res.status(405).json({ ok: false, reason: "Method not allowed" });
-    if (!OPENAI_API_KEY)
-      return res
-        .status(400)
-        .json({ ok: false, reason: "Missing OPENAI_API_KEY" });
+    if (req.method !== "POST") return res.status(405).json({ ok: false, reason: "Method not allowed" });
+    if (!OPENAI_API_KEY) return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
 
     // mode selection
     const urlMode = String((req.query.mode as string) || "").toLowerCase();
-    let mode: "full" | "fast" | "expand" =
-      urlMode === "fast" ? "fast" : urlMode === "expand" ? "expand" : "full";
+    let mode: "full" | "fast" | "expand" = urlMode === "fast" ? "fast" : urlMode === "expand" ? "expand" : "full";
 
     // expand path: reuse cached images; no need for multipart
     if (mode === "expand") {
       const cacheKey = String(req.query.cache || "").trim();
       const c = getCache(cacheKey);
-      if (!c) {
-        return res.status(400).json({
-          ok: false,
-          reason: "Expand failed: cache expired or not found.",
-        });
-      }
-      // Mandatory: ensure sentiment blocks exist in cache (CSM+COT were required in Stage-1)
-      if (!c.sentimentText) {
-        return res
-          .status(503)
-          .json({ ok: false, reason: "Missing sentiment snapshot for expand." });
-      }
+      if (!c) return res.status(400).json({ ok: false, reason: "Expand failed: cache expired or not found." });
+      if (!c.sentimentText) return res.status(503).json({ ok: false, reason: "Missing sentiment snapshot for expand." });
       const dateStr = new Date().toISOString().slice(0, 10);
       const messages = messagesExpandStage2({
-        instrument: c.instrument,
-        dateStr,
-        m15: c.m15,
-        h1: c.h1,
-        h4: c.h4,
-        calendarDataUrl: c.calendar || undefined,
-        headlinesText: c.headlinesText || undefined,
-        sentimentText: c.sentimentText || undefined,
+        instrument: c.instrument, dateStr, m15: c.m15, h1: c.h1, h4: c.h4,
+        calendarDataUrl: c.calendar || undefined, headlinesText: c.headlinesText || undefined, sentimentText: c.sentimentText || undefined,
         aiMetaHint: null,
       });
       const text = await callOpenAI(messages);
       res.setHeader("Cache-Control", "no-store");
-      return res.status(200).json({
-        ok: true,
-        text,
-        meta: { instrument: c.instrument, cacheKey },
-      });
+      return res.status(200).json({ ok: true, text, meta: { instrument: c.instrument, cacheKey } });
     }
 
     if (!isMultipart(req)) {
@@ -1075,13 +786,9 @@ export default async function handler(
     // parse
     const tParse = now();
     const { fields, files } = await parseMultipart(req);
-    if (process.env.NODE_ENV !== "production") {
-      console.log(`[vision-plan] parsed in ${dt(tParse)}`);
-    }
+    if (process.env.NODE_ENV !== "production") console.log(`[vision-plan] parsed in ${dt(tParse)}`);
 
-    const instrument = String(fields.instrument || fields.code || "EURUSD")
-      .toUpperCase()
-      .replace(/\s+/g, "");
+    const instrument = String(fields.instrument || fields.code || "EURUSD").toUpperCase().replace(/\s+/g, "");
     const requestedMode = String(fields.mode || "").toLowerCase();
     if (requestedMode === "fast") mode = "fast";
 
@@ -1099,10 +806,7 @@ export default async function handler(
     // Build images (prefer file; else fetch link) and process with sharp
     const tImg = now();
     const [m15FromFile, h1FromFile, h4FromFile, calUrl] = await Promise.all([
-      fileToDataUrl(m15f),
-      fileToDataUrl(h1f),
-      fileToDataUrl(h4f),
-      calF ? fileToDataUrl(calF) : Promise.resolve(null),
+      fileToDataUrl(m15f), fileToDataUrl(h1f), fileToDataUrl(h4f), calF ? fileToDataUrl(calF) : Promise.resolve(null),
     ]);
     const [m15FromUrl, h1FromUrl, h4FromUrl] = await Promise.all([
       m15FromFile ? Promise.resolve(null) : linkToDataUrl(m15Url),
@@ -1114,46 +818,34 @@ export default async function handler(
     const h4 = h4FromFile || h4FromUrl;
 
     if (process.env.NODE_ENV !== "production") {
-      console.log(
-        `[vision-plan] images ready ${dt(tImg)} (m15=${dataUrlSizeBytes(
-          m15
-        )}B, h1=${dataUrlSizeBytes(h1)}B, h4=${dataUrlSizeBytes(
-          h4
-        )}B, cal=${dataUrlSizeBytes(calUrl)}B)`
-      );
+      console.log(`[vision-plan] images ready ${dt(tImg)} (m15=${dataUrlSizeBytes(m15)}B, h1=${dataUrlSizeBytes(h1)}B, h4=${dataUrlSizeBytes(h4)}B, cal=${dataUrlSizeBytes(calUrl)}B)`);
     }
 
     if (!m15 || !h1 || !h4) {
       return res.status(400).json({
         ok: false,
-        reason:
-          "Provide all three charts: m15, h1, h4 — either as files or valid TradingView/Gyazo direct image links.",
+        reason: "Provide all three charts: m15, h1, h4 — either as files or valid TradingView/Gyazo direct image links.",
       });
     }
 
-    // Headlines: fetch 12; embed 6 into prompt
+    // Headlines: fetch 12; embed 6 in prompt
     const tNews = now();
-    const { items: headlineItems, promptText: headlinesText } =
-      await fetchedHeadlines(req, instrument);
+    const { items: headlineItems, promptText: headlinesText } = await fetchedHeadlines(req, instrument);
     if (process.env.NODE_ENV !== "production") {
-      console.log(
-        `[vision-plan] news fetched ${dt(tNews)} (items=${headlineItems.length})`
-      );
+      console.log(`[vision-plan] news fetched ${dt(tNews)} (items=${headlineItems.length})`);
     }
 
-    // ----- Mandatory CSM + COT -----
-    let csm: CsmSnapshot | null = null;
-    let cot: CotSnapshot | null = null;
-    try {
-      csm = await getCSM();
-      cot = await getCOT();
-    } catch (e: any) {
-      return res.status(503).json({
-        ok: false,
-        reason: `Sentiment required: ${e?.message || "CSM/COT unavailable"}. Check API keys/quotas.`,
-      });
+    // ----- Sentiment: CSM mandatory; COT soft-required -----
+    let csm: CsmSnapshot;
+    try { csm = await getCSM(); } catch (e: any) {
+      return res.status(503).json({ ok: false, reason: `CSM unavailable: ${e?.message || "fetch failed"}.` });
     }
-    const { text: sentimentText, provenance } = sentimentSummary(csm!, cot!);
+
+    let cot: CotSnapshot | null = null;
+    let cotErr: string | null = null;
+    try { cot = await getCOT(); } catch (e: any) { cot = null; cotErr = e?.message || "unavailable"; }
+
+    const { text: sentimentText, provenance } = sentimentSummary(csm, cot, cotErr);
 
     const dateStr = new Date().toISOString().slice(0, 10);
 
@@ -1161,193 +853,90 @@ export default async function handler(
     let text = "";
     let aiMeta: any = null;
 
-    // provenance for model (so it mirrors inside ai_meta.sources)
     const provForModel = {
       headlines_used: Math.min(6, headlineItems.length),
       headlines_instrument: instrument,
       calendar_used: !!calUrl,
       csm_used: true,
-      csm_time: csm!.tsISO,
-      cot_used: true,
-      cot_report_date: cot!.reportDate,
+      csm_time: csm.tsISO,
+      cot_used: !!cot,
+      cot_report_date: cot ? cot.reportDate : null,
+      cot_error: cot ? null : cotErr || "unavailable",
     };
 
     if (mode === "fast") {
       const messages = messagesFastStage1({
-        instrument,
-        dateStr,
-        m15,
-        h1,
-        h4,
-        calendarDataUrl: calUrl || undefined,
-        headlinesText: headlinesText || undefined,
-        sentimentText,
-        provenance: provForModel,
+        instrument, dateStr, m15, h1, h4, calendarDataUrl: calUrl || undefined,
+        headlinesText: headlinesText || undefined, sentimentText, provenance: provForModel,
       });
       text = await callOpenAI(messages);
       aiMeta = extractAiMeta(text);
 
       // enforcement passes
-      if (aiMeta && needsPendingLimit(aiMeta)) {
-        text = await rewriteAsPending(instrument, text);
-        aiMeta = extractAiMeta(text) || aiMeta;
-      }
+      if (aiMeta && needsPendingLimit(aiMeta)) { text = await rewriteAsPending(instrument, text); aiMeta = extractAiMeta(text) || aiMeta; }
       const bp = aiMeta?.breakoutProof || {};
-      const hasProof = !!(
-        bp?.bodyCloseBeyond === true &&
-        (bp?.retestHolds === true || bp?.sfpReclaim === true)
-      );
-      if (
-        String(aiMeta?.selectedStrategy || "")
-          .toLowerCase()
-          .includes("breakout") &&
-        !hasProof
-      ) {
-        text = await normalizeBreakoutLabel(text);
-        aiMeta = extractAiMeta(text) || aiMeta;
+      const hasProof = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+      if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
+        text = await normalizeBreakoutLabel(text); aiMeta = extractAiMeta(text) || aiMeta;
       }
       if (aiMeta) {
         const bad = invalidOrderRelativeToPrice(aiMeta);
-        if (bad) {
-          text = await fixOrderVsPrice(instrument, text, aiMeta);
-          aiMeta = extractAiMeta(text) || aiMeta;
-        }
+        if (bad) { text = await fixOrderVsPrice(instrument, text, aiMeta); aiMeta = extractAiMeta(text) || aiMeta; }
       }
 
       const cacheKey = setCache({
-        instrument,
-        m15,
-        h1,
-        h4,
-        calendar: calUrl || null,
-        headlinesText: headlinesText || null,
-        sentimentText,
+        instrument, m15, h1, h4, calendar: calUrl || null, headlinesText: headlinesText || null, sentimentText,
       });
 
       if (!text || refusalLike(text)) {
         const fb = fallbackCard(instrument, provForModel);
         return res.status(200).json({
-          ok: true,
-          text: fb,
-          meta: {
-            instrument,
-            mode,
-            cacheKey,
-            headlinesCount: headlineItems.length,
-            fallbackUsed: true,
-            aiMeta: extractAiMeta(fb),
-            sources: provForModel,
-          },
+          ok: true, text: fb,
+          meta: { instrument, mode, cacheKey, headlinesCount: headlineItems.length, fallbackUsed: true, aiMeta: extractAiMeta(fb), sources: provForModel },
         });
       }
 
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
-        ok: true,
-        text,
-        meta: {
-          instrument,
-          mode,
-          cacheKey,
-          headlinesCount: headlineItems.length,
-          fallbackUsed: false,
-          aiMeta,
-          sources: provForModel,
-        },
+        ok: true, text,
+        meta: { instrument, mode, cacheKey, headlinesCount: headlineItems.length, fallbackUsed: false, aiMeta, sources: provForModel },
       });
     }
 
     // FULL (legacy)
     const messages = messagesFull({
-      instrument,
-      dateStr,
-      m15,
-      h1,
-      h4,
-      calendarDataUrl: calUrl || undefined,
-      headlinesText: headlinesText || undefined,
-      sentimentText,
+      instrument, dateStr, m15, h1, h4, calendarDataUrl: calUrl || undefined,
+      headlinesText: headlinesText || undefined, sentimentText,
     });
     text = await callOpenAI(messages);
     aiMeta = extractAiMeta(text);
 
-    // enforcement passes
-    if (aiMeta && needsPendingLimit(aiMeta)) {
-      text = await rewriteAsPending(instrument, text);
-      aiMeta = extractAiMeta(text) || aiMeta;
-    }
+    if (aiMeta && needsPendingLimit(aiMeta)) { text = await rewriteAsPending(instrument, text); aiMeta = extractAiMeta(text) || aiMeta; }
     const bp = aiMeta?.breakoutProof || {};
-    const hasProof = !!(
-      bp?.bodyCloseBeyond === true &&
-      (bp?.retestHolds === true || bp?.sfpReclaim === true)
-    );
-    if (
-      String(aiMeta?.selectedStrategy || "")
-        .toLowerCase()
-        .includes("breakout") &&
-      !hasProof
-    ) {
-      text = await normalizeBreakoutLabel(text);
-      aiMeta = extractAiMeta(text) || aiMeta;
+    const hasProof = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+    if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
+      text = await normalizeBreakoutLabel(text); aiMeta = extractAiMeta(text) || aiMeta;
     }
     if (aiMeta) {
       const bad = invalidOrderRelativeToPrice(aiMeta);
-      if (bad) {
-        text = await fixOrderVsPrice(instrument, text, aiMeta);
-        aiMeta = extractAiMeta(text) || aiMeta;
-      }
+      if (bad) { text = await fixOrderVsPrice(instrument, text, aiMeta); aiMeta = extractAiMeta(text) || aiMeta; }
     }
 
     if (!text || refusalLike(text)) {
-      const fb = fallbackCard(instrument, {
-        headlines_used: Math.min(6, headlineItems.length),
-        headlines_instrument: instrument,
-        calendar_used: !!calUrl,
-        csm_used: true,
-        csm_time: csm!.tsISO,
-        cot_used: true,
-        cot_report_date: cot!.reportDate,
-      });
+      const fb = fallbackCard(instrument, provForModel);
       return res.status(200).json({
-        ok: true,
-        text: fb,
-        meta: {
-          instrument,
-          mode,
-          headlinesCount: headlineItems.length,
-          fallbackUsed: true,
-          aiMeta: extractAiMeta(fb),
-          sources: {
-            headlines_used: Math.min(6, headlineItems.length),
-            headlines_instrument: instrument,
-            calendar_used: !!calUrl,
-            csm_used: true,
-            csm_time: csm!.tsISO,
-            cot_used: true,
-            cot_report_date: cot!.reportDate,
-          },
-        },
+        ok: true, text: fb,
+        meta: { instrument, mode, headlinesCount: headlineItems.length, fallbackUsed: true, aiMeta: extractAiMeta(fb), sources: provForModel },
       });
     }
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
-      ok: true,
-      text,
-      meta: {
-        instrument,
-        mode,
-        headlinesCount: headlineItems.length,
-        fallbackUsed: false,
-        aiMeta,
-        sources: provForModel,
-      },
+      ok: true, text,
+      meta: { instrument, mode, headlinesCount: headlineItems.length, fallbackUsed: false, aiMeta, sources: provForModel },
     });
   } catch (err: any) {
-    return res.status(500).json({
-      ok: false,
-      reason: err?.message || "vision-plan failed",
-    });
+    return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
   }
 }
 
@@ -1361,7 +950,8 @@ function fallbackCard(
     csm_used: boolean;
     csm_time: string;
     cot_used: boolean;
-    cot_report_date: string;
+    cot_report_date: string | null;
+    cot_error?: string | null;
   }
 ) {
   return [
@@ -1410,11 +1000,7 @@ function fallbackCard(
         stop: null,
         tp1: null,
         tp2: null,
-        breakoutProof: {
-          bodyCloseBeyond: false,
-          retestHolds: false,
-          sfpReclaim: false,
-        },
+        breakoutProof: { bodyCloseBeyond: false, retestHolds: false, sfpReclaim: false },
         candidateScores: [],
         sources,
         note: "Fallback used due to refusal/empty output.",
