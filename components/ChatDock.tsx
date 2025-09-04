@@ -6,7 +6,7 @@ import React from "react";
 type ChatDockProps = {
   instrument?: string;
   planText?: string;
-  headlines?: any[]; // initial headlines (optional)
+  headlines?: any[]; // initial headlines at first mount only
   calendar?: any[];
 };
 
@@ -22,7 +22,7 @@ export default function ChatDock({
   const [input, setInput] = React.useState("");
   const [loading, setLoading] = React.useState(false);
 
-  // Headlines state is owned here to avoid stale carryover
+  // Headlines state is *owned here* to avoid stale carryover
   const [localHeadlines, setLocalHeadlines] = React.useState<any[]>(headlines || []);
   const [newsLoading, setNewsLoading] = React.useState(false);
 
@@ -56,7 +56,7 @@ export default function ChatDock({
     setLoading(false);
   }, []);
 
-  // One-time seed from props on mount
+  // One-time seed from props (mount only). After that, headlines are driven here.
   React.useEffect(() => {
     if (!seededPropsHeadlinesRef.current && headlines && headlines.length) {
       setLocalHeadlines(headlines);
@@ -65,7 +65,6 @@ export default function ChatDock({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // === OPTION A: USE symbols= (not instrument= or symbol=) ===
   const reloadHeadlines = React.useCallback(
     async (sym?: string) => {
       const symbol = (sym || instrument || "").trim();
@@ -83,8 +82,8 @@ export default function ChatDock({
       const myReqId = ++newsReqIdRef.current;
 
       try {
-        // Primary GET with cache-bust, using symbols=
-        const url = `/api/news?symbols=${encodeURIComponent(symbol)}&t=${Date.now()}`;
+        // Primary: GET with cache-bust
+        const url = `/api/news?symbol=${encodeURIComponent(symbol)}&t=${Date.now()}`;
         const rsp = await fetch(url, {
           method: "GET",
           headers: {
@@ -99,10 +98,10 @@ export default function ChatDock({
 
         if (rsp.ok) {
           const json = await rsp.json().catch(() => ({} as any));
-          items = Array.isArray(json) ? json : json?.items || json?.headlines || null;
+          items = Array.isArray(json) ? json : json?.headlines || null;
         }
 
-        // POST fallback (also with symbols in body)
+        // Fallback: POST body if GET isn’t wired to symbol
         if (!items) {
           const rsp2 = await fetch(`/api/news`, {
             method: "POST",
@@ -111,22 +110,23 @@ export default function ChatDock({
               accept: "application/json",
               "cache-control": "no-store",
             },
-            body: JSON.stringify({ symbols: [symbol] }),
+            body: JSON.stringify({ symbol }),
             signal: controller.signal,
           });
           if (rsp2.ok) {
             const json2 = await rsp2.json().catch(() => ({} as any));
-            items = Array.isArray(json2) ? json2 : json2?.items || json2?.headlines || [];
+            items = Array.isArray(json2) ? json2 : json2?.headlines || [];
           } else {
             items = [];
           }
         }
 
+        // Only apply if this is the latest request
         if (newsReqIdRef.current === myReqId) {
           setLocalHeadlines(items || []);
         }
       } catch {
-        // keep previous headlines on failure
+        // keep previous headlines if fetch fails
       } finally {
         if (newsReqIdRef.current === myReqId) {
           setNewsLoading(false);
@@ -140,10 +140,10 @@ export default function ChatDock({
   // Hard reset context on instrument change
   React.useEffect(() => {
     if (instrument === lastInstrumentRef.current) return;
-    onStop();                 // stop generation
-    setMessages([]);          // clear chat
-    setInput("");             // clear input
-    reloadHeadlines(instrument); // fetch fresh headlines with symbols=
+    onStop();                 // 1) stop in-flight chat
+    setMessages([]);          // 2) clear chat
+    setInput("");             // 3) clear input
+    reloadHeadlines(instrument); // 4) fetch fresh headlines for new instrument
     lastInstrumentRef.current = instrument;
   }, [instrument, onStop, reloadHeadlines]);
 
@@ -170,7 +170,7 @@ export default function ChatDock({
           question,
           instrument,
           planText,
-          headlines: localHeadlines, // always current instrument headlines
+          headlines: localHeadlines, // always the latest for current instrument
           calendar,
           stream: true,
         }),
@@ -183,7 +183,7 @@ export default function ChatDock({
         const reader = rsp.body.getReader();
         const decoder = new TextDecoder();
 
-        // seed assistant message
+        // seed assistant row
         updateLastAssistant("");
 
         let buf = "";
@@ -293,7 +293,7 @@ export default function ChatDock({
       <div className="h-72 overflow-auto rounded border p-3 bg-slate-50">
         {messages.length === 0 ? (
           <div className="opacity-60 text-sm">
-            Ask about the current trade plan, risk, or execution. Switching instruments clears this chat and pulls fresh (symbols-based) headlines automatically.
+            Ask about the current trade plan, risk, or execution. Switching instruments clears this chat and pulls fresh headlines automatically.
           </div>
         ) : (
           messages.map((m, i) => (
@@ -317,8 +317,10 @@ export default function ChatDock({
                       : "bg-emerald-50 text-emerald-900 border-emerald-300"
                   }`}
                   style={{
+                    // extra guard against global overrides
                     color: m.role === "user" ? "#ffffff" : "#064e3b",
-                    background: m.role === "user" ? "#2563eb" : "#ecfdf5",
+                    background:
+                      m.role === "user" ? "#2563eb" : "#ecfdf5",
                     borderColor: m.role === "user" ? "#1d4ed8" : "#86efac",
                   }}
                 >
