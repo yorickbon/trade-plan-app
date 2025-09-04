@@ -6,7 +6,7 @@ import React from "react";
 type ChatDockProps = {
   instrument?: string;
   planText?: string;
-  headlines?: any[];
+  headlines?: any[]; // initial headlines at first mount only
   calendar?: any[];
 };
 
@@ -22,13 +22,15 @@ export default function ChatDock({
   const [input, setInput] = React.useState("");
   const [loading, setLoading] = React.useState(false);
 
-  // local headlines that auto-refresh when instrument changes
+  // Headlines state is *owned here* to avoid stale carryover
   const [localHeadlines, setLocalHeadlines] = React.useState<any[]>(headlines || []);
   const [newsLoading, setNewsLoading] = React.useState(false);
 
   const abortRef = React.useRef<AbortController | null>(null);
   const newsAbortRef = React.useRef<AbortController | null>(null);
   const lastInstrumentRef = React.useRef<string | undefined>(instrument);
+  const seededPropsHeadlinesRef = React.useRef(false);
+  const newsReqIdRef = React.useRef(0);
 
   const addMsg = React.useCallback((m: Msg) => {
     setMessages((prev) => [...prev, m]);
@@ -54,52 +56,94 @@ export default function ChatDock({
     setLoading(false);
   }, []);
 
-  const reloadHeadlines = React.useCallback(async (sym?: string) => {
-    const symbol = (sym || instrument || "").trim();
-    if (!symbol) {
-      setLocalHeadlines([]);
-      return;
-    }
-    // abort any in-flight news request
-    newsAbortRef.current?.abort();
-    const controller = new AbortController();
-    newsAbortRef.current = controller;
-
-    try {
-      setNewsLoading(true);
-      const rsp = await fetch(`/api/news?symbol=${encodeURIComponent(symbol)}`, {
-        method: "GET",
-        headers: { accept: "application/json" },
-        signal: controller.signal,
-      });
-      if (!rsp.ok) throw new Error(`news ${rsp.status}`);
-      const json = await rsp.json().catch(() => ({} as any));
-      // expect { headlines: [...] } or array
-      const items = Array.isArray(json) ? json : json?.headlines || [];
-      setLocalHeadlines(items || []);
-    } catch {
-      // keep previous headlines if fetch fails
-    } finally {
-      setNewsLoading(false);
-      newsAbortRef.current = null;
-    }
-  }, [instrument]);
-
-  // seed local headlines from props on mount/prop-change
+  // One-time seed from props (mount only). After that, headlines are driven here.
   React.useEffect(() => {
-    setLocalHeadlines(headlines || []);
-  }, [headlines]);
+    if (!seededPropsHeadlinesRef.current && headlines && headlines.length) {
+      setLocalHeadlines(headlines);
+    }
+    seededPropsHeadlinesRef.current = true;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const reloadHeadlines = React.useCallback(
+    async (sym?: string) => {
+      const symbol = (sym || instrument || "").trim();
+      if (!symbol) {
+        setLocalHeadlines([]);
+        return;
+      }
+
+      // Cancel any in-flight request
+      newsAbortRef.current?.abort();
+      const controller = new AbortController();
+      newsAbortRef.current = controller;
+
+      setNewsLoading(true);
+      const myReqId = ++newsReqIdRef.current;
+
+      try {
+        // Primary: GET with cache-bust
+        const url = `/api/news?symbol=${encodeURIComponent(symbol)}&t=${Date.now()}`;
+        const rsp = await fetch(url, {
+          method: "GET",
+          headers: {
+            accept: "application/json",
+            "cache-control": "no-store, no-cache, must-revalidate",
+            pragma: "no-cache",
+          },
+          signal: controller.signal,
+        });
+
+        let items: any[] | null = null;
+
+        if (rsp.ok) {
+          const json = await rsp.json().catch(() => ({} as any));
+          items = Array.isArray(json) ? json : json?.headlines || null;
+        }
+
+        // Fallback: POST body if GET isn’t wired to symbol
+        if (!items) {
+          const rsp2 = await fetch(`/api/news`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              accept: "application/json",
+              "cache-control": "no-store",
+            },
+            body: JSON.stringify({ symbol }),
+            signal: controller.signal,
+          });
+          if (rsp2.ok) {
+            const json2 = await rsp2.json().catch(() => ({} as any));
+            items = Array.isArray(json2) ? json2 : json2?.headlines || [];
+          } else {
+            items = [];
+          }
+        }
+
+        // Only apply if this is the latest request
+        if (newsReqIdRef.current === myReqId) {
+          setLocalHeadlines(items || []);
+        }
+      } catch {
+        // keep previous headlines if fetch fails
+      } finally {
+        if (newsReqIdRef.current === myReqId) {
+          setNewsLoading(false);
+          newsAbortRef.current = null;
+        }
+      }
+    },
+    [instrument]
+  );
 
   // Hard reset context on instrument change
   React.useEffect(() => {
     if (instrument === lastInstrumentRef.current) return;
-    // 1) stop any active generation
-    onStop();
-    // 2) clear chat state
-    setMessages([]);
-    setInput("");
-    // 3) refresh headlines for the new instrument
-    reloadHeadlines(instrument);
+    onStop();                 // 1) stop in-flight chat
+    setMessages([]);          // 2) clear chat
+    setInput("");             // 3) clear input
+    reloadHeadlines(instrument); // 4) fetch fresh headlines for new instrument
     lastInstrumentRef.current = instrument;
   }, [instrument, onStop, reloadHeadlines]);
 
@@ -126,7 +170,7 @@ export default function ChatDock({
           question,
           instrument,
           planText,
-          headlines: localHeadlines, // use fresh headlines tied to instrument
+          headlines: localHeadlines, // always the latest for current instrument
           calendar,
           stream: true,
         }),
@@ -139,7 +183,7 @@ export default function ChatDock({
         const reader = rsp.body.getReader();
         const decoder = new TextDecoder();
 
-        // seed assistant message
+        // seed assistant row
         updateLastAssistant("");
 
         let buf = "";
@@ -199,7 +243,6 @@ export default function ChatDock({
   }
 
   const onReset = React.useCallback(() => {
-    // Abort any active generation and clear UI state (keep current instrument)
     onStop();
     setMessages([]);
     setInput("");
@@ -208,7 +251,7 @@ export default function ChatDock({
 
   return (
     <div className="w-full max-w-2xl mx-auto border rounded-xl p-3 flex flex-col gap-3 bg-white">
-      {/* Top bar: instrument + actions */}
+      {/* Top bar */}
       <div className="flex items-center justify-between">
         <div className="text-sm font-medium">
           {instrument ? (
@@ -246,28 +289,50 @@ export default function ChatDock({
         </div>
       </div>
 
+      {/* Messages */}
       <div className="h-72 overflow-auto rounded border p-3 bg-slate-50">
         {messages.length === 0 ? (
-            <div className="opacity-60 text-sm">
-              Ask about the current trade plan, risk, or execution. Switching instruments will clear this chat and pull fresh headlines automatically.
-            </div>
+          <div className="opacity-60 text-sm">
+            Ask about the current trade plan, risk, or execution. Switching instruments clears this chat and pulls fresh headlines automatically.
+          </div>
         ) : (
           messages.map((m, i) => (
-            <div key={i} className={`mb-3 ${m.role === "user" ? "text-right" : "text-left"}`}>
-              <div
-                className={`inline-block whitespace-pre-wrap rounded-xl px-3 py-2 border ${
-                  m.role === "user"
-                    ? "bg-blue-600 text-white border-blue-700"
-                    : "bg-emerald-50 text-emerald-900 border-emerald-200"
-                }`}
-              >
-                {m.content}
+            <div
+              key={i}
+              className={`mb-3 flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
+              data-role={m.role}
+            >
+              <div className="max-w-[90%]">
+                <div
+                  className={`text-[10px] mb-1 ${
+                    m.role === "user" ? "text-blue-700 text-right" : "text-emerald-700 text-left"
+                  }`}
+                >
+                  {m.role === "user" ? "You" : "Assistant"}
+                </div>
+                <div
+                  className={`inline-block whitespace-pre-wrap rounded-2xl px-3 py-2 border shadow-sm ${
+                    m.role === "user"
+                      ? "bg-blue-600 text-white border-blue-700"
+                      : "bg-emerald-50 text-emerald-900 border-emerald-300"
+                  }`}
+                  style={{
+                    // extra guard against global overrides
+                    color: m.role === "user" ? "#ffffff" : "#064e3b",
+                    background:
+                      m.role === "user" ? "#2563eb" : "#ecfdf5",
+                    borderColor: m.role === "user" ? "#1d4ed8" : "#86efac",
+                  }}
+                >
+                  {m.content}
+                </div>
               </div>
             </div>
           ))
         )}
       </div>
 
+      {/* Composer */}
       <form onSubmit={send} className="flex gap-2">
         <input
           className="flex-1 border rounded-lg px-3 py-2"
