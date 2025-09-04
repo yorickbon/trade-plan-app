@@ -228,7 +228,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
   }
 
   // Try preferred provider first, then fallback
-  const providerOrder = (prefer === "newsapi" ? ["newsapi", "newsdata"] : ["newsdata", "newsapi"]) as const;
+  const providerOrder =
+    prefer === "newsapi"
+      ? (["newsapi", "newsdata"] as const)
+      : (["newsdata", "newsapi"] as const);
+
   let first: { items: NewsItem[]; debug?: any; error?: string } = { items: [] };
   let providerUsed = providerOrder[0];
 
