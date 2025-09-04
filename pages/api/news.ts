@@ -1,22 +1,5 @@
-// pages/api/news.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 
-/**
- * Trade Plan App — Headlines API (instrument-scoped, finance-focused)
- * Flow:
- *   1) Primary: Newsdata (keyword OR-query built from instrument tokens + finance terms)
- *   2) Fallback: Yahoo Finance RSS search (instrument tokens + finance terms)
- *   3) Fallback: Google News RSS search (instrument tokens + finance terms)
- *
- * Notes:
- * - Accepts GET or POST. Reads symbol|symbols|instrument|currencies from query OR body.
- * - Enforces no-store caching to prevent stale headlines on instrument switch.
- * - Returns { ok, provider, count, items, query, debug? } — contract unchanged.
- * - Lightweight RSS parser (no extra deps).
- */
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Types
 type SentimentLabel = "positive" | "negative" | "neutral";
 type NewsItem = {
   title: string;
@@ -28,16 +11,16 @@ type NewsItem = {
   symbols?: string[];
   sentiment?: { score: number; label: SentimentLabel };
 };
+
 type Ok = { ok: true; provider: string; count: number; items: NewsItem[]; query: any; debug?: any };
 type Err = { ok: false; reason: string; provider?: string; query?: any; debug?: any };
 type Resp = Ok | Err;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Cheap heuristic sentiment (non-blocking)
-const POS = ["beats","surge","soar","rally","growth","optimism","strong","bull","gain","record","expand"];
-const NEG = ["miss","fall","drop","slump","recession","fear","weak","bear","loss","shrink","cut"];
+const POS = ["beats", "surge", "soar", "rally", "growth", "optimism", "strong", "bull", "gain"];
+const NEG = ["miss", "fall", "drop", "slump", "recession", "fear", "weak", "bear", "loss"];
+
 function simpleSentiment(s: string): { score: number; label: SentimentLabel } {
-  const t = (s || "").toLowerCase();
+  const t = s.toLowerCase();
   let score = 0;
   for (const w of POS) if (t.includes(w)) score += 1;
   for (const w of NEG) if (t.includes(w)) score -= 1;
@@ -49,250 +32,185 @@ function parseList(q: string | string[] | undefined): string[] {
   const raw = Array.isArray(q) ? q.join(",") : String(q);
   return raw.split(",").map((s) => s.trim()).filter(Boolean);
 }
+
 function hoursAgoISO(h: number) {
   return new Date(Date.now() - h * 3600 * 1000).toISOString();
 }
 
-// ── Instrument → token bag (instrument + synonyms + finance terms)
-function instrumentTokens(sym: string): string[] {
-  if (!sym) return [];
-  const s = sym.toUpperCase().trim();
-
-  // FX pairs like EURUSD, GBPJPY
-  const fx = s.match(/^([A-Z]{3})([A-Z]{3})$/);
-  if (fx) {
-    const b1 = fx[1], b2 = fx[2];
-    const map: Record<string, string> = {
-      EUR: "euro", USD: "US dollar", GBP: "British pound", JPY: "Japanese yen",
-      CHF: "Swiss franc", AUD: "Australian dollar", NZD: "New Zealand dollar",
-      CAD: "Canadian dollar", CNH: "offshore yuan", CNY: "Chinese yuan",
-    };
-    const t1 = map[b1] || b1, t2 = map[b2] || b2;
-    // Finance-scoped extras relevant to FX
-    const fxFinance = ["forex","FX","currency","exchange rate","yields","central bank","inflation","CPI","PMI","jobs","GDP","FOMC","BOJ","ECB","BOE"];
-    return [s, b1, b2, t1, t2, ...fxFinance];
-  }
-
-  // Metals
-  if (s === "XAUUSD" || s === "GOLD" || s === "XAU") {
-    return [s, "gold", "XAU", "COMEX gold", "gold price", "bullion", "precious metals", "real yields", "Treasury yields", "inflation", "CPI", "Fed", "FOMC"];
-  }
-  if (s === "XAGUSD" || s === "SILVER" || s === "XAG") {
-    return [s, "silver", "XAG", "COMEX silver", "silver price", "precious metals", "industrial metals", "yields", "inflation", "Fed"];
-  }
-
-  // Indices
-  if (s === "NAS100" || s === "NDX" || s === "US100") {
-    return [s, "Nasdaq 100", "Nasdaq", "NQ", "US tech stocks", "equities", "earnings", "Treasury yields", "risk appetite", "Fed", "FOMC"];
-  }
-  if (s === "US30" || s === "DJI" || s === "DOW") {
-    return [s, "Dow Jones", "DJIA", "YM", "US equities", "industrial stocks", "earnings", "Treasury yields", "Fed"];
-  }
-  if (s === "SPX" || s === "US500" || s === "SP500" || s === "SPX500") {
-    return [s, "S&P 500", "SPX", "ES", "US equities", "earnings", "Treasury yields", "Fed", "FOMC", "risk appetite"];
-  }
-  if (s === "DAX" || s === "DE40" || s === "GER40") {
-    return [s, "DAX", "German equities", "EU equities", "ECB", "Bund yields", "eurozone inflation"];
-  }
-
-  // Crypto
-  if (s === "BTCUSD" || s === "BTCUSDT" || s === "BTC") {
-    return [s, "Bitcoin", "BTC", "crypto", "ETF", "risk appetite", "liquidity"];
-  }
-  if (s === "ETHUSD" || s === "ETHUSDT" || s === "ETH") {
-    return [s, "Ethereum", "ETH", "crypto", "DeFi", "staking", "ETF"];
-  }
-
-  // Fallback
-  return [s, "market", "finance"];
-}
-
-// Build Newsdata query string (simple OR list, trimmed)
-function buildProviderQuery(tokens: string[], maxTerms = 12) {
-  const bag = tokens
+// Build a conservative, provider-friendly query (no parentheses/AND)
+function buildQuery(tokens: string[]) {
+  const base = ["forex", "currency", "rates", "inflation", "cpi", "gdp", "central bank", "market"];
+  const bag = [...tokens, ...base]
     .map((s) => s.replace(/[^\w/+.-]/g, " ").trim())
     .filter(Boolean);
-  const dedup = Array.from(new Set(bag)).slice(0, maxTerms);
+  // limit length to avoid 414/422
+  const dedup = Array.from(new Set(bag)).slice(0, 12);
   return dedup.join(" OR ");
 }
 
-// Minimal RSS parser (no external deps)
-function parseRss(xml: string, language?: string): NewsItem[] {
-  const items: NewsItem[] = [];
-  const blocks = xml.split(/<item[\s>]/i).slice(1);
-  for (const b of blocks) {
-    const get = (tag: string) => {
-      const m = b.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
-      return m ? m[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1").trim() : "";
-    };
-    const title = get("title");
-    const link = get("link") || get("guid");
-    const pub = get("pubDate") || get("published") || get("updated") || "";
-    const src = get("source") || get("dc:creator") || "";
-    if (!title || !link) continue;
-    items.push({
-      title,
-      url: link,
-      published_at: pub,
-      source: src || undefined,
-      language,
-      sentiment: simpleSentiment(title),
-    });
-  }
-  return items;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Handler
 export default async function handler(req: NextApiRequest, res: NextApiResponse<Resp>) {
-  if (req.method !== "GET" && req.method !== "POST") {
-    return res.status(405).json({ ok: false, reason: "Method not allowed" });
-  }
+  if (req.method !== "GET") return res.status(405).json({ ok: false, reason: "Method not allowed" });
 
-  // Prevent caching to avoid stale carryover on instrument switch
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Expires", "0");
+  const prefer = String(process.env.NEWS_API_PROVIDER || "newsdata");
+  const NEWSDATA_API_KEY = process.env.NEWSDATA_API_KEY || "";
+  const NEWS_API_KEY = process.env.NEWS_API_KEY || process.env.NEWSAPI_API_KEY || "";
 
-  // Inputs
-  const qQuery = req.query as any;
-  const qBody = (req.method === "POST" ? (req.body as any) : {}) || {};
+  const list = parseList((req.query as any).currencies ?? (req.query as any).symbols);
+  const lang = String(req.query.lang || process.env.HEADLINES_LANG || "en");
+  const hours = Math.max(1, Number(req.query.hours || process.env.HEADLINES_SINCE_HOURS || 48));
+  const max = Math.min(25, Math.max(1, Number(req.query.max || process.env.HEADLINES_MAX || 12)));
+  const debugWanted = String(req.query.debug || "") === "1";
+  const queryMeta = { list, lang, hours, max };
 
-  // Accept: symbol, symbols, instrument, currencies
-  const list =
-    parseList(qQuery.symbol) ||
-    parseList(qQuery.symbols) ||
-    parseList(qQuery.instrument) ||
-    parseList(qQuery.currencies) ||
-    parseList(qBody.symbol) ||
-    parseList(qBody.symbols) ||
-    parseList(qBody.instrument) ||
-    parseList(qBody.currencies);
-
-  const lang = String(qQuery.lang || qBody.lang || process.env.HEADLINES_LANG || "en");
-  const hours = Math.max(1, Number(qQuery.hours || qBody.hours || process.env.HEADLINES_SINCE_HOURS || 48));
-  const max = Math.min(25, Math.max(1, Number(qQuery.max || qBody.max || process.env.HEADLINES_MAX || 12)));
-  const debugWanted = String(qQuery.debug || qBody.debug || "") === "1";
-
-  const tokens = list.length ? list.flatMap(instrumentTokens) : instrumentTokens("USD");
-  const providerQuery = buildProviderQuery(tokens);
+  const tokens = list.length ? list : ["USD"];
+  const q = buildQuery(tokens);
   const sinceISO = hoursAgoISO(hours);
 
-  const NEWSDATA_API_KEY = process.env.NEWSDATA_API_KEY || "";
-
-  // ── Primary: Newsdata
+  // ───────────────────────────────────────────────────────────────────────────
   async function tryNewsdata() {
-    if (!NEWSDATA_API_KEY) {
-      return { items: [] as NewsItem[], debug: { note: "missing NEWSDATA_API_KEY" }, provider: "newsdata" as const };
-    }
+    if (!NEWSDATA_API_KEY) return { items: [] as NewsItem[], debug: { note: "missing NEWSDATA_API_KEY" }, error: "no-key" as string | undefined };
     const url = new URL("https://newsdata.io/api/1/news");
     url.searchParams.set("apikey", NEWSDATA_API_KEY);
-    url.searchParams.set("q", providerQuery);
+    url.searchParams.set("q", q);                 // keep simple OR query
     url.searchParams.set("language", lang);
     url.searchParams.set("from_date", sinceISO.slice(0, 10)); // yyyy-mm-dd
     url.searchParams.set("page", "1");
-
     try {
       const r = await fetch(url.toString(), { cache: "no-store" });
-      const j: any = await r.json().catch(() => ({}));
-      if (!r.ok || j?.status === "error") {
-        return { items: [], debug: { providerUrl: url.toString(), status: r.status, message: j?.message }, provider: "newsdata" as const };
-      }
+      if (!r.ok) return { items: [], debug: { providerUrl: url.toString(), status: r.status }, error: `http ${r.status}` };
+      const j: any = await r.json();
+      if (j?.status === "error") return { items: [], debug: { providerUrl: url.toString(), status: "error", message: j?.message }, error: String(j?.message || "newsdata error") };
       const results: any[] = Array.isArray(j?.results) ? j.results : [];
-      const items: NewsItem[] = results.slice(0, max).map((row: any) => ({
-        title: row?.title || row?.description || "",
-        url: row?.link || row?.url || "",
-        published_at: row?.pubDate || row?.published_at || row?.date || "",
-        source: row?.source_id || row?.source || "",
-        country: row?.country,
-        language: row?.language || lang,
-        symbols: list.length ? list : undefined,
-        sentiment: simpleSentiment(row?.title || ""),
-      }));
-      return { items, debug: { providerUrl: url.toString(), providerHits: results.length }, provider: "newsdata" as const };
+      const items: NewsItem[] = results.slice(0, max).map((r: any) => {
+        const title: string = r?.title || r?.description || "";
+        return {
+          title,
+          url: r?.link || r?.source_url || "",
+          published_at: r?.pubDate ? new Date(r.pubDate).toISOString() : new Date().toISOString(),
+          source: r?.source_id || r?.creator || r?.source || undefined,
+          country: r?.country,
+          language: r?.language || lang,
+          symbols: tokens,
+          sentiment: simpleSentiment(title),
+        };
+      });
+      return { items, debug: { providerUrl: url.toString(), providerHits: results.length } };
     } catch (e: any) {
-      return { items: [], debug: { providerUrl: "newsdata", message: e?.message }, provider: "newsdata" as const };
+      return { items: [], debug: { providerUrl: "newsdata", message: e?.message }, error: e?.message || "fetch error" };
     }
   }
 
-  // ── Fallback 1: Yahoo Finance RSS Search (finance-scoped keywords)
-  async function tryYahooFinanceRSS() {
-    // Use instrument tokens + finance words; Yahoo News search feeds Yahoo Finance when finance terms are included
-    const financeScoped = [...tokens, "finance", "markets", "forex", "FX", "exchange rate"].join(" ");
-    const url = `https://news.yahoo.com/rss/search?p=${encodeURIComponent(financeScoped)}`;
+  async function tryNewsAPI() {
+    if (!NEWS_API_KEY) return { items: [] as NewsItem[], debug: { note: "missing NEWS_API_KEY" }, error: "no-key" as string | undefined };
+    const url = new URL("https://newsapi.org/v2/everything");
+    url.searchParams.set("apiKey", NEWS_API_KEY);
+    url.searchParams.set("q", q);
+    url.searchParams.set("language", lang);
+    url.searchParams.set("from", sinceISO);
+    url.searchParams.set("pageSize", String(max));
+    url.searchParams.set("sortBy", "publishedAt");
+    try {
+      const r = await fetch(url.toString(), { cache: "no-store" });
+      if (!r.ok) return { items: [], debug: { providerUrl: url.toString(), status: r.status }, error: `http ${r.status}` };
+      const j: any = await r.json();
+      if (j?.status !== "ok") return { items: [], debug: { providerUrl: url.toString(), status: j?.status, code: j?.code, message: j?.message }, error: String(j?.message || "newsapi error") };
+      const arr: any[] = Array.isArray(j?.articles) ? j.articles : [];
+      const items: NewsItem[] = arr.slice(0, max).map((a: any) => {
+        const title: string = a?.title || a?.description || "";
+        return {
+          title,
+          url: a?.url || "",
+          published_at: a?.publishedAt ? new Date(a.publishedAt).toISOString() : new Date().toISOString(),
+          source: a?.source?.name || undefined,
+          language: lang,
+          symbols: tokens,
+          sentiment: simpleSentiment(title),
+        };
+      });
+      return { items, debug: { providerUrl: url.toString(), providerHits: arr.length } };
+    } catch (e: any) {
+      return { items: [], debug: { providerUrl: "newsapi", message: e?.message }, error: e?.message || "fetch error" };
+    }
+  }
+
+  // Very robust last-resort: Google News RSS (free)
+  async function tryGoogleRSS() {
+    const qRSS = encodeURIComponent(tokens.concat(["forex"]).join(" "));
+    const url = `https://news.google.com/rss/search?q=${qRSS}&hl=${encodeURIComponent(lang)}&gl=US&ceid=US:${encodeURIComponent(lang)}`;
     try {
       const r = await fetch(url, { cache: "no-store" });
+      if (!r.ok) return { items: [] as NewsItem[], debug: { providerUrl: url, status: r.status }, error: `http ${r.status}` };
       const xml = await r.text();
-      const parsed = parseRss(xml, lang);
-      // Filter to finance-looking domains or finance-related headlines (lightweight guard)
-      const allow = (u: string, title: string) => {
-        const L = (title || "").toLowerCase();
-        return /finance|market|forex|currency|yen|dollar|nasdaq|reuters|bloomberg|invest|econom/i.test(L) ||
-               /finance|money|markets|business|reuters|bloomberg|invest|wsj|ft\.com/i.test(u);
-      };
-      const items = parsed
-        .filter((it) => allow(it.url, it.title))
-        .slice(0, max)
-        .map((it) => ({ ...it, symbols: list.length ? list : undefined }));
-      return { items, debug: { providerUrl: url, providerHits: parsed.length }, provider: "yahoo-finance" as const };
+      // lite parse for <item><title>...<link>...<pubDate>...</item>
+      const items: NewsItem[] = [];
+      const re = /<item>([\s\S]*?)<\/item>/g;
+      let m: RegExpExecArray | null;
+      let count = 0;
+      while ((m = re.exec(xml)) && count < max) {
+        const block = m[1];
+        const title = (block.match(/<title>([\s\S]*?)<\/title>/)?.[1] || "").replace(/<!\[CDATA\[|\]\]>/g, "");
+        const link = (block.match(/<link>([\s\S]*?)<\/link>/)?.[1] || "").trim();
+        const pub = (block.match(/<pubDate>([\s\S]*?)<\/pubDate>/)?.[1] || "").trim();
+        if (title && link) {
+          items.push({
+            title,
+            url: link,
+            published_at: pub ? new Date(pub).toISOString() : new Date().toISOString(),
+            source: "Google News",
+            language: lang,
+            symbols: tokens,
+            sentiment: simpleSentiment(title),
+          });
+          count++;
+        }
+      }
+      return { items, debug: { providerUrl: url, providerHits: items.length } };
     } catch (e: any) {
-      return { items: [], debug: { providerUrl: url, message: e?.message }, provider: "yahoo-finance" as const };
+      return { items: [] as NewsItem[], debug: { providerUrl: "google-rss", message: e?.message }, error: e?.message || "fetch error" };
     }
   }
 
-  // ── Fallback 2: Google News RSS (finance-oriented query)
-  async function tryGoogleNewsRSS() {
-    // Add finance words to bias results to business/markets
-    const financeScoped = [...tokens, "finance", "markets", "forex", "FX", "exchange rate"].join(" ");
-    const url = `https://news.google.com/rss/search?q=${encodeURIComponent(financeScoped)}&hl=${encodeURIComponent(lang)}`;
-    try {
-      const r = await fetch(url, { cache: "no-store" });
-      const xml = await r.text();
-      const parsed = parseRss(xml, lang);
-      const allow = (u: string, title: string) => {
-        const L = (title || "").toLowerCase();
-        return /finance|market|forex|currency|yen|dollar|nasdaq|reuters|bloomberg|invest|econom/i.test(L) ||
-               /finance|money|markets|business|reuters|bloomberg|invest|wsj|ft\.com/i.test(u);
-      };
-      const items = parsed
-        .filter((it) => allow(it.url, it.title))
-        .slice(0, max)
-        .map((it) => ({ ...it, symbols: list.length ? list : undefined }));
-      return { items, debug: { providerUrl: url, providerHits: parsed.length }, provider: "google-news" as const };
-    } catch (e: any) {
-      return { items: [], debug: { providerUrl: url, message: e?.message }, provider: "google-news" as const };
+  try {
+    const order = prefer === "newsapi" ? ["newsapi", "newsdata"] : ["newsdata", "newsapi"];
+    let first: any = order[0] === "newsapi" ? await tryNewsAPI() : await tryNewsdata();
+    let providerUsed = order[0];
+
+    if (!first.items.length) {
+      const second: any = order[1] === "newsapi" ? await tryNewsAPI() : await tryNewsdata();
+      if (second.items.length) {
+        providerUsed = order[1];
+        first = second;
+      }
     }
-  }
 
-  // ── Orchestrate: Newsdata → Yahoo Finance RSS → Google News RSS
-  const debug: any = {};
-  let usedProvider: "newsdata" | "yahoo-finance" | "google-news" = "newsdata";
-  let items: NewsItem[] = [];
-
-  const p1 = await tryNewsdata();
-  debug.newsdata = p1.debug;
-  if (p1.items.length) {
-    items = p1.items;
-  } else {
-    const p2 = await tryYahooFinanceRSS();
-    debug.yahoo = p2.debug;
-    if (p2.items.length) {
-      items = p2.items;
-      usedProvider = "yahoo-finance";
-    } else {
-      const p3 = await tryGoogleNewsRSS();
-      debug.google = p3.debug;
-      items = p3.items;
-      usedProvider = "google-news";
+    if (!first.items.length) {
+      // last-resort
+      const rss = await tryGoogleRSS();
+      if (rss.items.length) {
+        providerUsed = "google-rss";
+        first = rss;
+      }
     }
-  }
 
-  return res.status(200).json({
-    ok: true,
-    provider: usedProvider,
-    count: items.length,
-    items,
-    query: { list, lang, hours, max, providerQuery },
-    debug: debugWanted ? debug : undefined,
-  });
+    if (!first.items.length) {
+      return res.status(200).json({
+        ok: false,
+        reason: `No headlines from providers (last error: ${first.error || "none"})`,
+        provider: providerUsed,
+        query: queryMeta,
+        debug: debugWanted ? first.debug : undefined,
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      provider: providerUsed,
+      count: first.items.length,
+      items: first.items,
+      query: queryMeta,
+      debug: debugWanted ? first.debug : undefined,
+    });
+  } catch (err: any) {
+    return res.status(200).json({ ok: false, reason: err?.message || "Unknown error", provider: prefer, query: queryMeta });
+  }
 }
