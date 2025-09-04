@@ -1,4 +1,3 @@
-// pages/api/news.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 
 type SentimentLabel = "positive" | "negative" | "neutral";
