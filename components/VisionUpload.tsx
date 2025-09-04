@@ -51,6 +51,9 @@ export default function VisionUpload({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Optional: show how many headlines we bundled (for sanity)
+  const [bundledHeadlines, setBundledHeadlines] = useState<number>(0);
+
   // Refs to clear inputs
   const refM15 = useRef<HTMLInputElement>(null);
   const refH1 = useRef<HTMLInputElement>(null);
@@ -73,6 +76,7 @@ export default function VisionUpload({
     setCacheKey(null);
     setStage1Text("");
     setError(null);
+    setBundledHeadlines(0);
     if (refM15.current) refM15.current.value = "";
     if (refH1.current) refH1.current.value = "";
     if (refH4.current) refH4.current.value = "";
@@ -85,11 +89,24 @@ export default function VisionUpload({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [instrument, resetSignal]);
 
+  async function fetchHeadlinesForInstrument(code: string) {
+    try {
+      const url = `/api/news?instrument=${encodeURIComponent(code)}&hours=48&max=12&_t=${Date.now()}`;
+      const r = await fetch(url, { cache: "no-store" });
+      const j = await r.json().catch(() => ({}));
+      const items: any[] = Array.isArray(j?.items) ? j.items : [];
+      return items.slice(0, 12);
+    } catch {
+      return [];
+    }
+  }
+
   async function handleGenerate() {
     try {
       setError(null);
       setBusyState(true);
 
+      // Prepare form
       const fd = new FormData();
       fd.append("instrument", instrument);
       if (mode === "fast") fd.append("mode", "fast");
@@ -102,6 +119,15 @@ export default function VisionUpload({
       if (m15Url) fd.append("m15Url", m15Url.trim());
       if (h1Url) fd.append("h1Url", h1Url.trim());
       if (h4Url) fd.append("h4Url", h4Url.trim());
+
+      // NEW: inject the exact headlines the UI would use (single source of truth)
+      const headlines = await fetchHeadlinesForInstrument(instrument);
+      if (headlines.length) {
+        fd.append("headlinesJson", JSON.stringify(headlines)); // server will prefer this if present
+        setBundledHeadlines(headlines.length);
+      } else {
+        setBundledHeadlines(0);
+      }
 
       const rsp = await fetch("/api/vision-plan", { method: "POST", body: fd });
       const j = await rsp.json();
@@ -132,9 +158,10 @@ export default function VisionUpload({
     try {
       setError(null);
       setBusyState(true);
-      const rsp = await fetch(`/api/vision-plan?mode=expand&cache=${encodeURIComponent(cacheKey)}`, {
-        method: "POST",
-      });
+      const rsp = await fetch(
+        `/api/vision-plan?mode=expand&cache=${encodeURIComponent(cacheKey)}`,
+        { method: "POST" }
+      );
       const j = await rsp.json();
       if (!rsp.ok || !j?.ok) throw new Error(j?.reason || "Expand failed");
       const stage2 = j.text || "";
@@ -203,14 +230,38 @@ export default function VisionUpload({
 
       {/* Files (optional if URLs provided) */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-        <input type="file" ref={refM15} accept="image/*" onChange={(e) => setM15(e.target.files?.[0] || null)} disabled={busy} />
-        <input type="file" ref={refH1} accept="image/*" onChange={(e) => setH1(e.target.files?.[0] || null)} disabled={busy} />
-        <input type="file" ref={refH4} accept="image/*" onChange={(e) => setH4(e.target.files?.[0] || null)} disabled={busy} />
+        <input
+          type="file"
+          ref={refM15}
+          accept="image/*"
+          onChange={(e) => setM15(e.target.files?.[0] || null)}
+          disabled={busy}
+        />
+        <input
+          type="file"
+          ref={refH1}
+          accept="image/*"
+          onChange={(e) => setH1(e.target.files?.[0] || null)}
+          disabled={busy}
+        />
+        <input
+          type="file"
+          ref={refH4}
+          accept="image/*"
+          onChange={(e) => setH4(e.target.files?.[0] || null)}
+          disabled={busy}
+        />
       </div>
 
       {/* Calendar (optional) */}
       <div>
-        <input type="file" ref={refCal} accept="image/*" onChange={(e) => setCalendar(e.target.files?.[0] || null)} disabled={busy} />
+        <input
+          type="file"
+          ref={refCal}
+          accept="image/*"
+          onChange={(e) => setCalendar(e.target.files?.[0] || null)}
+          disabled={busy}
+        />
       </div>
 
       {/* Actions */}
@@ -240,10 +291,18 @@ export default function VisionUpload({
           Clear All
         </button>
 
-        {cacheKey && <span className="text-xs opacity-70">cache: {cacheKey.slice(0, 10)}…</span>}
+        {cacheKey && (
+          <span className="text-xs opacity-70">cache: {cacheKey.slice(0, 10)}…</span>
+        )}
       </div>
 
-      {/* Inline error */}
+      {/* Inline helpers */}
+      {bundledHeadlines > 0 && (
+        <div className="text-xs text-emerald-400">
+          Headlines bundled: {bundledHeadlines} (UI and card will match)
+        </div>
+      )}
+
       {error && (
         <div className="text-sm text-red-400 whitespace-pre-wrap border border-red-800/60 bg-red-900/10 rounded p-2">
           {error}
