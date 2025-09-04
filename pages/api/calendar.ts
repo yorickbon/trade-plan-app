@@ -2,20 +2,30 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 
 /**
- * Calendar API with:
- *  - Provider fallback: FairEconomy RSS -> TradingEconomics (guest)
- *  - ±90m blackout for High impact
- *  - Fundamental bias scoring from Actual vs Forecast/Previous
- *  - Optional instrument bias (base - quote)
+ * Calendar API (Primary: ForexFactory XML → structured; Fallback: TradingEconomics guest JSON; Last: DailyFX RSS timing-only)
+ * - 60-minute warning (no blackout) for High impact.
+ * - Fundamental bias from Actual vs Forecast/Previous over a rolling window.
+ * - Optional instrument bias (base - quote).
+ * - Full transparency: if both structured providers fail, ok:false + notes prompts manual image upload.
  *
  * Query:
- *  - date=YYYY-MM-DD (default: today, API uses that day)
+ *  - date=YYYY-MM-DD (default: today)
  *  - currencies=EUR,USD (optional if instrument given)
- *  - instrument=EURUSD (optional; auto derives currencies)
- *  - windowHours=48 (bias lookback window around date; default 48)
+ *  - instrument=EURUSD (optional; derives currencies)
+ *  - windowHours (override lookback window; default CALENDAR_LOOKBACK_DAYS*24 or 168)
  *
- * Response:
- *  { ok, provider, date, count, items: CalItem[], bias: { perCurrency, instrument? } }
+ * Response (stable fields from your previous version preserved; added fields are optional):
+ *  {
+ *    ok: boolean,
+ *    provider: string,                 // "forexfactory" | "tradingeconomics" | "dailyfx" | "mixed"
+ *    date: string,
+ *    count: number,
+ *    items: CalItem[],                 // normalized events
+ *    bias: { windowHours, perCurrency, instrument? },
+ *    warning: { title, currency?, impact, time } | null,
+ *    notes?: string,                   // present when structured providers unavailable
+ *    calendar_status?: "ok" | "unavailable" | "timing-only"
+ *  }
  */
 
 type Impact = "High" | "Medium" | "Low" | "None";
@@ -25,19 +35,25 @@ type CalItem = {
   country: string;
   currency?: string;
   impact: Impact;
-  time: string;                   // ISO
+  time: string;                   // ISO UTC
   actual?: number | null;
   forecast?: number | null;
   previous?: number | null;
   unit?: string | null;
-  isBlackout?: boolean;
-  provider?: "fair" | "te";
+  provider?: "forexfactory" | "tradingeconomics" | "dailyfx";
 };
 
 type BiasSummary = {
-  score: number;      // -5..+5
-  count: number;      // events counted
-  label: "strongly bearish" | "bearish" | "slightly bearish" | "neutral" | "slightly bullish" | "bullish" | "strongly bullish";
+  score: number; // -5..+5
+  count: number;
+  label:
+    | "strongly bearish"
+    | "bearish"
+    | "slightly bearish"
+    | "neutral"
+    | "slightly bullish"
+    | "bullish"
+    | "strongly bullish";
   evidence: Array<{ title: string; time: string; delta: number; weight: number }>;
 };
 
@@ -52,18 +68,31 @@ type Ok = {
     perCurrency: Record<string, BiasSummary>;
     instrument?: { pair: string; score: number; label: BiasSummary["label"] };
   };
+  warning: { title: string; currency?: string; impact: Impact; time: string } | null;
+  notes?: string;
+  calendar_status?: "ok" | "unavailable" | "timing-only";
 };
 
-type Err = { ok: false; reason: string };
+type Err = { ok: false; reason: string; notes?: string; provider?: string; calendar_status?: "unavailable" | "timing-only" };
 type Resp = Ok | Err;
 
-const FEED = process.env.CALENDAR_RSS_URL || "https://nfs.faireconomy.media/ff_calendar_thisweek.xml";
+// ──────────────────────────────────────────────────────────────────────────────
+// ENV defaults
+const LOOKBACK_HOURS_DEFAULT = (Number(process.env.CALENDAR_LOOKBACK_DAYS) || 7) * 24;
+const WARN_MINS_DEFAULT = Number(process.env.CALENDAR_WARN_MINS) || 60;
+const TIMEOUT_MS = Number(process.env.CALENDAR_TIMEOUT_MS) || 12000;
+
+// Sources
+const FF_XML_URL = process.env.CALENDAR_RSS_URL || "https://nfs.faireconomy.media/ff_calendar_thisweek.xml";
 const TE_USER = process.env.TE_API_USER || "guest";
 const TE_PASS = process.env.TE_API_PASS || "guest";
+const TE_BASE = "https://api.tradingeconomics.com/calendar";
+const DAILYFX_RSS_URL = process.env.DAILYFX_RSS_URL || "https://www.dailyfx.com/feeds/market-news";
 
-// ----------------- utils -----------------
-const toISODate = (d: Date) => d.toISOString().slice(0, 10);
+// ──────────────────────────────────────────────────────────────────────────────
+// utils
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+const toISODate = (d: Date) => d.toISOString().slice(0, 10);
 
 function parseNum(x: any): number | null {
   if (x === null || x === undefined) return null;
@@ -74,14 +103,9 @@ function parseNum(x: any): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-function withinWindow(iso: string, d1: Date, d2: Date): boolean {
+function within(iso: string, d1: Date, d2: Date): boolean {
   const t = new Date(iso).getTime();
   return t >= d1.getTime() && t <= d2.getTime();
-}
-
-function blackout(iso: string, minutes = 90) {
-  const t = new Date(iso).getTime();
-  return { from: new Date(t - minutes * 60000).toISOString(), to: new Date(t + minutes * 60000).toISOString() };
 }
 
 function biasLabel(score: number): BiasSummary["label"] {
@@ -98,26 +122,16 @@ function biasLabel(score: number): BiasSummary["label"] {
 function goodIfHigher(title: string): boolean | null {
   const t = title.toLowerCase();
 
-  // Inflation / pricing: higher tends to be hawkish -> bullish (FX)
   if (/(cpi|core cpi|ppi|inflation)/.test(t)) return true;
-
-  // Growth & demand: higher bullish
   if (/(gdp|retail sales|industrial production|manufacturing production|consumer credit|housing starts|building permits|durable goods)/.test(t)) return true;
-
-  // PMI/ISM/Confidence: higher bullish (esp. above 50 for PMI)
   if (/(pmi|ism|confidence|sentiment)/.test(t)) return true;
 
-  // Employment: unemployment lower bullish; jobless claims lower bullish; payrolls higher bullish
-  if (/unemployment|jobless|jobless claims|initial claims|continuing claims/.test(t)) return false;   // lower is bullish
+  if (/unemployment|jobless|jobless claims|initial claims|continuing claims/.test(t)) return false; // lower is bullish
   if (/(nonfarm|nfp|employment change|payrolls|jobs)/.test(t)) return true;
 
-  // Trade balance: less negative (higher) can be bullish, but noisy -> treat higher as bullish
   if (/trade balance|current account/.test(t)) return true;
-
-  // Rates: higher rate is bullish; cuts bearish
   if (/interest rate|rate decision|refi rate|deposit facility|bank rate|cash rate|ocr/.test(t)) return true;
 
-  // If we don't know, return null -> neutral handling
   return null;
 }
 
@@ -128,7 +142,6 @@ function impactWeight(impact: Impact): number {
   return 0.2;
 }
 
-// score delta from actual vs forecast/previous
 function scoreDelta(title: string, actual: number | null, forecast: number | null, previous: number | null): number {
   const dir = goodIfHigher(title);
   if (dir === null || actual === null) return 0;
@@ -136,53 +149,83 @@ function scoreDelta(title: string, actual: number | null, forecast: number | nul
   const ref = forecast ?? previous;
   if (ref === null) return 0;
 
-  const rawDelta = (actual - ref) / (Math.abs(ref) || 1); // relative surprise
-  const signed = dir ? rawDelta : -rawDelta;              // invert if lower-is-bullish
-  // squash to -1..+1
+  const rawDelta = (actual - ref) / (Math.abs(ref) || 1);
+  const signed = dir ? rawDelta : -rawDelta;
   return clamp(signed * 4, -1, 1);
 }
 
-// ----------------- providers -----------------
-async function fetchFairEconomy(dateISO: string, windowHours: number): Promise<CalItem[]> {
+// fetch with timeout
+async function fWithTimeout(url: string, headers?: Record<string, string>): Promise<Response> {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
-    const rsp = await fetch(FEED, { cache: "no-store" });
+    return await fetch(url, { signal: ctrl.signal, cache: "no-store", headers });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Providers
+async function fetchForexFactory(dateISO: string, windowHours: number): Promise<CalItem[]> {
+  try {
+    const rsp = await fWithTimeout(FF_XML_URL);
     if (!rsp.ok) return [];
     const xml = await rsp.text();
 
     const out: CalItem[] = [];
+
+    const d1 = new Date(`${dateISO}T00:00:00Z`);
+    const d2 = new Date(`${dateISO}T23:59:59Z`);
+    const lo = new Date(d1.getTime() - windowHours * 3600 * 1000);
+    const hi = new Date(d2.getTime() + windowHours * 3600 * 1000);
+
+    // FF XML: <item><title>..</title><country>..</country><date>MM-DD-YYYY</date><time>HH:mm</time><impact>..</impact><forecast>..</forecast><previous>..</previous><actual>..</actual></item>
     const re = /<item>([\s\S]*?)<\/item>/g;
     let m: RegExpExecArray | null;
-
-    const start = new Date(`${dateISO}T00:00:00Z`);
-    const end = new Date(`${dateISO}T23:59:59Z`);
-    const lo = new Date(start.getTime() - windowHours * 3600 * 1000);
-    const hi = new Date(end.getTime() + windowHours * 3600 * 1000);
-
     while ((m = re.exec(xml))) {
       const block = m[1];
-      const title = (block.match(/<title>([\s\S]*?)<\/title>/)?.[1] || "").replace(/<!\[CDATA\[|\]\]>/g, "");
-      const pub = (block.match(/<pubDate>([\s\S]*?)<\/pubDate>/)?.[1] || "").trim();
-      const iso = pub ? new Date(pub).toISOString() : new Date().toISOString();
-      if (!withinWindow(iso, lo, hi)) continue;
 
-      // crude impact + currency extraction from title/category
-      const cat = (block.match(/<category>([\s\S]*?)<\/category>/)?.[1] || "").trim();
-      const impact: Impact =
-        /High/i.test(title + " " + cat) ? "High" :
-        /Medium/i.test(title + " " + cat) ? "Medium" :
-        /Low/i.test(title + " " + cat) ? "Low" : "None";
-      const currency = (title.match(/(USD|EUR|GBP|JPY|AUD|NZD|CAD|CHF|CNY|XAU)/i)?.[1] || "").toUpperCase() || undefined;
+      const pick = (tag: string) =>
+        (block.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, "i"))?.[1] || "")
+          .replace(/<!\[CDATA\[|\]\]>/g, "")
+          .trim();
+
+      const title = pick("title") || "Event";
+      const country = pick("country") || "Global";
+      const date = pick("date"); // e.g., 09-03-2025
+      const time = pick("time"); // e.g., 13:30
+      const impactRaw = pick("impact");
+      const actualRaw = pick("actual");
+      const forecastRaw = pick("forecast");
+      const previousRaw = pick("previous");
+      const currencyGuess =
+        title.match(/\b(USD|EUR|GBP|JPY|AUD|NZD|CAD|CHF|CNY|CNH|XAU)\b/i)?.[1]?.toUpperCase() ||
+        country.toUpperCase();
+
+      // Build ISO from date & time (assume UTC for consistency)
+      const iso = date && time ? new Date(`${date} ${time} UTC`).toISOString() : new Date().toISOString();
+      if (!within(iso, lo, hi)) continue;
+
+      const imp: Impact =
+        /high/i.test(impactRaw) ? "High" :
+        /medium/i.test(impactRaw) ? "Medium" :
+        /low/i.test(impactRaw) ? "Low" : "None";
 
       out.push({
         title,
-        country: currency || "Global",
-        currency,
-        impact,
+        country,
+        currency: currencyGuess,
+        impact: imp,
         time: iso,
-        provider: "fair",
-        actual: null, forecast: null, previous: null, unit: null,
+        provider: "forexfactory",
+        actual: parseNum(actualRaw),
+        forecast: parseNum(forecastRaw),
+        previous: parseNum(previousRaw),
+        unit: null,
       });
     }
+
     return out;
   } catch {
     return [];
@@ -191,24 +234,19 @@ async function fetchFairEconomy(dateISO: string, windowHours: number): Promise<C
 
 async function fetchTradingEconomics(dateISO: string, windowHours: number): Promise<CalItem[]> {
   try {
-    const base = "https://api.tradingeconomics.com/calendar";
-    // Pull +/- windowHours around the day (TE filters by d1..d2 UTC)
     const d1 = new Date(`${dateISO}T00:00:00Z`);
     const d2 = new Date(`${dateISO}T23:59:59Z`);
     const lo = new Date(d1.getTime() - windowHours * 3600 * 1000);
     const hi = new Date(d2.getTime() + windowHours * 3600 * 1000);
 
-    const url = new URL(base);
+    const url = new URL(TE_BASE);
     url.searchParams.set("d1", lo.toISOString().slice(0, 10));
     url.searchParams.set("d2", hi.toISOString().slice(0, 10));
     url.searchParams.set("c", "All");
     url.searchParams.set("format", "json");
 
     const auth = Buffer.from(`${TE_USER}:${TE_PASS}`).toString("base64");
-    const rsp = await fetch(url.toString(), {
-      headers: { Authorization: `Basic ${auth}` },
-      cache: "no-store",
-    });
+    const rsp = await fWithTimeout(url.toString(), { Authorization: `Basic ${auth}` });
     if (!rsp.ok) return [];
 
     const arr: any[] = await rsp.json();
@@ -217,7 +255,7 @@ async function fetchTradingEconomics(dateISO: string, windowHours: number): Prom
     for (const e of arr) {
       const title: string = e?.Event || e?.Category || "Event";
       const iso = e?.Date ? new Date(e.Date).toISOString() : new Date().toISOString();
-      if (!withinWindow(iso, lo, hi)) continue;
+      if (!within(iso, lo, hi)) continue;
 
       const currency: string | undefined = e?.Currency || undefined;
       const imp: Impact =
@@ -231,7 +269,7 @@ async function fetchTradingEconomics(dateISO: string, windowHours: number): Prom
         currency,
         impact: imp,
         time: iso,
-        provider: "te",
+        provider: "tradingeconomics",
         actual: parseNum(e?.Actual),
         forecast: parseNum(e?.Forecast),
         previous: parseNum(e?.Previous),
@@ -244,7 +282,61 @@ async function fetchTradingEconomics(dateISO: string, windowHours: number): Prom
   }
 }
 
-// ----------------- bias engine -----------------
+async function fetchDailyFxRSS(dateISO: string, windowHours: number): Promise<CalItem[]> {
+  try {
+    const rsp = await fWithTimeout(DAILYFX_RSS_URL);
+    if (!rsp.ok) return [];
+    const xml = await rsp.text();
+
+    const d1 = new Date(`${dateISO}T00:00:00Z`);
+    const d2 = new Date(`${dateISO}T23:59:59Z`);
+    const lo = new Date(d1.getTime() - windowHours * 3600 * 1000);
+    const hi = new Date(d2.getTime() + windowHours * 3600 * 1000);
+
+    const out: CalItem[] = [];
+    const re = /<item>([\s\S]*?)<\/item>/g;
+    let m: RegExpExecArray | null;
+
+    while ((m = re.exec(xml))) {
+      const block = m[1];
+
+      const pick = (tag: string) =>
+        (block.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, "i"))?.[1] || "")
+          .replace(/<!\[CDATA\[|\]\]>/g, "")
+          .trim();
+
+      const title = pick("title");
+      const pub = pick("pubDate");
+      const iso = pub ? new Date(pub).toISOString() : new Date().toISOString();
+
+      if (!within(iso, lo, hi)) continue;
+
+      const currencyGuess =
+        title.match(/\b(USD|EUR|GBP|JPY|AUD|NZD|CAD|CHF|CNY|CNH|XAU)\b/i)?.[1]?.toUpperCase() || undefined;
+      const imp: Impact = /high|red/i.test(title) ? "High" : /medium|yellow/i.test(title) ? "Medium" : "Low";
+
+      out.push({
+        title: title || "Event",
+        country: currencyGuess || "Global",
+        currency: currencyGuess,
+        impact: imp,
+        time: iso,
+        provider: "dailyfx",
+        actual: null,
+        forecast: null,
+        previous: null,
+        unit: null,
+      });
+    }
+
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Bias engine
 function computeBias(items: CalItem[], windowHours: number, currencies: string[]) {
   const end = new Date();
   const start = new Date(end.getTime() - windowHours * 3600 * 1000);
@@ -261,7 +353,7 @@ function computeBias(items: CalItem[], windowHours: number, currencies: string[]
   for (const it of items) {
     if (!it.currency) continue;
     if (currencies.length && !currencies.includes(it.currency)) continue;
-    if (!withinWindow(it.time, start, end)) continue;
+    if (!within(it.time, start, end)) continue;
 
     const delta = scoreDelta(it.title, it.actual ?? null, it.forecast ?? null, it.previous ?? null);
     if (delta === 0) continue;
@@ -270,7 +362,6 @@ function computeBias(items: CalItem[], windowHours: number, currencies: string[]
     add(it.currency, it.title, it.time, delta, weight);
   }
 
-  // normalize to -5..+5 and label
   for (const cur of Object.keys(per)) {
     per[cur].score = clamp(per[cur].score * 5, -5, 5);
     per[cur].label = biasLabel(Math.round(per[cur].score));
@@ -279,48 +370,89 @@ function computeBias(items: CalItem[], windowHours: number, currencies: string[]
   return { perCurrency: per };
 }
 
-// ----------------- handler -----------------
+// ──────────────────────────────────────────────────────────────────────────────
+// Handler
 export default async function handler(req: NextApiRequest, res: NextApiResponse<Resp>) {
   try {
+    // Avoid stale carryover between instruments
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+
     const date = String(req.query.date || toISODate(new Date()));
-    const windowHours = Math.max(6, Math.min(168, Number(req.query.windowHours || 48))); // 6h..7d
+    const windowHours = Math.max(6, Math.min(24 * 14, Number(req.query.windowHours || LOOKBACK_HOURS_DEFAULT || 168))); // 6h..14d
+    const warnMins = Math.max(15, Math.min(240, Number(process.env.CALENDAR_WARN_MINS || WARN_MINS_DEFAULT)));
 
     let currencies: string[] = [];
     const instrument = String(req.query.instrument || "").toUpperCase().replace(/[^A-Z]/g, "");
     if (instrument && instrument.length >= 6) {
       currencies = [instrument.slice(0, 3), instrument.slice(-3)];
     } else if (req.query.currencies) {
-      currencies = String(req.query.currencies).split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+      currencies = String(req.query.currencies).split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
     }
 
-    // 1) FairEconomy
-    let items = await fetchFairEconomy(date, windowHours);
-    let provider = "fair";
+    // Primary: ForexFactory XML
+    let items = await fetchForexFactory(date, windowHours);
+    let provider = "forexfactory";
+    let structuredOk = items.length > 0;
 
-    // 2) TradingEconomics fallback or merge
-    const teItems = await fetchTradingEconomics(date, windowHours);
-    if (!items.length && teItems.length) { items = teItems; provider = "te"; }
-    else if (teItems.length) { items = [...items, ...teItems]; provider = "mixed"; }
-
-    if (!items.length) {
-      return res.status(200).json({ ok: false, reason: "No calendar items from providers" });
-    }
-
-    // apply blackout (±90m) for High impact
-    const now = new Date().toISOString();
-    const withBlackout = items.map(i => {
-      if (i.impact === "High") {
-        const w = blackout(i.time, 90);
-        const inWindow = now >= w.from && now <= w.to;
-        return { ...i, isBlackout: inWindow };
+    // Fallback: TradingEconomics
+    if (!structuredOk) {
+      const te = await fetchTradingEconomics(date, windowHours);
+      if (te.length) {
+        items = te;
+        provider = "tradingeconomics";
+        structuredOk = true;
       }
-      return i;
-    });
+    } else {
+      // Merge TE if desired (kept simple: prefer FF; uncomment to merge for redundancy)
+      // const te = await fetchTradingEconomics(date, windowHours);
+      // if (te.length) { items = [...items, ...te]; provider = "mixed"; }
+    }
 
-    // compute bias
-    const { perCurrency } = computeBias(withBlackout, windowHours, currencies);
+    // Last fallback: DailyFX (timing only) if no structured items
+    if (!structuredOk) {
+      const df = await fetchDailyFxRSS(date, windowHours);
+      if (df.length) {
+        items = df;
+        provider = "dailyfx";
+      }
+    }
 
-    // optional instrument bias
+    // If still no items at all
+    if (!items.length) {
+      return res.status(200).json({
+        ok: false,
+        reason: "Calendar providers unavailable",
+        provider: "none",
+        notes: "⚠️ Calendar results unavailable (ForexFactory + TradingEconomics failed). Please upload a calendar image manually.",
+        calendar_status: "unavailable",
+      });
+    }
+
+    // Build warning (use available items; High-impact only; nearest upcoming; must match instrument currencies if provided)
+    const now = new Date();
+    let warning: Ok["warning"] = null;
+    const upcoming = items
+      .filter((i) => i.impact === "High")
+      .filter((i) => (currencies.length ? (i.currency ? currencies.includes(i.currency) : true) : true))
+      .map((i) => ({ i, t: new Date(i.time) }))
+      .filter(({ t }) => t.getTime() >= now.getTime())
+      .sort((a, b) => a.t.getTime() - b.t.getTime());
+
+    if (upcoming.length) {
+      const nearest = upcoming[0];
+      const mins = (nearest.t.getTime() - now.getTime()) / 60000;
+      if (mins <= warnMins) {
+        warning = { title: nearest.i.title, currency: nearest.i.currency, impact: nearest.i.impact, time: nearest.i.time };
+      }
+    }
+
+    // Compute bias only if structured results exist (actual/forecast/previous present for some items)
+    const hasStructured = items.some((i) => i.actual !== null || i.forecast !== null || i.previous !== null);
+    const { perCurrency } = hasStructured ? computeBias(items, windowHours, currencies) : { perCurrency: {} as Record<string, BiasSummary> };
+
+    // Optional instrument bias
     let instrumentBias: Ok["bias"]["instrument"] | undefined;
     if (currencies.length === 2) {
       const [base, quote] = currencies;
@@ -330,20 +462,38 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       instrumentBias = { pair: `${base}${quote}`, score, label: biasLabel(Math.round(score)) };
     }
 
-    // final
-    return res.status(200).json({
+    // Sorting (chronological)
+    const sorted = items.slice().sort((a, b) => a.time.localeCompare(b.time));
+
+    const basePayload: Ok = {
       ok: true,
       provider,
       date,
-      count: withBlackout.length,
-      items: withBlackout.sort((a, b) => b.time.localeCompare(a.time)),
+      count: sorted.length,
+      items: sorted,
       bias: {
         windowHours,
         perCurrency,
         instrument: instrumentBias,
       },
-    });
+      warning,
+      calendar_status: hasStructured ? "ok" : provider === "dailyfx" ? "timing-only" : "ok",
+    };
+
+    // Transparency: if we fell to timing-only (no structured), attach a note so VisionPlan can surface it in both Fast/Full
+    if (!hasStructured) {
+      basePayload.notes = "⚠️ Calendar results unavailable from structured sources (ForexFactory + TradingEconomics). Timing-only fallback in use. Consider uploading a calendar image.";
+      basePayload.calendar_status = provider === "dailyfx" ? "timing-only" : "unavailable";
+    }
+
+    return res.status(200).json(basePayload);
   } catch (e: any) {
-    return res.status(200).json({ ok: false, reason: e?.message || "calendar error" });
+    return res.status(200).json({
+      ok: false,
+      reason: e?.message || "calendar error",
+      provider: "error",
+      notes: "⚠️ Calendar error encountered. Consider uploading a calendar image.",
+      calendar_status: "unavailable",
+    });
   }
 }
