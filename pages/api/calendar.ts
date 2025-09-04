@@ -13,18 +13,20 @@ import type { NextApiRequest, NextApiResponse } from "next";
  *  - currencies=EUR,USD (optional if instrument given)
  *  - instrument=EURUSD (optional; derives currencies)
  *  - windowHours (override lookback window; default CALENDAR_LOOKBACK_DAYS*24 or 168)
+ *  - debug=1 (optional; adds provider/debug info)
  *
- * Response (stable fields from your previous version preserved; added fields are optional):
+ * Response (stable fields preserved; added fields are optional):
  *  {
  *    ok: boolean,
- *    provider: string,                 // "forexfactory" | "tradingeconomics" | "dailyfx" | "mixed"
+ *    provider: "forexfactory"|"tradingeconomics"|"dailyfx"|"mixed"|"none"|"error",
  *    date: string,
  *    count: number,
- *    items: CalItem[],                 // normalized events
+ *    items: CalItem[],
  *    bias: { windowHours, perCurrency, instrument? },
  *    warning: { title, currency?, impact, time } | null,
- *    notes?: string,                   // present when structured providers unavailable
- *    calendar_status?: "ok" | "unavailable" | "timing-only"
+ *    notes?: string,
+ *    calendar_status?: "ok" | "unavailable" | "timing-only",
+ *    debug?: any
  *  }
  */
 
@@ -71,9 +73,10 @@ type Ok = {
   warning: { title: string; currency?: string; impact: Impact; time: string } | null;
   notes?: string;
   calendar_status?: "ok" | "unavailable" | "timing-only";
+  debug?: any;
 };
 
-type Err = { ok: false; reason: string; notes?: string; provider?: string; calendar_status?: "unavailable" | "timing-only" };
+type Err = { ok: false; reason: string; notes?: string; provider?: string; calendar_status?: "unavailable" | "timing-only"; debug?: any };
 type Resp = Ok | Err;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -167,10 +170,12 @@ async function fWithTimeout(url: string, headers?: Record<string, string>): Prom
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Providers
-async function fetchForexFactory(dateISO: string, windowHours: number): Promise<CalItem[]> {
+async function fetchForexFactory(dateISO: string, windowHours: number, debugWanted: boolean): Promise<{ items: CalItem[]; debug?: any }> {
+  const debug: any = { provider: "forexfactory", url: FF_XML_URL };
   try {
     const rsp = await fWithTimeout(FF_XML_URL);
-    if (!rsp.ok) return [];
+    debug.status = rsp.status;
+    if (!rsp.ok) return { items: [], debug };
     const xml = await rsp.text();
 
     const out: CalItem[] = [];
@@ -183,6 +188,7 @@ async function fetchForexFactory(dateISO: string, windowHours: number): Promise<
     // FF XML: <item><title>..</title><country>..</country><date>MM-DD-YYYY</date><time>HH:mm</time><impact>..</impact><forecast>..</forecast><previous>..</previous><actual>..</actual></item>
     const re = /<item>([\s\S]*?)<\/item>/g;
     let m: RegExpExecArray | null;
+    let hits = 0;
     while ((m = re.exec(xml))) {
       const block = m[1];
 
@@ -224,34 +230,41 @@ async function fetchForexFactory(dateISO: string, windowHours: number): Promise<
         previous: parseNum(previousRaw),
         unit: null,
       });
+      hits++;
     }
+    debug.hits = hits;
 
-    return out;
-  } catch {
-    return [];
+    return { items: out, debug: debugWanted ? debug : undefined };
+  } catch (e: any) {
+    debug.error = e?.message || "fetch/parse error";
+    return { items: [], debug: debugWanted ? debug : undefined };
   }
 }
 
-async function fetchTradingEconomics(dateISO: string, windowHours: number): Promise<CalItem[]> {
+async function fetchTradingEconomics(dateISO: string, windowHours: number, debugWanted: boolean): Promise<{ items: CalItem[]; debug?: any }> {
+  const d1 = new Date(`${dateISO}T00:00:00Z`);
+  const d2 = new Date(`${dateISO}T23:59:59Z`);
+  const lo = new Date(d1.getTime() - windowHours * 3600 * 1000);
+  const hi = new Date(d2.getTime() + windowHours * 3600 * 1000);
+
+  const url = new URL(TE_BASE);
+  url.searchParams.set("d1", lo.toISOString().slice(0, 10));
+  url.searchParams.set("d2", hi.toISOString().slice(0, 10));
+  url.searchParams.set("c", "All");
+  url.searchParams.set("format", "json");
+
+  const debug: any = { provider: "tradingeconomics", url: url.toString() };
+
   try {
-    const d1 = new Date(`${dateISO}T00:00:00Z`);
-    const d2 = new Date(`${dateISO}T23:59:59Z`);
-    const lo = new Date(d1.getTime() - windowHours * 3600 * 1000);
-    const hi = new Date(d2.getTime() + windowHours * 3600 * 1000);
-
-    const url = new URL(TE_BASE);
-    url.searchParams.set("d1", lo.toISOString().slice(0, 10));
-    url.searchParams.set("d2", hi.toISOString().slice(0, 10));
-    url.searchParams.set("c", "All");
-    url.searchParams.set("format", "json");
-
     const auth = Buffer.from(`${TE_USER}:${TE_PASS}`).toString("base64");
     const rsp = await fWithTimeout(url.toString(), { Authorization: `Basic ${auth}` });
-    if (!rsp.ok) return [];
+    debug.status = rsp.status;
+    if (!rsp.ok) return { items: [], debug: debugWanted ? debug : undefined };
 
     const arr: any[] = await rsp.json();
     const out: CalItem[] = [];
 
+    let hits = 0;
     for (const e of arr) {
       const title: string = e?.Event || e?.Category || "Event";
       const iso = e?.Date ? new Date(e.Date).toISOString() : new Date().toISOString();
@@ -275,17 +288,23 @@ async function fetchTradingEconomics(dateISO: string, windowHours: number): Prom
         previous: parseNum(e?.Previous),
         unit: e?.Unit || null,
       });
+      hits++;
     }
-    return out;
-  } catch {
-    return [];
+    debug.hits = hits;
+
+    return { items: out, debug: debugWanted ? debug : undefined };
+  } catch (e: any) {
+    debug.error = e?.message || "fetch/parse error";
+    return { items: [], debug: debugWanted ? debug : undefined };
   }
 }
 
-async function fetchDailyFxRSS(dateISO: string, windowHours: number): Promise<CalItem[]> {
+async function fetchDailyFxRSS(dateISO: string, windowHours: number, debugWanted: boolean): Promise<{ items: CalItem[]; debug?: any }> {
+  const debug: any = { provider: "dailyfx", url: DAILYFX_RSS_URL };
   try {
     const rsp = await fWithTimeout(DAILYFX_RSS_URL);
-    if (!rsp.ok) return [];
+    debug.status = rsp.status;
+    if (!rsp.ok) return { items: [], debug: debugWanted ? debug : undefined };
     const xml = await rsp.text();
 
     const d1 = new Date(`${dateISO}T00:00:00Z`);
@@ -296,6 +315,7 @@ async function fetchDailyFxRSS(dateISO: string, windowHours: number): Promise<Ca
     const out: CalItem[] = [];
     const re = /<item>([\s\S]*?)<\/item>/g;
     let m: RegExpExecArray | null;
+    let hits = 0;
 
     while ((m = re.exec(xml))) {
       const block = m[1];
@@ -327,11 +347,14 @@ async function fetchDailyFxRSS(dateISO: string, windowHours: number): Promise<Ca
         previous: null,
         unit: null,
       });
+      hits++;
     }
+    debug.hits = hits;
 
-    return out;
-  } catch {
-    return [];
+    return { items: out, debug: debugWanted ? debug : undefined };
+  } catch (e: any) {
+    debug.error = e?.message || "fetch/parse error";
+    return { items: [], debug: debugWanted ? debug : undefined };
   }
 }
 
@@ -353,6 +376,7 @@ function computeBias(items: CalItem[], windowHours: number, currencies: string[]
   for (const it of items) {
     if (!it.currency) continue;
     if (currencies.length && !currencies.includes(it.currency)) continue;
+
     if (!within(it.time, start, end)) continue;
 
     const delta = scoreDelta(it.title, it.actual ?? null, it.forecast ?? null, it.previous ?? null);
@@ -382,6 +406,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const date = String(req.query.date || toISODate(new Date()));
     const windowHours = Math.max(6, Math.min(24 * 14, Number(req.query.windowHours || LOOKBACK_HOURS_DEFAULT || 168))); // 6h..14d
     const warnMins = Math.max(15, Math.min(240, Number(process.env.CALENDAR_WARN_MINS || WARN_MINS_DEFAULT)));
+    const debugWanted = String(req.query.debug || "") === "1";
 
     let currencies: string[] = [];
     const instrument = String(req.query.instrument || "").toUpperCase().replace(/[^A-Z]/g, "");
@@ -392,29 +417,35 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
 
     // Primary: ForexFactory XML
-    let items = await fetchForexFactory(date, windowHours);
+    const ff = await fetchForexFactory(date, windowHours, debugWanted);
+    let items = ff.items;
     let provider = "forexfactory";
     let structuredOk = items.length > 0;
 
     // Fallback: TradingEconomics
+    let teDebug: any = null;
     if (!structuredOk) {
-      const te = await fetchTradingEconomics(date, windowHours);
-      if (te.length) {
-        items = te;
+      const te = await fetchTradingEconomics(date, windowHours, debugWanted);
+      teDebug = te.debug;
+      if (te.items.length) {
+        items = te.items;
         provider = "tradingeconomics";
         structuredOk = true;
       }
     } else {
-      // Merge TE if desired (kept simple: prefer FF; uncomment to merge for redundancy)
-      // const te = await fetchTradingEconomics(date, windowHours);
-      // if (te.length) { items = [...items, ...te]; provider = "mixed"; }
+      // Optionally, merge TE for redundancy (disabled by default)
+      // const te = await fetchTradingEconomics(date, windowHours, debugWanted);
+      // teDebug = te.debug;
+      // if (te.items.length) { items = [...items, ...te.items]; provider = "mixed"; }
     }
 
     // Last fallback: DailyFX (timing only) if no structured items
+    let dfxDebug: any = null;
     if (!structuredOk) {
-      const df = await fetchDailyFxRSS(date, windowHours);
-      if (df.length) {
-        items = df;
+      const df = await fetchDailyFxRSS(date, windowHours, debugWanted);
+      dfxDebug = df.debug;
+      if (df.items.length) {
+        items = df.items;
         provider = "dailyfx";
       }
     }
@@ -427,10 +458,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         provider: "none",
         notes: "⚠️ Calendar results unavailable (ForexFactory + TradingEconomics failed). Please upload a calendar image manually.",
         calendar_status: "unavailable",
+        debug: debugWanted ? { ff: ff.debug, te: teDebug, dfx: dfxDebug } : undefined,
       });
     }
 
-    // Build warning (use available items; High-impact only; nearest upcoming; must match instrument currencies if provided)
+    // Build warning (High-impact only; nearest upcoming; must match instrument currencies if provided)
     const now = new Date();
     let warning: Ok["warning"] = null;
     const upcoming = items
@@ -448,7 +480,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       }
     }
 
-    // Compute bias only if structured results exist (actual/forecast/previous present for some items)
+    // Compute bias only if structured results exist
     const hasStructured = items.some((i) => i.actual !== null || i.forecast !== null || i.previous !== null);
     const { perCurrency } = hasStructured ? computeBias(items, windowHours, currencies) : { perCurrency: {} as Record<string, BiasSummary> };
 
@@ -478,6 +510,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       },
       warning,
       calendar_status: hasStructured ? "ok" : provider === "dailyfx" ? "timing-only" : "ok",
+      debug: debugWanted ? { ff: ff.debug, te: teDebug, dfx: dfxDebug, currencies, instrument } : undefined,
     };
 
     // Transparency: if we fell to timing-only (no structured), attach a note so VisionPlan can surface it in both Fast/Full
