@@ -21,7 +21,14 @@ export default function ChatDock({
   const [messages, setMessages] = React.useState<Msg[]>([]);
   const [input, setInput] = React.useState("");
   const [loading, setLoading] = React.useState(false);
+
+  // local headlines that auto-refresh when instrument changes
+  const [localHeadlines, setLocalHeadlines] = React.useState<any[]>(headlines || []);
+  const [newsLoading, setNewsLoading] = React.useState(false);
+
   const abortRef = React.useRef<AbortController | null>(null);
+  const newsAbortRef = React.useRef<AbortController | null>(null);
+  const lastInstrumentRef = React.useRef<string | undefined>(instrument);
 
   const addMsg = React.useCallback((m: Msg) => {
     setMessages((prev) => [...prev, m]);
@@ -47,6 +54,55 @@ export default function ChatDock({
     setLoading(false);
   }, []);
 
+  const reloadHeadlines = React.useCallback(async (sym?: string) => {
+    const symbol = (sym || instrument || "").trim();
+    if (!symbol) {
+      setLocalHeadlines([]);
+      return;
+    }
+    // abort any in-flight news request
+    newsAbortRef.current?.abort();
+    const controller = new AbortController();
+    newsAbortRef.current = controller;
+
+    try {
+      setNewsLoading(true);
+      const rsp = await fetch(`/api/news?symbol=${encodeURIComponent(symbol)}`, {
+        method: "GET",
+        headers: { accept: "application/json" },
+        signal: controller.signal,
+      });
+      if (!rsp.ok) throw new Error(`news ${rsp.status}`);
+      const json = await rsp.json().catch(() => ({} as any));
+      // expect { headlines: [...] } or array
+      const items = Array.isArray(json) ? json : json?.headlines || [];
+      setLocalHeadlines(items || []);
+    } catch {
+      // keep previous headlines if fetch fails
+    } finally {
+      setNewsLoading(false);
+      newsAbortRef.current = null;
+    }
+  }, [instrument]);
+
+  // seed local headlines from props on mount/prop-change
+  React.useEffect(() => {
+    setLocalHeadlines(headlines || []);
+  }, [headlines]);
+
+  // Hard reset context on instrument change
+  React.useEffect(() => {
+    if (instrument === lastInstrumentRef.current) return;
+    // 1) stop any active generation
+    onStop();
+    // 2) clear chat state
+    setMessages([]);
+    setInput("");
+    // 3) refresh headlines for the new instrument
+    reloadHeadlines(instrument);
+    lastInstrumentRef.current = instrument;
+  }, [instrument, onStop, reloadHeadlines]);
+
   async function send(e?: React.FormEvent) {
     e?.preventDefault();
     const question = input.trim();
@@ -70,7 +126,7 @@ export default function ChatDock({
           question,
           instrument,
           planText,
-          headlines,
+          headlines: localHeadlines, // use fresh headlines tied to instrument
           calendar,
           stream: true,
         }),
@@ -142,19 +198,67 @@ export default function ChatDock({
     }
   }
 
+  const onReset = React.useCallback(() => {
+    // Abort any active generation and clear UI state (keep current instrument)
+    onStop();
+    setMessages([]);
+    setInput("");
+    reloadHeadlines(instrument);
+  }, [instrument, onStop, reloadHeadlines]);
+
   return (
-    <div className="w-full max-w-2xl mx-auto border rounded-xl p-3 flex flex-col gap-3">
-      <div className="h-72 overflow-auto rounded border p-3 bg-white">
+    <div className="w-full max-w-2xl mx-auto border rounded-xl p-3 flex flex-col gap-3 bg-white">
+      {/* Top bar: instrument + actions */}
+      <div className="flex items-center justify-between">
+        <div className="text-sm font-medium">
+          {instrument ? (
+            <span className="inline-flex items-center gap-2">
+              <span className="px-2 py-0.5 rounded bg-black text-white text-xs">
+                {instrument}
+              </span>
+              {newsLoading ? (
+                <span className="text-xs opacity-60">refreshing headlines…</span>
+              ) : null}
+            </span>
+          ) : (
+            <span className="opacity-60 text-xs">No instrument selected</span>
+          )}
+        </div>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            className="px-3 py-1.5 rounded-lg border text-sm disabled:opacity-50"
+            onClick={onReset}
+            disabled={loading}
+            title="Clear chat"
+          >
+            Reset
+          </button>
+          <button
+            type="button"
+            className="px-3 py-1.5 rounded-lg border text-sm disabled:opacity-50"
+            onClick={onStop}
+            disabled={!loading}
+            title="Stop generating"
+          >
+            Stop
+          </button>
+        </div>
+      </div>
+
+      <div className="h-72 overflow-auto rounded border p-3 bg-slate-50">
         {messages.length === 0 ? (
-          <div className="opacity-60 text-sm">
-            Ask about the current trade plan, or request examples to learn concepts.
-          </div>
+            <div className="opacity-60 text-sm">
+              Ask about the current trade plan, risk, or execution. Switching instruments will clear this chat and pull fresh headlines automatically.
+            </div>
         ) : (
           messages.map((m, i) => (
             <div key={i} className={`mb-3 ${m.role === "user" ? "text-right" : "text-left"}`}>
               <div
-                className={`inline-block whitespace-pre-wrap rounded-lg px-3 py-2 ${
-                  m.role === "user" ? "bg-blue-50" : "bg-gray-50"
+                className={`inline-block whitespace-pre-wrap rounded-xl px-3 py-2 border ${
+                  m.role === "user"
+                    ? "bg-blue-600 text-white border-blue-700"
+                    : "bg-emerald-50 text-emerald-900 border-emerald-200"
                 }`}
               >
                 {m.content}
@@ -178,15 +282,6 @@ export default function ChatDock({
           disabled={loading || !input.trim()}
         >
           Send
-        </button>
-        <button
-          type="button"
-          className="px-3 py-2 rounded-lg border disabled:opacity-50"
-          onClick={onStop}
-          disabled={!loading}
-          title="Stop generating"
-        >
-          Stop
         </button>
       </form>
     </div>
