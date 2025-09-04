@@ -1,21 +1,21 @@
 // /pages/api/vision-plan.ts
-// Images-first planner with optional TradingView/Gyazo image URLs.
-// Uploads: m15 (execution), h1 (context), h4 (HTF), optional calendar image.
-// If no calendar image is provided, this route calls /api/calendar to inject a
-// compact "Calendar snapshot (used for bias)" text block into the model input.
+// Images-only planner with optional TradingView/Gyazo image URL fetch.
+// Uploads: m15 (execution), h1 (context), h4 (HTF), optional calendar.
+// You can also pass m15Url / h1Url / h4Url (TV/Gyazo direct image or page link).
 // -----------------------------------------------------------------------------
 // Two-stage support (non-breaking):
 //   • mode=full (default): full card (legacy).
-//   • mode=fast: Quick Plan (+Option 2) + Management + ai_meta only.
-//   • mode=expand&cache=<id>: reuse Stage-1 cache; ONLY remaining sections.
+//   • mode=fast: full analysis (images + calendar + headlines + **CSM mandatory + COT soft-required**),
+//                OUTPUT ONLY: Quick Plan (+Option 2) + Management + trailing ai_meta.
+//   • mode=expand&cache=<id>: reuse processed images/headlines/sentiment from Stage-1 and return
+//                ONLY the remaining sections (Full Breakdown, X-ray, Candidate Scores, Final Table).
 //
-// Headlines: fetch 12; embed **6** in the prompt.
-// Image downscale: sharp @ max 1280px, JPEG ~70%, strip EXIF, ≲600KB best-effort.
-// Strategy playbook & enforcement unchanged.
-// CSM (intraday) **mandatory**. COT **soft-required** (proceed if unavailable).
-// Calendar precedence: image > API feed (FF→TE→DailyFX timing-only).
-// Transparency: notes/warnings surface in Fast & Full when feed is unavailable.
-// Provenance: extended with calendar_status/provider/error.
+// Headlines: prefer client-provided `headlinesJson` (12 max) for consistency; otherwise fetch 12 and embed **6**.
+// Image downscale: sharp @ max 1280px, JPEG ~70%, strip EXIF, ≤ ~600 KB (best-effort).
+// Strategy playbook: expanded (no “default”) incl. **Fibonacci retracement confluence (38.2–61.8%)**.
+// Enforcement: same micro-passes (Pending proof, Breakout rename, Limit sanity).
+// CSM (intraday) is **mandatory**. COT is **soft-required** (use if available; otherwise proceed and mark unavailable).
+// Provenance: model is asked to include a `sources` field inside ai_meta; API always returns meta.sources.
 // -----------------------------------------------------------------------------
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -234,87 +234,34 @@ async function linkToDataUrl(link: string): Promise<string | null> {
   } catch { return null; }
 }
 
-// ---------- headlines: fetch 12; embed **6** ----------
-async function fetchedHeadlines(req: NextApiRequest, instrument: string): Promise<{ items: any[]; promptText: string | null }> {
+// ---------- headlines helpers ----------
+// Normalize any headline array (from client or server) into prompt text (embed 6)
+type AnyHeadline = { title?: string; source?: string; published_at?: string; ago?: string; sentiment?: { score?: number } | null } & Record<string, any>;
+
+function headlinesToPromptLines(items: AnyHeadline[], limit = 6): string | null {
+  const take = (items || []).slice(0, limit);
+  if (!take.length) return null;
+  const lines = take.map((it: AnyHeadline) => {
+    const s = typeof it?.sentiment?.score === "number" ? it.sentiment!.score as number : null;
+    const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
+    const t = String(it?.title || "").slice(0, 200);
+    const src = it?.source || "";
+    const when = it?.ago || "";
+    return `• ${t} — ${src}${when ? `, ${when}` : ""} — ${lab}`;
+  });
+  return lines.join("\n");
+}
+
+async function fetchedHeadlinesViaServer(req: NextApiRequest, instrument: string): Promise<{ items: AnyHeadline[]; promptText: string | null }> {
   try {
     const base = originFromReq(req);
     const url = `${base}/api/news?instrument=${encodeURIComponent(instrument)}&hours=48&max=12&_t=${Date.now()}`;
     const r = await fetch(url, { cache: "no-store" });
     const j = await r.json().catch(() => ({}));
-    const items: any[] = Array.isArray(j?.items) ? j.items : [];
-    const lines = items
-      .slice(0, 6)
-      .map((it: any) => {
-        const s = typeof it?.sentiment?.score === "number" ? it.sentiment.score : null;
-        const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
-        const t = String(it?.title || "").slice(0, 200);
-        const src = it?.source || "";
-        const when = it?.ago || "";
-        return `• ${t} — ${src}${when ? `, ${when}` : ""} — ${lab}`;
-      })
-      .join("\n");
-    return { items, promptText: lines || null };
+    const items: AnyHeadline[] = Array.isArray(j?.items) ? j.items : [];
+    return { items, promptText: headlinesToPromptLines(items, 6) };
   } catch {
     return { items: [], promptText: null };
-  }
-}
-
-// ---------- Calendar API fallback (when no image) ----------
-type CalendarAPI = {
-  ok: boolean;
-  provider?: string;
-  items?: any[];
-  warning?: { title: string; currency?: string; impact: string; time: string } | null;
-  notes?: string;
-  calendar_status?: "ok" | "unavailable" | "timing-only";
-  bias?: any;
-  debug?: any;
-};
-async function fetchCalendarAPI(req: NextApiRequest, instrument: string): Promise<{
-  snapshotText: string | null;
-  warningLine: string | null;
-  status: "image" | "ok" | "timing-only" | "unavailable";
-  provider: string;
-  noteLine: string | null;
-}> {
-  try {
-    const base = originFromReq(req);
-    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&_t=${Date.now()}`;
-    const r = await fetch(url, { cache: "no-store" });
-    const j: CalendarAPI = await r.json().catch(() => ({ ok: false }));
-    const provider = j?.provider || "none";
-    const status = (j?.calendar_status as any) || (j?.ok ? "ok" : "unavailable");
-
-    // Build compact snapshot (max ~6 lines) with Actual/Forecast/Previous when present
-    let snapshotText: string | null = null;
-    if (Array.isArray(j?.items) && j.items.length) {
-      const lines = j.items.slice(0, 6).map((it: any) => {
-        const when = new Date(it.time).toISOString().slice(11, 16); // HH:MM UTC
-        const imp = (it.impact || "").toString();
-        const cur = it.currency ? `[${it.currency}] ` : "";
-        const afp = [
-          isFinite(it.actual) ? `A:${it.actual}` : null,
-          isFinite(it.forecast) ? `F:${it.forecast}` : null,
-          isFinite(it.previous) ? `P:${it.previous}` : null,
-        ].filter(Boolean).join(" ");
-        return `• ${when} ${imp} ${cur}${it.title}${afp ? ` — ${afp}` : ""}`;
-      }).join("\n");
-      snapshotText = lines || null;
-    }
-
-    // Warning line (≤60m High-impact)
-    const warningLine = j?.warning
-      ? `⚠️ High-impact: ${j.warning.title}${j.warning.currency ? ` (${j.warning.currency})` : ""} at ${new Date(j.warning.time).toISOString().slice(11,16)} UTC. Expect spreads/volatility.`
-      : null;
-
-    // Notes line when unavailable/timing-only
-    const noteLine = (!j?.ok || status === "timing-only")
-      ? (j?.notes || `⚠️ Calendar results unavailable (structured providers failed). Consider uploading a calendar image.`)
-      : null;
-
-    return { snapshotText, warningLine, status, provider, noteLine };
-  } catch {
-    return { snapshotText: null, warningLine: null, status: "unavailable", provider: "error", noteLine: "⚠️ Calendar error. Consider uploading a calendar image." };
   }
 }
 
@@ -527,7 +474,7 @@ async function getCOT(): Promise<CotSnapshot> {
   let txt: string | null = null;
   try { txt = await fetchCFTCOnce(10_000); }
   catch {
-    await new Promise((r) => setTimeout(r, 600));
+    await new Promise((r) => setTimeout(r, 600)); // small backoff
     txt = await fetchCFTCOnce(10_000);
   }
   const snap = parseCFTC(txt);
@@ -596,15 +543,11 @@ function systemCore(instrument: string) {
     "Stops are price-action based (behind swing/OB/SR); if too tight, step to the next valid zone.",
     "Only reference **Headlines / Calendar / CSM / COT** if their respective blocks are present below. Otherwise omit them.",
     "Keep instrument alignment with " + instrument + ".",
-    "",
-    // Conviction floor rule:
-    "If fundamentals are missing/mixed but technical proof exists, still output a single actionable plan with Conviction 55–60% and state the mismatch explicitly.",
   ].join("\n");
 }
 function buildUserPartsBase(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
-  calendarDataUrl?: string | null; calendarSnapshot?: string | null;
-  headlinesText?: string | null; sentimentText?: string | null;
+  calendarDataUrl?: string | null; headlinesText?: string | null; sentimentText?: string | null;
 }) {
   const parts: any[] = [
     { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}` },
@@ -613,9 +556,6 @@ function buildUserPartsBase(args: {
     { type: "text", text: "Execution 15M Chart:" }, { type: "image_url", image_url: { url: args.m15 } },
   ];
   if (args.calendarDataUrl) { parts.push({ type: "text", text: "Economic Calendar Image:" }); parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } }); }
-  if (!args.calendarDataUrl && args.calendarSnapshot) {
-    parts.push({ type: "text", text: `Calendar snapshot (used for bias):\n${args.calendarSnapshot}` });
-  }
   if (args.headlinesText) { parts.push({ type: "text", text: `Recent headlines snapshot (used for bias; list shown in Stage-2):\n${args.headlinesText}` }); }
   if (args.sentimentText) { parts.push({ type: "text", text: `Sentiment snapshot (CSM + COT; used for bias):\n${args.sentimentText}` }); }
   return parts;
@@ -624,8 +564,7 @@ function buildUserPartsBase(args: {
 // FULL card (legacy)
 function messagesFull(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
-  calendarDataUrl?: string | null; calendarSnapshot?: string | null;
-  headlinesText?: string | null; sentimentText?: string | null;
+  calendarDataUrl?: string | null; headlinesText?: string | null; sentimentText?: string | null;
 }) {
   const system = [
     systemCore(args.instrument),
@@ -676,7 +615,7 @@ function messagesFull(args: {
     `  "stop": number, "tp1": number, "tp2": number,`,
     `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
     `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
-    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": "image"|"ok"|"timing-only"|"unavailable", "calendar_provider": string, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null } }`,
+    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null } }`,
     "```",
   ].join("\n");
 
@@ -689,13 +628,8 @@ function messagesFull(args: {
 // FAST Stage-1: Quick Plan + Management + ai_meta
 function messagesFastStage1(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
-  calendarDataUrl?: string | null; calendarSnapshot?: string | null;
-  headlinesText?: string | null; sentimentText?: string | null;
-  provenance?: {
-    headlines_used: number; headlines_instrument: string;
-    calendar_used: boolean; calendar_status: "image"|"ok"|"timing-only"|"unavailable"; calendar_provider: string;
-    csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string | null; cot_error?: string | null;
-  };
+  calendarDataUrl?: string | null; headlinesText?: string | null; sentimentText?: string | null;
+  provenance?: { headlines_used: number; headlines_instrument: string; calendar_used: boolean; csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string | null; cot_error?: string | null; };
 }) {
   const system = [
     systemCore(args.instrument),
@@ -728,7 +662,7 @@ function messagesFastStage1(args: {
     `  "stop": number, "tp1": number, "tp2": number,`,
     `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
     `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
-    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": "image"|"ok"|"timing-only"|"unavailable", "calendar_provider": string, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null } }`,
+    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null } }`,
     "```",
   ].join("\n");
 
@@ -742,8 +676,7 @@ function messagesFastStage1(args: {
 // Stage-2 Expand: ONLY the remaining sections
 function messagesExpandStage2(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
-  calendarDataUrl?: string | null; calendarSnapshot?: string | null;
-  headlinesText?: string | null; sentimentText?: string | null; aiMetaHint?: any;
+  calendarDataUrl?: string | null; headlinesText?: string | null; sentimentText?: string | null; aiMetaHint?: any;
 }) {
   const system = [
     systemCore(args.instrument),
@@ -776,9 +709,9 @@ function messagesExpandStage2(args: {
     "Append NOTHING after these sections (no ai_meta here).",
   ].join("\n");
 
-  const parts = buildUserPartsBase(args);
-  if (args.aiMetaHint) parts.push({ type: "text", text: `ai_meta_hint:\n${JSON.stringify(args.aiMetaHint, null, 2)}` });
-  return [{ role: "system", content: system }, { role: "user", content: parts }];
+  const userParts = buildUserPartsBase(args);
+  if (args.aiMetaHint) userParts.push({ type: "text", text: `ai_meta_hint:\n${JSON.stringify(args.aiMetaHint, null, 2)}` });
+  return [{ role: "system", content: system }, { role: "user", content: userParts }];
 }
 
 // ---------- OpenAI call ----------
@@ -798,51 +731,27 @@ async function callOpenAI(messages: any[]) {
   return String(out || "");
 }
 
-// ---------- text post-processing helpers ----------
-function injectLineIntoSection(text: string, sectionHeader: string, line: string): string {
-  if (!text || !line) return text;
-  const re = new RegExp(`(^|\\n)${sectionHeader}\\s*\\n`, "i");
-  const m = text.match(re);
-  if (!m) {
-    // fallback: prepend line at top
-    return `${line}\n\n${text}`;
-  }
-  const idx = (m.index ?? 0) + m[0].length;
-  return text.slice(0, idx) + `${line}\n` + text.slice(idx);
+// ---------- enforcement passes ----------
+async function rewriteAsPending(instrument: string, text: string) {
+  const messages = [
+    { role: "system", content: "Rewrite the trade card as PENDING (no Market) into a clean Buy/Sell LIMIT zone at OB/FVG/SR confluence if breakout proof is missing. Keep tournament section and X-ray." },
+    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nRewrite strictly to Pending.` },
+  ];
+  return callOpenAI(messages);
 }
-function randomConvictionBetween(a: number, b: number) {
-  const x = a + Math.random() * (b - a);
-  return Math.round(x);
+async function normalizeBreakoutLabel(text: string) {
+  const messages = [
+    { role: "system", content: "If 'Breakout + Retest' is claimed but proof is not shown (body close + retest hold or SFP reclaim), rename setup to 'Pullback (OB/FVG/SR)' and leave rest unchanged." },
+    { role: "user", content: text },
+  ];
+  return callOpenAI(messages);
 }
-async function enforceConvictionFloorIfNeeded(
-  instrument: string,
-  text: string,
-  aiMeta: any,
-  calendarStatus: "image"|"ok"|"timing-only"|"unavailable"
-): Promise<{ text: string; aiMeta: any }> {
-  // If technical proof exists but fundamentals are missing/mixed, ensure actionable 55–60%.
-  const hasZone = !!(aiMeta?.zone && isFinite(Number(aiMeta?.zone?.min)) && isFinite(Number(aiMeta?.zone?.max)));
-  const breakoutOk = !!(aiMeta?.breakoutProof?.bodyCloseBeyond && (aiMeta?.breakoutProof?.retestHolds || aiMeta?.breakoutProof?.sfpReclaim));
-  const technicalProof = hasZone || breakoutOk;
-
-  if (!technicalProof) return { text, aiMeta };
-
-  const dir = String(aiMeta?.direction || "").toLowerCase();
-  const conv = Number(aiMeta?.conviction ?? aiMeta?.convictionPct ?? 0);
-  const fundamentalsWeak = (calendarStatus === "timing-only" || calendarStatus === "unavailable");
-
-  if ((dir === "flat" || dir === "stay flat" || conv < 55) && fundamentalsWeak) {
-    // Rewrite to Pending Limit with conviction floor 55–60
-    const floor = randomConvictionBetween(55, 60);
-    const rewrite = [
-      { role: "system", content: "Rewrite as an actionable Pending Limit idea (no Market) with Conviction 55–60% because fundamentals are missing/mixed. Keep sections/format identical." },
-      { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nConstraints:\n- EntryType: Pending\n- Conviction: ${floor}%\n- Add one-line 'Tech vs Fundy: No macro tilt (calendar unavailable)'` },
-    ];
-    const newText = await callOpenAI(rewrite);
-    const newMeta = extractAiMeta(newText) || aiMeta;
-    return { text: newText || text, aiMeta: newMeta };
-  }
-  return { text, aiMeta };
+async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
+  const messages = [
+    { role: "system", content: "Adjust the LIMIT zone so that: Sell Limit is an ABOVE-price pullback into supply; Buy Limit is a BELOW-price pullback into demand. Keep all other content & sections." },
+    { role: "user", content: `Instrument: ${instrument}\n\nCurrent Price: ${aiMeta?.currentPrice}\nProvided Zone: ${JSON.stringify(aiMeta?.zone)}\n\nCard:\n${text}\n\nFix only the LIMIT zone side and entry, keep format.` },
+  ];
+  return callOpenAI(messages);
 }
 
 // ---------- handler ----------
@@ -864,8 +773,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const dateStr = new Date().toISOString().slice(0, 10);
       const messages = messagesExpandStage2({
         instrument: c.instrument, dateStr, m15: c.m15, h1: c.h1, h4: c.h4,
-        calendarDataUrl: c.calendar || undefined, calendarSnapshot: undefined,
-        headlinesText: c.headlinesText || undefined, sentimentText: c.sentimentText || undefined,
+        calendarDataUrl: c.calendar || undefined, headlinesText: c.headlinesText || undefined, sentimentText: c.sentimentText || undefined,
         aiMetaHint: null,
       });
       const text = await callOpenAI(messages);
@@ -926,11 +834,26 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       });
     }
 
-    // Headlines: fetch 12; embed 6 in prompt
-    const tNews = now();
-    const { items: headlineItems, promptText: headlinesText } = await fetchedHeadlines(req, instrument);
-    if (process.env.NODE_ENV !== "production") {
-      console.log(`[vision-plan] news fetched ${dt(tNews)} (items=${headlineItems.length})`);
+    // ----- Headlines: prefer client-provided; else server fetch -----
+    let headlineItems: AnyHeadline[] = [];
+    let headlinesText: string | null = null;
+
+    const rawHeadlines = pickFirst(fields.headlinesJson) as string | null;
+    if (rawHeadlines) {
+      try {
+        const parsed = JSON.parse(String(rawHeadlines));
+        if (Array.isArray(parsed)) {
+          headlineItems = parsed.slice(0, 12);
+          headlinesText = headlinesToPromptLines(headlineItems, 6);
+        }
+      } catch {
+        // fall through to server fetch below
+      }
+    }
+    if (!headlinesText) {
+      const viaServer = await fetchedHeadlinesViaServer(req, instrument);
+      headlineItems = viaServer.items;
+      headlinesText = viaServer.promptText;
     }
 
     // ----- Sentiment: CSM mandatory; COT soft-required -----
@@ -943,35 +866,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let cotErr: string | null = null;
     try { cot = await getCOT(); } catch (e: any) { cot = null; cotErr = e?.message || "unavailable"; }
 
-    const { text: sentimentText, provenance: provSent } = sentimentSummary(csm, cot, cotErr);
+    const { text: sentimentText, provenance } = sentimentSummary(csm, cot, cotErr);
+
     const dateStr = new Date().toISOString().slice(0, 10);
-
-    // ----- Calendar precedence: image first, else API snapshot -----
-    let calendarSnapshot: string | null = null;
-    let calendarWarningLine: string | null = null;
-    let calendarNoteLine: string | null = null;
-    let calendarStatus: "image"|"ok"|"timing-only"|"unavailable" = calUrl ? "image" : "unavailable";
-    let calendarProvider: string = calUrl ? "image" : "none";
-
-    if (!calUrl) {
-      const cal = await fetchCalendarAPI(req, instrument);
-      calendarSnapshot = cal.snapshotText;
-      calendarWarningLine = cal.warningLine;
-      calendarNoteLine = cal.noteLine;
-      calendarStatus = cal.status;
-      calendarProvider = cal.provider;
-    }
 
     // ---------- Stage 1 (fast) or Full ----------
     let text = "";
     let aiMeta: any = null;
 
     const provForModel = {
-      headlines_used: Math.min(6, headlineItems.length),
+      headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
       headlines_instrument: instrument,
-      calendar_used: !!calUrl || calendarStatus === "ok",
-      calendar_status: calendarStatus,
-      calendar_provider: calendarProvider,
+      calendar_used: !!calUrl,
       csm_used: true,
       csm_time: csm.tsISO,
       cot_used: !!cot,
@@ -981,8 +887,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     if (mode === "fast") {
       const messages = messagesFastStage1({
-        instrument, dateStr, m15, h1, h4,
-        calendarDataUrl: calUrl || undefined, calendarSnapshot: calendarSnapshot || undefined,
+        instrument, dateStr, m15, h1, h4, calendarDataUrl: calUrl || undefined,
         headlinesText: headlinesText || undefined, sentimentText, provenance: provForModel,
       });
       text = await callOpenAI(messages);
@@ -999,13 +904,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         const bad = invalidOrderRelativeToPrice(aiMeta);
         if (bad) { text = await fixOrderVsPrice(instrument, text, aiMeta); aiMeta = extractAiMeta(text) || aiMeta; }
       }
-
-      // Inject calendar warning/note into Management (top of section)
-      if (calendarWarningLine) text = injectLineIntoSection(text, "Management", calendarWarningLine);
-      if (calendarNoteLine) text = injectLineIntoSection(text, "Management", calendarNoteLine);
-
-      // Conviction floor if fundamentals missing/mixed but technical proof exists
-      ({ text, aiMeta } = await enforceConvictionFloorIfNeeded(instrument, text, aiMeta, calendarStatus));
 
       const cacheKey = setCache({
         instrument, m15, h1, h4, calendar: calUrl || null, headlinesText: headlinesText || null, sentimentText,
@@ -1028,8 +926,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     // FULL (legacy)
     const messages = messagesFull({
-      instrument, dateStr, m15, h1, h4,
-      calendarDataUrl: calUrl || undefined, calendarSnapshot: calendarSnapshot || undefined,
+      instrument, dateStr, m15, h1, h4, calendarDataUrl: calUrl || undefined,
       headlinesText: headlinesText || undefined, sentimentText,
     });
     text = await callOpenAI(messages);
@@ -1046,13 +943,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       if (bad) { text = await fixOrderVsPrice(instrument, text, aiMeta); aiMeta = extractAiMeta(text) || aiMeta; }
     }
 
-    // Inject calendar warning/note into Fundamental View section
-    if (calendarWarningLine) text = injectLineIntoSection(text, "• Fundamental View (Calendar + Sentiment + Headlines):", calendarWarningLine);
-    if (calendarNoteLine) text = injectLineIntoSection(text, "• Fundamental View (Calendar + Sentiment + Headlines):", calendarNoteLine);
-
-    // Conviction floor if fundamentals missing/mixed but technical proof exists
-    ({ text, aiMeta } = await enforceConvictionFloorIfNeeded(instrument, text, aiMeta, calendarStatus));
-
     if (!text || refusalLike(text)) {
       const fb = fallbackCard(instrument, provForModel);
       return res.status(200).json({
@@ -1066,33 +956,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       ok: true, text,
       meta: { instrument, mode, headlinesCount: headlineItems.length, fallbackUsed: false, aiMeta, sources: provForModel },
     });
-
   } catch (err: any) {
     return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
   }
-}
-
-// ---------- enforcement passes (LLM rewrite helpers) ----------
-async function rewriteAsPending(instrument: string, text: string) {
-  const messages = [
-    { role: "system", content: "Rewrite the trade card as PENDING (no Market) into a clean Buy/Sell LIMIT zone at OB/FVG/SR confluence if breakout proof is missing. Keep tournament section and X-ray." },
-    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nRewrite strictly to Pending.` },
-  ];
-  return callOpenAI(messages);
-}
-async function normalizeBreakoutLabel(text: string) {
-  const messages = [
-    { role: "system", content: "If 'Breakout + Retest' is claimed but proof is not shown (body close + retest hold or SFP reclaim), rename setup to 'Pullback (OB/FVG/SR)' and leave rest unchanged." },
-    { role: "user", content: text },
-  ];
-  return callOpenAI(messages);
-}
-async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
-  const messages = [
-    { role: "system", content: "Adjust the LIMIT zone so that: Sell Limit is an ABOVE-price pullback into supply; Buy Limit is a BELOW-price pullback into demand. Keep all other content & sections." },
-    { role: "user", content: `Instrument: ${instrument}\n\nCurrent Price: ${aiMeta?.currentPrice}\nProvided Zone: ${JSON.stringify(aiMeta?.zone)}\n\nCard:\n${text}\n\nFix only the LIMIT zone side and entry, keep format.` },
-  ];
-  return callOpenAI(messages);
 }
 
 // ---------- fallback (keeps structure + sources) ----------
@@ -1102,8 +968,6 @@ function fallbackCard(
     headlines_used: number;
     headlines_instrument: string;
     calendar_used: boolean;
-    calendar_status: "image"|"ok"|"timing-only"|"unavailable";
-    calendar_provider: string;
     csm_used: boolean;
     csm_time: string;
     cot_used: boolean;
@@ -1126,7 +990,7 @@ function fallbackCard(
     "",
     "Full Breakdown",
     "• Technical View: Indecisive; likely range.",
-    "• Fundamental View: Mixed/insufficient; keep size conservative.",
+    "• Fundamental View: Mixed; keep size conservative.",
     "• Tech vs Fundy Alignment: Mixed.",
     "• Conditional Scenarios: Break+retest for continuation; SFP & reclaim for reversal.",
     "• Surprise Risk: Headlines; CB speakers.",
