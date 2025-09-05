@@ -1,3 +1,4 @@
+// /pages/api/news.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 
 type SentimentLabel = "positive" | "negative" | "neutral";
@@ -10,6 +11,7 @@ type NewsItem = {
   language?: string;
   symbols?: string[];
   sentiment?: { score: number; label: SentimentLabel };
+  ago?: string;
 };
 
 type Ok = { ok: true; provider: string; count: number; items: NewsItem[]; query: any; debug?: any };
@@ -37,13 +39,35 @@ function hoursAgoISO(h: number) {
   return new Date(Date.now() - h * 3600 * 1000).toISOString();
 }
 
+function fmtAgo(iso: string) {
+  try {
+    const dt = new Date(iso).getTime();
+    const diffMs = Date.now() - dt;
+    const h = Math.floor(diffMs / 3600000);
+    if (h < 24) return `${h}h ago`;
+    const d = Math.floor(h / 24);
+    return `${d}d ago`;
+  } catch { return ""; }
+}
+
+// ---------------- instrument → tokens ----------------
+function tokenizeInstrument(raw: string): string[] {
+  if (!raw) return [];
+  const s = raw.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  // Common 6-letter FX pairs (e.g., EURUSD)
+  if (/^[A-Z]{6}$/.test(s)) return [s.slice(0, 3), s.slice(3, 6)];
+  // Metals / indices / crypto variants (XAUUSD, XAGUSD, BTCUSD, ETHUSD, DXY)
+  if (s.length >= 6 && /^[A-Z0-9]+USD$/.test(s)) return [s.replace(/USD$/, ""), "USD"];
+  if (s === "DXY") return ["USD", "DXY"];
+  return [];
+}
+
 // Build a conservative, provider-friendly query (no parentheses/AND)
 function buildQuery(tokens: string[]) {
   const base = ["forex", "currency", "rates", "inflation", "cpi", "gdp", "central bank", "market"];
   const bag = [...tokens, ...base]
-    .map((s) => s.replace(/[^\w/+.-]/g, " ").trim())
+    .map((x) => x.replace(/[^\w/+.-]/g, " ").trim())
     .filter(Boolean);
-  // limit length to avoid 414/422
   const dedup = Array.from(new Set(bag)).slice(0, 12);
   return dedup.join(" OR ");
 }
@@ -51,27 +75,36 @@ function buildQuery(tokens: string[]) {
 export default async function handler(req: NextApiRequest, res: NextApiResponse<Resp>) {
   if (req.method !== "GET") return res.status(405).json({ ok: false, reason: "Method not allowed" });
 
+  res.setHeader("Cache-Control", "no-store");
+
   const prefer = String(process.env.NEWS_API_PROVIDER || "newsdata");
   const NEWSDATA_API_KEY = process.env.NEWSDATA_API_KEY || "";
   const NEWS_API_KEY = process.env.NEWS_API_KEY || process.env.NEWSAPI_API_KEY || "";
 
+  // ---- derive tokens (instrument first, then currencies/symbols) ----
+  const instrument = String((req.query as any).instrument || "").trim();
+  let tokens: string[] = tokenizeInstrument(instrument);
+
   const list = parseList((req.query as any).currencies ?? (req.query as any).symbols);
+  if (!tokens.length && list.length) tokens = list.map((s) => s.toUpperCase());
+
+  // minimal default to avoid empty query
+  if (!tokens.length) tokens = ["USD"];
+
   const lang = String(req.query.lang || process.env.HEADLINES_LANG || "en");
   const hours = Math.max(1, Number(req.query.hours || process.env.HEADLINES_SINCE_HOURS || 48));
   const max = Math.min(25, Math.max(1, Number(req.query.max || process.env.HEADLINES_MAX || 12)));
   const debugWanted = String(req.query.debug || "") === "1";
-  const queryMeta = { list, lang, hours, max };
+  const queryMeta = { instrument, list, tokens, lang, hours, max };
 
-  const tokens = list.length ? list : ["USD"];
   const q = buildQuery(tokens);
   const sinceISO = hoursAgoISO(hours);
 
-  // ───────────────────────────────────────────────────────────────────────────
   async function tryNewsdata() {
     if (!NEWSDATA_API_KEY) return { items: [] as NewsItem[], debug: { note: "missing NEWSDATA_API_KEY" }, error: "no-key" as string | undefined };
     const url = new URL("https://newsdata.io/api/1/news");
     url.searchParams.set("apikey", NEWSDATA_API_KEY);
-    url.searchParams.set("q", q);                 // keep simple OR query
+    url.searchParams.set("q", q);
     url.searchParams.set("language", lang);
     url.searchParams.set("from_date", sinceISO.slice(0, 10)); // yyyy-mm-dd
     url.searchParams.set("page", "1");
@@ -83,15 +116,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const results: any[] = Array.isArray(j?.results) ? j.results : [];
       const items: NewsItem[] = results.slice(0, max).map((r: any) => {
         const title: string = r?.title || r?.description || "";
+        const published = r?.pubDate ? new Date(r.pubDate).toISOString() : new Date().toISOString();
         return {
           title,
           url: r?.link || r?.source_url || "",
-          published_at: r?.pubDate ? new Date(r.pubDate).toISOString() : new Date().toISOString(),
+          published_at: published,
           source: r?.source_id || r?.creator || r?.source || undefined,
           country: r?.country,
           language: r?.language || lang,
           symbols: tokens,
           sentiment: simpleSentiment(title),
+          ago: fmtAgo(published),
         };
       });
       return { items, debug: { providerUrl: url.toString(), providerHits: results.length } };
@@ -117,14 +152,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const arr: any[] = Array.isArray(j?.articles) ? j.articles : [];
       const items: NewsItem[] = arr.slice(0, max).map((a: any) => {
         const title: string = a?.title || a?.description || "";
+        const published = a?.publishedAt ? new Date(a.publishedAt).toISOString() : new Date().toISOString();
         return {
           title,
           url: a?.url || "",
-          published_at: a?.publishedAt ? new Date(a.publishedAt).toISOString() : new Date().toISOString(),
+          published_at: published,
           source: a?.source?.name || undefined,
           language: lang,
           symbols: tokens,
           sentiment: simpleSentiment(title),
+          ago: fmtAgo(published),
         };
       });
       return { items, debug: { providerUrl: url.toString(), providerHits: arr.length } };
@@ -141,7 +178,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const r = await fetch(url, { cache: "no-store" });
       if (!r.ok) return { items: [] as NewsItem[], debug: { providerUrl: url, status: r.status }, error: `http ${r.status}` };
       const xml = await r.text();
-      // lite parse for <item><title>...<link>...<pubDate>...</item>
       const items: NewsItem[] = [];
       const re = /<item>([\s\S]*?)<\/item>/g;
       let m: RegExpExecArray | null;
@@ -152,14 +188,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         const link = (block.match(/<link>([\s\S]*?)<\/link>/)?.[1] || "").trim();
         const pub = (block.match(/<pubDate>([\s\S]*?)<\/pubDate>/)?.[1] || "").trim();
         if (title && link) {
+          const published = pub ? new Date(pub).toISOString() : new Date().toISOString();
           items.push({
             title,
             url: link,
-            published_at: pub ? new Date(pub).toISOString() : new Date().toISOString(),
+            published_at: published,
             source: "Google News",
             language: lang,
             symbols: tokens,
             sentiment: simpleSentiment(title),
+            ago: fmtAgo(published),
           });
           count++;
         }
@@ -177,19 +215,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     if (!first.items.length) {
       const second: any = order[1] === "newsapi" ? await tryNewsAPI() : await tryNewsdata();
-      if (second.items.length) {
-        providerUsed = order[1];
-        first = second;
-      }
+      if (second.items.length) { providerUsed = order[1]; first = second; }
     }
 
     if (!first.items.length) {
-      // last-resort
       const rss = await tryGoogleRSS();
-      if (rss.items.length) {
-        providerUsed = "google-rss";
-        first = rss;
-      }
+      if (rss.items.length) { providerUsed = "google-rss"; first = rss; }
     }
 
     if (!first.items.length) {
