@@ -1048,22 +1048,35 @@ type CalendarBiasResp = {
 };
 
 function calendarShortText(resp: any, pair: string): string | null {
-  if (!resp?.ok) return null;
+  if (!resp || !resp.ok) return null;
+
   const instrBias = resp?.bias?.instrument;
   const parts: string[] = [];
+
   if (instrBias && instrBias.pair === pair) {
     parts.push(`Instrument bias: ${instrBias.label} (${instrBias.score})`);
   }
-const per = resp?.bias?.perCurrency || {};
-const base = pair.slice(0,3);
-const quote = pair.slice(3);
- }
-  const b = per[base]?.label ? `${base}:${per[base].label}` : null;
-  const q = per[quote]?.label ? `${quote}:${per[quote].label}` : null;
-  if (b or q) parts.push(`Per-currency: ${[b,q].filter(Boolean).join(" / ")}`);
-  if (!parts.length) parts.push("No strong calendar bias.");
+
+  const per: Record<string, { label?: string }> =
+    (resp && resp.bias && resp.bias.perCurrency) ? resp.bias.perCurrency : {};
+
+  const base = pair.slice(0, 3);
+  const quote = pair.slice(3);
+
+  const b = per[base] && per[base].label ? `${base}:${per[base].label}` : null;
+  const q = per[quote] && per[quote].label ? `${quote}:${per[quote].label}` : null;
+
+  if (b || q) {
+    parts.push(`Per-currency: ${[b, q].filter(Boolean).join(" / ")}`);
+  }
+
+  if (!parts.length) {
+    parts.push("No strong calendar bias.");
+  }
+
   return `Calendar bias for ${pair}: ${parts.join("; ")}`;
 }
+
 
 async function fetchCalendarBias(req: NextApiRequest, instrument: string): Promise<CalendarBiasResp> {
   try {
