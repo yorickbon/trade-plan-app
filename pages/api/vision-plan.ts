@@ -1055,14 +1055,12 @@ function calendarShortText(resp: any, pair: string): string | null {
     parts.push(`Instrument bias: ${instrBias.label} (${instrBias.score})`);
   }
   const per = resp?.bias?.perCurrency || {};
-  const base = pair.slice(0,3), quote = pair.slice(3);
- function headlinesBiasScore(selected: AnyHeadline[], prelimDir: Dir): { s: number, conf: number } {
-  if (!selected || selected.length === 0) return { s: 0, conf: 0 };
-  let pos = 0, neg = 0;
-  selected.forEach(h => {
-    const sc = Number(h?.sentiment?.score ?? 0);
-    ...
-
+  const base = pair.slice(0, 3), quote = pair.slice(3);
+  const b = per[base]?.label ? `${base}:${per[base].label}` : null;
+  const q = per[quote]?.label ? `${quote}:${per[quote].label}` : null;
+  if (b || q) parts.push(`Per-currency: ${[b, q].filter(Boolean).join(" / ")}`);
+  if (!parts.length) parts.push("No strong calendar bias.");
+  return `Calendar bias for ${pair}: ${parts.join("; ")}`;
 }
 
 async function fetchCalendarBias(req: NextApiRequest, instrument: string): Promise<CalendarBiasResp> {
@@ -1073,7 +1071,6 @@ async function fetchCalendarBias(req: NextApiRequest, instrument: string): Promi
     const j: any = await r.json().catch(() => ({}));
     if (j?.ok) {
       const t = calendarShortText(j, instrument) || `Calendar bias for ${instrument}: (no strong signal)`;
-      // try read optional fields if provided by your calendar API
       const instrumentBias = j?.bias?.instrument?.label ? { label: j.bias.instrument.label, score: j.bias.instrument.score } : null;
       const nextEvent = j?.nextEvent || null;
       const postResult = j?.postResult || null;
@@ -1084,6 +1081,7 @@ async function fetchCalendarBias(req: NextApiRequest, instrument: string): Promi
     return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null };
   }
 }
+
 
 // ---------- bias & conviction engine ----------
 function sign(x: number) { return x >= 0 ? 1 : -1; }
