@@ -1057,7 +1057,7 @@ function calendarShortText(resp: any, pair: string): string | null {
 const per = resp?.bias?.perCurrency || {};
 const base = pair.slice(0,3);
 const quote = pair.slice(3);
- 
+ }
   const b = per[base]?.label ? `${base}:${per[base].label}` : null;
   const q = per[quote]?.label ? `${quote}:${per[quote].label}` : null;
   if (b or q) parts.push(`Per-currency: ${[b,q].filter(Boolean).join(" / ")}`);
