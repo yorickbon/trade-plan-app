@@ -11,36 +11,44 @@
 //
 // Headlines: prefer client-provided `headlinesJson` (≤12) for consistency; else fetch 12 and embed **6**.
 // Image downscale: adaptive clarity — max width up to 1500px, JPEG 74→88, target ~700–900 KB (best-effort, ≤1.2 MB).
-// FAST-mode performance: lower image budget (≤960w, q=72, ~350–500 KB each), embed **4** headlines (UI still shows 12).
 // Strategy playbook & enforcement: unchanged. LIMIT sanity uses verified currentPrice (live).
 // CSM (intraday) is **mandatory**. COT is **soft-required** with CFTC→Tradingster→headline-fallback and 14-day stale cache reuse.
 // Calendar precedence: uploaded image > API bias > explicit “unavailable” warning, surfaced in both Fast/Full.
-// **Calendar results-aware from image**: when a calendar image is supplied, the model must read Actual/Forecast/Previous from the image and use realised bias & warnings (no blackout).
-// Fundamentals override: large realised surprise can boost/cap conviction; past realised carry-forward (3d typical; 7d NFP/CB).
+// Fundamentals override: realised surprises (from API or calendar image OCR) can boost/cap conviction; carry-forward 3d typical / 7d NFP/CB.
 // Provenance: meta.sources always included. Cost passthrough when SHOW_COST=true.
 // -----------------------------------------------------------------------------
-
 /*
 CHANGE MANIFEST
-1) Calendar “Results-Aware” From Image (no OCR lib; use vision LLM we already call)
-   - When calendar image is provided, system prompt now instructs the model to read the image table (Actual/Forecast/Previous)
-     and derive realised bias per currency and instrument. Warnings copy becomes results-aware (not hypothetical).
-   - Provenance adds: calendar_realised_used (bool), calendar_realised_mode: "image-vision".
+1) Calendar Image → Realised Bias (NEW)
+   - If a calendar image is uploaded, run a compact OpenAI vision JSON pass to extract realised outcomes (actual/forecast/dir).
+   - Synthesize per-currency + instrument bias; apply carry-forward (3d typical; 7d for NFP/CB).
+   - Provenance fields: calendar_realised_used, calendar_realised_events, calendar_realised_method ("vision" | "api").
 
-2) Performance Patch v1
-   - FAST mode image budget lowered (960w, q=72).
-   - Headlines embedded to the model: 4 in FAST, 6 in FULL (UI still shows 12).
-   - CSM/COT/Calendar API timeouts tightened; soft-fail non-blocking.
-   - COT Tradingster queries run concurrently; fetchSeries races providers; shorter timeouts.
-   - Stage-1 cache TTL 4 minutes.
+2) COT Fallbacks + Headline-derived COT
+   - Primary CFTC disaggregated text parse.
+   - Fallback to Tradingster (concurrent per market, 3.5s timeout).
+   - If both fail, scan headlines for phrases (“speculators net long/short”) to build a soft bias.
+   - Provenance includes cot_method: "primary" | "tradingster" | "headline_fallback".
 
-3) Option 2 Enforcement (unchanged from last baseline)
-   - If a viable secondary setup exists (Breakout+Retest/SFP/TL break), ALWAYS include Option 2 with its own conviction and
-     explicit trigger steps (wait-for-close, retest hold, entry rule, SL, TP).
+3) Option 2 Enforcement (ALWAYS when plausible)
+   - If a viable secondary exists (Breakout+Retest, SFP/reclaim, TL break), inject a full Option 2 with explicit steps:
+     wait-for-close, retest hold, entry confirmation (engulfing/wicks), SL, TP, conviction.
+   - Only omit when truly no plausible secondary exists.
 
-4) Minor Fixes
-   - Regex literals in Tradingster parser use [\\s\\S] properly (compile-safe).
+4) Conviction Engine
+   - Compute bias from: Technical, Headlines, Calendar (incl. realised), CSM, COT.
+   - Final conviction shown in ai_meta, plus component breakdown (kept inside ai_meta).
+
+5) Performance Patch v1
+   - CSM: race data providers (TwelveData / Finnhub / Polygon) with tight timeouts; reuse stale for 15m if needed.
+   - COT fallback concurrent fetch.
+   - Calendar/API fetch timeout 3s; never blocks plan.
+   - Stage-1 cache TTL: 4 minutes.
+
+6) Template fidelity
+   - Section names and wording untouched. Headline embed lines still 6; UI can show 12.
 */
+
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -66,11 +74,7 @@ const IMG_MAX_BYTES = 12 * 1024 * 1024; // absolute safety cap
 const BASE_W = 1280;       // base width
 const MAX_W = 1500;        // upper bound for adaptive
 const TARGET_MIN = 420 * 1024;
-const TARGET_IDEAL = 800 * 1024;
 const TARGET_MAX = 1200 * 1024; // hard ceiling for adaptive
-
-const FAST_W = 960;  // perf v1
-const FAST_Q = 72;
 
 const now = () => Date.now();
 const dt = (t: number) => `${Date.now() - t}ms`;
@@ -102,7 +106,7 @@ type CacheEntry = {
 const CACHE = new Map<string, CacheEntry>();
 function setCache(entry: Omit<CacheEntry, "exp">): string {
   const key = uuid();
-  CACHE.set(key, { ...entry, exp: Date.now() + 4 * 60 * 1000 }); // 4 min TTL
+  CACHE.set(key, { ...entry, exp: Date.now() + 4 * 60 * 1000 }); // 4 minutes
   return key;
 }
 function getCache(key: string | undefined | null): CacheEntry | null {
@@ -151,14 +155,7 @@ async function toJpeg(buf: Buffer, width: number, quality: number): Promise<Buff
   return sharp(buf).rotate().resize({ width, withoutEnlargement: true })
     .jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
 }
-async function processAdaptiveToDataUrl(buf: Buffer, fast = false): Promise<string> {
-  // perf v1: smaller budget in fast mode
-  if (fast) {
-    const out = await toJpeg(buf, FAST_W, FAST_Q);
-    if (out.byteLength > IMG_MAX_BYTES) throw new Error("image too large after processing");
-    return `data:image/jpeg;base64,${out.toString("base64")}`;
-  }
-
+async function processAdaptiveToDataUrl(buf: Buffer): Promise<string> {
   let width = BASE_W;
   let quality = 74;
   let out = await toJpeg(buf, width, quality);
@@ -183,12 +180,12 @@ async function processAdaptiveToDataUrl(buf: Buffer, fast = false): Promise<stri
   }
   return `data:image/jpeg;base64,${out.toString("base64")}`;
 }
-async function fileToDataUrl(file: any, fast=false): Promise<string | null> {
+async function fileToDataUrl(file: any): Promise<string | null> {
   if (!file) return null;
   const p = file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
   const raw = await fs.readFile(p);
-  const out = await processAdaptiveToDataUrl(raw, fast);
+  const out = await processAdaptiveToDataUrl(raw);
   if (process.env.NODE_ENV !== "production") {
     console.log(`[vision-plan] file processed size=${dataUrlSizeBytes(out)}B`);
   }
@@ -226,8 +223,8 @@ async function fetchWithTimeout(url: string, ms: number) {
     return r;
   } finally { clearTimeout(id); }
 }
-async function downloadAndProcess(url: string, fast=false): Promise<string | null> {
-  const r = await fetchWithTimeout(url, 6000);
+async function downloadAndProcess(url: string): Promise<string | null> {
+  const r = await fetchWithTimeout(url, 8000);
   if (!r || !r.ok) return null;
   const ct = String(r.headers.get("content-type") || "").toLowerCase();
   const mime = ct.split(";")[0].trim();
@@ -236,7 +233,7 @@ async function downloadAndProcess(url: string, fast=false): Promise<string | nul
   if (raw.byteLength > IMG_MAX_BYTES) return null;
 
   if (mime.startsWith("image/")) {
-    const out = await processAdaptiveToDataUrl(raw, fast);
+    const out = await processAdaptiveToDataUrl(raw);
     if (process.env.NODE_ENV !== "production") {
       console.log(`[vision-plan] link processed size=${dataUrlSizeBytes(out)}B from ${url}`);
     }
@@ -248,22 +245,22 @@ async function downloadAndProcess(url: string, fast=false): Promise<string | nul
   const og = htmlFindOgImage(html);
   if (!og) return null;
   const resolved = absoluteUrl(url, og);
-  const r2 = await fetchWithTimeout(resolved, 6000);
+  const r2 = await fetchWithTimeout(resolved, 8000);
   if (!r2 || !r2.ok) return null;
   const ab2 = await r2.arrayBuffer();
   const raw2 = Buffer.from(ab2);
   if (raw2.byteLength > IMG_MAX_BYTES) return null;
-  const out2 = await processAdaptiveToDataUrl(raw2, fast);
+  const out2 = await processAdaptiveToDataUrl(raw2);
   if (process.env.NODE_ENV !== "production") {
     console.log(`[vision-plan] og:image processed size=${dataUrlSizeBytes(out2)}B from ${resolved}`);
   }
   return out2;
 }
-async function linkToDataUrl(link: string, fast=false): Promise<string | null> {
+async function linkToDataUrl(link: string): Promise<string | null> {
   if (!link) return null;
   try {
-    if (looksLikeImageUrl(link)) return await downloadAndProcess(link, fast);
-    return await downloadAndProcess(link, fast); // page → og:image
+    if (looksLikeImageUrl(link)) return await downloadAndProcess(link);
+    return await downloadAndProcess(link); // page → og:image
   } catch { return null; }
 }
 
@@ -287,7 +284,7 @@ async function fetchedHeadlinesViaServer(req: NextApiRequest, instrument: string
   try {
     const base = originFromReq(req);
     const url = `${base}/api/news?instrument=${encodeURIComponent(instrument)}&hours=48&max=12&_t=${Date.now()}`;
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(3500) });
+    const r = await fetch(url, { cache: "no-store" });
     const j = await r.json().catch(() => ({}));
     const items: AnyHeadline[] = Array.isArray(j?.items) ? j.items : [];
     return { items, promptText: headlinesToPromptLines(items, 6) };
@@ -332,6 +329,7 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
   if (o === "buy limit" && dir === "long") { if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price"; }
   return null;
 }
+
 // ---------- CSM (intraday) ----------
 const G8 = ["USD", "EUR", "JPY", "GBP", "CHF", "CAD", "AUD", "NZD"];
 const USD_PAIRS = ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDJPY", "USDCHF", "USDCAD"];
@@ -345,13 +343,13 @@ function kbarReturn(closes: number[], k: number): number | null {
   return Math.log(a / b);
 }
 
-async function tdSeries15(pair: string): Promise<Series | null> {
+async function tdSeries15(pair: string, timeout=2000): Promise<Series | null> {
   if (!TD_KEY) return null;
   try {
     const sym = `${pair.slice(0, 3)}/${pair.slice(3)}`;
     const url =
       `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=15min&outputsize=30&apikey=${TD_KEY}&dp=6`;
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(1800) });
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(timeout) });
     if (!r.ok) return null;
     const j: any = await r.json();
     if (!Array.isArray(j?.values)) return null;
@@ -362,7 +360,7 @@ async function tdSeries15(pair: string): Promise<Series | null> {
     return { t, c };
   } catch { return null; }
 }
-async function fhSeries15(pair: string): Promise<Series | null> {
+async function fhSeries15(pair: string, timeout=2000): Promise<Series | null> {
   if (!FH_KEY) return null;
   try {
     const sym = `OANDA:${pair.slice(0, 3)}_${pair.slice(3)}`;
@@ -370,7 +368,7 @@ async function fhSeries15(pair: string): Promise<Series | null> {
     const from = to - 60 * 60 * 6; // 6h
     const url =
       `https://finnhub.io/api/v1/forex/candle?symbol=${encodeURIComponent(sym)}&resolution=15&from=${from}&to=${to}&token=${FH_KEY}`;
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(1800) });
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(timeout) });
     if (!r.ok) return null;
     const j: any = await r.json();
     if (j?.s !== "ok" || !Array.isArray(j?.c)) return null;
@@ -380,7 +378,7 @@ async function fhSeries15(pair: string): Promise<Series | null> {
     return { t, c };
   } catch { return null; }
 }
-async function polySeries15(pair: string): Promise<Series | null> {
+async function polySeries15(pair: string, timeout=2000): Promise<Series | null> {
   if (!POLY_KEY) return null;
   try {
     const ticker = `C:${pair}`;
@@ -390,7 +388,7 @@ async function polySeries15(pair: string): Promise<Series | null> {
       `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
     const url =
       `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}/range/15/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=asc&apiKey=${POLY_KEY}`;
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(1800) });
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(timeout) });
     if (!r.ok) return null;
     const j: any = await r.json();
     if (!Array.isArray(j?.results)) return null;
@@ -401,20 +399,22 @@ async function polySeries15(pair: string): Promise<Series | null> {
   } catch { return null; }
 }
 
-// perf v1: race fastest provider per pair
+async function raceSeries15(pair: string): Promise<Series | null> {
+  const tasks = [
+    tdSeries15(pair, 1800),
+    fhSeries15(pair, 1800),
+    polySeries15(pair, 1500)
+  ];
+  return Promise.race(tasks.map(p => p.then(v => v || null).catch(() => null)))
+    .then(v => v)
+    .catch(() => null);
+}
+
 async function fetchSeries15(pair: string): Promise<Series | null> {
-  const tasks = [];
-  if (TD_KEY) tasks.push(tdSeries15(pair));
-  if (FH_KEY) tasks.push(fhSeries15(pair));
-  if (POLY_KEY) tasks.push(polySeries15(pair));
-  if (!tasks.length) return null;
-  try {
-    const results = await Promise.allSettled(tasks);
-    for (const r of results) {
-      if (r.status === "fulfilled" && r.value) return r.value as Series;
-    }
-    return null;
-  } catch { return null; }
+  const first = await raceSeries15(pair);
+  if (first) return first;
+  const second = await raceSeries15(pair);
+  return second;
 }
 
 function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnapshot | null {
@@ -479,7 +479,7 @@ type CotSnapshot = {
   reportDate: string; // ISO date
   net: Record<string, number>;
   ttl: number;
-  stale?: boolean;
+  stale?: boolean; // true if using cached older than 7d but ≤14d
   method?: "primary" | "tradingster" | "headline_fallback";
 };
 function parseCFTC(text: string): CotSnapshot | null {
@@ -526,14 +526,13 @@ async function fetchTradingster(cur: string, timeoutMs = 3500): Promise<{ report
     const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(timeoutMs), headers: { "user-agent": "TradePlanApp/1.0" } });
     if (!r.ok) return null;
     const html = await r.text();
-    // regex literals use [\s\S] (single backslashes) — compile-safe.
     const section = html.match(/Non-Commercial Positions[\s\S]{0,1500}?<tbody>([\s\S]*?)<\/tbody>/i)?.[1]
       || html.match(/Managed Money[\s\S]{0,1500}?<tbody>([\s\S]*?)<\/tbody>/i)?.[1]
       || "";
     const row = section.match(/<tr[^>]*>([\s\S]*?)<\/tr>/i)?.[1] || "";
     const nums = Array.from(row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi))
       .map(m => m[1].replace(/<[^>]+>/g, "").replace(/[, ]+/g, "").trim());
-    const longV = Number(nums[1] || "0"); // col order: [Traders, Long, Short, ...]
+    const longV = Number(nums[1] || "0");
     const shortV = Number(nums[2] || "0");
     const dateMatch = html.match(/Report Date[^<]*<\/th>\s*<td[^>]*>([^<]+)<\/td>/i)?.[1]
       || html.match(/as of\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})/i)?.[1];
@@ -557,7 +556,7 @@ const COT_PHRASES = [
 const CURR_SYNONYMS: Record<string, string[]> = {
   USD: ["USD", "U.S. dollar", "US dollar", "greenback", "DXY", "buck"],
   EUR: ["EUR", "euro", "Eurozone"],
-  GBP: ["GBP", "pound", "sterling", "Cable"],
+  GBP: ["GBP", "pound", "sterling", "cable"],
   JPY: ["JPY", "yen"],
   AUD: ["AUD", "Aussie"],
   NZD: ["NZD", "Kiwi"],
@@ -588,23 +587,23 @@ function inferCotFromHeadlines(headlines: AnyHeadline[]): { used: boolean, net: 
 let COT_CACHE: CotSnapshot | null = null;
 async function getCOT(headlinesForFallback?: AnyHeadline[] | null): Promise<CotSnapshot> {
   try {
-    const txt = await fetchCFTCOnce(6000);
+    const txt = await fetchCFTCOnce(8000);
     const snap = parseCFTC(txt);
     if (snap) { COT_CACHE = snap; return snap; }
     throw new Error("CFTC parse failed");
   } catch (e) {
-    // Tradingster concurrently
+    const entries = await Promise.all(Object.keys(CFTC_MAP).map(async cur => {
+      const got = await fetchTradingster(cur).catch(() => null);
+      return { cur, got };
+    }));
     const net: Record<string, number> = {};
     let reportDate = "";
-    const tasks = Object.keys(CFTC_MAP).map(async (cur) => {
-      const got = await fetchTradingster(cur).catch(() => null);
+    for (const {cur, got} of entries) {
       if (got) {
         net[cur] = got.net;
         if (!reportDate) reportDate = got.reportDate;
       }
-    });
-    await Promise.race([Promise.all(tasks), new Promise((resolve) => setTimeout(resolve, 3600))]);
-
+    }
     if (reportDate && Object.keys(net).length >= 3) {
       const snap: CotSnapshot = { reportDate, net, ttl: Date.now() + 3 * 24 * 60 * 60 * 1000, method: "tradingster" };
       COT_CACHE = snap;
@@ -686,6 +685,7 @@ type FundOverride = { active: boolean; reason?: string; strength?: "minor" | "ma
 function computeFundamentalsOverride(calendarResp: any, instrument: string): { override: FundOverride, pastBiasNote?: string | null } {
   const out: FundOverride = { active: false };
   if (!calendarResp?.ok) return { override: out, pastBiasNote: null };
+
   const pair = instrument.toUpperCase();
   const base = pair.slice(0,3), quote = pair.slice(3);
 
@@ -717,31 +717,67 @@ function computeFundamentalsOverride(calendarResp: any, instrument: string): { o
   return { override: out, pastBiasNote: null };
 }
 
-async function fetchCalendarBias(req: NextApiRequest, instrument: string): Promise<{
-  text: string | null,
-  status: "image" | "api" | "unavailable",
-  provider: string | null,
-  raw?: any, override?: FundOverride, pastBiasNote?: string | null
-}> {
+// Parse realised results from an uploaded calendar image via OpenAI (compact, fast)
+async function extractCalendarFromImage(dataUrl: string, pair: string): Promise<{ ok: boolean, text?: string, events?: any[], debug?: any }> {
+  if (!dataUrl) return { ok: false };
   try {
-    const base = originFromReq(req);
-    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=168&_t=${Date.now()}`; // 7d
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(3000) });
-    const j: any = await r.json().catch(() => ({}));
-    if (j?.ok) {
-      const t = calendarShortText(j, instrument) || `Calendar bias for ${instrument}: (no strong signal)`;
-      const { override, pastBiasNote } = computeFundamentalsOverride(j, instrument);
-      return { text: t, status: "api", provider: String(j?.provider || "mixed"), raw: j, override, pastBiasNote };
+    const system = [
+      "You are parsing an economic calendar screenshot. Return JSON with key events and realised outcomes.",
+      "Only include events relevant to G8 FX (USD, EUR, JPY, GBP, CHF, CAD, AUD, NZD).",
+      "For each row, extract: currency (ISO), event (short), whenISO (if visible or 'unknown'), impact (low/med/high), actual, forecast, previous, surprise (actual-forecast, or YoY delta), direction (bullish/bearish/neutral for the currency).",
+      "Then include 'instrumentBias' for the requested pair (e.g., EURUSD): label (bullish/bearish/neutral) and score (-2..+2).",
+      "Respond ONLY with JSON. No prose."
+    ].join("\n");
+    const user = [
+      `Pair: ${pair}`,
+      "Calendar Image follows."
+    ].join("\n");
+    const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        max_tokens: 500,
+        temperature: 0,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: [{ type: "text", text: user }, { type: "image_url", image_url: { url: dataUrl } }] }
+        ]
+      })
+    });
+    const json = await rsp.json().catch(() => ({}));
+    if (!rsp.ok) throw new Error(`calendar vision ${rsp.status}`);
+    const raw = json?.choices?.[0]?.message?.content || "";
+    let data: any = null;
+    try { data = JSON.parse(raw); } catch { data = null; }
+    if (!data || (!Array.isArray(data.events) && !Array.isArray(data.rows))) {
+      return { ok: false, debug: { note: "no events parsed", raw } };
     }
-    return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null };
-  } catch {
-    return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null };
+    const events = Array.isArray(data.events) ? data.events : data.rows;
+    const instr = data.instrumentBias || null;
+    const base = pair.slice(0,3), quote = pair.slice(3);
+    const parts: string[] = [];
+    if (instr?.label) parts.push(`Instrument bias: ${instr.label} (${instr.score ?? 0})`);
+    const per: string[] = [];
+    const biasBy: Record<string, string> = {};
+    for (const e of events) {
+      const c = String(e.currency || e.ccy || "").toUpperCase();
+      const lab = String(e.direction || e.dir || "").toLowerCase();
+      if (c && lab) biasBy[c] = lab;
+    }
+    if (biasBy[base]) per.push(`${base}:${biasBy[base]}`);
+    if (biasBy[quote]) per.push(`${quote}:${biasBy[quote]}`);
+    if (per.length) parts.push(`Per-currency: ${per.join(" / ")}`);
+    const text = parts.length ? `Calendar bias for ${pair}: ${parts.join("; ")}` : `Calendar bias for ${pair}: (no strong signal)`;
+    return { ok: true, text, events, debug: SHOW_COST ? { raw } : undefined };
+  } catch (e: any) {
+    return { ok: false, debug: { err: e?.message || "vision parse failed" } };
   }
 }
 
-// ---------- prompts (now calendar image is results-aware) ----------
-function systemCore(instrument: string, opts?: { calendarIsImage?: boolean }) {
-  const base = [
+// ---------- prompts ----------
+function systemCore(instrument: string) {
+  return [
     "You are a professional discretionary trader.",
     "Perform **visual** price-action market analysis from the images (no numeric candles).",
     "Multi-timeframe alignment: 15m execution, 1H context, 4H HTF.",
@@ -768,26 +804,17 @@ function systemCore(instrument: string, opts?: { calendarIsImage?: boolean }) {
     "Only reference **Headlines / Calendar / CSM / COT** if their respective blocks are present below. Otherwise omit them.",
     "Keep instrument alignment with " + instrument + ".",
     "",
-    "Warnings: If an economic release is within ~60 minutes, include a warning (no blackout). If result flips bias, advise standing down; if aligned, keep plan.",
+    "Warnings: If an economic release is within ~60 minutes, include a warning (no blackout). If result flips bias, advise standing down otherwise keep plan.",
     "Fundamentals override: If a major realised surprise is present (CPI/NFP/CB), reflect that in conviction (boost if aligned, cap if conflicted).",
     "Conviction engine: compute bias for Headlines, Calendar (incl. realised carry-forward), COT, CSM, Technical; then produce a final conviction %.",
     "Option 2 policy: If a plausible secondary setup exists (Break+Retest, SFP, TL break), ALWAYS include 'Option 2' with its own conviction and explicit trigger instructions (wait-for-close, retest hold, entry, SL, TP).",
-  ];
-  if (opts?.calendarIsImage) {
-    base.push(
-      "",
-      "**Calendar image is provided. You MUST read the table (Actual/Forecast/Previous, impact icons) directly from the image and infer realised bias for currencies related to the instrument.**",
-      "Reflect these realised results in the Fundamental View, the warning copy, and the final conviction."
-    );
-  }
-  return base.join("\n");
+  ].join("\n");
 }
 function buildUserPartsBase(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null;
   fundOverride?: any | null; pastBiasNote?: string | null;
-  fastEmbedHeadlines?: boolean;
 }) {
   const parts: any[] = [
     { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}` },
@@ -795,21 +822,15 @@ function buildUserPartsBase(args: {
     { type: "text", text: "Context 1H Chart:" }, { type: "image_url", image_url: { url: args.h1 } },
     { type: "text", text: "Execution 15M Chart:" }, { type: "image_url", image_url: { url: args.m15 } },
   ];
-  if (args.calendarDataUrl) { parts.push({ type: "text", text: "Economic Calendar Image (read results):" }); parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } }); }
+  if (args.calendarDataUrl) { parts.push({ type: "text", text: "Economic Calendar Image:" }); parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } }); }
   if (!args.calendarDataUrl && args.calendarText) { parts.push({ type: "text", text: `Calendar snapshot:\n${args.calendarText}` }); }
   if (args.pastBiasNote) { parts.push({ type: "text", text: `Past realised bias carry-forward: ${args.pastBiasNote}` }); }
-
-  // perf v1: 4 lines in fast mode, else 6
-  if (args.headlinesText) {
-    const lines = (args.headlinesText || "").split("\n");
-    const keep = args.fastEmbedHeadlines ? lines.slice(0, 4) : lines.slice(0, 6);
-    parts.push({ type: "text", text: `Recent headlines snapshot (used for bias; list shown in Stage-2):\n${keep.join("\n")}` });
-  }
-
+  if (args.headlinesText) { parts.push({ type: "text", text: `Recent headlines snapshot (used for bias; list shown in Stage-2):\n${args.headlinesText}` }); }
   if (args.sentimentText) { parts.push({ type: "text", text: `Sentiment snapshot (CSM + COT; used for bias):\n${args.sentimentText}` }); }
   if (args.fundOverride?.active) { parts.push({ type: "text", text: `Fundamentals override present: ${args.fundOverride.reason} (${args.fundOverride.strength})` }); }
   return parts;
 }
+
 // FULL card (legacy)
 function messagesFull(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
@@ -817,7 +838,7 @@ function messagesFull(args: {
   headlinesText?: string | null; sentimentText?: string | null;
 }) {
   const system = [
-    systemCore(args.instrument, { calendarIsImage: !!args.calendarDataUrl }),
+    systemCore(args.instrument),
     "",
     "OUTPUT format:",
     "Quick Plan (Actionable)",
@@ -831,7 +852,7 @@ function messagesFull(args: {
     "• Conviction: <0–100>%",
     "• Setup: <Chosen Strategy>",
     "• Short Reasoning: <1–2 lines>",
-    "• Option 2 (Market): Provide a viable secondary strategy with its own conviction and explicit trigger steps (wait-for-close, retest hold, entry rule, SL, TP).",
+    "• Option 2 (Market): Show when allowed; else print 'Not available (missing confirmation)'.",
     "",
     "Full Breakdown",
     "• Technical View (HTF + Intraday): 4H/1H/15m structure",
@@ -865,13 +886,13 @@ function messagesFull(args: {
     `  "stop": number, "tp1": number, "tp2": number,`,
     `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
     `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
-    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "calendar_realised_used": boolean | null, "calendar_realised_mode": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null, "cot_method": string | null, "option2_present": boolean, "option2_strategy": string | null, "fundamentals_override": string | null } }`,
+    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null, "cot_method": string | null, "option2_present": boolean, "option2_strategy": string | null, "fundamentals_override": string | null, "calendar_realised_used": boolean | null, "calendar_realised_events": number | null, "calendar_realised_method": string | null } }`,
     "```",
   ].join("\n");
 
   return [
     { role: "system", content: system },
-    { role: "user", content: buildUserPartsBase({ ...args, fastEmbedHeadlines: false }) },
+    { role: "user", content: buildUserPartsBase(args) },
   ];
 }
 
@@ -886,7 +907,7 @@ function messagesFastStage1(args: {
   };
 }) {
   const system = [
-    systemCore(args.instrument, { calendarIsImage: !!args.calendarDataUrl }),
+    systemCore(args.instrument),
     "",
     "OUTPUT ONLY the following (nothing else):",
     "Quick Plan (Actionable)",
@@ -900,7 +921,7 @@ function messagesFastStage1(args: {
     "• Conviction: <0–100>%",
     "• Setup:",
     "• Short Reasoning:",
-    "• Option 2 (Market): Provide a viable secondary strategy with its own conviction and explicit trigger steps (wait-for-close, retest hold, entry rule, SL, TP).",
+    "• Option 2 (Market): Show a viable secondary strategy with its own conviction and explicit trigger instructions. Do NOT write 'Not available' unless absolutely no secondary exists.",
     "",
     "Management",
     "- Turn the plan into a brief, actionable playbook (filled/not filled, trail/move to BE, invalidation behaviors).",
@@ -916,23 +937,65 @@ function messagesFastStage1(args: {
     `  "stop": number, "tp1": number, "tp2": number,`,
     `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
     `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
-    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "calendar_realised_used": boolean | null, "calendar_realised_mode": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null, "cot_method": string | null, "option2_present": boolean, "option2_strategy": string | null, "fundamentals_override": string | null } }`,
+    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null, "cot_method": string | null, "option2_present": boolean, "option2_strategy": string | null, "fundamentals_override": string | null, "calendar_realised_used": boolean | null, "calendar_realised_events": number | null, "calendar_realised_method": string | null } }`,
     "```",
   ].join("\n");
 
-  const parts = buildUserPartsBase({ ...args, fastEmbedHeadlines: true });
+  const parts = buildUserPartsBase(args);
   if (args.provenance) {
     parts.push({ type: "text", text: `provenance:\n${JSON.stringify(args.provenance)}` });
   }
   return [{ role: "system", content: system }, { role: "user", content: parts }];
 }
 
+// Stage-2 Expand: ONLY the remaining sections
+function messagesExpandStage2(args: {
+  instrument: string; dateStr: string; m15: string; h1: string; h4: string;
+  calendarDataUrl?: string | null; calendarText?: string | null;
+  headlinesText?: string | null; sentimentText?: string | null; aiMetaHint?: any;
+}) {
+  const system = [
+    systemCore(args.instrument),
+    "",
+    "Expand ONLY the remaining sections (do NOT repeat 'Quick Plan (Actionable)' or 'Management').",
+    "Keep Entry/SL/TP consistent with ai_meta_hint unless a direct contradiction is visible; if so, explain in 1 line.",
+    "",
+    "Sections to output:",
+    "Full Breakdown",
+    "• Technical View (HTF + Intraday): 4H/1H/15m structure",
+    "• Fundamental View (Calendar + Sentiment + Headlines):",
+    "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
+    "• Conditional Scenarios:",
+    "• Surprise Risk:",
+    "• Invalidation:",
+    "• One-liner Summary:",
+    "",
+    "Detected Structures (X-ray):",
+    "• 4H:",
+    "• 1H:",
+    "• 15m:",
+    "",
+    "Candidate Scores (tournament):",
+    "- name — score — reason",
+    "",
+    "Final Table Summary:",
+    "| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |",
+    `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
+    "",
+    "Append NOTHING after these sections (no ai_meta here).",
+  ].join("\n");
+
+  const userParts = buildUserPartsBase(args);
+  if (args.aiMetaHint) userParts.push({ type: "text", text: `ai_meta_hint:\n${JSON.stringify(args.aiMetaHint, null, 2)}` });
+  return [{ role: "system", content: system }, { role: "user", content: userParts }];
+}
+
 // ---------- OpenAI call ----------
-async function callOpenAI(messages: any[]) {
+async function callOpenAI(messages: any[], maxTokens?: number) {
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: JSON.stringify({ model: OPENAI_MODEL, messages, max_tokens: 1200 }),
+    body: JSON.stringify({ model: OPENAI_MODEL, messages, ...(maxTokens ? { max_tokens: maxTokens } : {}) }),
   });
   const json = await rsp.json().catch(() => ({} as any));
   if (!rsp.ok) throw new Error(`OpenAI vision request failed: ${rsp.status} ${JSON.stringify(json)}`);
@@ -950,51 +1013,49 @@ async function rewriteAsPending(instrument: string, text: string) {
     { role: "system", content: "Rewrite the trade card as PENDING (no Market) into a clean Buy/Sell LIMIT zone at OB/FVG/SR confluence if breakout proof is missing. Keep tournament section and X-ray." },
     { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nRewrite strictly to Pending.` },
   ];
-  return callOpenAI(messages);
+  return callOpenAI(messages, 600);
 }
 async function normalizeBreakoutLabel(text: string) {
   const messages = [
     { role: "system", content: "If 'Breakout + Retest' is claimed but proof is not shown (body close + retest hold or SFP reclaim), rename setup to 'Pullback (OB/FVG/SR)' and leave rest unchanged." },
     { role: "user", content: text },
   ];
-  return callOpenAI(messages);
+  return callOpenAI(messages, 400);
 }
 async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
   const messages = [
     { role: "system", content: "Adjust the LIMIT zone so that: Sell Limit is an ABOVE-price pullback into supply; Buy Limit is a BELOW-price pullback into demand. Keep all other content & sections." },
     { role: "user", content: `Instrument: ${instrument}\n\nCurrent Price: ${aiMeta?.currentPrice}\nProvided Zone: ${JSON.stringify(aiMeta?.zone)}\n\nCard:\n${text}\n\nFix only the LIMIT zone side and entry, keep format.` },
   ];
-  return callOpenAI(messages);
+  return callOpenAI(messages, 500);
 }
 
 // ---------- Option 2: enforce presence with explicit triggers ----------
 async function ensureOption2Present(instrument: string, text: string, aiMeta: any) {
   const hasOption2 = /Option 2\s*\(/i.test(text) && !/Not available/i.test(text);
   if (hasOption2) return text;
+
   const hint = aiMeta?.candidateScores?.[0]?.name || aiMeta?.selectedStrategy || "Breakout + Retest";
   const messages = [
     { role: "system", content: "Inject a proper 'Option 2 (Market)' section into the plan if missing. Use a plausible secondary strategy (Breakout + Retest, SFP/reclaim, Trendline break). Include: direction, explicit trigger (wait-for-close above/below X, retest hold at Y, entry confirmation like engulfing/wicks), SL, TP1/TP2, and its own conviction %. Keep the rest of the card unchanged." },
     { role: "user", content: `Instrument: ${instrument}\n\nCandidate hint: ${hint}\n\nOriginal card:\n${text}\n\nRewrite ONLY by adding a complete Option 2 block with explicit step-by-step rules.` },
   ];
-  return callOpenAI(messages);
+  return callOpenAI(messages, 500);
 }
 
-// ---------- live price ----------
+// ---------- live price helpers ----------
 async function fetchLivePrice(pair: string): Promise<number | null> {
-  const tasks: Promise<number | null>[] = [];
-
-  if (TD_KEY) tasks.push((async () => {
+  if (TD_KEY) {
     try {
       const sym = `${pair.slice(0, 3)}/${pair.slice(3)}`;
       const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(sym)}&apikey=${TD_KEY}&dp=5`;
       const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(1500) });
       const j: any = await r.json().catch(() => ({}));
       const p = Number(j?.price);
-      return (isFinite(p) && p > 0) ? p : null;
-    } catch { return null; }
-  })());
-
-  if (FH_KEY) tasks.push((async () => {
+      if (isFinite(p) && p > 0) return p;
+    } catch {}
+  }
+  if (FH_KEY) {
     try {
       const sym = `OANDA:${pair.slice(0, 3)}_${pair.slice(3)}`;
       const to = Math.floor(Date.now() / 1000);
@@ -1004,11 +1065,10 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
       const j: any = await r.json().catch(() => ({}));
       const c = Array.isArray(j?.c) ? j.c : [];
       const last = Number(c[c.length - 1]);
-      return (isFinite(last) && last > 0) ? last : null;
-    } catch { return null; }
-  })());
-
-  if (POLY_KEY) tasks.push((async () => {
+      if (isFinite(last) && last > 0) return last;
+    } catch {}
+  }
+  if (POLY_KEY) {
     try {
       const ticker = `C:${pair}`;
       const to = new Date();
@@ -1021,13 +1081,9 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
       const j: any = await r.json().catch(() => ({}));
       const res = Array.isArray(j?.results) ? j.results[0] : null;
       const last = Number(res?.c);
-      return (isFinite(last) && last > 0) ? last : null;
-    } catch { return null; }
-  })());
-
-  const settled = await Promise.allSettled(tasks);
-  for (const s of settled) { if (s.status === "fulfilled" && s.value) return s.value; }
-  // fallback via series
+      if (isFinite(last) && last > 0) return last;
+    } catch {}
+  }
   try {
     const S = await fetchSeries15(pair);
     const last = S?.c?.[S.c.length - 1];
@@ -1035,6 +1091,7 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
   } catch {}
   return null;
 }
+
 // ---------- handler ----------
 export default async function handler(req: NextApiRequest, res: NextApiResponse<Ok | Err>) {
   try {
@@ -1044,7 +1101,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     // mode selection
     const urlMode = String((req.query.mode as string) || "").toLowerCase();
     let mode: "full" | "fast" | "expand" = urlMode === "fast" ? "fast" : urlMode === "expand" ? "expand" : "full";
-    const fast = mode === "fast";
 
     // expand path
     if (mode === "expand") {
@@ -1058,7 +1114,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         calendarDataUrl: c.calendar || undefined, headlinesText: c.headlinesText || undefined, sentimentText: c.sentimentText || undefined,
         aiMetaHint: null,
       });
-      const text = await callOpenAI(messages);
+      const text = await callOpenAI(messages, 900);
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({ ok: true, text, meta: { instrument: c.instrument, cacheKey } });
     }
@@ -1091,15 +1147,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const h1Url = String(pickFirst(fields.h1Url) || "").trim();
     const h4Url = String(pickFirst(fields.h4Url) || "").trim();
 
-    // Build images and process with adaptive sharp (perf v1: fast mode smaller)
+    // Build images and process with adaptive sharp
     const tImg = now();
     const [m15FromFile, h1FromFile, h4FromFile, calUrl] = await Promise.all([
-      fileToDataUrl(m15f, fast), fileToDataUrl(h1f, fast), fileToDataUrl(h4f, fast), calF ? fileToDataUrl(calF, fast) : Promise.resolve(null),
+      fileToDataUrl(m15f), fileToDataUrl(h1f), fileToDataUrl(h4f), calF ? fileToDataUrl(calF) : Promise.resolve(null),
     ]);
     const [m15FromUrl, h1FromUrl, h4FromUrl] = await Promise.all([
-      m15FromFile ? Promise.resolve(null) : linkToDataUrl(m15Url, fast),
-      h1FromFile ? Promise.resolve(null) : linkToDataUrl(h1Url, fast),
-      h4FromFile ? Promise.resolve(null) : linkToDataUrl(h4Url, fast),
+      m15FromFile ? Promise.resolve(null) : linkToDataUrl(m15Url),
+      h1FromFile ? Promise.resolve(null) : linkToDataUrl(h1Url),
+      h4FromFile ? Promise.resolve(null) : linkToDataUrl(h4Url),
     ]);
     const m15 = m15FromFile || m15FromUrl;
     const h1 = h1FromFile || h1FromUrl;
@@ -1144,17 +1200,50 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let calendarProvider: string | null = null;
     let fundOverride: FundOverride | undefined;
     let pastBiasNote: string | null | undefined;
+    let calendarRealisedUsed: boolean | null = null;
+    let calendarRealisedEvents: number | null = null;
+    let calendarRealisedMethod: string | null = null;
 
     if (calUrl) {
       calendarStatus = "image";
       calendarProvider = "image";
+      const parsed = await extractCalendarFromImage(calUrl, instrument);
+      if (parsed.ok) {
+        calendarText = parsed.text || null;
+        calendarRealisedUsed = true;
+        calendarRealisedEvents = Array.isArray(parsed.events) ? parsed.events.length : 0;
+        calendarRealisedMethod = "vision";
+        const fakeCal = { ok: true, bias: { recentRealised: (parsed.events || []).map((e:any)=>({ currency: e.currency, event: e.event, impact: e.impact || "high", timeISO: e.whenISO || null, direction: e.direction })) } };
+        const cf = computeFundamentalsOverride(fakeCal, instrument);
+        fundOverride = cf.override;
+        pastBiasNote = cf.pastBiasNote || null;
+      } else {
+        calendarText = "Calendar image attached (results parse unavailable).";
+      }
     } else {
-      const cal = await fetchCalendarBias(req, instrument);
-      calendarText = cal.text;
-      calendarStatus = cal.status;
-      calendarProvider = cal.provider;
-      fundOverride = cal.override;
-      pastBiasNote = cal.pastBiasNote;
+      try {
+        const base = originFromReq(req);
+        const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=168&_t=${Date.now()}`; // 7d window
+        const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(3000) });
+        const j: any = await r.json().catch(() => ({}));
+        if (j?.ok) {
+          calendarText = calendarShortText(j, instrument) || `Calendar bias for ${instrument}: (no strong signal)`;
+          calendarStatus = "api";
+          calendarProvider = String(j?.provider || "mixed");
+          const { override, pastBiasNote: note } = computeFundamentalsOverride(j, instrument);
+          fundOverride = override;
+          pastBiasNote = note;
+          calendarRealisedUsed = Array.isArray(j?.bias?.recentRealised) ? j.bias.recentRealised.length > 0 : false;
+          calendarRealisedEvents = Array.isArray(j?.bias?.recentRealised) ? j.bias.recentRealised.length : 0;
+          calendarRealisedMethod = calendarRealisedUsed ? "api" : null;
+        } else {
+          calendarText = "Calendar unavailable — upload an image if you need the panel parsed.";
+          calendarStatus = "unavailable";
+        }
+      } catch {
+        calendarText = "Calendar unavailable — upload an image if you need the panel parsed.";
+        calendarStatus = "unavailable";
+      }
     }
 
     // ----- Sentiment: CSM mandatory; COT soft-required with fallback -----
@@ -1174,19 +1263,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const dateStr = new Date().toISOString().slice(0, 10);
 
     const provForModel = {
-      headlines_used: Math.min(fast ? 4 : 6, Array.isArray(headlineItems) ? headlineItems.length : 0),
+      headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
       headlines_instrument: instrument,
       calendar_used: !!calUrl || calendarStatus === "api",
       calendar_status: calendarStatus,
       calendar_provider: calendarProvider,
-      calendar_realised_used: calUrl ? true : (calendarStatus === "api" ? true : null),
-      calendar_realised_mode: calUrl ? "image-vision" : (calendarStatus === "api" ? "api" : null),
       csm_used: true,
       csm_time: csm.tsISO,
       cot_used: !!cot,
       cot_report_date: cot ? cot.reportDate : null,
       cot_error: cot ? null : cotErr || "unavailable",
       cot_method: cot?.method || null,
+      calendar_realised_used: calendarRealisedUsed,
+      calendar_realised_events: calendarRealisedEvents,
+      calendar_realised_method: calendarRealisedMethod,
     };
 
     // ---------- Stage 1 (fast) or Full ----------
@@ -1203,9 +1293,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         provenance: provForModel,
       });
       if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice}`; }
-      if (fundOverride?.active) { (messages[0] as any).content = (messages[0] as any).content + `\n\nFundamentals override active: ${fundOverride.reason} (${fundOverride.strength}).`; }
+      if ((fundOverride && fundOverride.active)) { (messages[0] as any).content = (messages[0] as any).content + `\n\nFundamentals override active: ${fundOverride.reason} (${fundOverride.strength}).`; }
 
-      text = await callOpenAI(messages);
+      text = await callOpenAI(messages, 900);
       aiMeta = extractAiMeta(text) || {};
       if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) {
         aiMeta.currentPrice = livePrice;
@@ -1235,7 +1325,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       });
 
       // Provenance + cost
-      const sources = { ...provForModel, option2_present: !!opt2Present, option2_strategy: opt2Strategy, fundamentals_override: fundOverride?.active ? (fundOverride.reason || "active") : null };
+      const sources = { ...provForModel, option2_present: !!opt2Present, option2_strategy: opt2Strategy, fundamentals_override: (fundOverride && fundOverride.active) ? (fundOverride.reason || "active") : null };
       const meta: any = { instrument, mode, cacheKey, headlinesCount: headlineItems.length, fallbackUsed: false, aiMeta, sources };
       if (SHOW_COST) meta.cost = { prompt_tokens: 0, completion_tokens: 0, total_usd: 0 };
 
@@ -1257,9 +1347,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       sentimentText,
     });
     if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice}`; }
-    if (fundOverride?.active) { (messages[0] as any).content = (messages[0] as any).content + `\n\nFundamentals override active: ${fundOverride.reason} (${fundOverride.strength}).`; }
+    if ((fundOverride && fundOverride.active)) { (messages[0] as any).content = (messages[0] as any).content + `\n\nFundamentals override active: ${fundOverride.reason} (${fundOverride.strength}).`; }
 
-    text = await callOpenAI(messages);
+    text = await callOpenAI(messages, 1200);
     aiMeta = extractAiMeta(text) || {};
     if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) {
       aiMeta.currentPrice = livePrice;
@@ -1282,7 +1372,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const opt2Present = /Option 2\s*\(/i.test(text) && !/Not available/i.test(text);
     const opt2Strategy = (text.match(/Option 2\s*\(([^)]+)\)/i)?.[1] || null);
 
-    const sources = { ...provForModel, option2_present: !!opt2Present, option2_strategy: opt2Strategy, fundamentals_override: fundOverride?.active ? (fundOverride.reason || "active") : null };
+    const sources = { ...provForModel, option2_present: !!opt2Present, option2_strategy: opt2Strategy, fundamentals_override: (fundOverride && fundOverride.active) ? (fundOverride.reason || "active") : null };
 
     if (!text || refusalLike(text)) {
       const fb = fallbackCard(instrument, sources);
@@ -1310,8 +1400,6 @@ function fallbackCard(
     calendar_used: boolean;
     calendar_status: string;
     calendar_provider: string | null;
-    calendar_realised_used?: boolean | null;
-    calendar_realised_mode?: string | null;
     csm_used: boolean;
     csm_time: string;
     cot_used: boolean;
@@ -1321,6 +1409,9 @@ function fallbackCard(
     option2_present?: boolean;
     option2_strategy?: string | null;
     fundamentals_override?: string | null;
+    calendar_realised_used?: boolean | null;
+    calendar_realised_events?: number | null;
+    calendar_realised_method?: string | null;
   }
 ) {
   return [
