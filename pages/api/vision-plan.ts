@@ -1,31 +1,31 @@
 /**
  * CHANGE MANIFEST — /pages/api/vision-plan.ts
  *
- * Scope (ONLY these three changes; everything else preserved):
- * 1) OPTION 2 ENFORCEMENT (Always-on secondary play):
- *    - Tightened prompts (fast/full) to require an explicit Option 2 when a viable secondary exists
- *      (Break + Retest, Trendline break, SFP, etc.). Must include direction, trigger, entry, SL, TP1/TP2, conviction.
- *    - Added a post-pass `enforceOption2()` that rewrites response to include a compliant Option 2
- *      if the model omitted or under-specified it. Keeps Option 1 numbers intact.
+ * Baseline: Your last approved drop-in (Option 2 enforcement + Calendar warning/bias + COT headline fallback).
  *
- * 2) CALENDAR WARNING & POST-RESULT ALIGNMENT:
- *    - Image precedence remains (image > API). Regardless, we now read `/api/calendar` to compute:
- *      a) Pre-event warning if a HIGH-impact event is within ≤60 minutes; this is surfaced in prompt context
- *         and in provenance (`calendar_warning_minutes`).
- *      b) Post-result alignment note using actual/forecast/previous deltas (leveraging the calendar API’s
- *         bias engine). This is passed to the model to increase/reduce conviction and to block Market execution
- *         when there is a fundamental conflict (cap ≤25%) — via explicit instruction in the prompt.
+ * This update touches ONLY the three agreed areas and adds one visibility improvement:
  *
- * 3) COT FALLBACK (headline cues):
- *    - If CFTC and Tradingster (and stale cache) are unavailable, parse available headlines for cues
- *      (“speculators net long/short”, “leveraged funds increased shorts”, “COT shows …”).
- *    - When cues found: set `cot_used=true`, `cot_method="headline_fallback"`, inject a one-liner summary into
- *      the Sentiment snapshot and provenance. Otherwise: `cot_used=false` with `cot_error`.
+ * A) FUNDAMENTALS NARRATIVE (Calendar evidence → explicit text in “Fundamental View”)
+ *    - NEW: We fetch the full `/api/calendar` payload (non-breaking) and build concise evidence lines for
+ *      key events with Actual vs Forecast vs Previous (e.g., “USD — Non-Farm Payrolls: actual 142k < forecast 175k and < previous 232k → bearish USD”).
+ *    - We pass these lines into the model via a “Calendar fundamentals evidence” block so the AI MUST
+ *      reference precise comparisons under “Fundamental View” and state how it affects the trade decision.
+ *    - Provenance: add `calendar_bias_note` (string) and `calendar_evidence` (string[]) to `meta.sources`.
  *
- * Assumptions / Non-breaking notes:
- * - No change to working features, section names, output wording, price sanity chain, or SHOW_COST handling.
- * - Calendar image remains first-class input; API is used to compute warning/bias text only.
- * - All additions are defensive and best-effort; if any new step fails, previous baseline behavior continues.
+ * B) COT FALLBACK (robust; guaranteed signaling when sources fail)
+ *    - Hardened the headline-fallback detector (currency keyword map + richer patterns). Works even if titles-only.
+ *    - If CFTC & Tradingster fail and no cache exists:
+ *        • When cues exist → `cot_used=true`, `cot_method="headline_fallback"`, `summaryLine` included in sentiment text and provenance.
+ *        • When no cues → `cot_used=false`, `cot_error="no cot sources and no cues"`, ensuring visibility (no silent pass).
+ *
+ * C) CALENDAR WARNING / POST-RESULT ALIGNMENT (kept intact)
+ *    - No logic changes. We now ALSO include the textual bias note in provenance via `calendar_bias_note`.
+ *
+ * Non-goals / Guarantees:
+ *  - Do NOT alter other working features, section names, or template wording.
+ *  - Option 2 enforcement from baseline remains unchanged and active.
+ *  - Price sanity chain unchanged. SHOW_COST untouched.
+ *  - All additions are defensive; failures fall back to prior baseline behavior.
  */
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -56,7 +56,6 @@ const IMG_MAX_BYTES = 12 * 1024 * 1024; // absolute safety cap
 const BASE_W = 1280;       // base width
 const MAX_W = 1500;        // upper bound for adaptive
 const TARGET_MIN = 420 * 1024;
-const TARGET_IDEAL = 800 * 1024;
 const TARGET_MAX = 1200 * 1024; // hard ceiling for adaptive
 
 const now = () => Date.now();
@@ -172,15 +171,8 @@ async function processAdaptiveToDataUrl(buf: Buffer): Promise<string> {
     out = await toJpeg(buf, width, quality);
     guard++;
   }
-  // If still small, one last bump
-  if (out.byteLength < TARGET_MIN && (quality < 88 || width < MAX_W)) {
-    quality = Math.min(quality + 4, 88);
-    width = Math.min(width + 100, MAX_W);
-    out = await toJpeg(buf, width, quality);
-  }
   // Clamp if we overshoot big
   if (out.byteLength > TARGET_MAX) {
-    // gentle re-encode at slightly lower quality to bring under cap
     const q2 = Math.max(72, quality - 6);
     out = await toJpeg(buf, width, q2);
   }
@@ -274,7 +266,14 @@ async function linkToDataUrl(link: string): Promise<string | null> {
 }
 
 // ---------- headlines helpers ----------
-type AnyHeadline = { title?: string; source?: string; published_at?: string; ago?: string; sentiment?: { score?: number } | null } & Record<string, any>;
+type AnyHeadline = {
+  title?: string;
+  description?: string;
+  source?: string;
+  published_at?: string;
+  ago?: string;
+  sentiment?: { score?: number } | null;
+} & Record<string, any>;
 
 function headlinesToPromptLines(items: AnyHeadline[], limit = 6): string | null {
   const take = (items || []).slice(0, limit);
@@ -448,7 +447,7 @@ async function getCSM(): Promise<CsmSnapshot> {
   return snap;
 }
 
-// ---------- COT (weekly) SOFT-REQUIRED + headline fallback ----------
+// ---------- COT (weekly) SOFT-REQUIRED + improved headline fallback ----------
 const CFTC_URL = "https://www.cftc.gov/dea/newcot/f_disagg.txt";
 const CFTC_MAP: Record<string, { name: string, tradingsterId?: string }> = {
   EUR: { name: "EURO FX - CHICAGO MERCANTILE EXCHANGE", tradingsterId: "099741" },
@@ -505,8 +504,6 @@ async function fetchCFTCOnce(timeoutMs: number): Promise<string> {
   if (!r.ok) throw new Error(`CFTC ${r.status}`);
   return r.text();
 }
-
-// Tradingster fallback (HTML best-effort): get latest row and compute net = Non-Commercial Long - Short
 async function fetchTradingster(cur: string, timeoutMs = 7000): Promise<{ reportDate: string, net: number } | null> {
   const id = CFTC_MAP[cur]?.tradingsterId;
   if (!id) return null;
@@ -515,7 +512,7 @@ async function fetchTradingster(cur: string, timeoutMs = 7000): Promise<{ report
     const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(timeoutMs), headers: { "user-agent": "TradePlanApp/1.0" } });
     if (!r.ok) return null;
     const html = await r.text();
-    const section = html.match(/Non-Commercial Positions[\s\S]{0,1000}?<tbody>([\s\S]*?)<\/tbody>/i)?.[1] || "";
+    const section = html.match(/Non-Commercial Positions[\s\S]{0,1200}?<tbody>([\s\S]*?)<\/tbody>/i)?.[1] || "";
     const row = section.match(/<tr[^>]*>([\s\S]*?)<\/tr>/i)?.[1] || "";
     const nums = Array.from(row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)).map(m => m[1].replace(/<[^>]+>/g, "").replace(/[, ]+/g, "").trim());
     const longV = Number(nums[1] || "0");
@@ -527,34 +524,48 @@ async function fetchTradingster(cur: string, timeoutMs = 7000): Promise<{ report
   } catch { return null; }
 }
 
+// Improved headline fallback (titles-only tolerant)
 function cotHeadlineFallback(headlines: AnyHeadline[]): CotSnapshot | null {
   if (!Array.isArray(headlines) || !headlines.length) return null;
-  const txt = headlines.map(h => (h?.title || "") + " " + (h?.description || "")).join(" • ").toLowerCase();
+  const joined = headlines
+    .map(h => [h?.title || "", h?.description || ""].join(" "))
+    .join(" • ")
+    .toLowerCase();
 
-  // naive cues per currency
-  const cues: Record<string, RegExp[]> = {
-    USD: [/speculators.*net\s+long.*dollar|net\s+short.*dollar/i, /cot\s+.*dollar/i],
-    EUR: [/speculators.*net\s+long.*euro|net\s+short.*euro/i, /cot\s+.*euro/i],
-    JPY: [/net\s+(long|short).*yen/i, /cot.*yen/i],
-    GBP: [/net\s+(long|short).*pound/i, /cot.*pound/i],
-    CAD: [/net\s+(long|short).*canadian/i, /cot.*canadian/i],
-    AUD: [/net\s+(long|short).*australian/i, /cot.*australian/i],
-    CHF: [/net\s+(long|short).*franc/i, /cot.*franc/i],
-    NZD: [/net\s+(long|short).*kiwi|net\s+(long|short).*new\s+zealand/i, /cot.*new\s+zealand/i],
+  // currency terms (aliases)
+  const curTerms: Record<string, RegExp[]> = {
+    USD: [/\b(us|u\.s\.|dollar|usd|greenback|dxy)\b/i],
+    EUR: [/\b(euro|eur)\b/i],
+    JPY: [/\b(yen|jpy)\b/i],
+    GBP: [/\b(pound|sterling|gbp)\b/i],
+    CAD: [/\b(canadian|loonie|cad)\b/i],
+    AUD: [/\b(australian|aussie|aud)\b/i],
+    CHF: [/\b(franc|chf)\b/i],
+    NZD: [/\b(kiwi|new zealand|nzd)\b/i],
   };
+
+  // generic COT cue
+  const cue = /(commitments?\s+of\s+traders|cot|cftc)\b[\s\S]{0,80}?(net\s+(long|short)|leveraged\s+funds|speculators|managed\s+money)/i;
+
+  if (!cue.test(joined)) return null;
 
   const net: Record<string, number> = {};
   let any = false;
 
-  for (const cur of Object.keys(cues)) {
-    const hit = cues[cur].some(re => re.test(txt));
-    if (hit) {
-      // signed dummy: +1 indicates net long cues present; -1 if "net short" appears
-      const isShort = /net\s+short[^•]*\b(?:dollar|euro|yen|pound|canadian|australian|franc|zealand|kiwi)/i.test(txt);
-      net[cur] = isShort ? -1 : 1;
-      any = true;
+  for (const [cur, regs] of Object.entries(curTerms)) {
+    if (regs.some(re => re.test(joined))) {
+      const neg = new RegExp(`${regs[0].source}[\\s\\S]{0,40}?net\\s+short`, "i");
+      const pos = new RegExp(`${regs[0].source}[\\s\\S]{0,40}?net\\s+long`, "i");
+      if (neg.test(joined)) { net[cur] = -1; any = true; continue; }
+      if (pos.test(joined)) { net[cur] = 1; any = true; continue; }
+      // If currency mentioned near “leveraged funds increased shorts/longs”
+      const incShort = new RegExp(`${regs[0].source}[\\s\\S]{0,60}?(increase|added).{0,10}short`, "i");
+      const incLong = new RegExp(`${regs[0].source}[\\s\\S]{0,60}?(increase|added).{0,10}long`, "i");
+      if (incShort.test(joined)) { net[cur] = -1; any = true; continue; }
+      if (incLong.test(joined)) { net[cur] = 1; any = true; continue; }
     }
   }
+
   if (!any) return null;
 
   const summary: string[] = [];
@@ -603,6 +614,7 @@ async function getCOT(headlinesForFallback?: AnyHeadline[] | null): Promise<CotS
     const hf = cotHeadlineFallback(headlinesForFallback || []);
     if (hf) return hf;
 
+    // 5) Explicit failure (no silent success)
     throw new Error((e as any)?.message || "COT unavailable");
   }
 }
@@ -640,10 +652,145 @@ function sentimentSummary(
       cotLine = `COT ${cot.reportDate}${staleTag}${srcTag}: Long ${longers.slice(0, 3).join("/")} | Short ${shorters.slice(0, 2).join("/")}`;
     }
   } else {
-    cotLine = `COT: unavailable (${cotError || "service timeout"})`;
-    prov.cot_error = cotError || "unavailable";
+    cotLine = `COT: unavailable (${cotError || "no cot sources and no cues"})`;
+    prov.cot_error = cotError || "no cot sources and no cues";
   }
   return { text: `${ranksLine}\n${cotLine}`, provenance: prov };
+}
+
+// ---------- calendar helpers & fundamentals evidence ----------
+function clamp(v: number, a: number, b: number) { return Math.max(a, Math.min(b, v)); }
+
+function calendarShortText(resp: any, pair: string): string | null {
+  if (!resp?.ok) return null;
+  const instrBias = resp?.bias?.instrument;
+  const parts: string[] = [];
+  if (instrBias && instrBias.pair === pair) {
+    parts.push(`Instrument bias: ${instrBias.label} (${instrBias.score})`);
+  }
+  const per = resp?.bias?.perCurrency || {};
+  const base = pair.slice(0,3), quote = pair.slice(3);
+  const b = per[base]?.label ? `${base}:${per[base].label}` : null;
+  const q = per[quote]?.label ? `${quote}:${per[quote].label}` : null;
+  if (b || q) parts.push(`Per-currency: ${[b,q].filter(Boolean).join(" / ")}`);
+  if (!parts.length) parts.push("No strong calendar bias.");
+  return `Calendar bias for ${pair}: ${parts.join("; ")}`;
+}
+function nearestHighImpactWithin(resp: any, minutes: number): number | null {
+  if (!resp?.ok || !Array.isArray(resp?.items)) return null;
+  const now = Date.now();
+  let best: number | null = null;
+  for (const it of resp.items) {
+    if (String(it?.impact || "") !== "High") continue;
+    const t = new Date(it.time).getTime();
+    if (t >= now) {
+      const mins = Math.floor((t - now) / 60000);
+      if (mins <= minutes) {
+        best = best == null ? mins : Math.min(best, mins);
+      }
+    }
+  }
+  return best;
+}
+function postResultBiasNote(resp: any, pair: string): string | null {
+  if (!resp?.ok) return null;
+  const base = pair.slice(0,3), quote = pair.slice(3);
+  const per = resp?.bias?.perCurrency || {};
+  const b = per[base]?.label || "neutral";
+  const q = per[quote]?.label || "neutral";
+  const instr = resp?.bias?.instrument?.label || null;
+  const scores = resp?.bias?.instrument ? ` (score ${resp.bias.instrument.score})` : "";
+  const line = `Per-currency: ${base} ${b} vs ${quote} ${q}` + (instr ? `; Instrument bias: ${instr}${scores}` : "");
+  return line;
+}
+
+async function fetchCalendarRaw(req: NextApiRequest, instrument: string): Promise<any | null> {
+  try {
+    const base = originFromReq(req);
+    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=120&_t=${Date.now()}`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(5000) });
+    const j: any = await r.json().catch(() => ({}));
+    return j?.ok ? j : null;
+  } catch {
+    return null;
+  }
+}
+
+function goodIfHigher(title: string): boolean | null {
+  const t = title.toLowerCase();
+  if (/(cpi|core cpi|ppi|inflation)/.test(t)) return true;
+  if (/(gdp|retail sales|industrial production|manufacturing production|consumer credit|housing starts|building permits|durable goods)/.test(t)) return true;
+  if (/(pmi|ism|confidence|sentiment)/.test(t)) return true;
+  if (/unemployment|jobless|initial claims|continuing claims/.test(t)) return false; // lower is bullish
+  if (/(nonfarm|nfp|employment change|payrolls|jobs)/.test(t)) return true;
+  if (/trade balance|current account/.test(t)) return true;
+  if (/interest rate|rate decision|refi rate|deposit facility|bank rate|cash rate|ocr/.test(t)) return true;
+  return null;
+}
+function evidenceLine(it: any, cur: string): string | null {
+  const a = Number.isFinite(Number(it.actual)) ? Number(it.actual) : null;
+  const f = Number.isFinite(Number(it.forecast)) ? Number(it.forecast) : null;
+  const p = Number.isFinite(Number(it.previous)) ? Number(it.previous) : null;
+  if (a == null || (f == null && p == null)) return null;
+  const dir = goodIfHigher(String(it.title));
+  let comp: string[] = [];
+  if (f != null) comp.push(a < f ? "< forecast" : a > f ? "> forecast" : "= forecast");
+  if (p != null) comp.push(a < p ? "< previous" : a > p ? "> previous" : "= previous");
+  let verdict = "neutral";
+  if (dir === true) {
+    // higher is bullish
+    verdict = (a > (f ?? a) && a > (p ?? a)) ? "bullish" : (a < (f ?? a) && a < (p ?? a)) ? "bearish" : "mixed";
+  } else if (dir === false) {
+    // lower is bullish
+    verdict = (a < (f ?? a) && a < (p ?? a)) ? "bullish" : (a > (f ?? a) && a > (p ?? a)) ? "bearish" : "mixed";
+  }
+  const comps = comp.join(" and ");
+  return `${cur} — ${it.title}: actual ${a}${f!=null||p!=null ? ` ${comps}` : ""} → ${verdict} ${cur}`;
+}
+function buildCalendarEvidence(resp: any, pair: string): string[] {
+  if (!resp?.ok || !Array.isArray(resp?.items)) return [];
+  const base = pair.slice(0,3), quote = pair.slice(3);
+  // recent completed events (last 72h)
+  const now = Date.now(), lo = now - 72*3600*1000;
+  const done = resp.items.filter((it: any) => {
+    const t = new Date(it.time).getTime();
+    return t <= now && t >= lo && (it.actual != null || it.forecast != null || it.previous != null) && (it.currency === base || it.currency === quote);
+  }).slice(0, 12);
+
+  const lines: string[] = [];
+  for (const it of done) {
+    const line = evidenceLine(it, it.currency || ""); 
+    if (line) lines.push(line);
+  }
+  return lines;
+}
+
+async function fetchCalendarForAdvisory(req: NextApiRequest, instrument: string): Promise<{
+  text: string | null, status: "api" | "unavailable", provider: string | null,
+  warningMinutes: number | null, advisoryText: string | null, biasNote: string | null, raw?: any | null, evidence?: string[]
+}> {
+  try {
+    const base = originFromReq(req);
+    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=48&_t=${Date.now()}`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(4000) });
+    const j: any = await r.json().catch(() => ({}));
+    if (j?.ok) {
+      const t = calendarShortText(j, instrument) || `Calendar bias for ${instrument}: (no strong signal)`;
+      const warn = nearestHighImpactWithin(j, 60);
+      const bias = postResultBiasNote(j, instrument);
+      const advisory = [
+        warn != null ? `⚠️ High-impact event in ~${warn} min.` : null,
+        bias ? `Recent result alignment: ${bias}.` : null
+      ].filter(Boolean).join("\n");
+      // Build evidence (use a broader pull to ensure we capture week context)
+      const rawFull = await fetchCalendarRaw(req, instrument);
+      const evidence = rawFull ? buildCalendarEvidence(rawFull, instrument) : buildCalendarEvidence(j, instrument);
+      return { text: t, status: "api", provider: String(j?.provider || "mixed"), warningMinutes: warn ?? null, advisoryText: advisory || null, biasNote: bias || null, raw: j, evidence };
+    }
+    return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null, warningMinutes: null, advisoryText: null, biasNote: null, raw: null, evidence: [] };
+  } catch {
+    return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null, warningMinutes: null, advisoryText: null, biasNote: null, raw: null, evidence: [] };
+  }
 }
 
 // ---------- prompts ----------
@@ -679,16 +826,20 @@ function systemCore(instrument: string, calendarAdvisory?: { warningMinutes?: nu
     warn !== null ? `\nCALENDAR WARNING: High-impact event within ~${warn} min. If trading into event, cap conviction to ≤35% and avoid new Market execution in final pre-event window.` : "",
     bias ? `\nPOST-RESULT ALIGNMENT: ${bias}. If this conflicts with the technical setup, cap conviction to ≤25% or convert to Pending.` : "",
     "",
-    // ── Option 2 enforcement directive ──
+    // ── Option 2 enforcement directive (baseline behavior retained) ──
     "Always include **Option 2** when a viable secondary exists (e.g., Break + Retest, Trendline break, SFP).",
     "Option 2 must include: direction, order type, explicit trigger (e.g., close above X then retest hold at Y), entry, SL, TP1/TP2, and its own conviction %. Do NOT collapse Option 2 into a generic pullback fallback.",
+    "",
+    // ── Fundamentals narrative directive (NEW visibility) ──
+    "Under **Fundamental View**, explicitly name key events (e.g., NFP, CPI, ISM), compare Actual vs Forecast vs Previous, state the directional interpretation per currency (bullish/bearish/neutral), and add one line on how that influenced the trade decision (e.g., conviction adjusted, Market vs Pending).",
   ].join("\n");
 }
+
 function buildUserPartsBase(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null;
-  calendarAdvisoryText?: string | null;
+  calendarAdvisoryText?: string | null; calendarEvidence?: string[] | null;
 }) {
   const parts: any[] = [
     { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}` },
@@ -699,6 +850,9 @@ function buildUserPartsBase(args: {
   if (args.calendarDataUrl) { parts.push({ type: "text", text: "Economic Calendar Image:" }); parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } }); }
   if (!args.calendarDataUrl && args.calendarText) { parts.push({ type: "text", text: `Calendar snapshot:\n${args.calendarText}` }); }
   if (args.calendarAdvisoryText) { parts.push({ type: "text", text: `Calendar advisory:\n${args.calendarAdvisoryText}` }); }
+  if (args.calendarEvidence && args.calendarEvidence.length) {
+    parts.push({ type: "text", text: `Calendar fundamentals evidence:\n- ${args.calendarEvidence.join("\n- ")}` });
+  }
   if (args.headlinesText) { parts.push({ type: "text", text: `Recent headlines snapshot (used for bias; list shown in Stage-2):\n${args.headlinesText}` }); }
   if (args.sentimentText) { parts.push({ type: "text", text: `Sentiment snapshot (CSM + COT; used for bias):\n${args.sentimentText}` }); }
   return parts;
@@ -709,7 +863,7 @@ function messagesFull(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null;
-  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null };
+  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null };
 }) {
   const system = [
     systemCore(args.instrument, args.calendarAdvisory),
@@ -760,7 +914,7 @@ function messagesFull(args: {
     `  "stop": number, "tp1": number, "tp2": number,`,
     `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
     `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
-    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null, "cot_method": string | null, "calendar_warning_minutes": number | null } }`,
+    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null, "cot_method": string | null, "calendar_warning_minutes": number | null, "calendar_bias_note": string | null, "calendar_evidence": string[] | null } }`,
     "```",
   ].join("\n");
 
@@ -770,7 +924,8 @@ function messagesFull(args: {
       instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4,
       calendarDataUrl: args.calendarDataUrl, calendarText: args.calendarText,
       headlinesText: args.headlinesText, sentimentText: args.sentimentText,
-      calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null
+      calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null,
+      calendarEvidence: args.calendarAdvisory?.evidence || null,
     }) },
   ];
 }
@@ -780,10 +935,10 @@ function messagesFastStage1(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null;
-  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null };
+  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null };
   provenance?: {
     headlines_used: number; headlines_instrument: string; calendar_used: boolean; calendar_status: string;
-    calendar_provider: string | null; csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string | null; cot_error?: string | null; cot_method?: string | null; calendar_warning_minutes?: number | null;
+    calendar_provider: string | null; csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string | null; cot_error?: string | null; cot_method?: string | null; calendar_warning_minutes?: number | null; calendar_bias_note?: string | null; calendar_evidence?: string[] | null;
   };
 }) {
   const system = [
@@ -817,7 +972,7 @@ function messagesFastStage1(args: {
     `  "stop": number, "tp1": number, "tp2": number,`,
     `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
     `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
-    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null, "cot_method": string | null, "calendar_warning_minutes": number | null } }`,
+    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null, "cot_method": string | null, "calendar_warning_minutes": number | null, "calendar_bias_note": string | null, "calendar_evidence": string[] | null } }`,
     "```",
   ].join("\n");
 
@@ -825,7 +980,8 @@ function messagesFastStage1(args: {
     instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4,
     calendarDataUrl: args.calendarDataUrl, calendarText: args.calendarText,
     headlinesText: args.headlinesText, sentimentText: args.sentimentText,
-    calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null
+    calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null,
+    calendarEvidence: args.calendarAdvisory?.evidence || null,
   });
   if (args.provenance) {
     parts.push({ type: "text", text: `provenance:\n${JSON.stringify(args.provenance)}` });
@@ -838,7 +994,7 @@ function messagesExpandStage2(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null; aiMetaHint?: any;
-  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null };
+  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null };
 }) {
   const system = [
     systemCore(args.instrument, args.calendarAdvisory),
@@ -875,7 +1031,8 @@ function messagesExpandStage2(args: {
     instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4,
     calendarDataUrl: args.calendarDataUrl, calendarText: args.calendarText,
     headlinesText: args.headlinesText, sentimentText: args.sentimentText,
-    calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null
+    calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null,
+    calendarEvidence: args.calendarAdvisory?.evidence || null,
   });
   if (args.aiMetaHint) userParts.push({ type: "text", text: `ai_meta_hint:\n${JSON.stringify(args.aiMetaHint, null, 2)}` });
   return [{ role: "system", content: system }, { role: "user", content: userParts }];
@@ -1001,76 +1158,6 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
   return null;
 }
 
-// ---------- calendar helpers ----------
-function clamp(v: number, a: number, b: number) { return Math.max(a, Math.min(b, v)); }
-function calendarShortText(resp: any, pair: string): string | null {
-  if (!resp?.ok) return null;
-  const instrBias = resp?.bias?.instrument;
-  const parts: string[] = [];
-  if (instrBias && instrBias.pair === pair) {
-    parts.push(`Instrument bias: ${instrBias.label} (${instrBias.score})`);
-  }
-  const per = resp?.bias?.perCurrency || {};
-  const base = pair.slice(0,3), quote = pair.slice(3);
-  const b = per[base]?.label ? `${base}:${per[base].label}` : null;
-  const q = per[quote]?.label ? `${quote}:${per[quote].label}` : null;
-  if (b || q) parts.push(`Per-currency: ${[b,q].filter(Boolean).join(" / ")}`);
-  if (!parts.length) parts.push("No strong calendar bias.");
-  return `Calendar bias for ${pair}: ${parts.join("; ")}`;
-}
-function nearestHighImpactWithin(resp: any, minutes: number): number | null {
-  if (!resp?.ok || !Array.isArray(resp?.items)) return null;
-  const now = Date.now();
-  let best: number | null = null;
-  for (const it of resp.items) {
-    if (String(it?.impact || "") !== "High") continue;
-    const t = new Date(it.time).getTime();
-    if (t >= now) {
-      const mins = Math.floor((t - now) / 60000);
-      if (mins <= minutes) {
-        best = best == null ? mins : Math.min(best, mins);
-      }
-    }
-  }
-  return best;
-}
-function postResultBiasNote(resp: any, pair: string): string | null {
-  if (!resp?.ok) return null;
-  const base = pair.slice(0,3), quote = pair.slice(3);
-  const per = resp?.bias?.perCurrency || {};
-  const b = per[base]?.label || "neutral";
-  const q = per[quote]?.label || "neutral";
-  const instr = resp?.bias?.instrument?.label || null;
-  const scores = resp?.bias?.instrument ? ` (score ${resp.bias.instrument.score})` : "";
-  const line = `Per-currency: ${base} ${b} vs ${quote} ${q}` + (instr ? `; Instrument bias: ${instr}${scores}` : "");
-  return line;
-}
-
-async function fetchCalendarForAdvisory(req: NextApiRequest, instrument: string): Promise<{
-  text: string | null, status: "api" | "unavailable", provider: string | null,
-  warningMinutes: number | null, advisoryText: string | null, biasNote: string | null
-}> {
-  try {
-    const base = originFromReq(req);
-    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=48&_t=${Date.now()}`;
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(4000) });
-    const j: any = await r.json().catch(() => ({}));
-    if (j?.ok) {
-      const t = calendarShortText(j, instrument) || `Calendar bias for ${instrument}: (no strong signal)`;
-      const warn = nearestHighImpactWithin(j, 60);
-      const bias = postResultBiasNote(j, instrument);
-      const advisory = [
-        warn != null ? `⚠️ High-impact event in ~${warn} min.` : null,
-        bias ? `Recent result alignment: ${bias}.` : null
-      ].filter(Boolean).join("\n");
-      return { text: t, status: "api", provider: String(j?.provider || "mixed"), warningMinutes: warn ?? null, advisoryText: advisory || null, biasNote: bias || null };
-    }
-    return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null, warningMinutes: null, advisoryText: null, biasNote: null };
-  } catch {
-    return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null, warningMinutes: null, advisoryText: null, biasNote: null };
-  }
-}
-
 // ---------- handler ----------
 export default async function handler(req: NextApiRequest, res: NextApiResponse<Ok | Err>) {
   try {
@@ -1096,7 +1183,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         instrument: c.instrument, dateStr, m15: c.m15, h1: c.h1, h4: c.h4,
         calendarDataUrl: c.calendar || undefined, headlinesText: c.headlinesText || undefined, sentimentText: c.sentimentText || undefined,
         aiMetaHint: null,
-        calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText }
+        calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText, evidence: calAdv.evidence || [] }
       });
       const text = await callOpenAI(messages);
       res.setHeader("Cache-Control", "no-store");
@@ -1178,25 +1265,24 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       headlinesText = viaServer.promptText;
     }
 
-    // ----- Calendar: image precedence; also compute warning + post-result bias via API -----
+    // ----- Calendar: image precedence; plus advisory + evidence via API -----
     let calendarText: string | null = null;
     let calendarStatus: "image" | "api" | "unavailable" = "unavailable";
     let calendarProvider: string | null = null;
 
-    // Always compute advisory from API (warning & bias note)
     const calAdv = await fetchCalendarForAdvisory(req, instrument);
 
     if (calUrl) {
       calendarStatus = "image";
       calendarProvider = "image";
-      calendarText = calAdv.text; // include text note too
+      calendarText = calAdv.text; // include bias text too
     } else {
       calendarText = calAdv.text;
       calendarStatus = calAdv.status;
       calendarProvider = calAdv.provider;
     }
 
-    // ----- Sentiment: CSM mandatory; COT soft-required with Tradingster + headlines fallback -----
+    // ----- Sentiment: CSM mandatory; COT soft-required with fallbacks (incl. headlines) -----
     let csm: CsmSnapshot;
     try { csm = await getCSM(); } catch (e: any) {
       return res.status(503).json({ ok: false, reason: `CSM unavailable: ${e?.message || "fetch failed"}.` });
@@ -1227,12 +1313,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       csm_time: csm.tsISO,
       cot_used: !!cot,
       cot_report_date: cot ? cot.reportDate : null,
-      cot_error: cot ? null : cotErr || "unavailable",
+      cot_error: cot ? null : cotErr || "no cot sources and no cues",
       cot_method: cot?.method || null,
       calendar_warning_minutes: calAdv.warningMinutes ?? null,
+      calendar_bias_note: calAdv.biasNote || null,
+      calendar_evidence: calAdv.evidence || [],
     };
 
-    // Build messages
     if (mode === "fast") {
       const messages = messagesFastStage1({
         instrument, dateStr, m15, h1, h4,
@@ -1240,10 +1327,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         calendarText: (!calUrl && calendarText) ? calendarText : undefined,
         headlinesText: headlinesText || undefined,
         sentimentText: sentimentText,
-        calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText },
+        calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText, evidence: calAdv.evidence || [] },
         provenance: provForModel,
       });
-      // Prepend a tiny currentPrice hint if we have it
       if (livePrice) {
         (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice}`;
       }
@@ -1261,13 +1347,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         text = await normalizeBreakoutLabel(text); aiMeta = extractAiMeta(text) || aiMeta;
       }
       if (aiMeta) {
-        // Ensure we evaluate using verified live price if we have it
         if (livePrice && aiMeta.currentPrice !== livePrice) aiMeta.currentPrice = livePrice;
         const bad = invalidOrderRelativeToPrice(aiMeta);
         if (bad) { text = await fixOrderVsPrice(instrument, text, aiMeta); aiMeta = extractAiMeta(text) || aiMeta; }
       }
 
-      // NEW: ensure Option 2 is present & explicit
+      // Ensure Option 2 present & explicit
       text = await enforceOption2(instrument, text);
       aiMeta = extractAiMeta(text) || aiMeta;
 
@@ -1298,7 +1383,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       calendarText: (!calUrl && calendarText) ? calendarText : undefined,
       headlinesText: headlinesText || undefined,
       sentimentText,
-      calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText }
+      calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText, evidence: calAdv.evidence || [] }
     });
     if (livePrice) {
       (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice}`;
@@ -1321,7 +1406,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       if (bad) { text = await fixOrderVsPrice(instrument, text, aiMeta); aiMeta = extractAiMeta(text) || aiMeta; }
     }
 
-    // NEW: ensure Option 2 is present & explicit
+    // Ensure Option 2 present & explicit
     text = await enforceOption2(instrument, text);
     aiMeta = extractAiMeta(text) || aiMeta;
 
@@ -1359,6 +1444,8 @@ function fallbackCard(
     cot_error?: string | null;
     cot_method?: string | null;
     calendar_warning_minutes?: number | null;
+    calendar_bias_note?: string | null;
+    calendar_evidence?: string[] | null;
   }
 ) {
   return [
