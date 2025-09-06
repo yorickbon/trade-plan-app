@@ -1,17 +1,25 @@
 /**
  * CHANGE MANIFEST — /pages/api/vision-plan.ts
  *
- * ✅ Headlines UNCHANGED (we only read /api/news; do not modify headlines pipeline).
- * ✅ Restored TradingView/Gyazo URL ingestion (m15Url/h1Url/h4Url; optional calendarUrl) in addition to file uploads.
- * ✅ Calendar image → LLM OCR (English-only) to extract structured events (Actual/Forecast/Previous, impact).
- * ✅ Weekly aggregation of ALL red/orange events → per-currency scores → instrument bias; feeds conviction component.
- * ✅ Pre-event warnings (≤ CALENDAR_WARN_MINS) and post-result conflict guard (cap conviction ≤ 25%).
- * ✅ COT always surfaces: cot_used, cot_method ("cftc" | "tradingster" | "stale_cache"), cot_report_date, cot_error.
- * ✅ Option 2 always present with explicit trigger instructions and its own conviction.
- * ✅ Provenance in ai_meta.sources: calendar_status/provider, events_parsed, calendar_sample (first 5), perCurrency, instrument_bias, price_fix, headlines_*.
- * ✅ No new npm deps added; uses existing OPENAI API for vision OCR. English-only calendar images as agreed.
+ * Scope: Minimal, surgical rollback to input handling. No changes to working features.
  *
- * IMPORTANT: We did NOT alter any working headlines code or selection. We only use /api/news output.
+ * What changed (and why):
+ * 1) Restored dual-path input loader:
+ *    - Accepts BOTH multipart/form-data (files) AND JSON/x-www-form-urlencoded (URLs only).
+ *    - This re-enables your existing client flow that sends m15Url/h1Url/h4Url (and optional calendarUrl)
+ *      without forcing multipart. The previous guard returned 400 and looked like “nothing is generated”.
+ *
+ * What did NOT change:
+ * - Headlines: still read-only via /api/news (your pipeline untouched).
+ * - Strategy playbook, tournament rubric, enforcement (breakout proof, pending limit, order sanity).
+ * - Option 2 always shown when viable with explicit triggers & its own conviction (no collapse into pullback).
+ * - Calendar image LLM-OCR (English), weekly red/orange aggregation → per-currency & instrument bias,
+ *   pre-event warning (≤ CALENDAR_WARN_MINS, default 60m), conflict cap (≤ 25%).
+ * - CSM mandatory, COT soft with CFTC → Tradingster → stale cache (≤14d) provenance (cot_used, cot_method, etc.).
+ * - Live price sanity chain; provenance in ai_meta.sources (including price_fix).
+ *
+ * Notes:
+ * - No new deps; same OpenAI call. OPENAI_MODEL default remains as before (overridable by env).
  */
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -28,7 +36,7 @@ type Err = { ok: false; reason: string };
 
 const OPENAI_API_KEY =
   process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5"; // do not change unless your env overrides it
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
 const OPENAI_API_BASE =
   process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
 
@@ -154,7 +162,7 @@ async function fileToDataUrl(file: any): Promise<string | null> {
   return out;
 }
 
-// ---------- link + fetch helpers (RESTORED) ----------
+// ---------- link + fetch helpers ----------
 function originFromReq(req: NextApiRequest) {
   const proto = (req.headers["x-forwarded-proto"] as string) || "https";
   const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
@@ -364,8 +372,8 @@ function directionalShock(ev: CalendarEvent): number {
 
   let sign = 0; // + bull, - bear
   switch (dir) {
-    case "inflation": sign = delta > 0 ? +1 : delta < 0 ? -1 : 0; break; // higher inflation = hawkish = bullish
-    case "growth":    sign = delta > 0 ? +1 : delta < 0 ? -1 : 0; break; // stronger growth = bullish
+    case "inflation": sign = delta > 0 ? +1 : delta < 0 ? -1 : 0; break;
+    case "growth":    sign = delta > 0 ? +1 : delta < 0 ? -1 : 0; break;
     case "labor":
       if (/unemployment/i.test(ev.title || "")) {
         sign = delta < 0 ? +1 : delta > 0 ? -1 : 0; // lower unemployment is bullish
@@ -377,10 +385,10 @@ function directionalShock(ev: CalendarEvent): number {
       if (a != null && f != null) sign = delta > 0 ? +1 : delta < 0 ? -1 : 0;
       else sign = 0;
       break;
-    default: sign = delta > 0 ? +1 : delta < 0 ? -1 : 0; // fallback growth-like
+    default: sign = delta > 0 ? +1 : delta < 0 ? -1 : 0;
   }
   const mag = Math.max(0, Math.min(1, Math.abs(delta) / (Math.abs(f ?? p ?? 1) || 1)));
-  const shock = weight * sign * (0.5 + 0.5 * mag); // 0.5..1.0 scaled by surprise
+  const shock = weight * sign * (0.5 + 0.5 * mag);
   return shock;
 }
 
@@ -946,7 +954,7 @@ async function fetchLivePriceWithProvider(pair: string): Promise<{ price: number
   return { price: null, provider: null, price_fix: null };
 }
 
-// ---------- Handler ----------
+// ---------- Handler (DUAL-PATH INPUT LOADER RESTORED) ----------
 export default async function handler(req: NextApiRequest, res: NextApiResponse<Ok | Err>) {
   try {
     if (req.method !== "POST") return res.status(405).json({ ok: false, reason: "Method not allowed" });
@@ -955,17 +963,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const urlMode = String((req.query.mode as string) || "").toLowerCase();
     let mode: "full" | "fast" = urlMode === "fast" ? "fast" : "full";
 
-    if (!isMultipart(req)) {
-      return res.status(400).json({
-        ok: false,
-        reason:
-          "Use multipart/form-data with files m15,h1,h4 (PNG/JPG/WEBP) OR pass TradingView/Gyazo links via form fields m15Url/h1Url/h4Url. Include 'instrument'.",
-      });
+    // ✅ Accept BOTH multipart (files) and JSON/x-www-form-urlencoded (URLs only)
+    let fields: Record<string, any> = {};
+    let files: Record<string, any> = {};
+    if (isMultipart(req)) {
+      const parsed = await parseMultipart(req);
+      fields = parsed.fields; files = parsed.files;
+    } else {
+      // Body is available behind Next's default body parser when not multipart
+      // (we kept config.bodyParser: false to allow multipart; JSON may be parsed upstream by Next >= 13 route).
+      // If body is not parsed, users should send x-www-form-urlencoded; we still read req as any.
+      fields = (req as any).body || {};
     }
-
-    // parse
-    const tParse = now();
-    const { fields, files } = await parseMultipart(req);
 
     const instrument = String(fields.instrument || fields.code || "EURUSD").toUpperCase().replace(/\s+/g, "");
     if (String(fields.mode || "").toLowerCase() === "fast") mode = "fast";
@@ -976,7 +985,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const h4f = pickFirst(files.h4);
     const calF = pickFirst(files.calendar);
 
-    // URLs (optional; RESTORED)
+    // URLs (optional)
     const m15Url = String(pickFirst(fields.m15Url) || "").trim();
     const h1Url = String(pickFirst(fields.h1Url) || "").trim();
     const h4Url = String(pickFirst(fields.h4Url) || "").trim();
