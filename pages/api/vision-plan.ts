@@ -1,19 +1,21 @@
-/**
- * CHANGE MANIFEST — /pages/api/vision-plan.ts
- *
- * Why this update:
- * - Remove OCR dependency to fix build error "Module not found: Can't resolve 'tesseract.js'".
- * - Keep calendar image support (visual parsing by the model) + calendar API bias parsing and warnings.
- * - Guarantee Option 2 appears with explicit trigger instructions (Break+Retest / TL break / SFP).
- * - Preserve headlines behavior exactly (no changes to /api/news or its usage).
- * - Add stable price_fix provenance and live-price helper that returns { price, provider }.
- *
- * Non-breaking guarantees:
- * - Fast mode: returns Quick Plan (+Option 2) + Management + trailing ai_meta only.
- * - Full mode: returns entire template (unchanged headings/wording).
- * - CSM mandatory; COT soft-required with tolerant fallbacks; provenance always included.
- * - Calendar logic: pre-event warning (≤ CALENDAR_WARN_MINS) and post-result conflict caps conviction ≤ 25% and marks Do not trade.
- */
+// /pages/api/vision-plan.ts
+// Images-only planner with optional TradingView/Gyazo image URL fetch.
+// Uploads: m15 (execution), h1 (context), h4 (HTF), optional calendar.
+// You can also pass m15Url / h1Url / h4Url (TV/Gyazo direct image or page link) and headlinesJson (UI-fetched).
+// -----------------------------------------------------------------------------
+// Two-stage support (non-breaking):
+//   • mode=full (default): full card (legacy).
+//   • mode=fast: images + calendar (image>api) + headlines + CSM (mandatory) + COT (soft-required).
+//                OUTPUT ONLY: Quick Plan (+Option 2) + Management + trailing ai_meta.
+//   • mode=expand&cache=<id>: reuse Stage-1 cache and return ONLY remaining sections.
+//
+// Headlines: prefer client-provided `headlinesJson` (≤12) for consistency; else fetch 12 and embed **6**.
+// Image downscale: adaptive clarity — max width up to 1500px, JPEG 74→88, target ~700–900 KB (best-effort, ≤1.2 MB).
+// Strategy playbook & enforcement: unchanged. LIMIT sanity uses verified currentPrice (live).
+// CSM (intraday) is **mandatory**. COT is **soft-required** with Tradingster fallback and 14-day stale cache.
+// Calendar precedence: uploaded image > API bias > explicit “unavailable” warning, surfaced in both Fast/Full.
+// Provenance: meta.sources always included.
+// -----------------------------------------------------------------------------
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -37,9 +39,6 @@ const OPENAI_API_BASE =
 const TD_KEY = process.env.TWELVEDATA_API_KEY || "";
 const FH_KEY = process.env.FINNHUB_API_KEY || process.env.FINNHUB_APT_KEY || "";
 const POLY_KEY = process.env.POLYGON_API_KEY || "";
-
-// Calendar settings
-const CALENDAR_WARN_MINS = Math.max(15, Number(process.env.CALENDAR_WARN_MINS || 60));
 
 // ---------- small utils ----------
 const IMG_MAX_BYTES = 12 * 1024 * 1024; // absolute safety cap
@@ -168,6 +167,7 @@ async function processAdaptiveToDataUrl(buf: Buffer): Promise<string> {
   }
   // Clamp if we overshoot big
   if (out.byteLength > TARGET_MAX) {
+    // gentle re-encode at slightly lower quality to bring under cap
     const q2 = Math.max(72, quality - 6);
     out = await toJpeg(buf, width, q2);
   }
@@ -260,7 +260,7 @@ async function linkToDataUrl(link: string): Promise<string | null> {
   } catch { return null; }
 }
 
-// ---------- headlines helpers (UNCHANGED BEHAVIOR) ----------
+// ---------- headlines helpers ----------
 type AnyHeadline = { title?: string; source?: string; published_at?: string; ago?: string; sentiment?: { score?: number } | null } & Record<string, any>;
 
 function headlinesToPromptLines(items: AnyHeadline[], limit = 6): string | null {
@@ -276,17 +276,16 @@ function headlinesToPromptLines(items: AnyHeadline[], limit = 6): string | null 
   });
   return lines.join("\n");
 }
-async function fetchedHeadlinesViaServer(req: NextApiRequest, instrument: string): Promise<{ items: AnyHeadline[]; promptText: string | null; provider: string | null }> {
+async function fetchedHeadlinesViaServer(req: NextApiRequest, instrument: string): Promise<{ items: AnyHeadline[]; promptText: string | null }> {
   try {
     const base = originFromReq(req);
     const url = `${base}/api/news?instrument=${encodeURIComponent(instrument)}&hours=48&max=12&_t=${Date.now()}`;
     const r = await fetch(url, { cache: "no-store" });
     const j = await r.json().catch(() => ({}));
     const items: AnyHeadline[] = Array.isArray(j?.items) ? j.items : [];
-    const provider = typeof j?.provider === "string" ? j.provider : null;
-    return { items, promptText: headlinesToPromptLines(items, 6), provider };
+    return { items, promptText: headlinesToPromptLines(items, 6) };
   } catch {
-    return { items: [], promptText: null, provider: null };
+    return { items: [], promptText: null };
   }
 }
 
@@ -486,6 +485,7 @@ function parseCFTC(text: string): CotSnapshot | null {
   }
   if (!latestDate || Object.keys(net).length < 3) return null;
   const reportDateISO = new Date(latestDate).toISOString().slice(0, 10);
+  // 7d ttl normally; we will allow stale reuse up to 14d if fresh fails
   return { reportDate: reportDateISO, net, ttl: Date.now() + 7 * 24 * 60 * 60 * 1000 };
 }
 async function fetchCFTCOnce(timeoutMs: number): Promise<string> {
@@ -494,7 +494,7 @@ async function fetchCFTCOnce(timeoutMs: number): Promise<string> {
   return r.text();
 }
 
-// Tradingster fallback (HTML best-effort)
+// Tradingster fallback (HTML best-effort): get latest row and compute net = Non-Commercial Long - Short
 async function fetchTradingster(cur: string, timeoutMs = 7000): Promise<{ reportDate: string, net: number } | null> {
   const id = CFTC_MAP[cur]?.tradingsterId;
   if (!id) return null;
@@ -503,10 +503,12 @@ async function fetchTradingster(cur: string, timeoutMs = 7000): Promise<{ report
     const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(timeoutMs), headers: { "user-agent": "TradePlanApp/1.0" } });
     if (!r.ok) return null;
     const html = await r.text();
+    // crude parse: locate latest table row values
+    // We look for the "Non-Commercial Positions" section, then Long/Short numbers and the "Report Date"
     const section = html.match(/Non-Commercial Positions[\s\S]{0,1000}?<tbody>([\s\S]*?)<\/tbody>/i)?.[1] || "";
     const row = section.match(/<tr[^>]*>([\s\S]*?)<\/tr>/i)?.[1] || "";
     const nums = Array.from(row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)).map(m => m[1].replace(/<[^>]+>/g, "").replace(/[, ]+/g, "").trim());
-    const longV = Number(nums[1] || "0");
+    const longV = Number(nums[1] || "0"); // usually col order: Traders, Long, Short, Spreading...
     const shortV = Number(nums[2] || "0");
     const dateMatch = html.match(/Report Date[^<]*<\/th>\s*<td[^>]*>([^<]+)<\/td>/i)?.[1] || html.match(/as of\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})/i)?.[1];
     const reportDate = dateMatch ? new Date(dateMatch).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
@@ -516,12 +518,14 @@ async function fetchTradingster(cur: string, timeoutMs = 7000): Promise<{ report
 }
 
 async function getCOT(): Promise<CotSnapshot> {
+  // 1) Try fresh CFTC
   try {
     const txt = await fetchCFTCOnce(10_000);
     const snap = parseCFTC(txt);
     if (snap) { COT_CACHE = snap; return snap; }
     throw new Error("CFTC parse failed");
   } catch (e) {
+    // 2) Tradingster best-effort fallback
     const net: Record<string, number> = {};
     let reportDate = "";
     for (const cur of Object.keys(CFTC_MAP)) {
@@ -532,10 +536,11 @@ async function getCOT(): Promise<CotSnapshot> {
       }
     }
     if (reportDate && Object.keys(net).length >= 3) {
-      const snap: CotSnapshot = { reportDate, net, ttl: Date.now() + 3 * 24 * 60 * 60 * 1000 };
+      const snap: CotSnapshot = { reportDate, net, ttl: Date.now() + 3 * 24 * 60 * 60 * 1000 }; // shorter ttl for fallback
       COT_CACHE = snap;
       return snap;
     }
+    // 3) Reuse stale cache up to 14 days
     if (COT_CACHE) {
       const ageMs = Date.now() - new Date(COT_CACHE.reportDate + "T00:00:00Z").getTime();
       const fourteenDays = 14 * 24 * 60 * 60 * 1000;
@@ -621,11 +626,170 @@ function buildUserPartsBase(args: {
     { type: "text", text: "Context 1H Chart:" }, { type: "image_url", image_url: { url: args.h1 } },
     { type: "text", text: "Execution 15M Chart:" }, { type: "image_url", image_url: { url: args.m15 } },
   ];
-  if (args.calendarDataUrl) { parts.push({ type: "text", text: "Economic Calendar Image (visual-only):" }); parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } }); }
+  if (args.calendarDataUrl) { parts.push({ type: "text", text: "Economic Calendar Image:" }); parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } }); }
   if (!args.calendarDataUrl && args.calendarText) { parts.push({ type: "text", text: `Calendar snapshot:\n${args.calendarText}` }); }
   if (args.headlinesText) { parts.push({ type: "text", text: `Recent headlines snapshot (used for bias; list shown in Stage-2):\n${args.headlinesText}` }); }
   if (args.sentimentText) { parts.push({ type: "text", text: `Sentiment snapshot (CSM + COT; used for bias):\n${args.sentimentText}` }); }
   return parts;
+}
+
+// FULL card (legacy)
+function messagesFull(args: {
+  instrument: string; dateStr: string; m15: string; h1: string; h4: string;
+  calendarDataUrl?: string | null; calendarText?: string | null;
+  headlinesText?: string | null; sentimentText?: string | null;
+}) {
+  const system = [
+    systemCore(args.instrument),
+    "",
+    "OUTPUT format:",
+    "Quick Plan (Actionable)",
+    "",
+    "• Direction: Long | Short | Stay Flat",
+    "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
+    "• Trigger: (ex: Limit pullback / zone touch)",
+    "• Entry: <min–max> or specific level",
+    "• Stop Loss: <level> (based on PA: behind swing/OB/SR; step to the next zone if too tight)",
+    "• Take Profit(s): TP1 <level> / TP2 <level>",
+    "• Conviction: <0–100>%",
+    "• Setup: <Chosen Strategy>",
+    "• Short Reasoning: <1–2 lines>",
+    "• Option 2 (Market): Show when allowed; else print 'Not available (missing confirmation)'.",
+    "",
+    "Full Breakdown",
+    "• Technical View (HTF + Intraday): 4H/1H/15m structure",
+    "• Fundamental View (Calendar + Sentiment + Headlines):",
+    "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
+    "• Conditional Scenarios:",
+    "• Surprise Risk:",
+    "• Invalidation:",
+    "• One-liner Summary:",
+    "",
+    "Detected Structures (X-ray):",
+    "• 4H:",
+    "• 1H:",
+    "• 15m:",
+    "",
+    "Candidate Scores (tournament):",
+    "- name — score — reason",
+    "",
+    "Final Table Summary:",
+    "| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |",
+    `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
+    "",
+    "At the very end, append a fenced JSON block labeled ai_meta with:",
+    "```ai_meta",
+    `{ "selectedStrategy": string,`,
+    `  "entryType": "Pending" | "Market",`,
+    `  "entryOrder": "Sell Limit" | "Buy Limit" | "Sell Stop" | "Buy Stop" | "Market",`,
+    `  "direction": "Long" | "Short" | "Flat",`,
+    `  "currentPrice": number | null,`,
+    `  "zone": { "min": number, "max": number, "tf": "15m" | "1H" | "4H", "type": "OB" | "FVG" | "SR" | "Other" },`,
+    `  "stop": number, "tp1": number, "tp2": number,`,
+    `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
+    `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
+    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null } }`,
+    "```",
+  ].join("\n");
+
+  return [
+    { role: "system", content: system },
+    { role: "user", content: buildUserPartsBase(args) },
+  ];
+}
+
+// FAST Stage-1: Quick Plan + Management + ai_meta
+function messagesFastStage1(args: {
+  instrument: string; dateStr: string; m15: string; h1: string; h4: string;
+  calendarDataUrl?: string | null; calendarText?: string | null;
+  headlinesText?: string | null; sentimentText?: string | null;
+  provenance?: {
+    headlines_used: number; headlines_instrument: string; calendar_used: boolean; calendar_status: string;
+    calendar_provider: string | null; csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string | null; cot_error?: string | null;
+  };
+}) {
+  const system = [
+    systemCore(args.instrument),
+    "",
+    "OUTPUT ONLY the following (nothing else):",
+    "Quick Plan (Actionable)",
+    "",
+    "• Direction: Long | Short | Stay Flat",
+    "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
+    "• Trigger:",
+    "• Entry:",
+    "• Stop Loss: (price-action based; if first zone too tight, step to next)",
+    "• Take Profit(s): TP1 / TP2",
+    "• Conviction: <0–100>%",
+    "• Setup:",
+    "• Short Reasoning:",
+    "• Option 2 (Market): Show when allowed; else print 'Not available (missing confirmation)'.",
+    "",
+    "Management",
+    "- Turn the plan into a brief, actionable playbook (filled/not filled, trail/move to BE, invalidation behaviors).",
+    "",
+    "At the very end, append ONLY a fenced JSON block labeled ai_meta as specified below.",
+    "```ai_meta",
+    `{ "selectedStrategy": string,`,
+    `  "entryType": "Pending" | "Market",`,
+    `  "entryOrder": "Sell Limit" | "Buy Limit" | "Sell Stop" | "Buy Stop" | "Market",`,
+    `  "direction": "Long" | "Short" | "Flat",`,
+    `  "currentPrice": number | null,`,
+    `  "zone": { "min": number, "max": number, "tf": "15m" | "1H" | "4H", "type": "OB" | "FVG" | "SR" | "Other" },`,
+    `  "stop": number, "tp1": number, "tp2": number,`,
+    `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
+    `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
+    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null } }`,
+    "```",
+  ].join("\n");
+
+  const parts = buildUserPartsBase(args);
+  if (args.provenance) {
+    parts.push({ type: "text", text: `provenance:\n${JSON.stringify(args.provenance)}` });
+  }
+  return [{ role: "system", content: system }, { role: "user", content: parts }];
+}
+
+// Stage-2 Expand: ONLY the remaining sections
+function messagesExpandStage2(args: {
+  instrument: string; dateStr: string; m15: string; h1: string; h4: string;
+  calendarDataUrl?: string | null; calendarText?: string | null;
+  headlinesText?: string | null; sentimentText?: string | null; aiMetaHint?: any;
+}) {
+  const system = [
+    systemCore(args.instrument),
+    "",
+    "Expand ONLY the remaining sections (do NOT repeat 'Quick Plan (Actionable)' or 'Management').",
+    "Keep Entry/SL/TP consistent with ai_meta_hint unless a direct contradiction is visible; if so, explain in 1 line.",
+    "",
+    "Sections to output:",
+    "Full Breakdown",
+    "• Technical View (HTF + Intraday): 4H/1H/15m structure",
+    "• Fundamental View (Calendar + Sentiment + Headlines):",
+    "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
+    "• Conditional Scenarios:",
+    "• Surprise Risk:",
+    "• Invalidation:",
+    "• One-liner Summary:",
+    "",
+    "Detected Structures (X-ray):",
+    "• 4H:",
+    "• 1H:",
+    "• 15m:",
+    "",
+    "Candidate Scores (tournament):",
+    "- name — score — reason",
+    "",
+    "Final Table Summary:",
+    "| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |",
+    `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
+    "",
+    "Append NOTHING after these sections (no ai_meta here).",
+  ].join("\n");
+
+  const userParts = buildUserPartsBase(args);
+  if (args.aiMetaHint) userParts.push({ type: "text", text: `ai_meta_hint:\n${JSON.stringify(args.aiMetaHint, null, 2)}` });
+  return [{ role: "system", content: system }, { role: "user", content: userParts }];
 }
 
 // ---------- OpenAI call ----------
@@ -668,223 +832,8 @@ async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
   return callOpenAI(messages);
 }
 
-// FULL card (legacy)
-function messagesFull(args: {
-  instrument: string; dateStr: string; m15: string; h1: string; h4: string;
-  calendarDataUrl?: string | null; calendarText?: string | null;
-  headlinesText?: string | null; sentimentText?: string | null;
-  preWarnings?: string[]; postConflict?: boolean;
-}) {
-  const system = [
-    systemCore(args.instrument),
-    "",
-    ...(args.preWarnings?.length ? [`Warnings:\n- ${args.preWarnings.join("\n- ")}`] : []),
-    args.postConflict ? "Post-result conflict detected: Cap conviction ≤ 25% and mark Do not trade." : "",
-    "",
-    "OUTPUT format:",
-    "Quick Plan (Actionable)",
-    "",
-    "• Direction: Long | Short | Stay Flat",
-    "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-    "• Trigger: (ex: Limit pullback / zone touch)",
-    "• Entry: <min–max> or specific level",
-    "• Stop Loss: <level> (based on PA: behind swing/OB/SR; step to the next zone if too tight)",
-    "• Take Profit(s): TP1 <level> / TP2 <level>",
-    "• Conviction: <0–100>%",
-    "• Setup: <Chosen Strategy>",
-    "• Short Reasoning: <1–2 lines>",
-    "• Option 2 (Market): Always include if a plausible secondary play exists (Break+Retest, TL break, SFP). Provide explicit trigger instructions (wait-for-close level, retest hold level), Entry, SL, TP1/TP2, and its own Conviction %.",
-    "",
-    "Full Breakdown",
-    "• Technical View (HTF + Intraday): 4H/1H/15m structure",
-    "• Fundamental View (Calendar + Sentiment + Headlines):",
-    "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
-    "• Conditional Scenarios:",
-    "• Surprise Risk:",
-    "• Invalidation:",
-    "• One-liner Summary:",
-    "",
-    "Detected Structures (X-ray):",
-    "• 4H:",
-    "• 1H:",
-    "• 15m:",
-    "",
-    "Candidate Scores (tournament):",
-    "- name — score — reason",
-    "",
-    "Final Table Summary:",
-    "| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |",
-    `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
-    "",
-    "At the very end, append a fenced JSON block labeled ai_meta with:",
-    "```ai_meta",
-    `{ "selectedStrategy": string,`,
-    `  "entryType": "Pending" | "Market",`,
-    `  "entryOrder": "Sell Limit" | "Buy Limit" | "Sell Stop" | "Buy Stop" | "Market",`,
-    `  "direction": "Long" | "Short" | "Flat",`,
-    `  "currentPrice": number | null,`,
-    `  "zone": { "min": number, "max": number, "tf": "15m" | "1H" | "4H", "type": "OB" | "FVG" | "SR" | "Other" },`,
-    `  "stop": number, "tp1": number, "tp2": number,`,
-    `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
-    `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
-    `  "conviction": { "final": number, "components": { "headlines": number, "calendar": number, "cot": number, "csm": number, "technical": number } },`,
-    `  "sources": { "headlines_used": number, "headlines_instrument": string, "headlines_provider": string | null, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null, "price_fix": string | null } }`,
-    "```",
-  ].filter(Boolean).join("\n");
-
-  return [
-    { role: "system", content: system },
-    { role: "user", content: buildUserPartsBase(args) },
-  ];
-}
-
-// FAST Stage-1: Quick Plan + Management + ai_meta
-function messagesFastStage1(args: {
-  instrument: string; dateStr: string; m15: string; h1: string; h4: string;
-  calendarDataUrl?: string | null; calendarText?: string | null;
-  headlinesText?: string | null; sentimentText?: string | null;
-  provenance?: {
-    headlines_used: number; headlines_instrument: string; headlines_provider: string | null;
-    calendar_used: boolean; calendar_status: string; calendar_provider: string | null;
-    csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string | null; cot_error?: string | null;
-    price_fix: string | null;
-  };
-  preWarnings?: string[]; postConflict?: boolean;
-}) {
-  const system = [
-    systemCore(args.instrument),
-    "",
-    ...(args.preWarnings?.length ? [`Warnings:\n- ${args.preWarnings.join("\n- ")}`] : []),
-    args.postConflict ? "Post-result conflict detected: Cap conviction ≤ 25% and mark Do not trade." : "",
-    "",
-    "OUTPUT ONLY the following (nothing else):",
-    "Quick Plan (Actionable)",
-    "",
-    "• Direction: Long | Short | Stay Flat",
-    "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-    "• Trigger:",
-    "• Entry:",
-    "• Stop Loss: (price-action based; if first zone too tight, step to next)",
-    "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%",
-    "• Setup:",
-    "• Short Reasoning:",
-    "• Option 2 (Market): Always include if plausible (Break+Retest, TL break, SFP) with explicit triggers (wait-for-close + retest hold), Entry, SL, TP1/TP2, its own Conviction %.",
-    "",
-    "Management",
-    "- Turn the plan into a brief, actionable playbook (filled/not filled, trail/move to BE, invalidation behaviors).",
-    "",
-    "At the very end, append ONLY a fenced JSON block labeled ai_meta as specified below.",
-    "```ai_meta",
-    `{ "selectedStrategy": string,`,
-    `  "entryType": "Pending" | "Market",`,
-    `  "entryOrder": "Sell Limit" | "Buy Limit" | "Sell Stop" | "Buy Stop" | "Market",`,
-    `  "direction": "Long" | "Short" | "Flat",`,
-    `  "currentPrice": number | null,`,
-    `  "zone": { "min": number, "max": number, "tf": "15m" | "1H" | "4H", "type": "OB" | "FVG" | "SR" | "Other" },`,
-    `  "stop": number, "tp1": number, "tp2": number,`,
-    `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
-    `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
-    `  "conviction": { "final": number, "components": { "headlines": number, "calendar": number, "cot": number, "csm": number, "technical": number } },`,
-    `  "sources": { "headlines_used": number, "headlines_instrument": string, "headlines_provider": string | null, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null, "price_fix": string | null } }`,
-    "```",
-  ].filter(Boolean).join("\n");
-
-  const parts = buildUserPartsBase(args);
-  if (args.provenance) {
-    parts.push({ type: "text", text: `provenance:\n${JSON.stringify(args.provenance)}` });
-  }
-  return [{ role: "system", content: system }, { role: "user", content: parts }];
-}
-// ---------- calendar helpers ----------
-type CalendarBias = {
-  instrument?: { pair?: string; label?: string; score?: number | string } | null;
-  perCurrency?: Record<string, { label?: string; score?: number | string }>;
-};
-type CalendarAPI = {
-  ok?: boolean;
-  provider?: string | null;
-  bias?: CalendarBias;
-  nextEvent?: any;
-  postResult?: any;
-};
-
-function toNum(x: any): number | null {
-  const n = Number(x);
-  return isFinite(n) ? n : null;
-}
-
-function calendarShortText(resp: CalendarAPI, pair: string): string | null {
-  if (!resp?.ok) return null;
-  const bias = resp.bias || {};
-  const instr = bias.instrument;
-  const parts: string[] = [];
-  if (instr?.pair === pair && (instr.label || instr.score != null)) {
-    parts.push(`Instrument: ${instr.label ?? ""}${instr.score != null ? ` (${instr.score})` : ""}`.trim());
-  }
-  const per = bias.perCurrency || {};
-  const base = pair.slice(0, 3);
-  const quote = pair.slice(3);
-  const b = per[base]?.label ? `${base}:${per[base].label}` : null;
-  const q = per[quote]?.label ? `${quote}:${per[quote].label}` : null;
-  if (b || q) parts.push(`Per-currency: ${[b, q].filter(Boolean).join(" / ")}`);
-  if (!parts.length) parts.push("No strong calendar bias.");
-  return `Calendar bias for ${pair}: ${parts.join("; ")}`;
-}
-
-function parseCalendarWarnings(j: CalendarAPI, pair: string): { preWarnings: string[]; postConflict: boolean } {
-  const warns: string[] = [];
-  let conflict = false;
-
-  // Pre-event warning (≤ CALENDAR_WARN_MINS)
-  try {
-    const ne = j?.nextEvent || {};
-    const ts = new Date(ne.time || ne.timestamp || ne.ts || ne.when || 0).getTime();
-    const minsLeft = (ts - Date.now()) / 60000;
-    const impact = String(ne.impact || ne.importance || "").toLowerCase();
-    const isHigh = /high|red/.test(impact);
-    const isMed = /medium|orange/.test(impact);
-    if (isFinite(minsLeft) && minsLeft <= CALENDAR_WARN_MINS && (isHigh || isMed)) {
-      warns.push(`High/Med impact within ${Math.max(0, Math.round(minsLeft))}m: ${ne.title || ne.name || "event"}`);
-    }
-  } catch {}
-
-  // Post-result conflict — if API signals it
-  try {
-    const pr = j?.postResult || {};
-    const aligned = pr.aligned ?? pr.match ?? pr.ok;
-    const conflictFlag = pr.conflict ?? pr.mismatch ?? false;
-    if (conflictFlag === true || aligned === false) conflict = true;
-  } catch {}
-
-  return { preWarnings: warns, postConflict: conflict };
-}
-
-async function fetchCalendarBias(req: NextApiRequest, instrument: string): Promise<{
-  text: string | null;
-  status: "api" | "unavailable";
-  provider: string | null;
-  preWarnings: string[];
-  postConflict: boolean;
-}> {
-  try {
-    const base = originFromReq(req);
-    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=72&_t=${Date.now()}`;
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(4000) });
-    const j: CalendarAPI = await r.json().catch(() => ({} as any));
-    if (j?.ok) {
-      const t = calendarShortText(j, instrument) || `Calendar bias for ${instrument}: (no strong signal)`;
-      const { preWarnings, postConflict } = parseCalendarWarnings(j, instrument);
-      return { text: t, status: "api", provider: String(j?.provider || "mixed"), preWarnings, postConflict };
-    }
-    return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null, preWarnings: [], postConflict: false };
-  } catch {
-    return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null, preWarnings: [], postConflict: false };
-  }
-}
-
-// ---------- live price helpers with provenance ----------
-async function fetchLivePriceWithProvider(pair: string): Promise<{ price: number | null; provider: string | null; price_fix: string | null }> {
+// ---------- live price helpers ----------
+async function fetchLivePrice(pair: string): Promise<number | null> {
   // 1) TwelveData price endpoint
   if (TD_KEY) {
     try {
@@ -893,7 +842,7 @@ async function fetchLivePriceWithProvider(pair: string): Promise<{ price: number
       const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(1800) });
       const j: any = await r.json().catch(() => ({}));
       const p = Number(j?.price);
-      if (isFinite(p) && p > 0) return { price: p, provider: "twelvedata", price_fix: "twelvedata" };
+      if (isFinite(p) && p > 0) return p;
     } catch {}
   }
   // 2) Finnhub last 15m close
@@ -907,7 +856,7 @@ async function fetchLivePriceWithProvider(pair: string): Promise<{ price: number
       const j: any = await r.json().catch(() => ({}));
       const c = Array.isArray(j?.c) ? j.c : [];
       const last = Number(c[c.length - 1]);
-      if (isFinite(last) && last > 0) return { price: last, provider: "finnhub", price_fix: "finnhub" };
+      if (isFinite(last) && last > 0) return last;
     } catch {}
   }
   // 3) Polygon last agg close
@@ -924,95 +873,49 @@ async function fetchLivePriceWithProvider(pair: string): Promise<{ price: number
       const j: any = await r.json().catch(() => ({}));
       const res = Array.isArray(j?.results) ? j.results[0] : null;
       const last = Number(res?.c);
-      if (isFinite(last) && last > 0) return { price: last, provider: "polygon", price_fix: "polygon" };
+      if (isFinite(last) && last > 0) return last;
     } catch {}
   }
-  // 4) fallback: use latest 15m series
+  // 4) fallback: use latest 15m series close from our series fetch
   try {
     const S = await fetchSeries15(pair);
     const last = S?.c?.[S.c.length - 1];
-    if (isFinite(Number(last)) && Number(last) > 0) return { price: Number(last), provider: "series", price_fix: "series" };
+    if (isFinite(Number(last)) && Number(last) > 0) return Number(last);
   } catch {}
-  return { price: null, provider: null, price_fix: null };
+  return null;
 }
 
-// ---------- FAST/EXPAND helpers already defined in Part 1 ----------
-
-// ---------- fallback (keeps structure + sources) ----------
-function fallbackCard(
-  instrument: string,
-  sources: {
-    headlines_used: number;
-    headlines_instrument: string;
-    headlines_provider: string | null;
-    calendar_used: boolean;
-    calendar_status: string;
-    calendar_provider: string | null;
-    csm_used: boolean;
-    csm_time: string;
-    cot_used: boolean;
-    cot_report_date: string | null;
-    cot_error?: string | null;
-    price_fix: string | null;
+// ---------- calendar helpers ----------
+function clamp(v: number, a: number, b: number) { return Math.max(a, Math.min(b, v)); }
+function calendarShortText(resp: any, pair: string): string | null {
+  if (!resp?.ok) return null;
+  const instrBias = resp?.bias?.instrument;
+  const parts: string[] = [];
+  if (instrBias && instrBias.pair === pair) {
+    parts.push(`Instrument bias: ${instrBias.label} (${instrBias.score})`);
   }
-) {
-  return [
-    "Quick Plan (Actionable)",
-    "",
-    "• Direction: Stay Flat (low conviction).",
-    "• Order Type: Pending",
-    "• Trigger: Confluence (OB/FVG/SR) after a clean trigger.",
-    "• Entry: zone below/above current (structure based).",
-    "• Stop Loss: beyond invalidation with small buffer.",
-    "• Take Profit(s): Prior swing/liquidity; then trail.",
-    "• Conviction: 30%",
-    "• Setup: Await valid trigger (images inconclusive).",
-    "• Option 2 (Market): Not available (missing confirmation).",
-    "",
-    "Full Breakdown",
-    "• Technical View: Indecisive; likely range.",
-    "• Fundamental View: Mixed; keep size conservative.",
-    "• Tech vs Fundy Alignment: Mixed.",
-    "• Conditional Scenarios: Break+retest for continuation; SFP & reclaim for reversal.",
-    "• Surprise Risk: Headlines; CB speakers.",
-    "• Invalidation: Opposite-side body close beyond range edge.",
-    "• One-liner Summary: Stand by for a clean trigger.",
-    "",
-    "Detected Structures (X-ray):",
-    "• 4H: –",
-    "• 1H: –",
-    "• 15m: –",
-    "",
-    "Candidate Scores (tournament):",
-    "–",
-    "",
-    "Final Table Summary:",
-    `| Instrument | Bias   | Entry Zone | SL  | TP1 | TP2 | Conviction % |`,
-    `| ${instrument} | Neutral | Wait for trigger | Structure-based | Prior swing | Next liquidity | 30% |`,
-    "",
-    "```ai_meta",
-    JSON.stringify(
-      {
-        selectedStrategy: "Await valid trigger",
-        entryType: "Pending",
-        entryOrder: "Pending",
-        direction: "Flat",
-        currentPrice: null,
-        zone: null,
-        stop: null,
-        tp1: null,
-        tp2: null,
-        breakoutProof: { bodyCloseBeyond: false, retestHolds: false, sfpReclaim: false },
-        candidateScores: [],
-        conviction: { final: 30, components: { headlines: 0, calendar: 0, cot: 0, csm: 0, technical: 30 } },
-        sources,
-        note: "Fallback used due to refusal/empty output.",
-      },
-      null,
-      2
-    ),
-    "```",
-  ].join("\n");
+  const per = resp?.bias?.perCurrency || {};
+  const base = pair.slice(0,3), quote = pair.slice(3);
+  const b = per[base]?.label ? `${base}:${per[base].label}` : null;
+  const q = per[quote]?.label ? `${quote}:${per[quote].label}` : null;
+  if (b || q) parts.push(`Per-currency: ${[b,q].filter(Boolean).join(" / ")}`);
+  if (!parts.length) parts.push("No strong calendar bias.");
+  return `Calendar bias for ${pair}: ${parts.join("; ")}`;
+}
+async function fetchCalendarBias(req: NextApiRequest, instrument: string): Promise<{ text: string | null, status: "api" | "unavailable", provider: string | null }> {
+  try {
+    const base = originFromReq(req);
+    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=48&_t=${Date.now()}`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(4000) });
+    const j: any = await r.json().catch(() => ({}));
+    if (j?.ok) {
+      const t = calendarShortText(j, instrument) || `Calendar bias for ${instrument}: (no strong signal)`;
+      return { text: t, status: "api", provider: String(j?.provider || "mixed") };
+    }
+    return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null };
+  } catch {
+    return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null };
+  }
 }
 
 // ---------- handler ----------
@@ -1032,13 +935,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       if (!c) return res.status(400).json({ ok: false, reason: "Expand failed: cache expired or not found." });
       if (!c.sentimentText) return res.status(503).json({ ok: false, reason: "Missing sentiment snapshot for expand." });
       const dateStr = new Date().toISOString().slice(0, 10);
-      // No additional warnings in expand stage
-      const messages = [
-        ...messagesFull({
-          instrument: c.instrument, dateStr, m15: c.m15, h1: c.h1, h4: c.h4,
-          calendarDataUrl: c.calendar || undefined, headlinesText: c.headlinesText || undefined, sentimentText: c.sentimentText || undefined,
-        }),
-      ];
+      const messages = messagesExpandStage2({
+        instrument: c.instrument, dateStr, m15: c.m15, h1: c.h1, h4: c.h4,
+        calendarDataUrl: c.calendar || undefined, headlinesText: c.headlinesText || undefined, sentimentText: c.sentimentText || undefined,
+        aiMetaHint: null,
+      });
       const text = await callOpenAI(messages);
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({ ok: true, text, meta: { instrument: c.instrument, cacheKey } });
@@ -1097,10 +998,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       });
     }
 
-    // ----- Headlines: prefer client-provided; else server fetch (UNCHANGED) -----
+    // ----- Headlines: prefer client-provided; else server fetch -----
     let headlineItems: AnyHeadline[] = [];
     let headlinesText: string | null = null;
-    let headlinesProvider: string | null = null;
 
     const rawHeadlines = pickFirst(fields.headlinesJson) as string | null;
     if (rawHeadlines) {
@@ -1110,21 +1010,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           headlineItems = parsed.slice(0, 12);
           headlinesText = headlinesToPromptLines(headlineItems, 6);
         }
-      } catch {}
+      } catch {
+        // fall through to server fetch
+      }
     }
     if (!headlinesText) {
       const viaServer = await fetchedHeadlinesViaServer(req, instrument);
       headlineItems = viaServer.items;
       headlinesText = viaServer.promptText;
-      headlinesProvider = viaServer.provider;
     }
 
-    // ----- Calendar: image precedence; else API bias with warnings/post-conflict -----
+    // ----- Calendar: image precedence; else API bias with visible note on failure -----
     let calendarText: string | null = null;
     let calendarStatus: "image" | "api" | "unavailable" = "unavailable";
     let calendarProvider: string | null = null;
-    let preWarnings: string[] = [];
-    let postConflict = false;
 
     if (calUrl) {
       calendarStatus = "image";
@@ -1134,8 +1033,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       calendarText = cal.text;
       calendarStatus = cal.status;
       calendarProvider = cal.provider;
-      preWarnings = cal.preWarnings || [];
-      postConflict = cal.postConflict || false;
     }
 
     // ----- Sentiment: CSM mandatory; COT soft-required with fallback -----
@@ -1148,18 +1045,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let cotErr: string | null = null;
     try { cot = await getCOT(); } catch (e: any) { cot = null; cotErr = e?.message || "unavailable"; }
 
-    const { text: sentimentText, provenance: sentimentProv } = sentimentSummary(csm, cot, cotErr);
+    const { text: sentimentText, provenance } = sentimentSummary(csm, cot, cotErr);
 
-    // ----- Live price w/ provenance -----
-    const { price: livePrice, provider: priceProvider, price_fix } = await fetchLivePriceWithProvider(instrument);
+    // ----- Live price: read before enforcement and pass to model -----
+    const livePrice = await fetchLivePrice(instrument);
 
     const dateStr = new Date().toISOString().slice(0, 10);
 
-    // ---------- Build provenance for model + meta ----------
+    // ---------- Stage 1 (fast) or Full ----------
+    let text = "";
+    let aiMeta: any = null;
+
     const provForModel = {
       headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
       headlines_instrument: instrument,
-      headlines_provider: headlinesProvider,
       calendar_used: !!calUrl || calendarStatus === "api",
       calendar_status: calendarStatus,
       calendar_provider: calendarProvider,
@@ -1168,13 +1067,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       cot_used: !!cot,
       cot_report_date: cot ? cot.reportDate : null,
       cot_error: cot ? null : cotErr || "unavailable",
-      price_fix,
     };
 
-    // ---------- Stage 1 (fast) or Full ----------
-    let text = "";
-    let aiMeta: any = null;
-
+    // Build messages
     if (mode === "fast") {
       const messages = messagesFastStage1({
         instrument, dateStr, m15, h1, h4,
@@ -1183,8 +1078,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         headlinesText: headlinesText || undefined,
         sentimentText: sentimentText,
         provenance: provForModel,
-        preWarnings, postConflict,
       });
+      // Prepend a tiny currentPrice hint if we have it
       if (livePrice) {
         (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice}`;
       }
@@ -1194,7 +1089,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         aiMeta.currentPrice = livePrice;
       }
 
-      // Enforcement passes
+      // enforcement passes
       if (aiMeta && needsPendingLimit(aiMeta)) { text = await rewriteAsPending(instrument, text); aiMeta = extractAiMeta(text) || aiMeta; }
       const bp = aiMeta?.breakoutProof || {};
       const hasProof = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
@@ -1202,12 +1097,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         text = await normalizeBreakoutLabel(text); aiMeta = extractAiMeta(text) || aiMeta;
       }
       if (aiMeta) {
+        // Ensure we evaluate using verified live price if we have it
         if (livePrice && aiMeta.currentPrice !== livePrice) aiMeta.currentPrice = livePrice;
         const bad = invalidOrderRelativeToPrice(aiMeta);
         if (bad) { text = await fixOrderVsPrice(instrument, text, aiMeta); aiMeta = extractAiMeta(text) || aiMeta; }
       }
 
-      // Cache stage-1 for expand
+      // Cache stage-1
       const cacheKey = setCache({
         instrument, m15, h1, h4, calendar: calUrl || null, headlinesText: headlinesText || null, sentimentText,
       });
@@ -1227,14 +1123,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       });
     }
 
-    // FULL
+    // FULL (legacy)
     const messages = messagesFull({
       instrument, dateStr, m15, h1, h4,
       calendarDataUrl: calUrl || undefined,
       calendarText: (!calUrl && calendarText) ? calendarText : undefined,
       headlinesText: headlinesText || undefined,
       sentimentText,
-      preWarnings, postConflict,
     });
     if (livePrice) {
       (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice}`;
@@ -1246,17 +1141,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
 
     if (aiMeta && needsPendingLimit(aiMeta)) { text = await rewriteAsPending(instrument, text); aiMeta = extractAiMeta(text) || aiMeta; }
-    {
-      const bp = aiMeta?.breakoutProof || {};
-      const hasProof = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
-      if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
-        text = await normalizeBreakoutLabel(text); aiMeta = extractAiMeta(text) || aiMeta;
-      }
-      if (aiMeta) {
-        if (livePrice && aiMeta.currentPrice !== livePrice) aiMeta.currentPrice = livePrice;
-        const bad = invalidOrderRelativeToPrice(aiMeta);
-        if (bad) { text = await fixOrderVsPrice(instrument, text, aiMeta); aiMeta = extractAiMeta(text) || aiMeta; }
-      }
+    const bp = aiMeta?.breakoutProof || {};
+    const hasProof = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+    if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
+      text = await normalizeBreakoutLabel(text); aiMeta = extractAiMeta(text) || aiMeta;
+    }
+    if (aiMeta) {
+      if (livePrice && aiMeta.currentPrice !== livePrice) aiMeta.currentPrice = livePrice;
+      const bad = invalidOrderRelativeToPrice(aiMeta);
+      if (bad) { text = await fixOrderVsPrice(instrument, text, aiMeta); aiMeta = extractAiMeta(text) || aiMeta; }
     }
 
     if (!text || refusalLike(text)) {
@@ -1275,4 +1168,78 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
   } catch (err: any) {
     return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
   }
+}
+
+// ---------- fallback (keeps structure + sources) ----------
+function fallbackCard(
+  instrument: string,
+  sources: {
+    headlines_used: number;
+    headlines_instrument: string;
+    calendar_used: boolean;
+    calendar_status: string;
+    calendar_provider: string | null;
+    csm_used: boolean;
+    csm_time: string;
+    cot_used: boolean;
+    cot_report_date: string | null;
+    cot_error?: string | null;
+  }
+) {
+  return [
+    "Quick Plan (Actionable)",
+    "",
+    "• Direction: Stay Flat (low conviction).",
+    "• Order Type: Pending",
+    "• Trigger: Confluence (OB/FVG/SR) after a clean trigger.",
+    "• Entry: zone below/above current (structure based).",
+    "• Stop Loss: beyond invalidation with small buffer.",
+    "• Take Profit(s): Prior swing/liquidity; then trail.",
+    "• Conviction: 30%",
+    "• Setup: Await valid trigger (images inconclusive).",
+    "• Option 2 (Market): Not available (missing confirmation).",
+    "",
+    "Full Breakdown",
+    "• Technical View: Indecisive; likely range.",
+    "• Fundamental View: Mixed; keep size conservative.",
+    "• Tech vs Fundy Alignment: Mixed.",
+    "• Conditional Scenarios: Break+retest for continuation; SFP & reclaim for reversal.",
+    "• Surprise Risk: Headlines; CB speakers.",
+    "• Invalidation: Opposite-side body close beyond range edge.",
+    "• One-liner Summary: Stand by for a clean trigger.",
+    "",
+    "Detected Structures (X-ray):",
+    "• 4H: –",
+    "• 1H: –",
+    "• 15m: –",
+    "",
+    "Candidate Scores (tournament):",
+    "–",
+    "",
+    "Final Table Summary:",
+    `| Instrument | Bias   | Entry Zone | SL  | TP1 | TP2 | Conviction % |`,
+    `| ${instrument} | Neutral | Wait for trigger | Structure-based | Prior swing | Next liquidity | 30% |`,
+    "",
+    "```ai_meta",
+    JSON.stringify(
+      {
+        selectedStrategy: "Await valid trigger",
+        entryType: "Pending",
+        entryOrder: "Pending",
+        direction: "Flat",
+        currentPrice: null,
+        zone: null,
+        stop: null,
+        tp1: null,
+        tp2: null,
+        breakoutProof: { bodyCloseBeyond: false, retestHolds: false, sfpReclaim: false },
+        candidateScores: [],
+        sources,
+        note: "Fallback used due to refusal/empty output.",
+      },
+      null,
+      2
+    ),
+    "```",
+  ].join("\n");
 }
