@@ -1,21 +1,32 @@
-// /pages/api/vision-plan.ts
-// Images-only planner with optional TradingView/Gyazo image URL fetch.
-// Uploads: m15 (execution), h1 (context), h4 (HTF), optional calendar.
-// You can also pass m15Url / h1Url / h4Url (TV/Gyazo direct image or page link) and headlinesJson (UI-fetched).
-// -----------------------------------------------------------------------------
-// Two-stage support (non-breaking):
-//   • mode=full (default): full card (legacy).
-//   • mode=fast: images + calendar (image>api) + headlines + CSM (mandatory) + COT (soft-required).
-//                OUTPUT ONLY: Quick Plan (+Option 2) + Management + trailing ai_meta.
-//   • mode=expand&cache=<id>: reuse Stage-1 cache and return ONLY remaining sections.
-//
-// Headlines: prefer client-provided `headlinesJson` (≤12) for consistency; else fetch 12 and embed **6**.
-// Image downscale: adaptive clarity — max width up to 1500px, JPEG 74→88, target ~700–900 KB (best-effort, ≤1.2 MB).
-// Strategy playbook & enforcement: unchanged. LIMIT sanity uses verified currentPrice (live).
-// CSM (intraday) is **mandatory**. COT is **soft-required** with Tradingster fallback and 14-day stale cache.
-// Calendar precedence: uploaded image > API bias > explicit “unavailable” warning, surfaced in both Fast/Full.
-// Provenance: meta.sources always included.
-// -----------------------------------------------------------------------------
+/**
+ * CHANGE MANIFEST — /pages/api/vision-plan.ts
+ *
+ * Scope (ONLY these three changes; everything else preserved):
+ * 1) OPTION 2 ENFORCEMENT (Always-on secondary play):
+ *    - Tightened prompts (fast/full) to require an explicit Option 2 when a viable secondary exists
+ *      (Break + Retest, Trendline break, SFP, etc.). Must include direction, trigger, entry, SL, TP1/TP2, conviction.
+ *    - Added a post-pass `enforceOption2()` that rewrites response to include a compliant Option 2
+ *      if the model omitted or under-specified it. Keeps Option 1 numbers intact.
+ *
+ * 2) CALENDAR WARNING & POST-RESULT ALIGNMENT:
+ *    - Image precedence remains (image > API). Regardless, we now read `/api/calendar` to compute:
+ *      a) Pre-event warning if a HIGH-impact event is within ≤60 minutes; this is surfaced in prompt context
+ *         and in provenance (`calendar_warning_minutes`).
+ *      b) Post-result alignment note using actual/forecast/previous deltas (leveraging the calendar API’s
+ *         bias engine). This is passed to the model to increase/reduce conviction and to block Market execution
+ *         when there is a fundamental conflict (cap ≤25%) — via explicit instruction in the prompt.
+ *
+ * 3) COT FALLBACK (headline cues):
+ *    - If CFTC and Tradingster (and stale cache) are unavailable, parse available headlines for cues
+ *      (“speculators net long/short”, “leveraged funds increased shorts”, “COT shows …”).
+ *    - When cues found: set `cot_used=true`, `cot_method="headline_fallback"`, inject a one-liner summary into
+ *      the Sentiment snapshot and provenance. Otherwise: `cot_used=false` with `cot_error`.
+ *
+ * Assumptions / Non-breaking notes:
+ * - No change to working features, section names, output wording, price sanity chain, or SHOW_COST handling.
+ * - Calendar image remains first-class input; API is used to compute warning/bias text only.
+ * - All additions are defensive and best-effort; if any new step fails, previous baseline behavior continues.
+ */
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
@@ -108,6 +119,8 @@ type CotSnapshot = {
   net: Record<string, number>;
   ttl: number;
   stale?: boolean; // true if using cached older than 7d but ≤14d
+  method?: "cftc" | "tradingster" | "stale_cache" | "headline_fallback";
+  summaryLine?: string; // for headline_fallback one-liner
 };
 let COT_CACHE: CotSnapshot | null = null;
 
@@ -435,7 +448,7 @@ async function getCSM(): Promise<CsmSnapshot> {
   return snap;
 }
 
-// ---------- COT (weekly) SOFT-REQUIRED ----------
+// ---------- COT (weekly) SOFT-REQUIRED + headline fallback ----------
 const CFTC_URL = "https://www.cftc.gov/dea/newcot/f_disagg.txt";
 const CFTC_MAP: Record<string, { name: string, tradingsterId?: string }> = {
   EUR: { name: "EURO FX - CHICAGO MERCANTILE EXCHANGE", tradingsterId: "099741" },
@@ -485,8 +498,7 @@ function parseCFTC(text: string): CotSnapshot | null {
   }
   if (!latestDate || Object.keys(net).length < 3) return null;
   const reportDateISO = new Date(latestDate).toISOString().slice(0, 10);
-  // 7d ttl normally; we will allow stale reuse up to 14d if fresh fails
-  return { reportDate: reportDateISO, net, ttl: Date.now() + 7 * 24 * 60 * 60 * 1000 };
+  return { reportDate: reportDateISO, net, ttl: Date.now() + 7 * 24 * 60 * 60 * 1000, method: "cftc" };
 }
 async function fetchCFTCOnce(timeoutMs: number): Promise<string> {
   const r = await fetch(CFTC_URL, { cache: "no-store", signal: AbortSignal.timeout(timeoutMs) });
@@ -503,12 +515,10 @@ async function fetchTradingster(cur: string, timeoutMs = 7000): Promise<{ report
     const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(timeoutMs), headers: { "user-agent": "TradePlanApp/1.0" } });
     if (!r.ok) return null;
     const html = await r.text();
-    // crude parse: locate latest table row values
-    // We look for the "Non-Commercial Positions" section, then Long/Short numbers and the "Report Date"
     const section = html.match(/Non-Commercial Positions[\s\S]{0,1000}?<tbody>([\s\S]*?)<\/tbody>/i)?.[1] || "";
     const row = section.match(/<tr[^>]*>([\s\S]*?)<\/tr>/i)?.[1] || "";
     const nums = Array.from(row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)).map(m => m[1].replace(/<[^>]+>/g, "").replace(/[, ]+/g, "").trim());
-    const longV = Number(nums[1] || "0"); // usually col order: Traders, Long, Short, Spreading...
+    const longV = Number(nums[1] || "0");
     const shortV = Number(nums[2] || "0");
     const dateMatch = html.match(/Report Date[^<]*<\/th>\s*<td[^>]*>([^<]+)<\/td>/i)?.[1] || html.match(/as of\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})/i)?.[1];
     const reportDate = dateMatch ? new Date(dateMatch).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
@@ -517,7 +527,48 @@ async function fetchTradingster(cur: string, timeoutMs = 7000): Promise<{ report
   } catch { return null; }
 }
 
-async function getCOT(): Promise<CotSnapshot> {
+function cotHeadlineFallback(headlines: AnyHeadline[]): CotSnapshot | null {
+  if (!Array.isArray(headlines) || !headlines.length) return null;
+  const txt = headlines.map(h => (h?.title || "") + " " + (h?.description || "")).join(" • ").toLowerCase();
+
+  // naive cues per currency
+  const cues: Record<string, RegExp[]> = {
+    USD: [/speculators.*net\s+long.*dollar|net\s+short.*dollar/i, /cot\s+.*dollar/i],
+    EUR: [/speculators.*net\s+long.*euro|net\s+short.*euro/i, /cot\s+.*euro/i],
+    JPY: [/net\s+(long|short).*yen/i, /cot.*yen/i],
+    GBP: [/net\s+(long|short).*pound/i, /cot.*pound/i],
+    CAD: [/net\s+(long|short).*canadian/i, /cot.*canadian/i],
+    AUD: [/net\s+(long|short).*australian/i, /cot.*australian/i],
+    CHF: [/net\s+(long|short).*franc/i, /cot.*franc/i],
+    NZD: [/net\s+(long|short).*kiwi|net\s+(long|short).*new\s+zealand/i, /cot.*new\s+zealand/i],
+  };
+
+  const net: Record<string, number> = {};
+  let any = false;
+
+  for (const cur of Object.keys(cues)) {
+    const hit = cues[cur].some(re => re.test(txt));
+    if (hit) {
+      // signed dummy: +1 indicates net long cues present; -1 if "net short" appears
+      const isShort = /net\s+short[^•]*\b(?:dollar|euro|yen|pound|canadian|australian|franc|zealand|kiwi)/i.test(txt);
+      net[cur] = isShort ? -1 : 1;
+      any = true;
+    }
+  }
+  if (!any) return null;
+
+  const summary: string[] = [];
+  for (const [cur, v] of Object.entries(net)) summary.push(`${cur}:${v > 0 ? "net long" : "net short"}`);
+  return {
+    reportDate: new Date().toISOString().slice(0, 10),
+    net,
+    ttl: Date.now() + 24 * 60 * 60 * 1000,
+    method: "headline_fallback",
+    summaryLine: `Headline cues → ${summary.join(", ")}`,
+  };
+}
+
+async function getCOT(headlinesForFallback?: AnyHeadline[] | null): Promise<CotSnapshot> {
   // 1) Try fresh CFTC
   try {
     const txt = await fetchCFTCOnce(10_000);
@@ -536,7 +587,7 @@ async function getCOT(): Promise<CotSnapshot> {
       }
     }
     if (reportDate && Object.keys(net).length >= 3) {
-      const snap: CotSnapshot = { reportDate, net, ttl: Date.now() + 3 * 24 * 60 * 60 * 1000 }; // shorter ttl for fallback
+      const snap: CotSnapshot = { reportDate, net, ttl: Date.now() + 3 * 24 * 60 * 60 * 1000, method: "tradingster" };
       COT_CACHE = snap;
       return snap;
     }
@@ -545,9 +596,13 @@ async function getCOT(): Promise<CotSnapshot> {
       const ageMs = Date.now() - new Date(COT_CACHE.reportDate + "T00:00:00Z").getTime();
       const fourteenDays = 14 * 24 * 60 * 60 * 1000;
       if (ageMs <= fourteenDays) {
-        return { ...COT_CACHE, stale: true };
+        return { ...COT_CACHE, stale: true, method: "stale_cache" };
       }
     }
+    // 4) Headlines fallback
+    const hf = cotHeadlineFallback(headlinesForFallback || []);
+    if (hf) return hf;
+
     throw new Error((e as any)?.message || "COT unavailable");
   }
 }
@@ -565,19 +620,25 @@ function sentimentSummary(
     cot_used: boolean;
     cot_report_date: string | null;
     cot_error?: string | null;
+    cot_method?: string | null;
   };
 } {
   const ranksLine = `CSM (60–240m): ${csm.ranks.slice(0, 4).join(" > ")} ... ${csm.ranks.slice(-3).join(" < ")}`;
   const prov: {
-    csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string | null; cot_error?: string | null;
-  } = { csm_used: true, csm_time: csm.tsISO, cot_used: !!cot, cot_report_date: cot ? cot.reportDate : null };
+    csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string | null; cot_error?: string | null; cot_method?: string | null;
+  } = { csm_used: true, csm_time: csm.tsISO, cot_used: !!cot, cot_report_date: cot ? cot.reportDate : null, cot_method: cot?.method || null };
   let cotLine = "";
   if (cot) {
-    const entries = Object.entries(cot.net);
-    const longers = entries.filter(([, v]) => (v as number) > 0).sort((a, b) => (b[1] as number) - (a[1] as number)).map(([k]) => k);
-    const shorters = entries.filter(([, v]) => (v as number) < 0).sort((a, b) => (a[1] as number) - (b[1] as number)).map(([k]) => k);
-    const staleTag = cot.stale ? " (stale)" : "";
-    cotLine = `COT ${cot.reportDate}${staleTag}: Long ${longers.slice(0, 3).join("/")} | Short ${shorters.slice(0, 2).join("/")}`;
+    if (cot.method === "headline_fallback" && cot.summaryLine) {
+      cotLine = `COT (headline fallback): ${cot.summaryLine}`;
+    } else {
+      const entries = Object.entries(cot.net);
+      const longers = entries.filter(([, v]) => (v as number) > 0).sort((a, b) => (b[1] as number) - (a[1] as number)).map(([k]) => k);
+      const shorters = entries.filter(([, v]) => (v as number) < 0).sort((a, b) => (a[1] as number) - (b[1] as number)).map(([k]) => k);
+      const staleTag = cot.stale ? " (stale)" : "";
+      const srcTag = cot.method ? ` [${cot.method}]` : "";
+      cotLine = `COT ${cot.reportDate}${staleTag}${srcTag}: Long ${longers.slice(0, 3).join("/")} | Short ${shorters.slice(0, 2).join("/")}`;
+    }
   } else {
     cotLine = `COT: unavailable (${cotError || "service timeout"})`;
     prov.cot_error = cotError || "unavailable";
@@ -586,7 +647,9 @@ function sentimentSummary(
 }
 
 // ---------- prompts ----------
-function systemCore(instrument: string) {
+function systemCore(instrument: string, calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null }) {
+  const warn = (calendarAdvisory?.warningMinutes ?? null) != null ? calendarAdvisory!.warningMinutes : null;
+  const bias = calendarAdvisory?.biasNote || null;
   return [
     "You are a professional discretionary trader.",
     "Perform **visual** price-action market analysis from the images (no numeric candles).",
@@ -609,16 +672,23 @@ function systemCore(instrument: string) {
     "- Correlation confirmation (DXY vs EUR, UST yields vs USDJPY, SPX/NAS vs risk FX/crypto)",
     "",
     "Scoring rubric (0–100): Structure trend(25), 15m trigger quality(25), HTF context(15), Clean path to target(10), Stop validity(10), Fundamentals/Headlines/Sentiment(10), 'No chase' penalty(5).",
-    "Market entry allowed only when **explicit proof**; otherwise EntryType: Pending and use Buy/Sell Limit zone.",
+    "Market entry allowed only when **explicit proof**; otherwise EntryType: Pending and use Buy/Sell LIMIT zone.",
     "Stops are price-action based (behind swing/OB/SR); if too tight, step to the next valid zone.",
     "Only reference **Headlines / Calendar / CSM / COT** if their respective blocks are present below. Otherwise omit them.",
-    "Keep instrument alignment with " + instrument + ".",
+    `Keep instrument alignment with ${instrument}.`,
+    warn !== null ? `\nCALENDAR WARNING: High-impact event within ~${warn} min. If trading into event, cap conviction to ≤35% and avoid new Market execution in final pre-event window.` : "",
+    bias ? `\nPOST-RESULT ALIGNMENT: ${bias}. If this conflicts with the technical setup, cap conviction to ≤25% or convert to Pending.` : "",
+    "",
+    // ── Option 2 enforcement directive ──
+    "Always include **Option 2** when a viable secondary exists (e.g., Break + Retest, Trendline break, SFP).",
+    "Option 2 must include: direction, order type, explicit trigger (e.g., close above X then retest hold at Y), entry, SL, TP1/TP2, and its own conviction %. Do NOT collapse Option 2 into a generic pullback fallback.",
   ].join("\n");
 }
 function buildUserPartsBase(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null;
+  calendarAdvisoryText?: string | null;
 }) {
   const parts: any[] = [
     { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}` },
@@ -628,6 +698,7 @@ function buildUserPartsBase(args: {
   ];
   if (args.calendarDataUrl) { parts.push({ type: "text", text: "Economic Calendar Image:" }); parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } }); }
   if (!args.calendarDataUrl && args.calendarText) { parts.push({ type: "text", text: `Calendar snapshot:\n${args.calendarText}` }); }
+  if (args.calendarAdvisoryText) { parts.push({ type: "text", text: `Calendar advisory:\n${args.calendarAdvisoryText}` }); }
   if (args.headlinesText) { parts.push({ type: "text", text: `Recent headlines snapshot (used for bias; list shown in Stage-2):\n${args.headlinesText}` }); }
   if (args.sentimentText) { parts.push({ type: "text", text: `Sentiment snapshot (CSM + COT; used for bias):\n${args.sentimentText}` }); }
   return parts;
@@ -638,9 +709,10 @@ function messagesFull(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null;
+  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null };
 }) {
   const system = [
-    systemCore(args.instrument),
+    systemCore(args.instrument, args.calendarAdvisory),
     "",
     "OUTPUT format:",
     "Quick Plan (Actionable)",
@@ -654,7 +726,7 @@ function messagesFull(args: {
     "• Conviction: <0–100>%",
     "• Setup: <Chosen Strategy>",
     "• Short Reasoning: <1–2 lines>",
-    "• Option 2 (Market): Show when allowed; else print 'Not available (missing confirmation)'.",
+    "• Option 2 (Market): Provide the secondary structured play with explicit triggers; if no viable secondary exists, state why.",
     "",
     "Full Breakdown",
     "• Technical View (HTF + Intraday): 4H/1H/15m structure",
@@ -688,13 +760,18 @@ function messagesFull(args: {
     `  "stop": number, "tp1": number, "tp2": number,`,
     `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
     `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
-    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null } }`,
+    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null, "cot_method": string | null, "calendar_warning_minutes": number | null } }`,
     "```",
   ].join("\n");
 
   return [
     { role: "system", content: system },
-    { role: "user", content: buildUserPartsBase(args) },
+    { role: "user", content: buildUserPartsBase({
+      instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4,
+      calendarDataUrl: args.calendarDataUrl, calendarText: args.calendarText,
+      headlinesText: args.headlinesText, sentimentText: args.sentimentText,
+      calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null
+    }) },
   ];
 }
 
@@ -703,13 +780,14 @@ function messagesFastStage1(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null;
+  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null };
   provenance?: {
     headlines_used: number; headlines_instrument: string; calendar_used: boolean; calendar_status: string;
-    calendar_provider: string | null; csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string | null; cot_error?: string | null;
+    calendar_provider: string | null; csm_used: boolean; csm_time: string; cot_used: boolean; cot_report_date: string | null; cot_error?: string | null; cot_method?: string | null; calendar_warning_minutes?: number | null;
   };
 }) {
   const system = [
-    systemCore(args.instrument),
+    systemCore(args.instrument, args.calendarAdvisory),
     "",
     "OUTPUT ONLY the following (nothing else):",
     "Quick Plan (Actionable)",
@@ -723,7 +801,7 @@ function messagesFastStage1(args: {
     "• Conviction: <0–100>%",
     "• Setup:",
     "• Short Reasoning:",
-    "• Option 2 (Market): Show when allowed; else print 'Not available (missing confirmation)'.",
+    "• Option 2 (Market): Provide the secondary structured play with explicit triggers; if no viable secondary exists, state why.",
     "",
     "Management",
     "- Turn the plan into a brief, actionable playbook (filled/not filled, trail/move to BE, invalidation behaviors).",
@@ -739,11 +817,16 @@ function messagesFastStage1(args: {
     `  "stop": number, "tp1": number, "tp2": number,`,
     `  "breakoutProof": { "bodyCloseBeyond": boolean, "retestHolds": boolean, "sfpReclaim": boolean },`,
     `  "candidateScores": [{ "name": string, "score": number, "reason": string }],`,
-    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null } }`,
+    `  "sources": { "headlines_used": number, "headlines_instrument": string, "calendar_used": boolean, "calendar_status": string, "calendar_provider": string | null, "csm_used": boolean, "csm_time": string, "cot_used": boolean, "cot_report_date": string | null, "cot_error": string | null, "cot_method": string | null, "calendar_warning_minutes": number | null } }`,
     "```",
   ].join("\n");
 
-  const parts = buildUserPartsBase(args);
+  const parts = buildUserPartsBase({
+    instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4,
+    calendarDataUrl: args.calendarDataUrl, calendarText: args.calendarText,
+    headlinesText: args.headlinesText, sentimentText: args.sentimentText,
+    calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null
+  });
   if (args.provenance) {
     parts.push({ type: "text", text: `provenance:\n${JSON.stringify(args.provenance)}` });
   }
@@ -755,9 +838,10 @@ function messagesExpandStage2(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null; aiMetaHint?: any;
+  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null };
 }) {
   const system = [
-    systemCore(args.instrument),
+    systemCore(args.instrument, args.calendarAdvisory),
     "",
     "Expand ONLY the remaining sections (do NOT repeat 'Quick Plan (Actionable)' or 'Management').",
     "Keep Entry/SL/TP consistent with ai_meta_hint unless a direct contradiction is visible; if so, explain in 1 line.",
@@ -787,7 +871,12 @@ function messagesExpandStage2(args: {
     "Append NOTHING after these sections (no ai_meta here).",
   ].join("\n");
 
-  const userParts = buildUserPartsBase(args);
+  const userParts = buildUserPartsBase({
+    instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4,
+    calendarDataUrl: args.calendarDataUrl, calendarText: args.calendarText,
+    headlinesText: args.headlinesText, sentimentText: args.sentimentText,
+    calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null
+  });
   if (args.aiMetaHint) userParts.push({ type: "text", text: `ai_meta_hint:\n${JSON.stringify(args.aiMetaHint, null, 2)}` });
   return [{ role: "system", content: system }, { role: "user", content: userParts }];
 }
@@ -828,6 +917,33 @@ async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
   const messages = [
     { role: "system", content: "Adjust the LIMIT zone so that: Sell Limit is an ABOVE-price pullback into supply; Buy Limit is a BELOW-price pullback into demand. Keep all other content & sections." },
     { role: "user", content: `Instrument: ${instrument}\n\nCurrent Price: ${aiMeta?.currentPrice}\nProvided Zone: ${JSON.stringify(aiMeta?.zone)}\n\nCard:\n${text}\n\nFix only the LIMIT zone side and entry, keep format.` },
+  ];
+  return callOpenAI(messages);
+}
+
+// NEW: ensure Option 2 is present and explicit
+function hasCompliantOption2(text: string): boolean {
+  const re = /Option\s*2/i;
+  if (!re.test(text || "")) return false;
+  // Look for key tokens near Option 2
+  const block = (text.match(/Option\s*2[\s\S]{0,800}/i)?.[0] || "").toLowerCase();
+  const must = ["direction", "trigger", "entry", "stop", "tp", "conviction"];
+  return must.every(k => block.includes(k));
+}
+async function enforceOption2(instrument: string, text: string) {
+  if (hasCompliantOption2(text)) return text;
+  const messages = [
+    { role: "system", content:
+`Add a compliant **Option 2** to this trade card. Keep Option 1 exactly as-is (numbers and wording).
+Option 2 must be a secondary structured play (e.g., Break + Retest, Trendline break, SFP), and MUST include:
+- Direction, Order Type
+- Explicit trigger instructions (e.g., "Wait for a 1H close above X, then retest hold at Y")
+- Entry level(s)
+- Stop Loss
+- TP1 and TP2
+- Its own Conviction % (may differ from Option 1)
+Do not remove or alter any other sections or text.` },
+    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd Option 2 below the existing Option 1 with the required details.` }
   ];
   return callOpenAI(messages);
 }
@@ -902,7 +1018,38 @@ function calendarShortText(resp: any, pair: string): string | null {
   if (!parts.length) parts.push("No strong calendar bias.");
   return `Calendar bias for ${pair}: ${parts.join("; ")}`;
 }
-async function fetchCalendarBias(req: NextApiRequest, instrument: string): Promise<{ text: string | null, status: "api" | "unavailable", provider: string | null }> {
+function nearestHighImpactWithin(resp: any, minutes: number): number | null {
+  if (!resp?.ok || !Array.isArray(resp?.items)) return null;
+  const now = Date.now();
+  let best: number | null = null;
+  for (const it of resp.items) {
+    if (String(it?.impact || "") !== "High") continue;
+    const t = new Date(it.time).getTime();
+    if (t >= now) {
+      const mins = Math.floor((t - now) / 60000);
+      if (mins <= minutes) {
+        best = best == null ? mins : Math.min(best, mins);
+      }
+    }
+  }
+  return best;
+}
+function postResultBiasNote(resp: any, pair: string): string | null {
+  if (!resp?.ok) return null;
+  const base = pair.slice(0,3), quote = pair.slice(3);
+  const per = resp?.bias?.perCurrency || {};
+  const b = per[base]?.label || "neutral";
+  const q = per[quote]?.label || "neutral";
+  const instr = resp?.bias?.instrument?.label || null;
+  const scores = resp?.bias?.instrument ? ` (score ${resp.bias.instrument.score})` : "";
+  const line = `Per-currency: ${base} ${b} vs ${quote} ${q}` + (instr ? `; Instrument bias: ${instr}${scores}` : "");
+  return line;
+}
+
+async function fetchCalendarForAdvisory(req: NextApiRequest, instrument: string): Promise<{
+  text: string | null, status: "api" | "unavailable", provider: string | null,
+  warningMinutes: number | null, advisoryText: string | null, biasNote: string | null
+}> {
   try {
     const base = originFromReq(req);
     const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=48&_t=${Date.now()}`;
@@ -910,11 +1057,17 @@ async function fetchCalendarBias(req: NextApiRequest, instrument: string): Promi
     const j: any = await r.json().catch(() => ({}));
     if (j?.ok) {
       const t = calendarShortText(j, instrument) || `Calendar bias for ${instrument}: (no strong signal)`;
-      return { text: t, status: "api", provider: String(j?.provider || "mixed") };
+      const warn = nearestHighImpactWithin(j, 60);
+      const bias = postResultBiasNote(j, instrument);
+      const advisory = [
+        warn != null ? `⚠️ High-impact event in ~${warn} min.` : null,
+        bias ? `Recent result alignment: ${bias}.` : null
+      ].filter(Boolean).join("\n");
+      return { text: t, status: "api", provider: String(j?.provider || "mixed"), warningMinutes: warn ?? null, advisoryText: advisory || null, biasNote: bias || null };
     }
-    return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null };
+    return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null, warningMinutes: null, advisoryText: null, biasNote: null };
   } catch {
-    return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null };
+    return { text: "Calendar unavailable — upload an image if you need the panel parsed.", status: "unavailable", provider: null, warningMinutes: null, advisoryText: null, biasNote: null };
   }
 }
 
@@ -935,10 +1088,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       if (!c) return res.status(400).json({ ok: false, reason: "Expand failed: cache expired or not found." });
       if (!c.sentimentText) return res.status(503).json({ ok: false, reason: "Missing sentiment snapshot for expand." });
       const dateStr = new Date().toISOString().slice(0, 10);
+
+      // Advisory from calendar API even when using cached images
+      const calAdv = await fetchCalendarForAdvisory(req, c.instrument);
+
       const messages = messagesExpandStage2({
         instrument: c.instrument, dateStr, m15: c.m15, h1: c.h1, h4: c.h4,
         calendarDataUrl: c.calendar || undefined, headlinesText: c.headlinesText || undefined, sentimentText: c.sentimentText || undefined,
         aiMetaHint: null,
+        calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText }
       });
       const text = await callOpenAI(messages);
       res.setHeader("Cache-Control", "no-store");
@@ -1020,22 +1178,25 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       headlinesText = viaServer.promptText;
     }
 
-    // ----- Calendar: image precedence; else API bias with visible note on failure -----
+    // ----- Calendar: image precedence; also compute warning + post-result bias via API -----
     let calendarText: string | null = null;
     let calendarStatus: "image" | "api" | "unavailable" = "unavailable";
     let calendarProvider: string | null = null;
 
+    // Always compute advisory from API (warning & bias note)
+    const calAdv = await fetchCalendarForAdvisory(req, instrument);
+
     if (calUrl) {
       calendarStatus = "image";
       calendarProvider = "image";
+      calendarText = calAdv.text; // include text note too
     } else {
-      const cal = await fetchCalendarBias(req, instrument);
-      calendarText = cal.text;
-      calendarStatus = cal.status;
-      calendarProvider = cal.provider;
+      calendarText = calAdv.text;
+      calendarStatus = calAdv.status;
+      calendarProvider = calAdv.provider;
     }
 
-    // ----- Sentiment: CSM mandatory; COT soft-required with fallback -----
+    // ----- Sentiment: CSM mandatory; COT soft-required with Tradingster + headlines fallback -----
     let csm: CsmSnapshot;
     try { csm = await getCSM(); } catch (e: any) {
       return res.status(503).json({ ok: false, reason: `CSM unavailable: ${e?.message || "fetch failed"}.` });
@@ -1043,7 +1204,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     let cot: CotSnapshot | null = null;
     let cotErr: string | null = null;
-    try { cot = await getCOT(); } catch (e: any) { cot = null; cotErr = e?.message || "unavailable"; }
+    try { cot = await getCOT(headlineItems); } catch (e: any) { cot = null; cotErr = e?.message || "unavailable"; }
 
     const { text: sentimentText, provenance } = sentimentSummary(csm, cot, cotErr);
 
@@ -1067,6 +1228,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       cot_used: !!cot,
       cot_report_date: cot ? cot.reportDate : null,
       cot_error: cot ? null : cotErr || "unavailable",
+      cot_method: cot?.method || null,
+      calendar_warning_minutes: calAdv.warningMinutes ?? null,
     };
 
     // Build messages
@@ -1077,6 +1240,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         calendarText: (!calUrl && calendarText) ? calendarText : undefined,
         headlinesText: headlinesText || undefined,
         sentimentText: sentimentText,
+        calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText },
         provenance: provForModel,
       });
       // Prepend a tiny currentPrice hint if we have it
@@ -1102,6 +1266,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         const bad = invalidOrderRelativeToPrice(aiMeta);
         if (bad) { text = await fixOrderVsPrice(instrument, text, aiMeta); aiMeta = extractAiMeta(text) || aiMeta; }
       }
+
+      // NEW: ensure Option 2 is present & explicit
+      text = await enforceOption2(instrument, text);
+      aiMeta = extractAiMeta(text) || aiMeta;
 
       // Cache stage-1
       const cacheKey = setCache({
@@ -1130,6 +1298,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       calendarText: (!calUrl && calendarText) ? calendarText : undefined,
       headlinesText: headlinesText || undefined,
       sentimentText,
+      calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText }
     });
     if (livePrice) {
       (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice}`;
@@ -1151,6 +1320,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const bad = invalidOrderRelativeToPrice(aiMeta);
       if (bad) { text = await fixOrderVsPrice(instrument, text, aiMeta); aiMeta = extractAiMeta(text) || aiMeta; }
     }
+
+    // NEW: ensure Option 2 is present & explicit
+    text = await enforceOption2(instrument, text);
+    aiMeta = extractAiMeta(text) || aiMeta;
 
     if (!text || refusalLike(text)) {
       const fb = fallbackCard(instrument, provForModel);
@@ -1184,6 +1357,8 @@ function fallbackCard(
     cot_used: boolean;
     cot_report_date: string | null;
     cot_error?: string | null;
+    cot_method?: string | null;
+    calendar_warning_minutes?: number | null;
   }
 ) {
   return [
