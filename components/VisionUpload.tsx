@@ -13,16 +13,7 @@ type Props = {
 type ApiMeta = {
   cacheKey?: string;
   mode?: "fast" | "full" | "expand";
-  sources?: {
-    headlines_used: number;
-    headlines_instrument: string;
-    calendar_used: boolean;
-    csm_used: boolean;
-    csm_time: string;
-    cot_used: boolean;
-    cot_report_date: string | null;
-    cot_error?: string | null;
-  };
+  sources?: any;
 };
 
 export default function VisionUpload({
@@ -37,24 +28,23 @@ export default function VisionUpload({
   const [h4, setH4] = useState<File | null>(null);
   const [calendar, setCalendar] = useState<File | null>(null);
 
-  // URL states (TradingView/Gyazo direct image or page link)
+  // URL states
   const [m15Url, setM15Url] = useState("");
   const [h1Url, setH1Url] = useState("");
   const [h4Url, setH4Url] = useState("");
 
   // Mode & flow
   const [mode, setMode] = useState<"fast" | "full">("fast");
+  const [model, setModel] = useState<"gpt-4o" | "gpt-5">("gpt-4o"); // NEW toggle
   const [cacheKey, setCacheKey] = useState<string | null>(null);
   const [stage1Text, setStage1Text] = useState<string>("");
 
   // UI
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // Optional: show how many headlines we bundled (for sanity)
   const [bundledHeadlines, setBundledHeadlines] = useState<number>(0);
 
-  // Refs to clear inputs
+  // Refs
   const refM15 = useRef<HTMLInputElement>(null);
   const refH1 = useRef<HTMLInputElement>(null);
   const refH4 = useRef<HTMLInputElement>(null);
@@ -83,15 +73,15 @@ export default function VisionUpload({
     if (refCal.current) refCal.current.value = "";
   }
 
-  // hard reset when instrument changes or parent bumps resetSignal
   useEffect(() => {
     clearAll();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [instrument, resetSignal]);
 
   async function fetchHeadlinesForInstrument(code: string) {
     try {
-      const url = `/api/news?instrument=${encodeURIComponent(code)}&hours=48&max=12&_t=${Date.now()}`;
+      const url = `/api/news?instrument=${encodeURIComponent(
+        code
+      )}&hours=48&max=12&_t=${Date.now()}`;
       const r = await fetch(url, { cache: "no-store" });
       const j = await r.json().catch(() => ({}));
       const items: any[] = Array.isArray(j?.items) ? j.items : [];
@@ -106,9 +96,9 @@ export default function VisionUpload({
       setError(null);
       setBusyState(true);
 
-      // Prepare form
       const fd = new FormData();
       fd.append("instrument", instrument);
+      fd.append("model", model); // <-- send model to backend
       if (mode === "fast") fd.append("mode", "fast");
 
       if (m15) fd.append("m15", m15);
@@ -120,10 +110,9 @@ export default function VisionUpload({
       if (h1Url) fd.append("h1Url", h1Url.trim());
       if (h4Url) fd.append("h4Url", h4Url.trim());
 
-      // NEW: inject the exact headlines the UI would use (single source of truth)
       const headlines = await fetchHeadlinesForInstrument(instrument);
       if (headlines.length) {
-        fd.append("headlinesJson", JSON.stringify(headlines)); // server will prefer this if present
+        fd.append("headlinesJson", JSON.stringify(headlines));
         setBundledHeadlines(headlines.length);
       } else {
         setBundledHeadlines(0);
@@ -144,7 +133,6 @@ export default function VisionUpload({
         setStage1Text("");
       }
 
-      // Always show result
       onResult(text);
     } catch (e: any) {
       setError(e?.message || "Error generating plan");
@@ -203,32 +191,46 @@ export default function VisionUpload({
         </label>
       </div>
 
-      {/* URLs (TV/Gyazo) */}
+      {/* Model selector */}
+      <div className="flex items-center gap-3">
+        <label className="text-sm font-medium">Model:</label>
+        <select
+          value={model}
+          onChange={(e) => setModel(e.target.value as "gpt-4o" | "gpt-5")}
+          disabled={busy}
+          className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700 text-sm"
+        >
+          <option value="gpt-4o">GPT-4o (default, faster)</option>
+          <option value="gpt-5">GPT-5 (deeper, slower)</option>
+        </select>
+      </div>
+
+      {/* URLs */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
         <input
           className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700"
-          placeholder="15m image URL (TradingView/Gyazo)"
+          placeholder="15m image URL"
           value={m15Url}
           onChange={(e) => setM15Url(e.target.value)}
           disabled={busy}
         />
         <input
           className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700"
-          placeholder="1H image URL (TradingView/Gyazo)"
+          placeholder="1H image URL"
           value={h1Url}
           onChange={(e) => setH1Url(e.target.value)}
           disabled={busy}
         />
         <input
           className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700"
-          placeholder="4H image URL (TradingView/Gyazo)"
+          placeholder="4H image URL"
           value={h4Url}
           onChange={(e) => setH4Url(e.target.value)}
           disabled={busy}
         />
       </div>
 
-      {/* Files (optional if URLs provided) */}
+      {/* Files */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
         <input
           type="file"
@@ -253,7 +255,7 @@ export default function VisionUpload({
         />
       </div>
 
-      {/* Calendar (optional) */}
+      {/* Calendar */}
       <div>
         <input
           type="file"
@@ -273,16 +275,13 @@ export default function VisionUpload({
         >
           {mode === "fast" ? "Generate (Stage-1)" : "Generate Full"}
         </button>
-
         <button
           onClick={handleExpand}
           disabled={busy || !cacheKey}
           className="px-3 py-1 rounded border border-neutral-700 hover:bg-neutral-800 disabled:opacity-50"
-          title={!cacheKey ? "Run Stage-1 first" : "Expand the rest"}
         >
           Expand Full Breakdown
         </button>
-
         <button
           onClick={clearAll}
           disabled={busy}
@@ -290,27 +289,26 @@ export default function VisionUpload({
         >
           Clear All
         </button>
-
         {cacheKey && (
-          <span className="text-xs opacity-70">cache: {cacheKey.slice(0, 10)}…</span>
+          <span className="text-xs opacity-70">
+            cache: {cacheKey.slice(0, 10)}…
+          </span>
         )}
       </div>
 
       {/* Inline helpers */}
       {bundledHeadlines > 0 && (
         <div className="text-xs text-emerald-400">
-          Headlines bundled: {bundledHeadlines} (UI and card will match)
+          Headlines bundled: {bundledHeadlines}
         </div>
       )}
-
       {error && (
         <div className="text-sm text-red-400 whitespace-pre-wrap border border-red-800/60 bg-red-900/10 rounded p-2">
           {error}
         </div>
       )}
-
       <div className="text-xs opacity-70">
-        Required: 15m + 1h + 4h — either files or TV/Gyazo links. Calendar is optional.
+        Required: 15m + 1h + 4h — either files or URLs. Calendar optional.
       </div>
     </div>
   );
