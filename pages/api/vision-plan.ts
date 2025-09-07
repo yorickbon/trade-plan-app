@@ -7,28 +7,29 @@
  * - Headlines+CSM sentiment
  *
  * ✅ What changed (minimal, non-breaking; speed-focused):
- * 1) Removed all COT network calls/caches (CFTC/Tradingster/stale-cache). Reason: latency + flakiness.  (unchanged)
- * 2) Added an **optional headlines-only COT cue** detector: (unchanged)
+ * 1) Removed all COT network calls/caches (CFTC/Tradingster/stale-cache). Reason: latency + flakiness.
+ * 2) Added an **optional headlines-only COT cue** detector:
  *    - If headlines mention “COT/Commitments” with “net long/short” (per currency), surface a one-liner.
  *    - Provenance sets: cot_used=true, cot_method="headline_fallback", cot_report_date=null.
  *    - If no cue, cot_used=false and cot_error="no cot cues".
- * 3) Fundamentals = **Calendar + CSM + Headlines** (COT entirely optional via cues).  (unchanged)
- * 4) Option 2 clarity guard retained.  (unchanged)
- * 5) Provenance polish (unchanged) + **NEW** headline bias fields:
- *    - meta.sources now also includes:
- *      headlines_bias_label ("bullish" | "bearish" | "neutral" | "unavailable")
- *      headlines_bias_score (number | null)
- *      cot_bias_summary (string | null)
+ * 3) Fundamentals = **Calendar + CSM + Headlines** (COT entirely optional via cues).
+ * 4) Option 2 clarity guard retained.
+ * 5) Provenance polish (+headline bias + COT bias summary).
  *
  * 🆕 NEW (your request):
  * - Sentiment snapshot now shows:
  *   • “Headlines bias (48h): <label> (<avgScore>)”
  *   • “COT: <summary>”  OR  “COT news not found.”
  *
+ * 🆕 NEW (speed):
+ * - Single-pass fixer `consolidateFixes` replaces multiple LLM enforcement passes.
+ * - `passes` form field (or env DEFAULT_PASSES) controls whether we run that pass.
+ * - Parallel price/series fetch via Promise.any; tighter timeouts via VISION_NET_TIMEOUT_MS.
+ *
  * ❗ What did NOT change:
  * - API shape, output template/section names, fast/full/expand modes.
  * - Headlines fallback chain (/api/news), image handling, price sanity chain, SHOW_COST behavior.
- * - Primary Option 1 enforcement and order sanity fixes.
+ * - Primary Option 1 enforcement and order sanity fixes (now consolidated).
  */
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -60,6 +61,10 @@ const BASE_W = 1280; // base width
 const MAX_W = 1500; // upper bound for adaptive
 const TARGET_MIN = 420 * 1024;
 const TARGET_MAX = 1200 * 1024; // hard ceiling for adaptive
+
+// Speed knobs
+const DEFAULT_PASSES = Number(process.env.VISION_ENFORCE_PASSES ?? 1); // 0=skip enforcement; >=1 run consolidated pass
+const NET_TIMEOUT_MS = Number(process.env.VISION_NET_TIMEOUT_MS ?? 2000);
 
 const now = () => Date.now();
 const dt = (t: number) => `${Date.now() - t}ms`;
@@ -438,7 +443,7 @@ async function tdSeries15(pair: string): Promise<Series | null> {
     )}&interval=15min&outputsize=30&apikey=${TD_KEY}&dp=6`;
     const r = await fetch(url, {
       cache: "no-store",
-      signal: AbortSignal.timeout(2500),
+      signal: AbortSignal.timeout(NET_TIMEOUT_MS),
     });
     if (!r.ok) return null;
     const j: any = await r.json();
@@ -463,7 +468,7 @@ async function fhSeries15(pair: string): Promise<Series | null> {
     )}&resolution=15&from=${from}&to=${to}&token=${FH_KEY}`;
     const r = await fetch(url, {
       cache: "no-store",
-      signal: AbortSignal.timeout(2500),
+      signal: AbortSignal.timeout(NET_TIMEOUT_MS),
     });
     if (!r.ok) return null;
     const j: any = await r.json();
@@ -492,7 +497,7 @@ async function polySeries15(pair: string): Promise<Series | null> {
     )}/range/15/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=asc&apiKey=${POLY_KEY}`;
     const r = await fetch(url, {
       cache: "no-store",
-      signal: AbortSignal.timeout(2500),
+      signal: AbortSignal.timeout(NET_TIMEOUT_MS),
     });
     if (!r.ok) return null;
     const j: any = await r.json();
@@ -506,13 +511,22 @@ async function polySeries15(pair: string): Promise<Series | null> {
   }
 }
 async function fetchSeries15(pair: string): Promise<Series | null> {
-  const td = await tdSeries15(pair);
-  if (td) return td;
-  const fh = await fhSeries15(pair);
-  if (fh) return fh;
-  const pg = await polySeries15(pair);
-  if (pg) return pg;
-  return null;
+  const attempts: Array<Promise<Series | null>> = [];
+  if (TD_KEY) attempts.push(tdSeries15(pair));
+  if (FH_KEY) attempts.push(fhSeries15(pair));
+  if (POLY_KEY) attempts.push(polySeries15(pair));
+  if (attempts.length === 0) return null;
+  const wrapped = attempts.map((p) =>
+    p.then((r) =>
+      r && Array.isArray(r.c) && r.c.length ? r : Promise.reject("empty")
+    )
+  );
+  try {
+    const first = await Promise.any(wrapped);
+    return first || null;
+  } catch {
+    return null;
+  }
 }
 function computeCSMFromPairs(
   seriesMap: Record<string, Series | null>
@@ -1309,7 +1323,7 @@ async function callOpenAI(messages: any[]) {
   return String(out || "");
 }
 
-// ---------- enforcement passes ----------
+// ---------- enforcement helpers (legacy single funcs used by consolidated pass logic checks) ----------
 async function rewriteAsPending(instrument: string, text: string) {
   const messages = [
     {
@@ -1353,8 +1367,6 @@ async function fixOrderVsPrice(instrument: string, text: string, aiMeta: any) {
   ];
   return callOpenAI(messages);
 }
-
-// Ensure Option 2 is present and explicit
 function hasCompliantOption2(text: string): boolean {
   const re = /Option\s*2/i;
   if (!re.test(text || "")) return false;
@@ -1378,9 +1390,36 @@ async function enforceOption2(instrument: string, text: string) {
   return callOpenAI(messages);
 }
 
+// ---------- Consolidated single-pass fixer ----------
+async function consolidateFixes(
+  instrument: string,
+  text: string,
+  aiMeta: any,
+  livePrice?: number | null
+) {
+  const sys = [
+    "Act as a *finalizer* that applies ALL corrections in ONE pass to the trade card below.",
+    "- If EntryType = Market but breakout proof is missing (no bodyCloseBeyond or no retestHolds/SFP), rewrite as PENDING with a clean LIMIT zone.",
+    "- If 'Breakout + Retest' is claimed without proof, rename setup to 'Pullback (OB/FVG/SR)'.",
+    "- If LIMIT side contradicts current price (sell-limit-below or buy-limit-above), fix just the LIMIT side & entry.",
+    "- Ensure a compliant **Option 2** block exists (direction, order type, trigger, entry, SL, TP1/TP2, conviction%).",
+    "Keep everything else unchanged. Output ONLY the corrected card (same format) and keep the ai_meta block in sync."
+  ].join("\n");
+  const usr = [
+    `Instrument: ${instrument}`,
+    livePrice ? `Current Price (hint): ${livePrice}` : null,
+    "ai_meta:",
+    JSON.stringify(aiMeta || {}, null, 2),
+    "",
+    "CARD:",
+    text
+  ].filter(Boolean).join("\n");
+  return callOpenAI([{ role: "system", content: sys }, { role: "user", content: usr }]);
+}
+
 // ---------- live price helpers ----------
 async function fetchLivePrice(pair: string): Promise<number | null> {
-  // 1) TwelveData
+  // 1) TwelveData price
   if (TD_KEY) {
     try {
       const sym = `${pair.slice(0, 3)}/${pair.slice(3)}`;
@@ -1389,7 +1428,7 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
       )}&apikey=${TD_KEY}&dp=5`;
       const r = await fetch(url, {
         cache: "no-store",
-        signal: AbortSignal.timeout(1800),
+        signal: AbortSignal.timeout(NET_TIMEOUT_MS),
       });
       const j: any = await r.json().catch(() => ({}));
       const p = Number(j?.price);
@@ -1407,7 +1446,7 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
       )}&resolution=15&from=${from}&to=${to}&token=${FH_KEY}`;
       const r = await fetch(url, {
         cache: "no-store",
-        signal: AbortSignal.timeout(1800),
+        signal: AbortSignal.timeout(NET_TIMEOUT_MS),
       });
       const j: any = await r.json().catch(() => ({}));
       const c = Array.isArray(j?.c) ? j.c : [];
@@ -1415,7 +1454,7 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
       if (isFinite(last) && last > 0) return last;
     } catch {}
   }
-  // 3) Polygon last agg
+  // 3) Polygon last agg close
   if (POLY_KEY) {
     try {
       const ticker = `C:${pair}`;
@@ -1431,7 +1470,7 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
       )}/range/1/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=desc&limit=1&apiKey=${POLY_KEY}`;
       const r = await fetch(url, {
         cache: "no-store",
-        signal: AbortSignal.timeout(1500),
+        signal: AbortSignal.timeout(NET_TIMEOUT_MS),
       });
       const j: any = await r.json().catch(() => ({}));
       const res = Array.isArray(j?.results) ? j.results[0] : null;
@@ -1439,12 +1478,7 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
       if (isFinite(last) && last > 0) return last;
     } catch {}
   }
-  // 4) fallback
-  try {
-    const S = await fetchSeries15(pair);
-    const last = S?.c?.[S.c.length - 1];
-    if (isFinite(Number(last)) && Number(last) > 0) return Number(last);
-  } catch {}
+  // No slow series fallback here (avoid double-paying latency)
   return null;
 }
 
@@ -1523,6 +1557,7 @@ export default async function handler(
       .toUpperCase()
       .replace(/\s+/g, "");
     const requestedMode = String(fields.mode || "").toLowerCase();
+    const passes = Number(fields.passes ?? DEFAULT_PASSES); // 0=skip consolidated fixes; >=1 run them
     if (requestedMode === "fast") mode = "fast";
 
     // Files (if provided)
@@ -1696,40 +1731,17 @@ export default async function handler(
         aiMeta.currentPrice = livePrice;
       }
 
-      // enforcement passes
-      if (aiMeta && needsPendingLimit(aiMeta)) {
-        text = await rewriteAsPending(instrument, text);
-        aiMeta = extractAiMeta(text) || aiMeta;
-      }
-
+      // ---- consolidated single-pass fixes (optional, for speed) ----
       const bp = aiMeta?.breakoutProof || {};
-      const hasProof = !!(
-        bp?.bodyCloseBeyond === true &&
-        (bp?.retestHolds === true || bp?.sfpReclaim === true)
-      );
-      if (
-        String(aiMeta?.selectedStrategy || "")
-          .toLowerCase()
-          .includes("breakout") &&
-        !hasProof
-      ) {
-        text = await normalizeBreakoutLabel(text);
+      const breakoutClaim = String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout");
+      const missingProof = !(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+      const badLimit = aiMeta ? invalidOrderRelativeToPrice(aiMeta) : null;
+      const missingOpt2 = !hasCompliantOption2(text);
+      const needFix = passes > 0 && (missingProof || (breakoutClaim && missingProof) || !!badLimit || missingOpt2);
+      if (needFix) {
+        text = await consolidateFixes(instrument, text, aiMeta, livePrice);
         aiMeta = extractAiMeta(text) || aiMeta;
       }
-
-      if (aiMeta) {
-        if (livePrice && aiMeta.currentPrice !== livePrice)
-          aiMeta.currentPrice = livePrice;
-        const bad = invalidOrderRelativeToPrice(aiMeta);
-        if (bad) {
-          text = await fixOrderVsPrice(instrument, text, aiMeta);
-          aiMeta = extractAiMeta(text) || aiMeta;
-        }
-      }
-
-      // Ensure Option 2 present & explicit
-      text = await enforceOption2(instrument, text);
-      aiMeta = extractAiMeta(text) || aiMeta;
 
       // Cache stage-1
       const cacheKey = setCache({
@@ -1805,41 +1817,19 @@ export default async function handler(
       aiMeta.currentPrice = livePrice;
     }
 
-    if (aiMeta && needsPendingLimit(aiMeta)) {
-      text = await rewriteAsPending(instrument, text);
-      aiMeta = extractAiMeta(text) || aiMeta;
-    }
-
+    // ---- consolidated single-pass fixes for FULL path (controlled by DEFAULT_PASSES env) ----
     {
       const bp = aiMeta?.breakoutProof || {};
-      const hasProof = !!(
-        bp?.bodyCloseBeyond === true &&
-        (bp?.retestHolds === true || bp?.sfpReclaim === true)
-      );
-      if (
-        String(aiMeta?.selectedStrategy || "")
-          .toLowerCase()
-          .includes("breakout") &&
-        !hasProof
-      ) {
-        text = await normalizeBreakoutLabel(text);
+      const breakoutClaim = String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout");
+      const missingProof = !(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+      const badLimit = aiMeta ? invalidOrderRelativeToPrice(aiMeta) : null;
+      const missingOpt2 = !hasCompliantOption2(text);
+      const needFix = DEFAULT_PASSES > 0 && (missingProof || (breakoutClaim && missingProof) || !!badLimit || missingOpt2);
+      if (needFix) {
+        text = await consolidateFixes(instrument, text, aiMeta, livePrice);
         aiMeta = extractAiMeta(text) || aiMeta;
       }
     }
-
-    if (aiMeta) {
-      if (livePrice && aiMeta.currentPrice !== livePrice)
-        aiMeta.currentPrice = livePrice;
-      const bad = invalidOrderRelativeToPrice(aiMeta);
-      if (bad) {
-        text = await fixOrderVsPrice(instrument, text, aiMeta);
-        aiMeta = extractAiMeta(text) || aiMeta;
-      }
-    }
-
-    // Ensure Option 2 present & explicit
-    text = await enforceOption2(instrument, text);
-    aiMeta = extractAiMeta(text) || aiMeta;
 
     if (!text || refusalLike(text)) {
       const fb = fallbackCard(instrument, provForModel);
