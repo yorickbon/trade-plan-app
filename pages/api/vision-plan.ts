@@ -19,7 +19,7 @@ export const config = { api: { bodyParser: false, sizeLimit: "25mb" } };
 type Ok = { ok: true; text: string; meta?: any };
 type Err = { ok: false; reason: string };
 
-const VP_VERSION = "2025-09-08-noguess-v2";
+const VP_VERSION = "2025-09-08-noguess-v3"; // ⬅️ bumped for OCR + Breakout proof fixes
 
 // ---------- OpenAI / Model pick ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
@@ -57,6 +57,7 @@ function dataUrlSizeBytes(s: string | null | undefined): number {
   const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
   return Math.floor((b64.length * 3) / 4) - padding;
 }
+const safeNum = (v: any): number | null => (Number.isFinite(Number(v)) ? Number(v) : null);
 
 // ---------- in-memory image cache ----------
 type CacheEntry = {
@@ -429,7 +430,154 @@ function sentimentSummary(
   return { text: `${ranksLine}\n${hBiasLine}\n${cotLine}`, provenance: prov };
 }
 
-// ---------- calendar helpers ----------
+// ---------- calendar helpers (shared logic) ----------
+function goodIfHigher(title: string): boolean | null {
+  const t = title.toLowerCase();
+  if (/(cpi|core cpi|ppi|inflation)/.test(t)) return true;
+  if (/(gdp|retail sales|industrial production|manufacturing production|consumer credit|housing starts|building permits|durable goods)/.test(t)) return true;
+  if (/(pmi|ism|confidence|sentiment)/.test(t)) return true;
+  if (/unemployment|jobless|initial claims|continuing claims/.test(t)) return false;
+  if (/(nonfarm|nfp|employment change|payrolls|jobs)/.test(t)) return true;
+  if (/trade balance|current account/.test(t)) return true;
+  if (/interest rate|rate decision|refi rate|deposit facility|bank rate|cash rate|ocr/.test(t)) return true;
+  return null;
+}
+function evidenceLine(it: any, cur: string): string | null {
+  const a = safeNum(it.actual);
+  const f = safeNum(it.forecast);
+  const p = safeNum(it.previous);
+  if (a == null || (f == null && p == null)) return null;
+  const dir = goodIfHigher(String(it.title || ""));
+  let comp: string[] = [];
+  if (f != null) comp.push(a < f ? "< forecast" : a > f ? "> forecast" : "= forecast");
+  if (p != null) comp.push(a < p ? "< previous" : a > p ? "> previous" : "= previous");
+  let verdict = "neutral";
+  if (dir === true) {
+    verdict = (a > (f ?? a) && a > (p ?? a)) ? "bullish" : (a < (f ?? a) && a < (p ?? a)) ? "bearish" : "mixed";
+  } else if (dir === false) {
+    verdict = (a < (f ?? a) && a < (p ?? a)) ? "bullish" : (a > (f ?? a) && a > (p ?? a)) ? "bearish" : "mixed";
+  }
+  const comps = comp.join(" and ");
+  return `${cur} — ${it.title}: actual ${a}${f!=null||p!=null ? ` ${comps}` : ""} → ${verdict} ${cur}`;
+}
+
+// ---------- NEW: OpenAI Vision OCR for calendar image (image-first, no guessing) ----------
+async function callOpenAI(model: string, messages: any[]) {
+  const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: JSON.stringify({ model, messages }),
+  });
+  const json = await rsp.json().catch(() => ({} as any));
+  if (!rsp.ok) throw new Error(`OpenAI request failed: ${rsp.status} ${JSON.stringify(json)}`);
+  const out =
+    json?.choices?.[0]?.message?.content ??
+    (Array.isArray(json?.choices?.[0]?.message?.content)
+      ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
+      : "");
+  return String(out || "");
+}
+
+function tryParseJsonBlock(s: string): any | null {
+  if (!s) return null;
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  const raw = fence ? fence[1] : s;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+type OcrCalendarRow = {
+  timeISO: string | null;
+  title: string | null;
+  currency: string | null;
+  impact: "Low" | "Medium" | "High" | null;
+  actual: number | string | null;
+  forecast: number | string | null;
+  previous: number | string | null;
+};
+type OcrCalendar = { items: OcrCalendarRow[] };
+
+async function ocrCalendarFromImage(model: string, calendarDataUrl: string): Promise<OcrCalendar | null> {
+  const sys = [
+    "You are extracting ECONOMIC CALENDAR rows via image OCR.",
+    "Return STRICT JSON only. DO NOT GUESS values. If unreadable/absent, use null.",
+    "Fields per row: timeISO (ISO8601 if visible, otherwise null), title, currency (e.g., USD, EUR), impact (Low|Medium|High), actual, forecast, previous.",
+    "If numbers include symbols (%, k, m), keep the numeric form if obvious; otherwise keep original string; if unreadable → null.",
+  ].join("\n");
+  const user = [
+    { type: "text", text: "Extract rows as specified. JSON only." },
+    { type: "image_url", image_url: { url: calendarDataUrl } },
+  ];
+  const msg = [{ role: "system", content: sys }, { role: "user", content: user }];
+  const text = await callOpenAI(model, msg);
+  const parsed = tryParseJsonBlock(text);
+  if (!parsed || !Array.isArray(parsed?.items)) return null;
+
+  // sanitize
+  const items: OcrCalendarRow[] = (parsed.items as any[]).map((r) => ({
+    timeISO: r?.timeISO && typeof r.timeISO === "string" ? r.timeISO : null,
+    title: r?.title && typeof r.title === "string" ? r.title : null,
+    currency: r?.currency && typeof r.currency === "string" ? r.currency.toUpperCase().slice(0,3) : null,
+    impact: r?.impact && typeof r.impact === "string" ? (["low","medium","high"].includes(r.impact.toLowerCase()) ? (r.impact[0].toUpperCase()+r.impact.slice(1).toLowerCase()) as any : null) : null,
+    actual: r?.actual ?? null,
+    forecast: r?.forecast ?? null,
+    previous: r?.previous ?? null,
+  }));
+  return { items };
+}
+
+// ---------- Build bias/evidence/warning from OCR (no guessing) ----------
+function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
+  biasLine: string | null;
+  biasNote: string | null;
+  warningMinutes: number | null;
+  evidenceLines: string[];
+} {
+  const base = pair.slice(0,3), quote = pair.slice(3);
+  const nowMs = Date.now();
+  const lines: string[] = [];
+  const per: Record<string, number> = {};
+  function addScore(cur: string, verdict: string) {
+    if (!cur) return;
+    if (!per[cur]) per[cur] = 0;
+    if (verdict.includes("bullish")) per[cur] += 1;
+    else if (verdict.includes("bearish")) per[cur] -= 1;
+  }
+
+  let warn: number | null = null;
+  for (const it of (ocr.items || [])) {
+    // warningMinutes for upcoming High within ~60m
+    if (it?.impact === "High" && it?.timeISO) {
+      const t = Date.parse(it.timeISO);
+      if (isFinite(t) && t >= nowMs) {
+        const mins = Math.floor((t - nowMs) / 60000);
+        if (mins <= 60) warn = warn == null ? mins : Math.min(warn, mins);
+      }
+    }
+    // evidence lines from last 72h
+    if (it?.timeISO) {
+      const t = Date.parse(it.timeISO);
+      if (isFinite(t) && t <= nowMs && t >= nowMs - 72*3600*1000) {
+        const cur = it?.currency || "";
+        const ev = evidenceLine(it, cur);
+        if (ev) { lines.push(ev); addScore(cur, ev); }
+      }
+    }
+  }
+
+  const label = (s: number) => s > 0 ? "bullish" : s < 0 ? "bearish" : "neutral";
+  const bScore = per[base] ?? 0, qScore = per[quote] ?? 0;
+  const bLab = label(bScore), qLab = label(qScore);
+
+  let instr: string | null = null;
+  if (bLab === "bullish" && qLab === "bearish") instr = "bullish (base stronger than quote)";
+  else if (bLab === "bearish" && qLab === "bullish") instr = "bearish (quote stronger than base)";
+  const biasLine = `Calendar bias for ${pair}: ${instr ? `Instrument: ${instr}; ` : ""}Per-currency: ${base}:${bLab} / ${quote}:${qLab}`;
+
+  const biasNote = `Per-currency: ${base} ${bLab} vs ${quote} ${qLab}${instr ? `; Instrument bias: ${instr}` : ""}`;
+  return { biasLine, biasNote, warningMinutes: warn, evidenceLines: lines };
+}
+
+// ---------- API calendar (fallback) ----------
 function calendarShortText(resp: any, pair: string): string | null {
   if (!resp?.ok) return null;
   const instrBias = resp?.bias?.instrument;
@@ -475,35 +623,6 @@ async function fetchCalendarRaw(req: NextApiRequest, instrument: string): Promis
     const j: any = await r.json().catch(() => ({}));
     return j?.ok ? j : null;
   } catch { return null; }
-}
-function goodIfHigher(title: string): boolean | null {
-  const t = title.toLowerCase();
-  if (/(cpi|core cpi|ppi|inflation)/.test(t)) return true;
-  if (/(gdp|retail sales|industrial production|manufacturing production|consumer credit|housing starts|building permits|durable goods)/.test(t)) return true;
-  if (/(pmi|ism|confidence|sentiment)/.test(t)) return true;
-  if (/unemployment|jobless|initial claims|continuing claims/.test(t)) return false;
-  if (/(nonfarm|nfp|employment change|payrolls|jobs)/.test(t)) return true;
-  if (/trade balance|current account/.test(t)) return true;
-  if (/interest rate|rate decision|refi rate|deposit facility|bank rate|cash rate|ocr/.test(t)) return true;
-  return null;
-}
-function evidenceLine(it: any, cur: string): string | null {
-  const a = Number.isFinite(Number(it.actual)) ? Number(it.actual) : null;
-  const f = Number.isFinite(Number(it.forecast)) ? Number(it.forecast) : null;
-  const p = Number.isFinite(Number(it.previous)) ? Number(it.previous) : null;
-  if (a == null || (f == null && p == null)) return null;
-  const dir = goodIfHigher(String(it.title));
-  let comp: string[] = [];
-  if (f != null) comp.push(a < f ? "< forecast" : a > f ? "> forecast" : "= forecast");
-  if (p != null) comp.push(a < p ? "< previous" : a > p ? "> previous" : "= previous");
-  let verdict = "neutral";
-  if (dir === true) {
-    verdict = (a > (f ?? a) && a > (p ?? a)) ? "bullish" : (a < (f ?? a) && a < (p ?? a)) ? "bearish" : "mixed";
-  } else if (dir === false) {
-    verdict = (a < (f ?? a) && a < (p ?? a)) ? "bullish" : (a > (f ?? a) && a > (p ?? a)) ? "bearish" : "mixed";
-  }
-  const comps = comp.join(" and ");
-  return `${cur} — ${it.title}: actual ${a}${f!=null||p!=null ? ` ${comps}` : ""} → ${verdict} ${cur}`;
 }
 function buildCalendarEvidence(resp: any, pair: string): string[] {
   if (!resp?.ok || !Array.isArray(resp?.items)) return [];
@@ -701,46 +820,7 @@ function messagesFastStage1(args: {
 
   return [{ role: "system", content: system }, { role: "user", content: parts }];
 }
-
-// ---------- OpenAI call ----------
-async function callOpenAI(model: string, messages: any[]) {
-  const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: JSON.stringify({ model, messages }),
-  });
-  const json = await rsp.json().catch(() => ({} as any));
-  if (!rsp.ok) throw new Error(`OpenAI vision request failed: ${rsp.status} ${JSON.stringify(json)}`);
-  const out =
-    json?.choices?.[0]?.message?.content ??
-    (Array.isArray(json?.choices?.[0]?.message?.content)
-      ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
-      : "");
-  return String(out || "");
-}
-
-// ---------- enforcement passes ----------
-async function rewriteAsPending(model: string, instrument: string, text: string) {
-  const messages = [
-    { role: "system", content: "Rewrite the trade card as PENDING (no Market) into a clean Buy/Sell LIMIT zone at OB/FVG/SR confluence if breakout proof is missing. Keep tournament & X-ray." },
-    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nRewrite strictly to Pending.` },
-  ];
-  return callOpenAI(model, messages);
-}
-async function normalizeBreakoutLabel(model: string, text: string) {
-  const messages = [
-    { role: "system", content: "If 'Breakout + Retest' is claimed but proof is not shown (body close + retest hold or SFP reclaim), rename setup to 'Pullback (OB/FVG/SR)' and leave rest unchanged." },
-    { role: "user", content: text },
-  ];
-  return callOpenAI(model, messages);
-}
-async function fixOrderVsPrice(model: string, instrument: string, text: string, aiMeta: any) {
-  const messages = [
-    { role: "system", content: "Adjust the LIMIT zone so that: Sell Limit is an ABOVE-price pullback into supply; Buy Limit is a BELOW-price pullback into demand. Keep other content unchanged." },
-    { role: "user", content: `Instrument: ${instrument}\n\nCurrent Price: ${aiMeta?.currentPrice}\nProvided Zone: ${JSON.stringify(aiMeta?.zone)}\n\nCard:\n${text}\n\nFix only the LIMIT side.` },
-  ];
-  return callOpenAI(model, messages);
-}
+// ---------- enforcement + formatting helpers ----------
 function hasCompliantOption2(text: string): boolean {
   const re = /Option\s*2/i; if (!re.test(text || "")) return false;
   const block = (text.match(/Option\s*2[\s\S]{0,800}/i)?.[0] || "").toLowerCase();
@@ -754,6 +834,42 @@ async function enforceOption2(model: string, instrument: string, text: string) {
     { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd Option 2 below the existing Option 1.` },
   ];
   return callOpenAI(model, messages);
+}
+
+async function fixOrderVsPrice(model: string, instrument: string, text: string, aiMeta: any) {
+  const messages = [
+    { role: "system", content: "Adjust the LIMIT zone so that: Sell Limit is an ABOVE-price pullback into supply; Buy Limit is a BELOW-price pullback into demand. Keep other content unchanged." },
+    { role: "user", content: `Instrument: ${instrument}\n\nCurrent Price: ${aiMeta?.currentPrice}\nProvided Zone: ${JSON.stringify(aiMeta?.zone)}\n\nCard:\n${text}\n\nFix only the LIMIT side.` },
+  ];
+  return callOpenAI(model, messages);
+}
+
+// NEW: Keep 'Breakout + Retest' (no rename). If proof missing → add Proof Checklist and convert to Pending with explicit trigger sequence.
+async function enforceBreakoutProofChecklist(model: string, instrument: string, text: string) {
+  const sys = [
+    "If the plan claims **Breakout + Retest** but lacks explicit proof, DO NOT rename it to Pullback.",
+    "Instead, keep the setup label as 'Breakout + Retest' and ADD a **Proof Checklist** with:",
+    "- Required body close beyond the key level with explicit timeframe (e.g., 1H close).",
+    "- Retest hold confirmation (e.g., 15m close or wick rejection at the reclaimed level/zone).",
+    "- Optional SFP reclaim if applicable.",
+    "- Invalidation line (precise level/condition that kills the idea).",
+    "If Entry was Market but proof is not yet confirmed, CONVERT to Pending and specify an exact trigger sequence:",
+    "close beyond → retest hold → enter at X (state whether Limit at reclaimed level/zone or Stop above/below).",
+    "Preserve all other sections (Quick Plan, Management, Full Breakdown, Candidate Scores, Final Table, ai_meta).",
+  ].join("\n");
+  const usr = `Instrument: ${instrument}\n\n${text}\n\nMake only the Proof Checklist + Pending conversion edits as required above.`;
+  return callOpenAI(model, [{ role: "system", content: sys }, { role: "user", content: usr }]);
+}
+
+// If Market entry without proof → rewrite to Pending but KEEP 'Breakout + Retest' wording and include explicit trigger sequence.
+async function rewriteAsPendingBreakout(model: string, instrument: string, text: string) {
+  const sys = [
+    "Rewrite the trade card to EntryType: Pending **while keeping the setup name 'Breakout + Retest'**.",
+    "Provide a clear LIMIT or STOP entry with exact trigger sequence: close beyond → retest hold → enter at X.",
+    "Do not delete or rename sections. Keep tournament/X-ray content.",
+  ].join("\n");
+  const usr = `Instrument: ${instrument}\n\n${text}\n\nConvert to Pending with exact trigger sequence and keep 'Breakout + Retest' as the setup.`;
+  return callOpenAI(model, [{ role: "system", content: sys }, { role: "user", content: usr }]);
 }
 
 // ---------- live price ----------
@@ -803,6 +919,26 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
   return null;
 }
 
+// ---------- server-provenance footer (human-readable, non-model) ----------
+function buildServerProvenanceFooter(args: {
+  headlines_provider: string | null;
+  calendar_status: "api" | "image-ocr" | "unavailable";
+  calendar_provider: string | null;
+  csm_time: string | null;
+  extras?: Record<string, any>;
+}) {
+  const lines = [
+    "\n---",
+    "Data Provenance (server — authoritative):",
+    `• Headlines: ${args.headlines_provider || "unknown"}`,
+    `• Calendar: ${args.calendar_status}${args.calendar_provider ? ` (${args.calendar_provider})` : ""}`,
+    `• Sentiment CSM timestamp: ${args.csm_time || "n/a"}`,
+    args.extras ? `• Meta: ${JSON.stringify(args.extras)}` : undefined,
+    "---\n",
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+
 // ---------- handler ----------
 export default async function handler(req: NextApiRequest, res: NextApiResponse<Ok | Err>) {
   try {
@@ -819,14 +955,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const cacheKey = String(req.query.cache || "").trim();
       const c = getCache(cacheKey);
       if (!c) return res.status(400).json({ ok: false, reason: "Expand failed: cache expired or not found." });
-      if (!c.sentimentText) return res.status(503).json({ ok: false, reason: "Missing sentiment snapshot for expand." });
 
       const dateStr = new Date().toISOString().slice(0, 10);
+
+      // Calendar advisory still uses API, but provenance will reflect what Stage-1 had
       const calAdv = await fetchCalendarForAdvisory(req, c.instrument);
 
       const provHint = {
         headlines_present: !!c.headlinesText,
-        calendar_status: c.calendar ? "image" : "api", // expand is only possible after stage-1 which had advisory; treat as available if advisory worked
+        calendar_status: c.calendar ? "image-ocr" : "api",
       };
 
       const messages = messagesFull({
@@ -838,13 +975,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText, evidence: calAdv.evidence || [] },
         provenance: provHint,
       });
+
       let text = await callOpenAI(modelExpand, messages);
 
       // Append server provenance footer (truth)
       const footer = buildServerProvenanceFooter({
         headlines_provider: "expand-uses-stage1",
-        calendar_status: c.calendar ? "image" : "api",
-        calendar_provider: c.calendar ? "image" : calAdv?.provider || null,
+        calendar_status: c.calendar ? "image-ocr" : "api",
+        calendar_provider: c.calendar ? "image-ocr" : calAdv?.provider || null,
         csm_time: null,
         extras: { vp_version: VP_VERSION, model: modelExpand, mode: "expand" },
       });
@@ -927,14 +1065,44 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
     const hBias = computeHeadlinesBias(headlineItems);
 
-    // ----- Calendar -----
-    let calendarText: string | null = null;
-    let calendarStatus: "image" | "api" | "unavailable" = "unavailable";
+    // ----- Calendar (OCR-first) -----
+    let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
     let calendarProvider: string | null = null;
+    let calendarText: string | null = null;
+    let calendarEvidence: string[] = [];
+    let warningMinutes: number | null = null;
+    let biasNote: string | null = null;
 
-    const calAdv = await fetchCalendarForAdvisory(req, instrument);
-    if (calUrl) { calendarStatus = "image"; calendarProvider = "image"; calendarText = calAdv.text; }
-    else { calendarText = calAdv.text; calendarStatus = calAdv.status; calendarProvider = calAdv.provider; }
+    if (calUrl) {
+      const ocr = await ocrCalendarFromImage(MODEL, calUrl).catch(() => null);
+      if (ocr && Array.isArray(ocr.items)) {
+        calendarStatus = "image-ocr";
+        calendarProvider = "image-ocr";
+        const analyzed = analyzeCalendarOCR(ocr, instrument);
+        calendarText = analyzed.biasLine;
+        calendarEvidence = analyzed.evidenceLines;
+        warningMinutes = analyzed.warningMinutes;
+        biasNote = analyzed.biasNote;
+      } else {
+        // fallback to API only if OCR failed
+        const calAdv = await fetchCalendarForAdvisory(req, instrument);
+        calendarStatus = calAdv.status;
+        calendarProvider = calAdv.provider;
+        calendarText = calAdv.text;
+        calendarEvidence = calAdv.evidence || [];
+        warningMinutes = calAdv.warningMinutes;
+        biasNote = calAdv.biasNote;
+      }
+    } else {
+      // No image provided → API
+      const calAdv = await fetchCalendarForAdvisory(req, instrument);
+      calendarStatus = calAdv.status;
+      calendarProvider = calAdv.provider;
+      calendarText = calAdv.text;
+      calendarEvidence = calAdv.evidence || [];
+      warningMinutes = calAdv.warningMinutes;
+      biasNote = calAdv.biasNote;
+    }
 
     // ----- Sentiment -----
     let csm: CsmSnapshot;
@@ -952,7 +1120,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     const provForModel = {
       headlines_present: !!headlinesText,
-      calendar_status: calendarStatus, // "api" | "image" | "unavailable"
+      calendar_status: calendarStatus, // "image-ocr" | "api" | "unavailable"
     };
 
     if (mode === "fast") {
@@ -962,7 +1130,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         calendarText: (!calUrl && calendarText) ? calendarText : undefined,
         headlinesText: headlinesText || undefined,
         sentimentText: sentimentText,
-        calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText, evidence: calAdv.evidence || [] },
+        calendarAdvisory: { warningMinutes, biasNote, advisoryText: biasNote || null, evidence: calendarEvidence || [] },
         provenance: provForModel,
       });
       if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
@@ -970,21 +1138,29 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       aiMeta = extractAiMeta(text) || {};
       if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
 
-      // Enforcement passes
-      if (aiMeta && needsPendingLimit(aiMeta)) { text = await rewriteAsPending(MODEL, instrument, text); aiMeta = extractAiMeta(text) || aiMeta; }
-      {
-        const bp = aiMeta?.breakoutProof || {};
-        const hasProof = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
-        if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
-          text = await normalizeBreakoutLabel(MODEL, text);
+      // Enforcement passes — Breakout proof
+      const isBreakout = String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout");
+      const bp = aiMeta?.breakoutProof || {};
+      const hasProof = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
+
+      if (isBreakout && !hasProof) {
+        // ensure there's a Proof Checklist and convert Market→Pending with explicit sequence
+        text = await enforceBreakoutProofChecklist(MODEL, instrument, text);
+        aiMeta = extractAiMeta(text) || aiMeta;
+        if (String(aiMeta?.entryType || "").toLowerCase() === "market") {
+          text = await rewriteAsPendingBreakout(MODEL, instrument, text);
           aiMeta = extractAiMeta(text) || aiMeta;
         }
       }
+
+      // Validate order relative to price if we have LIMIT
       if (aiMeta) {
         if (livePrice && aiMeta.currentPrice !== livePrice) aiMeta.currentPrice = livePrice;
         const bad = invalidOrderRelativeToPrice(aiMeta);
         if (bad) { text = await fixOrderVsPrice(MODEL, instrument, text, aiMeta); aiMeta = extractAiMeta(text) || aiMeta; }
       }
+
+      // Must include Option 2
       text = await enforceOption2(MODEL, instrument, text);
       aiMeta = extractAiMeta(text) || aiMeta;
 
@@ -1011,7 +1187,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
             headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
             headlines_instrument: instrument,
             headlines_provider: headlinesProvider || "unknown",
-            calendar_used: calendarStatus === "api" || calendarStatus === "image",
+            calendar_used: calendarStatus === "api" || calendarStatus === "image-ocr",
             calendar_status: calendarStatus,
             calendar_provider: calendarProvider,
             csm_used: true,
@@ -1020,9 +1196,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
             cot_report_date: null as string | null,
             cot_error: cotCue ? null : "no cot cues",
             cot_method: cotCue ? "headline_fallback" : null,
-            calendar_warning_minutes: calAdv.warningMinutes ?? null,
-            calendar_bias_note: calAdv.biasNote || null,
-            calendar_evidence: calAdv.evidence || [],
+            calendar_warning_minutes: warningMinutes ?? null,
+            calendar_bias_note: biasNote || null,
+            calendar_evidence: calendarEvidence || [],
             headlines_bias_label: hBias.label,
             headlines_bias_score: hBias.avg,
             cot_bias_summary: cotCue ? cotCue.summary : null,
@@ -1032,37 +1208,48 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       });
     }
 
-    // FULL
+    // ---------- FULL ----------
     const messages = messagesFull({
       instrument, dateStr, m15, h1, h4,
       calendarDataUrl: calUrl || undefined,
       calendarText: (!calUrl && calendarText) ? calendarText : undefined,
       headlinesText: headlinesText || undefined,
       sentimentText,
-      calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText, evidence: calAdv.evidence || [] },
+      calendarAdvisory: { warningMinutes, biasNote, advisoryText: biasNote || null, evidence: calendarEvidence || [] },
       provenance: provForModel,
     });
     if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
-    text = await callOpenAI(MODEL, messages);
-    aiMeta = extractAiMeta(text) || {};
+
+    let textFull = await callOpenAI(MODEL, messages);
+    aiMeta = extractAiMeta(textFull) || {};
     if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
 
-    if (aiMeta && needsPendingLimit(aiMeta)) { text = await rewriteAsPending(MODEL, instrument, text); aiMeta = extractAiMeta(text) || aiMeta; }
+    // Breakout proof enforcement
     {
+      const isBreakout = String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout");
       const bp = aiMeta?.breakoutProof || {};
       const hasProof = !!(bp?.bodyCloseBeyond === true && (bp?.retestHolds === true || bp?.sfpReclaim === true));
-      if (String(aiMeta?.selectedStrategy || "").toLowerCase().includes("breakout") && !hasProof) {
-        text = await normalizeBreakoutLabel(MODEL, text);
-        aiMeta = extractAiMeta(text) || aiMeta;
+
+      if (isBreakout && !hasProof) {
+        textFull = await enforceBreakoutProofChecklist(MODEL, instrument, textFull);
+        aiMeta = extractAiMeta(textFull) || aiMeta;
+        if (String(aiMeta?.entryType || "").toLowerCase() === "market") {
+          textFull = await rewriteAsPendingBreakout(MODEL, instrument, textFull);
+          aiMeta = extractAiMeta(textFull) || aiMeta;
+        }
       }
     }
+
+    // Fix order vs price if needed
     if (aiMeta) {
       if (livePrice && aiMeta.currentPrice !== livePrice) aiMeta.currentPrice = livePrice;
       const bad = invalidOrderRelativeToPrice(aiMeta);
-      if (bad) { text = await fixOrderVsPrice(MODEL, instrument, text, aiMeta); aiMeta = extractAiMeta(text) || aiMeta; }
+      if (bad) { textFull = await fixOrderVsPrice(MODEL, instrument, textFull, aiMeta); aiMeta = extractAiMeta(textFull) || aiMeta; }
     }
-    text = await enforceOption2(MODEL, instrument, text);
-    aiMeta = extractAiMeta(text) || aiMeta;
+
+    // Ensure Option 2 exists
+    textFull = await enforceOption2(MODEL, instrument, textFull);
+    aiMeta = extractAiMeta(textFull) || aiMeta;
 
     // Append server provenance footer (truth)
     const footer = buildServerProvenanceFooter({
@@ -1072,19 +1259,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       csm_time: csm.tsISO,
       extras: { vp_version: VP_VERSION, model: MODEL, mode },
     });
-    text = `${text}\n${footer}`;
+    textFull = `${textFull}\n${footer}`;
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
       ok: true,
-      text,
+      text: textFull,
       meta: {
         instrument, mode, vp_version: VP_VERSION, model: MODEL,
         sources: {
           headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
           headlines_instrument: instrument,
           headlines_provider: headlinesProvider || "unknown",
-          calendar_used: calendarStatus === "api" || calendarStatus === "image",
+          calendar_used: calendarStatus === "api" || calendarStatus === "image-ocr",
           calendar_status: calendarStatus,
           calendar_provider: calendarProvider,
           csm_used: true,
@@ -1093,9 +1280,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           cot_report_date: null as string | null,
           cot_error: cotCue ? null : "no cot cues",
           cot_method: cotCue ? "headline_fallback" : null,
-          calendar_warning_minutes: calAdv.warningMinutes ?? null,
-          calendar_bias_note: calAdv.biasNote || null,
-          calendar_evidence: calAdv.evidence || [],
+          calendar_warning_minutes: warningMinutes ?? null,
+          calendar_bias_note: biasNote || null,
+          calendar_evidence: calendarEvidence || [],
           headlines_bias_label: hBias.label,
           headlines_bias_score: hBias.avg,
           cot_bias_summary: cotCue ? cotCue.summary : null,
@@ -1106,24 +1293,4 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
   } catch (err: any) {
     return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
   }
-}
-
-// ---------- server-provenance footer (human-readable, non-model) ----------
-function buildServerProvenanceFooter(args: {
-  headlines_provider: string | null;
-  calendar_status: "api" | "image" | "unavailable";
-  calendar_provider: string | null;
-  csm_time: string | null;
-  extras?: Record<string, any>;
-}) {
-  const lines = [
-    "\n---",
-    "Data Provenance (server — authoritative):",
-    `• Headlines: ${args.headlines_provider || "unknown"}`,
-    `• Calendar: ${args.calendar_status}${args.calendar_provider ? ` (${args.calendar_provider})` : ""}`,
-    `• Sentiment CSM timestamp: ${args.csm_time || "n/a"}`,
-    args.extras ? `• Meta: ${JSON.stringify(args.extras)}` : undefined,
-    "---\n",
-  ].filter(Boolean);
-  return lines.join("\n");
 }
