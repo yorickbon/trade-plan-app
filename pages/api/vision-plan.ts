@@ -414,7 +414,7 @@ function sentimentSummary(
   const hBiasLine = headlineBias.label === "unavailable"
     ? "Headlines bias (48h): unavailable"
     : `Headlines bias (48h): ${headlineBias.label}${headlineBias.avg != null ? ` (${headlineBias.avg.toFixed(2)})` : ""}`;
-  const cotLine = cotCue ? `COT: ${cotCue.summary}` : "COT: no cues from headlines.";
+  const cotLine = cotCue ? `COT: ${cotCue.summary}` : "COT news not found.";
   const prov = {
     csm_used: true, csm_time: csm.tsISO,
     cot_used: !!cotCue, cot_report_date: null as string | null, cot_error: cotCue ? null : "no cot cues", cot_method: cotCue ? cotCue.method : null,
@@ -831,7 +831,6 @@ function messagesFastStage1(args: {
 
   return [{ role: "system", content: system }, { role: "user", content: parts }];
 }
-
 // ---------- Enforcement helpers (Option 2 / Option 1 / Quick Plan) ----------
 function hasCompliantOption2(text: string): boolean {
   const re = /Option\s*2/i; if (!re.test(text || "")) return false;
@@ -960,6 +959,7 @@ function buildServerProvenanceFooter(args: {
   ].filter(Boolean);
   return lines.join("\n");
 }
+
 // ---------- Handler ----------
 export default async function handler(req: NextApiRequest, res: NextApiResponse<Ok | Err>) {
   try {
@@ -1080,7 +1080,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
     const hBias = computeHeadlinesBias(headlineItems);
 
-    // Calendar (OCR-first, no guessing)
+    // Calendar (OCR-first)
     let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
     let calendarProvider: string | null = null;
     let calendarText: string | null = null;
@@ -1099,9 +1099,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         warningMinutes = analyzed.warningMinutes;
         biasNote = analyzed.biasNote;
       } else {
-        // OCR present but unreadable → fall back to API for text, but keep provenance of image-ocr in sources when an image was provided
         const calAdv = await fetchCalendarForAdvisory(req, instrument);
-        calendarStatus = calAdv.status; // "api" or "unavailable"
+        calendarStatus = calAdv.status;
         calendarProvider = calAdv.provider;
         calendarText = calAdv.text;
         calendarEvidence = calAdv.evidence || [];
@@ -1160,10 +1159,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         }
       }
 
-      // order sanity vs price
+      // order sanity vs price (if a later pass adjusts text we’ll re-extract)
       {
         const bad = invalidOrderRelativeToPrice(aiMeta);
         if (bad) {
+          // do minimal correction by ensuring primary/alt blocks exist, then Option2 enforcement (zones often included)
           text = await enforceOption1(MODEL, instrument, text);
           text = await enforceOption2(MODEL, instrument, text);
           aiMeta = extractAiMeta(text) || aiMeta;
