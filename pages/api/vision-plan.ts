@@ -17,7 +17,7 @@ export const config = { api: { bodyParser: false, sizeLimit: "25mb" } };
 type Ok = { ok: true; text: string; meta?: any };
 type Err = { ok: false; reason: string };
 
-const VP_VERSION = "2025-09-08-noguess-v6";
+const VP_VERSION = "2025-09-08-noguess-v7";
 
 // ---------- OpenAI / Model pick ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
@@ -156,7 +156,7 @@ async function downloadAndProcess(url: string): Promise<string | null> {
   const r = await fetchWithTimeout(url, 8000);
   if (!r || !r.ok) return null;
   const ct = String(r.headers.get("content-type") || "").toLowerCase();
-  const mime = ct.split(";")[0].trim();
+  const mime = ct.split(";)[0].trim();
   const ab = await r.arrayBuffer();
   const raw = Buffer.from(ab);
   if (raw.byteLength > IMG_MAX_BYTES) return null;
@@ -453,6 +453,95 @@ function evidenceLine(it: any, cur: string): string | null {
   }
   const comps = comp.join(" and ");
   return `${cur} — ${it.title}: actual ${a}${f!=null||p!=null ? ` ${comps}` : ""} → ${verdict} ${cur}`;
+}
+
+// calendar helpers restored (used by expand path & API fallback)
+function calendarShortText(resp: any, pair: string): string | null {
+  if (!resp?.ok) return null;
+  const instrBias = resp?.bias?.instrument;
+  const parts: string[] = [];
+  if (instrBias && instrBias.pair === pair) { parts.push(`Instrument bias: ${instrBias.label} (${instrBias.score})`); }
+  const per = resp?.bias?.perCurrency || {};
+  const base = pair.slice(0,3), quote = pair.slice(3);
+  const b = per[base]?.label ? `${base}:${per[base].label}` : null;
+  const q = per[quote]?.label ? `${quote}:${per[quote].label}` : null;
+  if (b || q) parts.push(`Per-currency: ${[b,q].filter(Boolean).join(" / ")}`);
+  if (!parts.length) parts.push("No strong calendar bias.");
+  return `Calendar bias for ${pair}: ${parts.join("; ")}`;
+}
+function nearestHighImpactWithin(resp: any, minutes: number): number | null {
+  if (!resp?.ok || !Array.isArray(resp?.items)) return null;
+  const nowMs = Date.now(); let best: number | null = null;
+  for (const it of resp.items) {
+    if (String(it?.impact || "") !== "High") continue;
+    const t = new Date(it.time).getTime();
+    if (t >= nowMs) {
+      const mins = Math.floor((t - nowMs) / 60000);
+      if (mins <= minutes) { best = best == null ? mins : Math.min(best, mins); }
+    }
+  }
+  return best;
+}
+function postResultBiasNote(resp: any, pair: string): string | null {
+  if (!resp?.ok) return null;
+  const base = pair.slice(0,3), quote = pair.slice(3);
+  const per = resp?.bias?.perCurrency || {};
+  const b = per[base]?.label || "neutral";
+  const q = per[quote]?.label || "neutral";
+  const instr = resp?.bias?.instrument?.label || null;
+  const scores = resp?.bias?.instrument ? `(score ${resp.bias.instrument.score})` : "";
+  const line = `Per-currency: ${base} ${b} vs ${quote} ${q}${instr ? `; Instrument bias: ${instr} ${scores}` : ""}`;
+  return line;
+}
+async function fetchCalendarRaw(req: NextApiRequest, instrument: string): Promise<any | null> {
+  try {
+    const base = originFromReq(req);
+    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=120&_t=${Date.now()}`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(5000) });
+    const j: any = await r.json().catch(() => ({}));
+    return j?.ok ? j : null;
+  } catch { return null; }
+}
+function buildCalendarEvidence(resp: any, pair: string): string[] {
+  if (!resp?.ok || !Array.isArray(resp?.items)) return [];
+  const base = pair.slice(0,3), quote = pair.slice(3);
+  const nowMs = Date.now(), lo = nowMs - 72*3600*1000;
+  const done = resp.items.filter((it: any) => {
+    const t = new Date(it.time).getTime();
+    return t <= nowMs && t >= lo && (it.actual != null || it.forecast != null || it.previous != null) && (it.currency === base || it.currency === quote);
+  }).slice(0, 12);
+  const lines: string[] = [];
+  for (const it of done) {
+    const line = evidenceLine(it, it.currency || ""); if (line) lines.push(line);
+  }
+  return lines;
+}
+async function fetchCalendarForAdvisory(req: NextApiRequest, instrument: string): Promise<{
+  text: string | null, status: "api" | "unavailable", provider: string | null,
+  warningMinutes: number | null, advisoryText: string | null, biasNote: string | null,
+  raw?: any | null, evidence?: string[] | null
+}> {
+  try {
+    const base = originFromReq(req);
+    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=48&_t=${Date.now()}`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(4000) });
+    const j: any = await r.json().catch(() => ({}));
+    if (j?.ok) {
+      const t = calendarShortText(j, instrument) || `Calendar bias for ${instrument}: (no strong signal)`;
+      const warn = nearestHighImpactWithin(j, 60);
+      const bias = postResultBiasNote(j, instrument);
+      const advisory = [
+        warn != null ? `⚠️ High-impact event in ~${warn} min.` : null,
+        bias ? `Recent result alignment: ${bias}.` : null
+      ].filter(Boolean).join("\n");
+      const rawFull = await fetchCalendarRaw(req, instrument);
+      const evidence = rawFull ? buildCalendarEvidence(rawFull, instrument) : buildCalendarEvidence(j, instrument);
+      return { text: t, status: "api", provider: String(j?.provider || "mixed"), warningMinutes: warn ?? null, advisoryText: advisory || null, biasNote: bias || null, raw: j, evidence };
+    }
+    return { text: "Calendar unavailable.", status: "unavailable", provider: null, warningMinutes: null, advisoryText: null, biasNote: null, raw: null, evidence: [] };
+  } catch {
+    return { text: "Calendar unavailable.", status: "unavailable", provider: null, warningMinutes: null, advisoryText: null, biasNote: null, raw: null, evidence: [] };
+  }
 }
 
 // ---------- OpenAI call ----------
@@ -1025,7 +1114,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const h1 = h1FromFile || h1FromUrl;
     const h4 = h4FromFile || h4FromUrl;
 
-    // NOTE: Calendar is file-only by design (explicit choice to avoid URL failures). If needed, add calendarUrl support later.
+    // NOTE: Calendar is file-only by design. (Avoid URL failures.)
     const calUrl = calFromFile || null;
 
     if (process.env.NODE_ENV !== "production") {
@@ -1133,7 +1222,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         }
       }
 
-      // order sanity vs price
+      // order sanity vs price (and ensure sections)
       {
         const bad = invalidOrderRelativeToPrice(aiMeta);
         if (bad) {
