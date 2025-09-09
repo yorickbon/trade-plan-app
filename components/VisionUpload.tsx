@@ -41,10 +41,11 @@ export default function VisionUpload({
   const [m15Url, setM15Url] = useState("");
   const [h1Url, setH1Url] = useState("");
   const [h4Url, setH4Url] = useState("");
+  const [calendarUrl, setCalendarUrl] = useState(""); // NEW: calendar URL
 
   // Mode & flow
   const [mode, setMode] = useState<"fast" | "full">("fast");
-  const [model, setModel] = useState<"gpt-4o" | "gpt-5">("gpt-4o"); // NEW: runtime model toggle
+  const [model, setModel] = useState<"gpt-4o" | "gpt-5">("gpt-4o"); // runtime model toggle
   const [cacheKey, setCacheKey] = useState<string | null>(null);
   const [stage1Text, setStage1Text] = useState<string>("");
 
@@ -74,6 +75,7 @@ export default function VisionUpload({
     setM15Url("");
     setH1Url("");
     setH4Url("");
+    setCalendarUrl(""); // NEW: clear calendar URL
     setCacheKey(null);
     setStage1Text("");
     setError(null);
@@ -112,7 +114,7 @@ export default function VisionUpload({
       // Prepare form
       const fd = new FormData();
       fd.append("instrument", instrument);
-      fd.append("model", model); // NEW: send model toggle to server
+      fd.append("model", model); // send model toggle to server
       if (mode === "fast") fd.append("mode", "fast");
 
       if (m15) fd.append("m15", m15);
@@ -123,6 +125,7 @@ export default function VisionUpload({
       if (m15Url) fd.append("m15Url", m15Url.trim());
       if (h1Url) fd.append("h1Url", h1Url.trim());
       if (h4Url) fd.append("h4Url", h4Url.trim());
+      if (calendarUrl) fd.append("calendarUrl", calendarUrl.trim()); // NEW: calendar URL field
 
       // Inject headlines the UI would use
       const headlines = await fetchHeadlinesForInstrument(instrument);
@@ -210,7 +213,7 @@ export default function VisionUpload({
           </label>
         </div>
 
-        {/* Model selector (NEW) */}
+        {/* Model selector */}
         <div className="flex items-center gap-3">
           <label className="text-sm font-medium">Model:</label>
           <label className="flex items-center gap-1 text-sm">
@@ -288,8 +291,15 @@ export default function VisionUpload({
         />
       </div>
 
-      {/* Calendar (optional) */}
-      <div>
+      {/* Calendar (optional) — URL + File */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+        <input
+          className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700"
+          placeholder="Calendar image URL (Gyazo/TV) — e.g. https://i.gyazo.com/<id>.png"
+          value={calendarUrl}
+          onChange={(e) => setCalendarUrl(e.target.value)}
+          disabled={busy}
+        />
         <input
           type="file"
           ref={refCal}
@@ -345,7 +355,7 @@ export default function VisionUpload({
       )}
 
       <div className="text-xs opacity-70">
-        Required: 15m + 1h + 4h — either files or TV/Gyazo links. Calendar is optional.
+        Required: 15m + 1h + 4h — either files or TV/Gyazo links. Calendar is optional (URL or file).
       </div>
     </div>
   );
