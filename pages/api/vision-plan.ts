@@ -1,19 +1,14 @@
 /**
- * /pages/api/vision-plan.ts — NO-GUESS GUARANTEE (enhanced + URL calendar + macro-aligned primary)
+ * /pages/api/vision-plan.ts — NO-GUESS GUARANTEE (enhanced)
  *
  * Enhancements:
- * 1) Calendar OCR (image-first) and URL support:
- *    - Accepts a calendar image file (field: "calendar") OR a URL (field: "calendarUrl").
- *    - If URL is an image → OCR (same as file). If URL is HTML (e.g., ForexFactory) → LLM parses rows.
- *    - If OCR/URL parsing runs but yields no usable rows for the instrument OR parsing fails, mark as seen and say:
- *      "Calendar provided, but no relevant info for <INSTRUMENT>." (no "unavailable").
- * 2) Headlines + CSM still used; add composite bias to guide conviction caps via provenance_hint.
+ * 1) Calendar OCR (image-first, robust parsing for %, K/M/B, evidence/bias/warning + provenance "image-ocr").
+ *    If OCR runs but yields no usable rows for the instrument, mark as seen and say:
+ *    "Calendar provided, but no relevant info for <INSTRUMENT>."
+ * 2) Headlines + CSM still used; add lightweight composite bias to guide conviction caps via provenance_hint.
  * 3) Breakout + Retest proof handling (no auto-rename; add Proof Checklist; Market→Pending with trigger sequence).
  * 4) Trade-card guidance: allow entry zones OR single price; require explanation; keep section order: Quick Plan → Option 1 → Option 2.
- * 5) Macro-aligned Primary enforcer (tiny post-gen step):
- *    - If composite direction conflicts with Primary, ensure a macro-aligned setup exists; swap to make it Primary unless
- *      the current Primary is clearly superior. If keeping mismatch Primary, force conviction cap ≤25% (≤20% if event ≤60m),
- *      require Pending unless breakout proof confirmed, and add a one-line justification.
+ * 5) (This revision) Add calendarUrl support (direct image links like i.gyazo.com/…png) and fix TS narrowing error on calendar_used.
  */
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -26,7 +21,7 @@ export const config = { api: { bodyParser: false, sizeLimit: "25mb" } };
 type Ok = { ok: true; text: string; meta?: any };
 type Err = { ok: false; reason: string };
 
-const VP_VERSION = "2025-09-09-noguess-v7";
+const VP_VERSION = "2025-09-08-noguess-v6";
 
 // ---------- OpenAI / Model pick ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
@@ -155,7 +150,7 @@ async function fileToDataUrl(file: any): Promise<string | null> {
   return out;
 }
 
-// ---------- tradingview/gyazo/any link → dataURL or HTML ----------
+// ---------- tradingview/gyazo link → dataURL ----------
 function originFromReq(req: NextApiRequest) {
   const proto = (req.headers["x-forwarded-proto"] as string) || "https";
   const host = (req.headers.host as string) || process.env.VERCEL_URL || "localhost:3000";
@@ -449,7 +444,7 @@ function sentimentSummary(
   return { text: `${ranksLine}\n${hBiasLine}\n${cotLine}`, provenance: prov };
 }
 
-// ---------- Calendar helpers (OCR + URL HTML + API fallback) ----------
+// ---------- Calendar helpers (OCR + API fallback) ----------
 function goodIfHigher(title: string): boolean | null {
   const t = title.toLowerCase();
   if (/(cpi|core cpi|ppi|inflation)/.test(t)) return true;
@@ -480,7 +475,7 @@ function evidenceLine(it: any, cur: string): string | null {
   return `${cur} — ${it.title}: actual ${a}${f!=null||p!=null ? ` ${comps}` : ""} → ${verdict} ${cur}`;
 }
 
-// ---------- OpenAI call (used by prompts & OCR/HTML) ----------
+// ---------- OpenAI call (used by prompts & OCR) ----------
 async function callOpenAI(model: string, messages: any[]) {
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
@@ -525,39 +520,6 @@ async function ocrCalendarFromImage(model: string, calendarDataUrl: string): Pro
     { type: "image_url", image_url: { url: calendarDataUrl } },
   ];
   const msg = [{ role: "system", content: sys }, { role: "user", content: user } ];
-  const text = await callOpenAI(model, msg);
-  const parsed = tryParseJsonBlock(text);
-  if (!parsed || !Array.isArray(parsed?.items)) return null;
-
-  const items: OcrCalendarRow[] = (parsed.items as any[]).map((r) => ({
-    timeISO: r?.timeISO && typeof r.timeISO === "string" ? r.timeISO : null,
-    title: r?.title && typeof r.title === "string" ? r.title : null,
-    currency: r?.currency && typeof r.currency === "string" ? r.currency.toUpperCase().slice(0,3) : null,
-    impact: r?.impact && typeof r.impact === "string" ? (["low","medium","high"].includes(r.impact.toLowerCase()) ? (r.impact[0].toUpperCase()+r.impact.slice(1).toLowerCase()) as any : null) : null,
-    actual: r?.actual ?? null,
-    forecast: r?.forecast ?? null,
-    previous: r?.previous ?? null,
-  }));
-  return { items };
-}
-
-// HTML calendar extractor (e.g., ForexFactory)
-async function parseCalendarFromHtml(model: string, html: string, pageUrl: string): Promise<OcrCalendar | null> {
-  const sys = [
-    "You are extracting ECONOMIC CALENDAR rows from raw HTML. DO NOT GUESS.",
-    "Return STRICT JSON only with shape: { items: [ { timeISO, title, currency, impact, actual, forecast, previous } ] }.",
-    "Rules:",
-    "- timeISO: Convert any visible date/time to ISO8601 (assume page's timezone if obvious, else null).",
-    "- currency: 3-letter code (USD, EUR...).",
-    "- impact: Low | Medium | High, if available; else null.",
-    "- For numbers: parse %, K/M/B; preserve sign; if ambiguous/unreadable → null.",
-    "- Include only real economic events; ignore ads/navigation.",
-  ].join("\n");
-  const user = [
-    { type: "text", text: `Page URL: ${pageUrl}\nExtract as specified. JSON ONLY.` },
-    { type: "text", text: html.slice(0, 60000) }, // cap to avoid huge payloads
-  ];
-  const msg = [{ role: "system", content: sys }, { role: "user", content: user }];
   const text = await callOpenAI(model, msg);
   const parsed = tryParseJsonBlock(text);
   if (!parsed || !Array.isArray(parsed?.items)) return null;
@@ -624,7 +586,7 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
   return { biasLine, biasNote, warningMinutes: warn, evidenceLines: lines };
 }
 
-// Helpers to determine instrument-relevant currencies for OCR/HTML usability checks
+// Helpers to determine instrument-relevant currencies for OCR usability checks
 const CURRENCIES = new Set(G8);
 function relevantCurrenciesFromInstrument(instr: string): string[] {
   const U = (instr || "").toUpperCase();
@@ -707,7 +669,7 @@ async function fetchCalendarForAdvisory(req: NextApiRequest, instrument: string)
 }> {
   try {
     const base = originFromReq(req);
-    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=48&_t=${Date.now()}`;
+    aconst url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=48&_t=${Date.now()}`;
     const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(4000) });
     const j: any = await r.json().catch(() => ({}));
     if (j?.ok) {
@@ -800,9 +762,6 @@ function computeCompositeBias(args: {
     conflict,
     cap
   };
-}
-function compositeDirectionSign(composite: { total: number }): number {
-  return composite.total > 0 ? 1 : composite.total < 0 ? -1 : 0;
 }
 
 // ---------- prompts (NO-GUESS + forced section order) ----------
@@ -1049,41 +1008,11 @@ async function enforceBreakoutProofChecklist(model: string, instrument: string, 
 }
 async function rewriteAsPendingBreakout(model: string, instrument: string, text: string) {
   const sys = [
-    "Rewrite to EntryType: Pending **while keeping the setup name 'Breakout + Retest'**.",
+    "Rewrite to EntryType: Pending **while keeping the setup name 'Breakout + Retest'.**",
     "Provide a clear LIMIT or STOP entry with exact trigger sequence: close beyond → retest hold → enter at X.",
     "Do not delete or rename sections. Keep tournament/X-ray content.",
   ].join("\n");
   const usr = `Instrument: ${instrument}\n\n${text}\n\nConvert to Pending with exact trigger sequence and keep 'Breakout + Retest' as the setup.`;
-  return callOpenAI(model, [{ role: "system", content: sys }, { role: "user", content: usr }]);
-}
-
-// ---------- Macro-aligned Primary enforcer ----------
-async function enforceCompositePrimary(model: string, instrument: string, text: string, composite: any, warningMinutes: number | null) {
-  const sign = compositeDirectionSign(composite); // 1 long, -1 short, 0 neutral
-  if (sign === 0) return text; // neutral → no enforcement
-
-  const sys = [
-    "Enforcement objective: ensure a **macro-aligned primary** when composite bias is clear, without deleting content.",
-    "Definitions:",
-    "- Composite direction: +1 = Long, -1 = Short (provided below).",
-    "Actions:",
-    "1) Ensure a fully detailed setup aligned with the composite direction exists (Direction, Order Type, Trigger, Entry (zone or single), SL, TP1/TP2, Conviction %, 'Why').",
-    "2) If the current Primary direction conflicts with composite and is not **clearly superior** (≥8 pts advantage on the rubric or concrete structural edge), **swap** so the composite-aligned idea is **Option 1 (Primary)**. Keep section order otherwise unchanged.",
-    "3) If you keep a mismatch as Primary anyway: cap Conviction ≤25% (≤20% if high-impact ≤60m), set EntryType: Pending unless breakout proof is confirmed, and add a one-line 'why we are defying macro' justification.",
-    "Constraints: Do NOT remove sections; keep Quick Plan → Option 1 → Option 2 order; keep tables and ai_meta. Edit minimally.",
-  ].join("\n");
-
-  const compDir = sign === 1 ? "Long" : "Short";
-  const usr = [
-    `Instrument: ${instrument}`,
-    `Composite: ${JSON.stringify(composite)}`,
-    `Composite direction to align with: ${compDir}`,
-    warningMinutes != null ? `High-impact event within ~${warningMinutes} min → if mismatch kept, cap at 20–25%.` : "",
-    "",
-    "Current plan text follows. Apply minimal edits per the enforcement objective:",
-    text,
-  ].join("\n");
-
   return callOpenAI(model, [{ role: "system", content: sys }, { role: "user", content: usr }]);
 }
 
@@ -1228,26 +1157,31 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const m15Url = String(pickFirst(fields.m15Url) || "").trim();
     const h1Url = String(pickFirst(fields.h1Url) || "").trim();
     const h4Url = String(pickFirst(fields.h4Url) || "").trim();
-
-    const calendarUrlField = String(pickFirst(fields.calendarUrl) || "").trim();
+    const calendarUrlField = String(pickFirst(fields.calendarUrl) || "").trim(); // NEW
 
     // build images
     const tImg = now();
-    const [m15FromFile, h1FromFile, h4FromFile, calFromFileDataUrl] = await Promise.all([
+    const [m15FromFile, h1FromFile, h4FromFile, calFromFile] = await Promise.all([
       fileToDataUrl(m15f), fileToDataUrl(h1f), fileToDataUrl(h4f),
       calF ? fileToDataUrl(calF) : Promise.resolve(null),
     ]);
-    const [m15FromUrl, h1FromUrl, h4FromUrl] = await Promise.all([
+    const [m15FromUrl, h1FromUrl, h4FromUrl, calFromUrl] = await Promise.all([
       m15FromFile ? Promise.resolve(null) : linkToDataUrl(m15Url),
       h1FromFile ? Promise.resolve(null) : linkToDataUrl(h1Url),
       h4FromFile ? Promise.resolve(null) : linkToDataUrl(h4Url),
+      calFromFile ? Promise.resolve(null) : linkToDataUrl(calendarUrlField),
     ]);
+
     const m15 = m15FromFile || m15FromUrl;
     const h1 = h1FromFile || h1FromUrl;
     const h4 = h4FromFile || h4FromUrl;
+    const calUrlOrig = calFromFile || calFromUrl || null; // NEW
+
+    // calendar image for prompt can be overridden later
+    let calDataUrlForPrompt: string | null = calUrlOrig;
 
     if (process.env.NODE_ENV !== "production") {
-      console.log(`[vision-plan] images ready ${dt(tImg)} (m15=${dataUrlSizeBytes(m15)}B, h1=${dataUrlSizeBytes(h1)}B, h4=${dataUrlSizeBytes(h4)}B, calFile=${dataUrlSizeBytes(calFromFileDataUrl)}B)`);
+      console.log(`[vision-plan] images ready ${dt(tImg)} (m15=${dataUrlSizeBytes(m15)}B, h1=${dataUrlSizeBytes(h1)}B, h4=${dataUrlSizeBytes(h4)}B, cal=${dataUrlSizeBytes(calUrlOrig)}B)`);
     }
     if (!m15 || !h1 || !h4) {
       return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either as files or valid TradingView/Gyazo direct image links." });
@@ -1276,7 +1210,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
     const hBias = computeHeadlinesBias(headlineItems);
 
-    // Calendar (OCR-first, URL support, no guessing)
+    // Calendar (OCR-first, no guessing)
     let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
     let calendarProvider: string | null = null;
     let calendarText: string | null = null;
@@ -1285,11 +1219,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let biasNote: string | null = null;
     let advisoryText: string | null = null;
 
-    // This is what we pass to the model as an image (only if usable OCR rows exist)
-    let calDataUrlForPrompt: string | null = calFromFileDataUrl || null;
-
-    // Helper: handle OCR result (image)
-    const handleOcrResult = (ocr: OcrCalendar | null) => {
+    if (calUrlOrig) {
+      const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch(() => null);
       if (ocr && Array.isArray(ocr.items)) {
         const relCurs = new Set(relevantCurrenciesFromInstrument(instrument));
         const usableForInstr = (ocr.items || []).some(r => relCurs.has(String(r?.currency || "")) && hasUsableFields(r));
@@ -1303,7 +1234,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           calendarEvidence = analyzed.evidenceLines;
           warningMinutes = analyzed.warningMinutes;
           biasNote = analyzed.biasNote;
-          // keep image in prompt
+          // keep the image in prompt
+          calDataUrlForPrompt = calUrlOrig;
         } else {
           // OCR ran but yielded no usable rows for the instrument → mark as seen and provide explicit text
           calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
@@ -1315,92 +1247,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           calDataUrlForPrompt = null;
         }
       } else {
-        // OCR parse failed entirely → treat as seen-but-unreadable (no "unavailable")
-        calendarStatus = "image-ocr";
-        calendarProvider = "image-ocr";
-        calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
-        calendarEvidence = [];
-        warningMinutes = null;
-        biasNote = null;
-        advisoryText = null;
+        // OCR failed → fall back to API advisory
+        const calAdv = await fetchCalendarForAdvisory(req, instrument);
+        calendarStatus = calAdv.status;
+        calendarProvider = calAdv.provider;
+        calendarText = calAdv.text;
+        advisoryText = calAdv.advisoryText || null;
+        calendarEvidence = calAdv.evidence || [];
+        warningMinutes = calAdv.warningMinutes;
+        biasNote = calAdv.biasNote;
+        // no image in prompt for API text
         calDataUrlForPrompt = null;
       }
-    };
-
-    // Helper: handle HTML parsed calendar (URL)
-    const handleHtmlCalendar = (ocrLike: OcrCalendar | null) => {
-      calendarStatus = "api";
-      calendarProvider = "url-html";
-      if (ocrLike && Array.isArray(ocrLike.items)) {
-        const relCurs = new Set(relevantCurrenciesFromInstrument(instrument));
-        const usableForInstr = (ocrLike.items || []).some(r => relCurs.has(String(r?.currency || "")) && hasUsableFields(r));
-        const analyzed = analyzeCalendarOCR(ocrLike, instrument);
-        if (usableForInstr && (analyzed.evidenceLines.length > 0 || analyzed.biasLine)) {
-          calendarText = analyzed.biasLine;
-          calendarEvidence = analyzed.evidenceLines;
-          warningMinutes = analyzed.warningMinutes;
-          biasNote = analyzed.biasNote;
-        } else {
-          calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
-          calendarEvidence = [];
-          warningMinutes = null;
-          biasNote = null;
-        }
-      } else {
-        calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
-        calendarEvidence = [];
-        warningMinutes = null;
-        biasNote = null;
-      }
-      // never attach an image for HTML path
-      calDataUrlForPrompt = null;
-    };
-
-    // Priority: file image > calendarUrl image > calendarUrl HTML > API advisory
-    if (calFromFileDataUrl) {
-      const ocr = await ocrCalendarFromImage(MODEL, calFromFileDataUrl).catch(() => null);
-      handleOcrResult(ocr);
-    } else if (calendarUrlField) {
-      try {
-        if (looksLikeImageUrl(calendarUrlField)) {
-          const dataUrl = await linkToDataUrl(calendarUrlField);
-          if (dataUrl) {
-            calDataUrlForPrompt = dataUrl;
-            const ocr = await ocrCalendarFromImage(MODEL, dataUrl).catch(() => null);
-            handleOcrResult(ocr);
-          } else {
-            // Image fetch failed → treat as seen but unreadable
-            handleOcrResult(null);
-          }
-        } else {
-          // HTML page (e.g., ForexFactory)
-          const r = await fetchWithTimeout(calendarUrlField, 10000).catch(() => null as any);
-          if (r && r.ok) {
-            const ct = String(r.headers.get("content-type") || "").toLowerCase();
-            if (ct.startsWith("image/")) {
-              const dataUrl = await downloadAndProcess(calendarUrlField);
-              if (dataUrl) {
-                calDataUrlForPrompt = dataUrl;
-                const ocr = await ocrCalendarFromImage(MODEL, dataUrl).catch(() => null);
-                handleOcrResult(ocr);
-              } else {
-                handleOcrResult(null);
-              }
-            } else {
-              const html = await r.text();
-              const parsed = await parseCalendarFromHtml(MODEL, html, calendarUrlField).catch(() => null);
-              handleHtmlCalendar(parsed);
-            }
-          } else {
-            // URL fetch failed → seen but no relevant info
-            handleHtmlCalendar(null);
-          }
-        }
-      } catch {
-        handleHtmlCalendar(null);
-      }
     } else {
-      // No file or URL → fall back to server advisory (may be unavailable)
       const calAdv = await fetchCalendarForAdvisory(req, instrument);
       calendarStatus = calAdv.status;
       calendarProvider = calAdv.provider;
@@ -1482,15 +1341,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       text = await enforceOption2(MODEL, instrument, text);
       aiMeta = extractAiMeta(text) || aiMeta;
 
-      // Macro-aligned Primary enforcer
-      const dir = String(aiMeta?.direction || "").toLowerCase();
-      const compSign = compositeDirectionSign(composite);
-      const mismatch = compSign !== 0 && ((compSign > 0 && !dir.includes("long")) || (compSign < 0 && !dir.includes("short")));
-      if (mismatch) {
-        text = await enforceCompositePrimary(MODEL, instrument, text, composite, warningMinutes);
-        aiMeta = extractAiMeta(text) || aiMeta;
-      }
-
       const cacheKey = setCache({ instrument, m15, h1, h4, calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
 
       const footer = buildServerProvenanceFooter({
@@ -1512,7 +1362,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
             headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
             headlines_instrument: instrument,
             headlines_provider: headlinesProvider || "unknown",
-            calendar_used: calendarStatus === "api" || calendarStatus === "image-ocr",
+            calendar_used: calendarStatus !== "unavailable", // FIX
             calendar_status: calendarStatus,
             calendar_provider: calendarProvider,
             csm_used: true,
@@ -1571,17 +1421,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     textFull = await enforceOption2(MODEL, instrument, textFull);
     aiMetaFull = extractAiMeta(textFull) || aiMetaFull;
 
-    // Macro-aligned Primary enforcer
-    {
-      const dir = String(aiMetaFull?.direction || "").toLowerCase();
-      const compSign = compositeDirectionSign(composite);
-      const mismatch = compSign !== 0 && ((compSign > 0 && !dir.includes("long")) || (compSign < 0 && !dir.includes("short")));
-      if (mismatch) {
-        textFull = await enforceCompositePrimary(MODEL, instrument, textFull, composite, warningMinutes);
-        aiMetaFull = extractAiMeta(textFull) || aiMetaFull;
-      }
-    }
-
     const footer = buildServerProvenanceFooter({
       headlines_provider: headlinesProvider || "unknown",
       calendar_status: calendarStatus,
@@ -1601,7 +1440,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
           headlines_instrument: instrument,
           headlines_provider: headlinesProvider || "unknown",
-          calendar_used: calendarStatus === "api" || calendarStatus === "image-ocr",
+          calendar_used: calendarStatus !== "unavailable", // FIX
           calendar_status: calendarStatus,
           calendar_provider: calendarProvider,
           csm_used: true,
