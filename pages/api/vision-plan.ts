@@ -669,7 +669,7 @@ async function fetchCalendarForAdvisory(req: NextApiRequest, instrument: string)
 }> {
   try {
     const base = originFromReq(req);
-    aconst url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=48&_t=${Date.now()}`;
+    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=48&_t=${Date.now()}`;
     const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(4000) });
     const j: any = await r.json().catch(() => ({}));
     if (j?.ok) {
@@ -1362,7 +1362,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
             headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
             headlines_instrument: instrument,
             headlines_provider: headlinesProvider || "unknown",
-            calendar_used: calendarStatus !== "unavailable", // FIX
+           calendar_used: calendarStatus !== "unavailable",
             calendar_status: calendarStatus,
             calendar_provider: calendarProvider,
             csm_used: true,
@@ -1440,7 +1440,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
           headlines_instrument: instrument,
           headlines_provider: headlinesProvider || "unknown",
-          calendar_used: calendarStatus !== "unavailable", // FIX
+          calendar_used: calendarStatus !== "unavailable",
           calendar_status: calendarStatus,
           calendar_provider: calendarProvider,
           csm_used: true,
