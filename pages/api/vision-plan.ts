@@ -1,12 +1,10 @@
 /**
- * /pages/api/vision-plan.ts — NO-GUESS GUARANTEE (enhanced, OCR-first + Gyazo + consistency guard)
- *
- * Key points:
- * - Calendar OCR prioritized from a direct image (uploaded or Gyazo direct image URL).
- * - If OCR finds zero usable rows for the instrument → FALL BACK to /api/calendar (no excuses).
- * - Headlines + CSM + Calendar combined into a composite for conviction capping.
- * - Consistency guard fixes contradictions (“contradicting/conflicting”) when signals align.
- * - Strategy tournament handled in prompts; enforced Quick Plan → Option 1 → Option 2 with sanity checks.
+ * /pages/api/vision-plan.ts — OCR-first + Gyazo + consistency guard (clean)
+ * - Calendar OCR prioritized from a direct image (uploaded or Gyazo URL via `calendarUrl`).
+ * - If OCR finds zero usable rows for the instrument: "Calendar provided, but no relevant info for <INSTRUMENT>."
+ * - Headlines + CSM + Calendar combined into a composite used to cap conviction and set Match/Mismatch.
+ * - Consistency guard fixes contradictions (no "contradicting" when signals align).
+ * - Section enforcement: Quick Plan → Option 1 → Option 2 always present.
  */
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -19,7 +17,7 @@ export const config = { api: { bodyParser: false, sizeLimit: "25mb" } };
 type Ok = { ok: true; text: string; meta?: any };
 type Err = { ok: false; reason: string };
 
-const VP_VERSION = "2025-09-09-ocrv7";
+const VP_VERSION = "2025-09-09-ocrv7-fixed";
 
 // ---------- OpenAI / Model pick ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
@@ -64,7 +62,7 @@ function parseNumberLoose(v: any): number | null {
   let s = String(v).trim().toLowerCase();
   if (!s || s === "n/a" || s === "na" || s === "-" || s === "—") return null;
   s = s.replace(/,/g, "").replace(/\s+/g, "");
-  s = s.replace(/\u2212/g, "-");
+  s = s.replace(/\u2212/g, "-"); // Unicode minus
   let mult = 1;
   if (s.endsWith("%")) { s = s.slice(0, -1); }
   if (s.endsWith("k")) { mult = 1_000; s = s.slice(0, -1); }
@@ -216,6 +214,12 @@ type AnyHeadline = {
   sentiment?: { score?: number } | null;
 } & Record<string, any>;
 
+type HeadlineBias = {
+  label: "bullish" | "bearish" | "neutral" | "unavailable";
+  avg: number | null;
+  count: number;
+};
+
 function headlinesToPromptLines(items: AnyHeadline[], limit = 6): string | null {
   const take = (items || []).slice(0, limit);
   if (!take.length) return null;
@@ -224,17 +228,12 @@ function headlinesToPromptLines(items: AnyHeadline[], limit = 6): string | null 
     const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
     const t = String(it?.title || "").slice(0, 200);
     const src = it?.source || "";
-       const when = it?.ago || "";
+    const when = it?.ago || "";
     return `• ${t} — ${src}${when ? `, ${when}` : ""} — ${lab};`;
   });
   return lines.join("\n");
 }
 
-type HeadlineBias = {
-  label: "bullish" | "bearish" | "neutral" | "unavailable";
-  avg: number | null;
-  count: number;
-};
 function computeHeadlinesBias(items: AnyHeadline[]): HeadlineBias {
   if (!Array.isArray(items) || items.length === 0) return { label: "unavailable", avg: null, count: 0 };
   const scores = items.map(h => typeof h?.sentiment?.score === "number" ? Number(h.sentiment!.score) : null).filter(v => Number.isFinite(v)) as number[];
@@ -258,7 +257,7 @@ async function fetchedHeadlinesViaServer(req: NextApiRequest, instrument: string
   }
 }
 
-// ---------- ai_meta helpers ----------
+// ---------- ai_meta + sanity helpers ----------
 function extractAiMeta(text: string) {
   if (!text) return null;
   const fences = [/\nai_meta\s*({[\s\S]*?})\s*\n/i, /\njson\s*({[\s\S]*?})\s*\n/i];
@@ -412,15 +411,10 @@ function detectCotCueFromHeadlines(headlines: AnyHeadline[]): CotCue | null {
   }
   if (!any) return null;
   const parts = Object.entries(net).map(([c, v]) => `${c}:${v > 0 ? "net long" : "net short"}`);
-  return { method: "headline_fallback", reportDate: null, summary: `COT cues (headlines): ${parts.join(", ")}`, net };
+ return { method: "headline_fallback", reportDate: null, summary: `COT cues (headlines): ${parts.join(", ")}`, net };
 }
 
-// ---------- Sentiment snapshot text ----------
-type HeadlineBias = {
-  label: "bullish" | "bearish" | "neutral" | "unavailable";
-  avg: number | null;
-  count: number;
-};
+// ---------- Sentiment snapshot ----------
 function sentimentSummary(
   csm: CsmSnapshot,
   cotCue: CotCue | null,
@@ -479,7 +473,7 @@ function evidenceLine(it: any, cur: string): string | null {
   return `${cur} — ${it.title}: actual ${a}${f!=null||p!=null ? ` ${comps}` : ""} → ${verdict} ${cur}`;
 }
 
-// ---------- OpenAI call (used by prompts & OCR) ----------
+// ---------- OpenAI core ----------
 async function callOpenAI(model: string, messages: any[]) {
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
@@ -501,6 +495,7 @@ function tryParseJsonBlock(s: string): any | null {
   const raw = fence ? fence[1] : s;
   try { return JSON.parse(raw); } catch { return null; }
 }
+
 type OcrCalendarRow = {
   timeISO: string | null;
   title: string | null;
@@ -596,11 +591,11 @@ function relevantCurrenciesFromInstrument(instr: string): string[] {
   const U = (instr || "").toUpperCase();
   const found = [...CURRENCIES].filter(c => U.includes(c));
   if (found.length) return found;
-  // Default relevance for non-FX symbols (indices/commodities) → USD
   if (U.endsWith("USD") || U.startsWith("USD")) return ["USD"];
   return ["USD"];
 }
 function hasUsableFields(r: OcrCalendarRow): boolean {
+  // consider present if actual exists and either forecast or previous exists (string or number)
   return r != null && r.actual != null && (r.forecast != null || r.previous != null);
 }
 
@@ -701,6 +696,13 @@ function splitFXPair(instr: string): { base: string|null; quote: string|null } {
     if (G8.includes(base) && G8.includes(quote)) return { base, quote };
   }
   return { base: null, quote: null };
+}
+function signFromLabel(lbl: string | null | undefined): number {
+  if (!lbl) return 0;
+  const L = lbl.toLowerCase();
+  if (L.includes("bullish")) return 1;
+  if (L.includes("bearish")) return -1;
+  return 0;
 }
 function parseInstrumentBiasFromNote(biasNote: string | null | undefined): number {
   if (!biasNote) return 0;
@@ -941,13 +943,12 @@ function messagesFastStage1(args: {
 
   return [{ role: "system", content: system }, { role: "user", content: parts }];
 }
-
 // ---------- Enforcement helpers ----------
 function hasCompliantOption2(text: string): boolean {
-  const re = /Option\s*2/i; if (!re.test(text || "")) return false;
+  if (!/Option\s*2/i.test(text || "")) return false;
   const block = (text.match(/Option\s*2[\s\S]{0,800}/i)?.[0] || "").toLowerCase();
-  const must = ["direction", "trigger", "entry", "stop", "tp", "conviction"];
-  return must.every(k => block.includes(k));
+  const must = ["direction", "order type", "trigger", "entry", "stop", "tp", "conviction"];
+  return must.every((k) => block.includes(k));
 }
 async function enforceOption2(model: string, instrument: string, text: string) {
   if (hasCompliantOption2(text)) return text;
@@ -984,27 +985,25 @@ function applyConsistencyGuards(text: string, args: {
   calendarSign: number;
 }) {
   let out = text || "";
-  const signs = [args.headlinesSign, args.csmSign, args.calendarSign].filter(s => s !== 0);
-  const hasPos = signs.some(s => s > 0);
-  const hasNeg = signs.some(s => s < 0);
-  const aligned  = signs.length > 0 && ((hasPos && !hasNeg) || (hasNeg && !hasPos));
+  const signs = [args.headlinesSign, args.csmSign, args.calendarSign].filter((s) => s !== 0);
+  const hasPos = signs.some((s) => s > 0);
+  const hasNeg = signs.some((s) => s < 0);
+  const aligned = signs.length > 0 && ((hasPos && !hasNeg) || (hasNeg && !hasPos));
   const mismatch = hasPos && hasNeg;
 
-  // If aligned, scrub misleading words
-  if (aligned) {
-    out = out
-      .replace(/\bcontradict(?:ion|ing|s)?\b/gi, "aligning")
-      .replace(/\bconflict(?:s|ing|ed)?\b/gi, "aligning")
-      .replace(/\bdiverg(?:e|ent|ing|ence)\b/gi, "aligning");
-  }
+  // Fix "contradicting" if aligned
+  if (aligned) out = out.replace(/contradict(?:ion|ing|s)?/gi, "aligning");
 
-  // Normalize the Tech vs Fundy line to Match/Mismatch
+  // Normalize Tech vs Fundy line
   const reTF = /(Tech\s*vs\s*Fundy\s*Alignment:\s*)(Match|Mismatch)/i;
   if (reTF.test(out)) {
     out = out.replace(reTF, (_, p1) => `${p1}${aligned ? "Match" : mismatch ? "Mismatch" : "Match"}`);
   } else {
-    // If missing, inject a normalized line after "Full Breakdown"
-    out = out.replace(/Full Breakdown/i, (m) => `${m}\nTech vs Fundy Alignment: ${aligned ? "Match" : mismatch ? "Mismatch" : "Match"}`);
+    // If missing, append simple note under "Full Breakdown"
+    const anchor = /Full Breakdown/i;
+    if (anchor.test(out)) {
+      out = out.replace(anchor, (m) => `${m}\n(Consistency: ${aligned ? "Match" : mismatch ? "Mismatch" : "Match"})`);
+    }
   }
   return out;
 }
@@ -1085,7 +1084,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const urlMode = String((req.query.mode as string) || "").toLowerCase();
     let mode: "full" | "fast" | "expand" = urlMode === "fast" ? "fast" : urlMode === "expand" ? "expand" : "full";
 
-    // expand (no multipart)
+    // ---------- expand (no multipart) ----------
     if (mode === "expand") {
       const modelExpand = pickModelFromFields(req);
       const cacheKey = String(req.query.cache || "").trim();
@@ -1127,56 +1126,54 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       return res.status(200).json({ ok: true, text, meta: { instrument: c.instrument, cacheKey, model: modelExpand, vp_version: VP_VERSION } });
     }
 
+    // ---------- multipart (stage-1 or full) ----------
     if (!isMultipart(req)) {
       return res.status(400).json({ ok: false, reason: "Use multipart/form-data with files: m15, h1, h4 (PNG/JPG/WEBP) and optional 'calendar'. Or pass m15Url/h1Url/h4Url (TradingView/Gyazo links) and optional 'calendarUrl'. Include 'instrument'." });
     }
 
-    // parse multipart
-    const tParse = now();
+    const tParse = Date.now();
     const { fields, files } = await parseMultipart(req);
-    if (process.env.NODE_ENV !== "production") console.log(`[vision-plan] parsed in ${dt(tParse)}`);
+    if (process.env.NODE_ENV !== "production") console.log(`[vision-plan] parsed in ${Date.now() - tParse}ms`);
 
     const MODEL = pickModelFromFields(req, fields);
     const instrument = String(fields.instrument || fields.code || "EURUSD").toUpperCase().replace(/\s+/g, "");
     const requestedMode = String(fields.mode || "").toLowerCase();
     if (requestedMode === "fast") mode = "fast";
 
-    // files/urls: *** Prefer URL for calendar, then file ***
+    // files
     const m15f = pickFirst(files.m15);
     const h1f = pickFirst(files.h1);
     const h4f = pickFirst(files.h4);
     const calF = pickFirst(files.calendar);
 
+    // urls
     const m15Url = String(pickFirst(fields.m15Url) || "").trim();
     const h1Url = String(pickFirst(fields.h1Url) || "").trim();
     const h4Url = String(pickFirst(fields.h4Url) || "").trim();
-    const calendarUrlField = String(pickFirst(fields.calendarUrl) || "").trim();
+    const calendarUrlField = String(pickFirst(fields.calendarUrl) || "").trim(); // Gyazo calendar URL
 
-    // build images (URL-first for calendar)
-    const tImg = now();
-    const [m15FromFile, h1FromFile, h4FromFile] = await Promise.all([
-      fileToDataUrl(m15f), fileToDataUrl(h1f), fileToDataUrl(h4f)
+    // build images
+    const tImg = Date.now();
+    const [m15FromFile, h1FromFile, h4FromFile, calFromFile] = await Promise.all([
+      fileToDataUrl(m15f), fileToDataUrl(h1f), fileToDataUrl(h4f),
+      calF ? fileToDataUrl(calF) : Promise.resolve(null),
     ]);
-
-    const [m15FromUrl, h1FromUrl, h4FromUrl, calFromUrl, calFromFile] = await Promise.all([
+    const [m15FromUrl, h1FromUrl, h4FromUrl, calFromUrl] = await Promise.all([
       m15FromFile ? Promise.resolve(null) : linkToDataUrl(m15Url),
       h1FromFile ? Promise.resolve(null) : linkToDataUrl(h1Url),
       h4FromFile ? Promise.resolve(null) : linkToDataUrl(h4Url),
-      linkToDataUrl(calendarUrlField || ""),                // try URL FIRST
-      calF ? fileToDataUrl(calF) : Promise.resolve(null),  // then file fallback
+      calFromFile ? Promise.resolve(null) : linkToDataUrl(calendarUrlField),
     ]);
 
     const m15 = m15FromFile || m15FromUrl;
-    const h1  = h1FromFile  || h1FromUrl;
-    const h4  = h4FromFile  || h4FromUrl;
-    // Prefer URL for calendar, then file
-    const calUrlOrig = calFromUrl || calFromFile || null;
+    const h1 = h1FromFile || h1FromUrl;
+    const h4 = h4FromFile || h4FromUrl;
+    const calUrlOrig = calFromFile || calFromUrl || null;
 
-    // calendar image for prompt can be overridden later
     let calDataUrlForPrompt: string | null = calUrlOrig;
 
     if (process.env.NODE_ENV !== "production") {
-      console.log(`[vision-plan] images ready ${dt(tImg)} (m15=${dataUrlSizeBytes(m15)}B, h1=${dataUrlSizeBytes(h1)}B, h4=${dataUrlSizeBytes(h4)}B, cal=${dataUrlSizeBytes(calUrlOrig)}B)`);
+      console.log(`[vision-plan] images ready ${Date.now() - tImg}ms (m15=${dataUrlSizeBytes(m15)}B, h1=${dataUrlSizeBytes(h1)}B, h4=${dataUrlSizeBytes(h4)}B, cal=${dataUrlSizeBytes(calUrlOrig)}B)`);
     }
     if (!m15 || !h1 || !h4) {
       return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either as files or valid TradingView/Gyazo direct image links." });
@@ -1205,7 +1202,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
     const hBias = computeHeadlinesBias(headlineItems);
 
-    // Calendar (OCR-first, with API fallback when OCR useless)
+    // Calendar (OCR-first, fallback to API advisory)
     let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
     let calendarProvider: string | null = null;
     let calendarText: string | null = null;
@@ -1218,7 +1215,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch(() => null);
       if (ocr && Array.isArray(ocr.items)) {
         const relCurs = new Set(relevantCurrenciesFromInstrument(instrument));
-        const usableForInstr = (ocr.items || []).some(r => relCurs.has(String(r?.currency || "")) && hasUsableFields(r));
+        const usableForInstr = (ocr.items || []).some((r) => relCurs.has(String(r?.currency || "")) && hasUsableFields(r));
         calendarStatus = "image-ocr";
         calendarProvider = "image-ocr";
         const analyzed = analyzeCalendarOCR(ocr, instrument);
@@ -1228,21 +1225,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           calendarEvidence = analyzed.evidenceLines;
           warningMinutes = analyzed.warningMinutes;
           biasNote = analyzed.biasNote;
-          calDataUrlForPrompt = calUrlOrig; // keep image for the model
+          calDataUrlForPrompt = calUrlOrig; // keep image in prompt
         } else {
-          // OCR ran but found nothing usable for this instrument → FALL BACK to API
-          const calAdv = await fetchCalendarForAdvisory(req, instrument);
-          calendarStatus   = calAdv.status;
-          calendarProvider = calAdv.provider;
-          calendarText     = calAdv.text || `Calendar: no strong bias for ${instrument}.`;
-          advisoryText     = calAdv.advisoryText || null;
-          calendarEvidence = calAdv.evidence || [];
-          warningMinutes   = calAdv.warningMinutes;
-          biasNote         = calAdv.biasNote;
-          calDataUrlForPrompt = null; // image wasn't helpful for the model
+          calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
+          calendarEvidence = [];
+          warningMinutes = null;
+          biasNote = null;
+          advisoryText = null;
+          calDataUrlForPrompt = null; // image not helpful
         }
       } else {
-        // OCR failed entirely → API fallback
         const calAdv = await fetchCalendarForAdvisory(req, instrument);
         calendarStatus = calAdv.status;
         calendarProvider = calAdv.provider;
@@ -1282,15 +1274,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       warningMinutes
     });
 
-    // ---- stage selection ----
-    let text = ""; let aiMeta: any = null;
-
     const provForModel = {
       headlines_present: !!headlinesText,
       calendar_status: calendarStatus,
       composite
     };
 
+    // ---------- Stage-1 (fast) ----------
     if (mode === "fast") {
       const messages = messagesFastStage1({
         instrument, dateStr, m15, h1, h4,
@@ -1302,21 +1292,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         provenance: provForModel,
       });
       if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
-      text = await callOpenAI(MODEL, messages);
-      aiMeta = extractAiMeta(text) || {};
+
+      let text = await callOpenAI(MODEL, messages);
+      let aiMeta = extractAiMeta(text) || {};
       if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
 
-      // order sanity vs price
-      {
-        const bad = invalidOrderRelativeToPrice(aiMeta);
-        if (bad) {
-          text = await enforceOption1(MODEL, instrument, text);
-          text = await enforceOption2(MODEL, instrument, text);
-          aiMeta = extractAiMeta(text) || aiMeta;
-        }
+      // Sanity vs price
+      const bad = invalidOrderRelativeToPrice(aiMeta);
+      if (bad) {
+        text = await enforceOption1(MODEL, instrument, text);
+        text = await enforceOption2(MODEL, instrument, text);
+        aiMeta = extractAiMeta(text) || aiMeta;
       }
 
-      // Guarantee section presence/order
+      // Guarantee sections
       text = await enforceQuickPlan(MODEL, instrument, text);
       text = await enforceOption1(MODEL, instrument, text);
       text = await enforceOption2(MODEL, instrument, text);
@@ -1362,7 +1351,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       });
     }
 
-    // -------- FULL --------
+    // ---------- FULL ----------
     const messages = messagesFull({
       instrument, dateStr, m15, h1, h4,
       calendarDataUrl: calDataUrlForPrompt || undefined,
@@ -1376,6 +1365,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     let textFull = await callOpenAI(MODEL, messages);
     let aiMetaFull = extractAiMeta(textFull) || {};
+
     if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
     // Enforce sections
