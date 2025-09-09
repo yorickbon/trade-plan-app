@@ -41,11 +41,11 @@ export default function VisionUpload({
   const [m15Url, setM15Url] = useState("");
   const [h1Url, setH1Url] = useState("");
   const [h4Url, setH4Url] = useState("");
-  const [calendarUrl, setCalendarUrl] = useState(""); // NEW: calendar image URL
+  const [calendarUrl, setCalendarUrl] = useState(""); // NEW: calendar Gyazo URL
 
-  // Mode & model
+  // Mode & flow
   const [mode, setMode] = useState<"fast" | "full">("fast");
-  const [model, setModel] = useState<"gpt-4o" | "gpt-5">("gpt-4o");
+  const [model, setModel] = useState<"gpt-4o" | "gpt-5">("gpt-4o"); // runtime model toggle
   const [cacheKey, setCacheKey] = useState<string | null>(null);
   const [stage1Text, setStage1Text] = useState<string>("");
 
@@ -53,7 +53,7 @@ export default function VisionUpload({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Optional: show how many headlines we bundled
+  // Optional: show how many headlines we bundled (for sanity)
   const [bundledHeadlines, setBundledHeadlines] = useState<number>(0);
 
   // Refs to clear inputs
@@ -75,7 +75,7 @@ export default function VisionUpload({
     setM15Url("");
     setH1Url("");
     setH4Url("");
-    setCalendarUrl(""); // NEW
+    setCalendarUrl(""); // clear calendar URL
     setCacheKey(null);
     setStage1Text("");
     setError(null);
@@ -111,13 +111,13 @@ export default function VisionUpload({
       setError(null);
       setBusyState(true);
 
-      // Prepare form data
+      // Prepare form
       const fd = new FormData();
-      fd.append("instrument", instrument.trim());
+      fd.append("instrument", instrument);
       fd.append("model", model);
       if (mode === "fast") fd.append("mode", "fast");
 
-      // Files (optional if URLs provided)
+      // Files
       if (m15) fd.append("m15", m15);
       if (h1) fd.append("h1", h1);
       if (h4) fd.append("h4", h4);
@@ -127,9 +127,9 @@ export default function VisionUpload({
       if (m15Url) fd.append("m15Url", m15Url.trim());
       if (h1Url) fd.append("h1Url", h1Url.trim());
       if (h4Url) fd.append("h4Url", h4Url.trim());
-      if (calendarUrl) fd.append("calendarUrl", calendarUrl.trim()); // NEW
+      if (calendarUrl) fd.append("calendarUrl", calendarUrl.trim()); // send calendar URL
 
-      // Inject headlines (client snapshot)
+      // Inject headlines the UI would use
       const headlines = await fetchHeadlinesForInstrument(instrument);
       if (headlines.length) {
         fd.append("headlinesJson", JSON.stringify(headlines));
@@ -153,7 +153,7 @@ export default function VisionUpload({
         setStage1Text("");
       }
 
-      onResult(text);
+      onResult(text); // server appends Data Provenance footer
     } catch (e: any) {
       setError(e?.message || "Error generating plan");
     } finally {
@@ -211,7 +211,7 @@ export default function VisionUpload({
               onChange={() => setMode("full")}
               disabled={busy}
             />
-            Full (one-shot)
+            Full (one shot)
           </label>
         </div>
 
@@ -268,11 +268,11 @@ export default function VisionUpload({
         />
       </div>
 
-      {/* Calendar URL (NEW, e.g., https://i.gyazo.com/<hash>.png) */}
+      {/* Calendar URL (Gyazo/TV) */}
       <div>
         <input
-          className="w-full px-2 py-1 rounded bg-neutral-900 border border-neutral-700"
-          placeholder="Calendar image URL (Gyazo direct .png/.jpg recommended)"
+          className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700 w-full"
+          placeholder="Calendar image URL (TradingView/Gyazo)"
           value={calendarUrl}
           onChange={(e) => setCalendarUrl(e.target.value)}
           disabled={busy}
@@ -343,7 +343,9 @@ export default function VisionUpload({
         </button>
 
         {cacheKey && (
-          <span className="text-xs opacity-70">cache: {cacheKey.slice(0, 10)}…</span>
+          <span className="text-xs opacity-70">
+            cache: {cacheKey.slice(0, 10)}…
+          </span>
         )}
       </div>
 
@@ -361,7 +363,8 @@ export default function VisionUpload({
       )}
 
       <div className="text-xs opacity-70">
-        Required: 15m + 1h + 4h — either files or TV/Gyazo links. Calendar is optional (file or direct image URL).
+        Required: 15m + 1h + 4h — either files or TV/Gyazo links. Calendar is
+        optional.
       </div>
     </div>
   );
