@@ -162,11 +162,15 @@ function htmlFindOgImage(html: string): string | null {
 }
 function looksLikeImageUrl(u: string) { const s = String(u || "").split("?")[0] || ""; return /\.(png|jpe?g|webp|gif)$/i.test(s); }
 async function fetchWithTimeout(url: string, ms: number) {
-  const ac = new AbortController(); const id = setTimeout(() => ac.abort(), ms);
-  try {
-    const r = await fetch(url, { signal: ac.signal, redirect: "follow", headers: { "user-agent": "TradePlanApp/1.0", accept: "text/html,application/xhtml+xml,application/xml,image/avif,image/webp,image/apng,image/*,*/*;q=0.8" } });
-    return r;
-  } finally { clearTimeout(id); }
+  const r = await fetch(url, {
+    signal: AbortSignal.timeout(ms),
+    redirect: "follow",
+    headers: {
+      "user-agent": "TradePlanApp/1.0",
+      accept: "text/html,application/xhtml+xml,application/xml,image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    },
+  });
+  return r;
 }
 async function downloadAndProcess(url: string): Promise<string | null> {
   const r = await fetchWithTimeout(url, 8000);
