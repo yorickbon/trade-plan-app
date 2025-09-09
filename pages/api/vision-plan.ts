@@ -1018,6 +1018,57 @@ function systemCore(
     "Under **Fundamental View**, if Calendar is unavailable, write exactly 'Calendar: unavailable'.",
   ].join("\n");
 }
+// SECTION 16A — buildUserPartsBase (helper used by messagesFull/messagesFastStage1)
+function buildUserPartsBase(args: {
+  instrument: string;
+  dateStr: string;
+  m15: string; h1: string; h4: string;
+  calendarDataUrl?: string | null;
+  calendarText?: string | null;
+  headlinesText?: string | null;
+  sentimentText?: string | null;
+  calendarAdvisoryText?: string | null;
+  calendarEvidence?: string[] | null;
+}) {
+  const parts: any[] = [
+    { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}` },
+    { type: "text", text: "HTF 4H Chart:" },
+    { type: "image_url", image_url: { url: args.h4 } },
+    { type: "text", text: "Context 1H Chart:" },
+    { type: "image_url", image_url: { url: args.h1 } },
+    { type: "text", text: "Execution 15M Chart:" },
+    { type: "image_url", image_url: { url: args.m15 } },
+  ];
+
+  if (args.calendarDataUrl) {
+    parts.push({ type: "text", text: "Economic Calendar Image:" });
+    parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } });
+  } else if (args.calendarText) {
+    parts.push({ type: "text", text: `Calendar snapshot:\n${args.calendarText}` });
+  }
+
+  if (args.calendarAdvisoryText) {
+    parts.push({ type: "text", text: `Calendar advisory:\n${args.calendarAdvisoryText}` });
+  }
+
+  if (args.calendarEvidence && args.calendarEvidence.length) {
+    parts.push({
+      type: "text",
+      text: `Calendar fundamentals evidence:\n- ${args.calendarEvidence.join("\n- ")}`
+    });
+  }
+
+  if (args.headlinesText) {
+    parts.push({ type: "text", text: `Headlines snapshot:\n${args.headlinesText}` });
+  }
+
+  if (args.sentimentText) {
+    parts.push({ type: "text", text: `Sentiment snapshot (server):\n${args.sentimentText}` });
+  }
+
+  return parts;
+}
+
 // SECTION 16 — Message builders
 function messagesFull(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string;
