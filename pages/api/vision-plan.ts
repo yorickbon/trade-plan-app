@@ -3,9 +3,9 @@
  *
  * Key points:
  * - Calendar OCR prioritized from a direct image (uploaded or Gyazo direct image URL).
- * - If OCR finds zero usable rows for the instrument: "Calendar provided, but no relevant info for <INSTRUMENT>."
+ * - If OCR finds zero usable rows for the instrument → FALL BACK to /api/calendar (no excuses).
  * - Headlines + CSM + Calendar combined into a composite for conviction capping.
- * - Consistency guard fixes contradictions (e.g., don’t say “contradicting” when both biases are bullish).
+ * - Consistency guard fixes contradictions (“contradicting/conflicting”) when signals align.
  * - Strategy tournament handled in prompts; enforced Quick Plan → Option 1 → Option 2 with sanity checks.
  */
 
@@ -224,7 +224,7 @@ function headlinesToPromptLines(items: AnyHeadline[], limit = 6): string | null 
     const lab = s == null ? "neu" : s > 0.05 ? "pos" : s < -0.05 ? "neg" : "neu";
     const t = String(it?.title || "").slice(0, 200);
     const src = it?.source || "";
-    const when = it?.ago || "";
+       const when = it?.ago || "";
     return `• ${t} — ${src}${when ? `, ${when}` : ""} — ${lab};`;
   });
   return lines.join("\n");
@@ -416,6 +416,11 @@ function detectCotCueFromHeadlines(headlines: AnyHeadline[]): CotCue | null {
 }
 
 // ---------- Sentiment snapshot text ----------
+type HeadlineBias = {
+  label: "bullish" | "bearish" | "neutral" | "unavailable";
+  avg: number | null;
+  count: number;
+};
 function sentimentSummary(
   csm: CsmSnapshot,
   cotCue: CotCue | null,
@@ -591,6 +596,7 @@ function relevantCurrenciesFromInstrument(instr: string): string[] {
   const U = (instr || "").toUpperCase();
   const found = [...CURRENCIES].filter(c => U.includes(c));
   if (found.length) return found;
+  // Default relevance for non-FX symbols (indices/commodities) → USD
   if (U.endsWith("USD") || U.startsWith("USD")) return ["USD"];
   return ["USD"];
 }
@@ -981,24 +987,24 @@ function applyConsistencyGuards(text: string, args: {
   const signs = [args.headlinesSign, args.csmSign, args.calendarSign].filter(s => s !== 0);
   const hasPos = signs.some(s => s > 0);
   const hasNeg = signs.some(s => s < 0);
-  const aligned = signs.length > 0 && ((hasPos && !hasNeg) || (hasNeg && !hasPos));
+  const aligned  = signs.length > 0 && ((hasPos && !hasNeg) || (hasNeg && !hasPos));
   const mismatch = hasPos && hasNeg;
 
-  // Fix "contradicting" when signals align
+  // If aligned, scrub misleading words
   if (aligned) {
-    out = out.replace(/contradict(?:ion|ing|s)?/gi, "aligning");
+    out = out
+      .replace(/\bcontradict(?:ion|ing|s)?\b/gi, "aligning")
+      .replace(/\bconflict(?:s|ing|ed)?\b/gi, "aligning")
+      .replace(/\bdiverg(?:e|ent|ing|ence)\b/gi, "aligning");
   }
 
-  // Normalize Tech vs Fundy Alignment line
+  // Normalize the Tech vs Fundy line to Match/Mismatch
   const reTF = /(Tech\s*vs\s*Fundy\s*Alignment:\s*)(Match|Mismatch)/i;
   if (reTF.test(out)) {
     out = out.replace(reTF, (_, p1) => `${p1}${aligned ? "Match" : mismatch ? "Mismatch" : "Match"}`);
   } else {
-    // If not present, append a simple alignment note under Full Breakdown
-    const anchor = /Full Breakdown/i;
-    if (anchor.test(out)) {
-      out = out.replace(anchor, m => `${m}\n(Consistency: ${aligned ? "Match" : mismatch ? "Mismatch" : "Match"})`);
-    }
+    // If missing, inject a normalized line after "Full Breakdown"
+    out = out.replace(/Full Breakdown/i, (m) => `${m}\nTech vs Fundy Alignment: ${aligned ? "Match" : mismatch ? "Mismatch" : "Match"}`);
   }
   return out;
 }
@@ -1135,7 +1141,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const requestedMode = String(fields.mode || "").toLowerCase();
     if (requestedMode === "fast") mode = "fast";
 
-    // files/urls
+    // files/urls: *** Prefer URL for calendar, then file ***
     const m15f = pickFirst(files.m15);
     const h1f = pickFirst(files.h1);
     const h4f = pickFirst(files.h4);
@@ -1144,25 +1150,27 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const m15Url = String(pickFirst(fields.m15Url) || "").trim();
     const h1Url = String(pickFirst(fields.h1Url) || "").trim();
     const h4Url = String(pickFirst(fields.h4Url) || "").trim();
-    const calendarUrlField = String(pickFirst(fields.calendarUrl) || "").trim(); // NEW
+    const calendarUrlField = String(pickFirst(fields.calendarUrl) || "").trim();
 
-    // build images
+    // build images (URL-first for calendar)
     const tImg = now();
-    const [m15FromFile, h1FromFile, h4FromFile, calFromFile] = await Promise.all([
-      fileToDataUrl(m15f), fileToDataUrl(h1f), fileToDataUrl(h4f),
-      calF ? fileToDataUrl(calF) : Promise.resolve(null),
+    const [m15FromFile, h1FromFile, h4FromFile] = await Promise.all([
+      fileToDataUrl(m15f), fileToDataUrl(h1f), fileToDataUrl(h4f)
     ]);
-    const [m15FromUrl, h1FromUrl, h4FromUrl, calFromUrl] = await Promise.all([
+
+    const [m15FromUrl, h1FromUrl, h4FromUrl, calFromUrl, calFromFile] = await Promise.all([
       m15FromFile ? Promise.resolve(null) : linkToDataUrl(m15Url),
       h1FromFile ? Promise.resolve(null) : linkToDataUrl(h1Url),
       h4FromFile ? Promise.resolve(null) : linkToDataUrl(h4Url),
-      calFromFile ? Promise.resolve(null) : linkToDataUrl(calendarUrlField),
+      linkToDataUrl(calendarUrlField || ""),                // try URL FIRST
+      calF ? fileToDataUrl(calF) : Promise.resolve(null),  // then file fallback
     ]);
 
     const m15 = m15FromFile || m15FromUrl;
-    const h1 = h1FromFile || h1FromUrl;
-    const h4 = h4FromFile || h4FromUrl;
-    const calUrlOrig = calFromFile || calFromUrl || null; // NEW
+    const h1  = h1FromFile  || h1FromUrl;
+    const h4  = h4FromFile  || h4FromUrl;
+    // Prefer URL for calendar, then file
+    const calUrlOrig = calFromUrl || calFromFile || null;
 
     // calendar image for prompt can be overridden later
     let calDataUrlForPrompt: string | null = calUrlOrig;
@@ -1197,7 +1205,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
     const hBias = computeHeadlinesBias(headlineItems);
 
-    // Calendar (OCR-first, no guessing)
+    // Calendar (OCR-first, with API fallback when OCR useless)
     let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
     let calendarProvider: string | null = null;
     let calendarText: string | null = null;
@@ -1222,14 +1230,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           biasNote = analyzed.biasNote;
           calDataUrlForPrompt = calUrlOrig; // keep image for the model
         } else {
-          calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
-          calendarEvidence = [];
-          warningMinutes = null;
-          biasNote = null;
-          advisoryText = null;
-          calDataUrlForPrompt = null; // don't send image if not helpful
+          // OCR ran but found nothing usable for this instrument → FALL BACK to API
+          const calAdv = await fetchCalendarForAdvisory(req, instrument);
+          calendarStatus   = calAdv.status;
+          calendarProvider = calAdv.provider;
+          calendarText     = calAdv.text || `Calendar: no strong bias for ${instrument}.`;
+          advisoryText     = calAdv.advisoryText || null;
+          calendarEvidence = calAdv.evidence || [];
+          warningMinutes   = calAdv.warningMinutes;
+          biasNote         = calAdv.biasNote;
+          calDataUrlForPrompt = null; // image wasn't helpful for the model
         }
       } else {
+        // OCR failed entirely → API fallback
         const calAdv = await fetchCalendarForAdvisory(req, instrument);
         calendarStatus = calAdv.status;
         calendarProvider = calAdv.provider;
