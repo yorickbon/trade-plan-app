@@ -1089,26 +1089,45 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let biasNote: string | null = null;
     let advisoryText: string | null = null;
 
-    if (calUrl) {
-      const ocr = await ocrCalendarFromImage(MODEL, calUrl).catch(() => null);
-      if (ocr && Array.isArray(ocr.items)) {
-        calendarStatus = "image-ocr";
-        calendarProvider = "image-ocr";
-        const analyzed = analyzeCalendarOCR(ocr, instrument);
-        calendarText = analyzed.biasLine;
-        calendarEvidence = analyzed.evidenceLines;
-        warningMinutes = analyzed.warningMinutes;
-        biasNote = analyzed.biasNote;
-      } else {
-        const calAdv = await fetchCalendarForAdvisory(req, instrument);
-        calendarStatus = calAdv.status;
-        calendarProvider = calAdv.provider;
-        calendarText = calAdv.text;
-        advisoryText = calAdv.advisoryText || null;
-        calendarEvidence = calAdv.evidence || [];
-        warningMinutes = calAdv.warningMinutes;
-        biasNote = calAdv.biasNote;
-      }
+   if (calUrl) {
+  const ocr = await ocrCalendarFromImage(MODEL, calUrl).catch(() => null);
+  if (ocr && Array.isArray(ocr.items)) {
+    calendarStatus = "image-ocr";
+    calendarProvider = "image-ocr";
+    const analyzed = analyzeCalendarOCR(ocr, instrument);
+
+    // If the calendar image has no numeric data (e.g., just a speech),
+    // show a clear "no useful info for this instrument" message instead of "unavailable".
+    if (!analyzed.evidenceLines || analyzed.evidenceLines.length === 0) {
+      calendarText = `No useful calendar info for ${instrument} (no forecast/actual/previous values found; e.g., speeches).`;
+      calendarEvidence = [];
+      warningMinutes = analyzed.warningMinutes;
+      biasNote = analyzed.biasNote;
+    } else {
+      calendarText = analyzed.biasLine;
+      calendarEvidence = analyzed.evidenceLines;
+      warningMinutes = analyzed.warningMinutes;
+      biasNote = analyzed.biasNote;
+    }
+  } else {
+    const calAdv = await fetchCalendarForAdvisory(req, instrument);
+    calendarStatus = calAdv.status;
+    calendarProvider = calAdv.provider;
+    calendarText = calAdv.text;
+    advisoryText = calAdv.advisoryText || null;
+    calendarEvidence = calAdv.evidence || [];
+    warningMinutes = calAdv.warningMinutes;
+    biasNote = calAdv.biasNote;
+  }
+} else {
+  const calAdv = await fetchCalendarForAdvisory(req, instrument);
+  calendarStatus = calAdv.status;
+  calendarProvider = calAdv.provider;
+  calendarText = calAdv.text;
+  calendarEvidence = calAdv.evidence || [];
+  warningMinutes = calAdv.warningMinutes;
+  biasNote = calAdv.biasNote;
+}
     } else {
       const calAdv = await fetchCalendarForAdvisory(req, instrument);
       calendarStatus = calAdv.status;
