@@ -565,6 +565,20 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
   return { biasLine, biasNote, warningMinutes: warn, evidenceLines: lines };
 }
 
+// Helpers to determine instrument-relevant currencies for OCR usability checks
+const CURRENCIES = new Set(G8);
+function relevantCurrenciesFromInstrument(instr: string): string[] {
+  const U = (instr || "").toUpperCase();
+  const found = [...CURRENCIES].filter(c => U.includes(c));
+  if (found.length) return found;
+  // Default relevance for non-FX symbols (indices/commodities) → USD
+  if (U.endsWith("USD") || U.startsWith("USD")) return ["USD"];
+  return ["USD"];
+}
+function hasUsableFields(r: OcrCalendarRow): boolean {
+  return r != null && r.actual != null && (r.forecast != null || r.previous != null);
+}
+
 // ---------- API calendar fallback ----------
 async function fetchCalendarRaw(req: NextApiRequest, instrument: string): Promise<any | null> {
   try {
@@ -1037,7 +1051,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     // build images
     const tImg = now();
-    const [m15FromFile, h1FromFile, h4FromFile, calUrl] = await Promise.all([
+    const [m15FromFile, h1FromFile, h4FromFile, calUrlRaw] = await Promise.all([
       fileToDataUrl(m15f), fileToDataUrl(h1f), fileToDataUrl(h4f),
       calF ? fileToDataUrl(calF) : Promise.resolve(null),
     ]);
@@ -1049,9 +1063,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const m15 = m15FromFile || m15FromUrl;
     const h1 = h1FromFile || h1FromUrl;
     const h4 = h4FromFile || h4FromUrl;
+    let calDataUrl: string | null = calUrlRaw; // mutable copy used for prompt routing
 
     if (process.env.NODE_ENV !== "production") {
-      console.log(`[vision-plan] images ready ${dt(tImg)} (m15=${dataUrlSizeBytes(m15)}B, h1=${dataUrlSizeBytes(h1)}B, h4=${dataUrlSizeBytes(h4)}B, cal=${dataUrlSizeBytes(calUrl)}B)`);
+      console.log(`[vision-plan] images ready ${dt(tImg)} (m15=${dataUrlSizeBytes(m15)}B, h1=${dataUrlSizeBytes(h1)}B, h4=${dataUrlSizeBytes(h4)}B, cal=${dataUrlSizeBytes(calDataUrl)}B)`);
     }
     if (!m15 || !h1 || !h4) {
       return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either as files or valid TradingView/Gyazo direct image links." });
@@ -1089,26 +1104,45 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let biasNote: string | null = null;
     let advisoryText: string | null = null;
 
-    if (calUrl) {
-      const ocr = await ocrCalendarFromImage(MODEL, calUrl).catch(() => null);
-      if (ocr && Array.isArray(ocr.items) && ocr.items.length > 0) {
-        // Keep current behavior when OCR returns usable rows
-        calendarStatus = "image-ocr";
-        calendarProvider = "image-ocr";
-        const analyzed = analyzeCalendarOCR(ocr, instrument);
-        calendarText = analyzed.biasLine;
-        calendarEvidence = analyzed.evidenceLines;
-        warningMinutes = analyzed.warningMinutes;
-        biasNote = analyzed.biasNote;
+    if (calDataUrl) {
+      const ocr = await ocrCalendarFromImage(MODEL, calDataUrl).catch(() => null);
+      if (ocr && Array.isArray(ocr.items)) {
+        // Determine instrument-relevant usability
+        const relevant = new Set(relevantCurrenciesFromInstrument(instrument));
+        const usable = (ocr.items || []).filter(
+          (r) => r && r.currency != null && relevant.has(String(r.currency)) && hasUsableFields(r)
+        );
+
+        if (usable.length > 0) {
+          calendarStatus = "image-ocr";
+          calendarProvider = "image-ocr";
+          const analyzed = analyzeCalendarOCR({ items: usable }, instrument);
+          calendarText = analyzed.biasLine;
+          calendarEvidence = analyzed.evidenceLines;
+          warningMinutes = analyzed.warningMinutes;
+          biasNote = analyzed.biasNote;
+        } else {
+          // OCR ran but yielded no usable rows for this instrument → mark as seen with explicit message
+          calendarStatus = "image-ocr";
+          calendarProvider = "image-ocr";
+          calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
+          calendarEvidence = [];
+          warningMinutes = null;
+          biasNote = null;
+          advisoryText = null;
+          // IMPORTANT: route prompt to use text snapshot instead of image to avoid "Calendar: unavailable"
+          calDataUrl = null;
+        }
       } else {
-        // OCR ran but yielded no usable rows → mark as provided with no relevant info
-        calendarStatus = "image-ocr";
-        calendarProvider = "image-ocr";
-        calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
-        calendarEvidence = [];
-        warningMinutes = null;
-        biasNote = null;
-        advisoryText = null;
+        // OCR entirely failed → fall back to API advisory
+        const calAdv = await fetchCalendarForAdvisory(req, instrument);
+        calendarStatus = calAdv.status;
+        calendarProvider = calAdv.provider;
+        calendarText = calAdv.text;
+        advisoryText = calAdv.advisoryText || null;
+        calendarEvidence = calAdv.evidence || [];
+        warningMinutes = calAdv.warningMinutes;
+        biasNote = calAdv.biasNote;
       }
     } else {
       const calAdv = await fetchCalendarForAdvisory(req, instrument);
@@ -1137,8 +1171,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (mode === "fast") {
       const messages = messagesFastStage1({
         instrument, dateStr, m15, h1, h4,
-        calendarDataUrl: calUrl || undefined,
-        calendarText: (!calUrl && calendarText) ? calendarText : undefined,
+        calendarDataUrl: calDataUrl || undefined,
+        calendarText: (!calDataUrl && calendarText) ? calendarText : undefined,
         headlinesText: headlinesText || undefined,
         sentimentText: sentimentText,
         calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [] },
@@ -1178,7 +1212,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       text = await enforceOption2(MODEL, instrument, text);
       aiMeta = extractAiMeta(text) || aiMeta;
 
-      const cacheKey = setCache({ instrument, m15, h1, h4, calendar: calUrl || null, headlinesText: headlinesText || null, sentimentText });
+      const cacheKey = setCache({ instrument, m15, h1, h4, calendar: calDataUrl || null, headlinesText: headlinesText || null, sentimentText });
 
       const footer = buildServerProvenanceFooter({
         headlines_provider: headlinesProvider || "unknown",
@@ -1223,8 +1257,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     // -------- FULL --------
     const messages = messagesFull({
       instrument, dateStr, m15, h1, h4,
-      calendarDataUrl: calUrl || undefined,
-      calendarText: (!calUrl && calendarText) ? calendarText : undefined,
+      calendarDataUrl: calDataUrl || undefined,
+      calendarText: (!calDataUrl && calendarText) ? calendarText : undefined,
       headlinesText: headlinesText || undefined,
       sentimentText,
       calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [] },
