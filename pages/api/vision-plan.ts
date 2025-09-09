@@ -1091,7 +1091,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     if (calUrl) {
       const ocr = await ocrCalendarFromImage(MODEL, calUrl).catch(() => null);
-      if (ocr && Array.isArray(ocr.items)) {
+      if (ocr && Array.isArray(ocr.items) && ocr.items.length > 0) {
+        // Keep current behavior when OCR returns usable rows
         calendarStatus = "image-ocr";
         calendarProvider = "image-ocr";
         const analyzed = analyzeCalendarOCR(ocr, instrument);
@@ -1100,14 +1101,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         warningMinutes = analyzed.warningMinutes;
         biasNote = analyzed.biasNote;
       } else {
-        const calAdv = await fetchCalendarForAdvisory(req, instrument);
-        calendarStatus = calAdv.status;
-        calendarProvider = calAdv.provider;
-        calendarText = calAdv.text;
-        advisoryText = calAdv.advisoryText || null;
-        calendarEvidence = calAdv.evidence || [];
-        warningMinutes = calAdv.warningMinutes;
-        biasNote = calAdv.biasNote;
+        // OCR ran but yielded no usable rows → mark as provided with no relevant info
+        calendarStatus = "image-ocr";
+        calendarProvider = "image-ocr";
+        calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
+        calendarEvidence = [];
+        warningMinutes = null;
+        biasNote = null;
+        advisoryText = null;
       }
     } else {
       const calAdv = await fetchCalendarForAdvisory(req, instrument);
