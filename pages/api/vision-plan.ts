@@ -414,7 +414,7 @@ function sentimentSummary(
   const hBiasLine = headlineBias.label === "unavailable"
     ? "Headlines bias (48h): unavailable"
     : `Headlines bias (48h): ${headlineBias.label}${headlineBias.avg != null ? ` (${headlineBias.avg.toFixed(2)})` : ""}`;
-  const cotLine = cotCue ? `COT: ${cotCue.summary}` : "COT news not found.";
+  const cotLine = cotCue ? `COT: ${cotCue.summary}` : "COT: no cues from headlines.";
   const prov = {
     csm_used: true, csm_time: csm.tsISO,
     cot_used: !!cotCue, cot_report_date: null as string | null, cot_error: cotCue ? null : "no cot cues", cot_method: cotCue ? cotCue.method : null,
@@ -831,6 +831,7 @@ function messagesFastStage1(args: {
 
   return [{ role: "system", content: system }, { role: "user", content: parts }];
 }
+
 // ---------- Enforcement helpers (Option 2 / Option 1 / Quick Plan) ----------
 function hasCompliantOption2(text: string): boolean {
   const re = /Option\s*2/i; if (!re.test(text || "")) return false;
@@ -939,7 +940,6 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
   } catch {}
   return null;
 }
-
 // ---------- Provenance footer ----------
 function buildServerProvenanceFooter(args: {
   headlines_provider: string | null;
@@ -1080,13 +1080,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
     const hBias = computeHeadlinesBias(headlineItems);
 
-    // Calendar (OCR-first)
+    // Calendar (OCR-first, no guessing)
     let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
     let calendarProvider: string | null = null;
     let calendarText: string | null = null;
     let calendarEvidence: string[] = [];
     let warningMinutes: number | null = null;
     let biasNote: string | null = null;
+    let advisoryText: string | null = null;
 
     if (calUrl) {
       const ocr = await ocrCalendarFromImage(MODEL, calUrl).catch(() => null);
@@ -1103,6 +1104,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         calendarStatus = calAdv.status;
         calendarProvider = calAdv.provider;
         calendarText = calAdv.text;
+        advisoryText = calAdv.advisoryText || null;
         calendarEvidence = calAdv.evidence || [];
         warningMinutes = calAdv.warningMinutes;
         biasNote = calAdv.biasNote;
@@ -1138,7 +1140,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         calendarText: (!calUrl && calendarText) ? calendarText : undefined,
         headlinesText: headlinesText || undefined,
         sentimentText: sentimentText,
-        calendarAdvisory: { warningMinutes, biasNote, advisoryText: biasNote || null, evidence: calendarEvidence || [] },
+        calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [] },
         provenance: provForModel,
       });
       if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
@@ -1159,11 +1161,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         }
       }
 
-      // order sanity vs price (if a later pass adjusts text we’ll re-extract)
+      // order sanity vs price
       {
         const bad = invalidOrderRelativeToPrice(aiMeta);
         if (bad) {
-          // do minimal correction by ensuring primary/alt blocks exist, then Option2 enforcement (zones often included)
           text = await enforceOption1(MODEL, instrument, text);
           text = await enforceOption2(MODEL, instrument, text);
           aiMeta = extractAiMeta(text) || aiMeta;
@@ -1225,7 +1226,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       calendarText: (!calUrl && calendarText) ? calendarText : undefined,
       headlinesText: headlinesText || undefined,
       sentimentText,
-      calendarAdvisory: { warningMinutes, biasNote, advisoryText: biasNote || null, evidence: calendarEvidence || [] },
+      calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [] },
       provenance: provForModel,
     });
     if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
