@@ -562,15 +562,16 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     const f = parseNumberLoose(it.forecast);
     const p = parseNumberLoose(it.previous);
 
-    // Post-result evidence only if actual exists and row is within last ~72h
-    if (a != null && (f != null || p != null) && it.timeISO) {
-      const t = Date.parse(it.timeISO);
-      if (isFinite(t) && t <= nowMs && (nowMs - t) <= H72) {
-        const ev = evidenceLine(it, cur);
-        if (ev) lines.push(ev);
-        postRows.push(it);
-      }
-    }
+   // Post-result evidence only if actual exists and row is within last ~72h.
+// If OCR didn't give timeISO, assume it's recent (treat as within 72h).
+const ts = it.timeISO ? Date.parse(it.timeISO) : NaN;
+const isWithin72h = isFinite(ts) ? (ts <= nowMs && (nowMs - ts) <= H72) : true;
+
+if (a != null && (f != null || p != null) && isWithin72h) {
+  const ev = evidenceLine(it, cur);
+  if (ev) lines.push(ev);
+  postRows.push(it);
+}
   }
 
   // If NO post-result rows → pre-release only (no bias; explicit phrasing)
