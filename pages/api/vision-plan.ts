@@ -17,7 +17,7 @@ export const config = { api: { bodyParser: false, sizeLimit: "25mb" } };
 type Ok = { ok: true; text: string; meta?: any };
 type Err = { ok: false; reason: string };
 
-const VP_VERSION = "2025-09-09-ocrv8-preReleaseAccepted";
+const VP_VERSION = "2025-09-09-ocrv9-prerelease-strict+M5+debug";
 
 // ---------- OpenAI / Model pick ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
@@ -73,6 +73,7 @@ function parseNumberLoose(v: any): number | null {
 type CacheEntry = {
   exp: number;
   instrument: string;
+  m5?: string | null;
   m15: string;
   h1: string;
   h4: string;
@@ -457,7 +458,7 @@ async function callOpenAI(model: string, messages: any[]) {
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: JSON.stringify({ model, messages }),
+    body: JSON.stringify({ model, messages, temperature: 0 }), // deterministic Fast ↔ Full parity
   });
   const json = await rsp.json().catch(() => ({} as any));
   if (!rsp.ok) throw new Error(`OpenAI request failed: ${rsp.status} ${JSON.stringify(json)}`);
@@ -522,20 +523,25 @@ async function ocrCalendarFromImage(model: string, calendarDataUrl: string): Pro
   return { items };
 }
 
-// -------- Enhanced OCR analysis: accepts pre-release (forecast vs previous) --------
+// -------- Enhanced OCR analysis: STRICT pre-release handling --------
 function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
   biasLine: string | null;
   biasNote: string | null;
   warningMinutes: number | null;
   evidenceLines: string[];
+  preReleaseOnly: boolean;
+  rowsForDebug: { timeISO: string | null; title: string | null; currency: string | null; impact: any; actual: any; forecast: any; previous: any }[];
 } {
   const base = pair.slice(0,3), quote = pair.slice(3);
   const nowMs = Date.now();
-  const FUTURE_HORIZON_MS = 5 * 24 * 3600 * 1000; // accept expectations up to ~5 days ahead
+  const H72 = 72 * 3600 * 1000;
 
   const lines: string[] = [];
-  const perScore: Record<string, number> = {};
-  function add(cur: string, amt: number) { if (!cur) return; perScore[cur] = (perScore[cur] ?? 0) + amt; }
+  const postRows: OcrCalendarRow[] = [];
+  const rowsForDebug = (ocr.items || []).slice(0, 3).map(r => ({
+    timeISO: r.timeISO || null, title: r.title || null, currency: r.currency || null,
+    impact: r.impact || null, actual: r.actual ?? null, forecast: r.forecast ?? null, previous: r.previous ?? null
+  }));
 
   let warn: number | null = null;
 
@@ -543,7 +549,7 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     const cur = (it?.currency || "").toUpperCase();
     if (!cur) continue;
 
-    // High-impact upcoming event warning
+    // High-impact upcoming event warning (≤60 minutes)
     if (it?.impact === "High" && it?.timeISO) {
       const tt = Date.parse(it.timeISO);
       if (isFinite(tt) && tt >= nowMs) {
@@ -552,47 +558,55 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
       }
     }
 
-    const dir = goodIfHigher(String(it?.title || "")); // true=higher bullish, false=lower bullish, null=unknown
-
     const a = parseNumberLoose(it.actual);
     const f = parseNumberLoose(it.forecast);
     const p = parseNumberLoose(it.previous);
 
-    // Post-result evidence (highest weight)
-    if (a != null && (f != null || p != null)) {
-      const ev = evidenceLine(it, cur);
-      if (ev) lines.push(ev);
-      // scoring from actual surprise (±1)
-      if (dir !== null) {
-        const ref = f ?? p;
-        const rawDelta = (a - (ref as number)) / (Math.abs(ref as number) || 1);
-        const signed = (dir ? rawDelta : -rawDelta);
-        const score = Math.max(-1, Math.min(1, signed * 4)); // squash
-        add(cur, score * 1.0); // full weight
-      }
-      continue;
-    }
-
-    // Pre-release expectation (no actual yet) — lighter weight
-    if (a == null && f != null && p != null) {
-      // Only consider within horizon
-      let withinHorizon = true;
-      if (it.timeISO) {
-        const tt = Date.parse(it.timeISO);
-        if (isFinite(tt)) withinHorizon = tt <= nowMs + FUTURE_HORIZON_MS;
-      }
-      if (withinHorizon && dir !== null) {
-        const expDelta = (f - p) / (Math.abs(p) || 1);
-        const signed = (dir ? expDelta : -expDelta);
-        const score = Math.max(-0.6, Math.min(0.6, signed * 3)); // lighter weight cap
-        add(cur, score * 0.6);
+    // Post-result evidence only if actual exists and row is within last ~72h
+    if (a != null && (f != null || p != null) && it.timeISO) {
+      const t = Date.parse(it.timeISO);
+      if (isFinite(t) && t <= nowMs && (nowMs - t) <= H72) {
+        const ev = evidenceLine(it, cur);
+        if (ev) lines.push(ev);
+        postRows.push(it);
       }
     }
   }
 
+  // If NO post-result rows → pre-release only (no bias; explicit phrasing)
+  if (postRows.length === 0) {
+    const preLine = `Calendar: ${warn != null ? `High-impact events scheduled (≤${warn} min). ` : ""}Pre-release only, no confirmed bias until data is out.`;
+    return {
+      biasLine: preLine,
+      biasNote: null,
+      warningMinutes: warn,
+      evidenceLines: [],
+      preReleaseOnly: true,
+      rowsForDebug,
+    };
+  }
+
+  // If we have post-result rows: derive per-currency bias from actual vs forecast/previous surprises
+  const scoreByCur: Record<string, number> = {};
+  function add(cur: string, v: number) { scoreByCur[cur] = (scoreByCur[cur] ?? 0) + v; }
+
+  for (const it of postRows) {
+    const cur = (it.currency || "").toUpperCase();
+    const dir = goodIfHigher(String(it.title || "")); // true=higher good; false=lower good
+    const a = parseNumberLoose(it.actual)!;
+    const f = parseNumberLoose(it.forecast);
+    const p = parseNumberLoose(it.previous);
+    const ref = f ?? p;
+    if (ref == null || dir == null) continue;
+    const rawDelta = (a - ref) / (Math.abs(ref) || 1);
+    const signed = dir ? rawDelta : -rawDelta;
+    const score = Math.max(-1, Math.min(1, signed * 4)); // squash
+    add(cur, score);
+  }
+
   const label = (s: number) => s > 0.05 ? "bullish" : s < -0.05 ? "bearish" : "neutral";
-  const bScore = perScore[base] ?? 0, qScore = perScore[quote] ?? 0;
-  const bLab = label(bScore), qLab = label(qScore);
+  const bLab = label(scoreByCur[base] ?? 0);
+  const qLab = label(scoreByCur[quote] ?? 0);
 
   let instr: string | null = null;
   if (bLab === "bullish" && qLab === "bearish") instr = "bullish (base stronger than quote)";
@@ -600,7 +614,7 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
 
   const biasLine = `Calendar bias for ${pair}: ${instr ? `Instrument: ${instr}; ` : ""}Per-currency: ${base}:${bLab} / ${quote}:${qLab}`;
   const biasNote = `Per-currency: ${base} ${bLab} vs ${quote} ${qLab}${instr ? `; Instrument bias: ${instr}` : ""}`;
-  return { biasLine, biasNote, warningMinutes: warn, evidenceLines: lines };
+  return { biasLine, biasNote, warningMinutes: warn, evidenceLines: lines, preReleaseOnly: false, rowsForDebug };
 }
 
 // Helpers to determine instrument-relevant currencies for OCR usability checks
@@ -609,6 +623,9 @@ function relevantCurrenciesFromInstrument(instr: string): string[] {
   const U = (instr || "").toUpperCase();
   const found = [...CURRENCIES].filter(c => U.includes(c));
   if (found.length) return found;
+  // Minimal non-FX coverage → map instrument → USD relevance when appropriate
+  if (/(XAUUSD|BTCUSD)/.test(U)) return ["USD"];
+  if (/(US500|SPX|SP500|S&P)/.test(U)) return ["USD"];
   if (U.endsWith("USD") || U.startsWith("USD")) return ["USD"];
   return ["USD"];
 }
@@ -781,7 +798,7 @@ function systemCore(instrument: string, calendarAdvisory?: { warningMinutes?: nu
     "- Prefer **Entry zones (min–max)** for OB/FVG/SR confluence; use a **single price** for tight breakout/trigger.",
     "- SL behind structure; TP1/TP2 with R multiples; BE rules; invalidation.",
     "",
-    "Multi-timeframe: 4H HTF → 1H context → 15m execution.",
+    "Multi-timeframe: 4H HTF → 1H context → 15m execution. 5m may be used for scalp execution if supplied.",
     "Tournament: evaluate strategies; Option 2 must be a distinct viable alternative.",
     "Breakout discipline: if proof not confirmed, mark Pending with explicit trigger sequence.",
     "",
@@ -798,6 +815,7 @@ function systemCore(instrument: string, calendarAdvisory?: { warningMinutes?: nu
     bias ? `\nPOST-RESULT ALIGNMENT: ${bias}.` : "",
     "",
     "Under **Fundamental View**, if Calendar is unavailable, write exactly 'Calendar: unavailable'.",
+    "If Calendar is pre-release only, write exactly 'Pre-release only, no confirmed bias until data is out.' and do NOT claim a bullish/bearish/mixed calendar bias.",
   ].join("\n");
 }
 
@@ -805,12 +823,14 @@ function buildUserPartsBase(args: {
   instrument: string;
   dateStr: string;
   m15: string; h1: string; h4: string;
+  m5?: string | null;
   calendarDataUrl?: string | null;
   calendarText?: string | null;
   headlinesText?: string | null;
   sentimentText?: string | null;
   calendarAdvisoryText?: string | null;
   calendarEvidence?: string[] | null;
+  debugOCRRows?: { timeISO: string | null; title: string | null; currency: string | null; impact: any; actual: any; forecast: any; previous: any }[] | null;
 }) {
   const parts: any[] = [
     { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}` },
@@ -821,21 +841,26 @@ function buildUserPartsBase(args: {
     { type: "text", text: "Execution 15M Chart:" },
     { type: "image_url", image_url: { url: args.m15 } },
   ];
+  if (args.m5) { parts.push({ type: "text", text: "Scalp 5M Chart" }); parts.push({ type: "image_url", image_url: { url: args.m5 } }); }
   if (args.calendarDataUrl) { parts.push({ type: "text", text: "Economic Calendar Image:" }); parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } }); }
   if (!args.calendarDataUrl && args.calendarText) { parts.push({ type: "text", text: `Calendar snapshot:\n${args.calendarText}` }); }
   if (args.calendarAdvisoryText) { parts.push({ type: "text", text: `Calendar advisory:\n${args.calendarAdvisoryText}` }); }
   if (args.calendarEvidence && args.calendarEvidence.length) { parts.push({ type: "text", text: `Calendar fundamentals evidence:\n- ${args.calendarEvidence.join("\n- ")}` }); }
   if (args.headlinesText) { parts.push({ type: "text", text: `Headlines snapshot:\n${args.headlinesText}` }); }
   if (args.sentimentText) { parts.push({ type: "text", text: `Sentiment snapshot (server):\n${args.sentimentText}` }); }
+  if (args.debugOCRRows && args.debugOCRRows.length) {
+    const rows = args.debugOCRRows.map(r => `${r.timeISO ?? "n/a"} | ${r.currency ?? "??"} | ${r.title ?? "??"} | A:${r.actual ?? "?"} F:${r.forecast ?? "?"} P:${r.previous ?? "?"}`).join("\n");
+    parts.push({ type: "text", text: `DEBUG OCR ROWS (first 3):\n${rows}` });
+  }
   return parts;
 }
 
 // ---------- Message builders ----------
 function messagesFull(args: {
-  instrument: string; dateStr: string; m15: string; h1: string; h4: string;
+  instrument: string; dateStr: string; m15: string; h1: string; h4: string; m5?: string | null;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null;
-  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null; };
+  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null; debugRows?: any[] | null; preReleaseOnly?: boolean | null };
   provenance?: any;
 }) {
   const system = [
@@ -865,8 +890,8 @@ function messagesFull(args: {
     "• Conviction: <0–100>%", "• Why this alternative:",
     "",
     "Full Breakdown",
-    "• Technical View (HTF + Intraday): 4H/1H/15m structure",
-    "• Fundamental View (Calendar + Sentiment + Headlines)",
+    "• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m if used)",
+    "• Fundamental View (Calendar + Sentiment + Headlines) — include explicit Calendar bias for <PAIR> when available; if pre-release, say: 'Pre-release only, no confirmed bias until data is out.'",
     "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
     "• Conditional Scenarios:",
     "• Surprise Risk:",
@@ -874,7 +899,7 @@ function messagesFull(args: {
     "• One-liner Summary:",
     "",
     "Detected Structures (X-ray):",
-    "• 4H:", "• 1H:", "• 15m:",
+    "• 4H:", "• 1H:", "• 15m:", "• 5m (if used):",
     "",
     "Candidate Scores (tournament):",
     "- name — score — reason",
@@ -892,20 +917,21 @@ function messagesFull(args: {
   return [
     { role: "system", content: system },
     { role: "user", content: buildUserPartsBase({
-      instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4,
+      instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4, m5: args.m5 || null,
       calendarDataUrl: args.calendarDataUrl, calendarText: args.calendarText,
       headlinesText: args.headlinesText, sentimentText: args.sentimentText,
       calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null,
       calendarEvidence: args.calendarAdvisory?.evidence || null,
+      debugOCRRows: args.calendarAdvisory?.debugRows || null,
     }) },
   ];
 }
 
 function messagesFastStage1(args: {
-  instrument: string; dateStr: string; m15: string; h1: string; h4: string;
+  instrument: string; dateStr: string; m15: string; h1: string; h4: string; m5?: string | null;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null;
-  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null; };
+  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null; debugRows?: any[] | null; preReleaseOnly?: boolean | null };
   provenance?: any;
 }) {
   const system = [
@@ -938,13 +964,14 @@ function messagesFastStage1(args: {
   ].join("\n");
 
   const parts = buildUserPartsBase({
-    instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4,
+    instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4, m5: args.m5 || null,
     calendarDataUrl: args.calendarDataUrl,
     calendarText: !args.calendarDataUrl && args.calendarText ? args.calendarText : undefined,
     headlinesText: args.headlinesText || undefined,
     sentimentText: args.sentimentText || undefined,
     calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null,
     calendarEvidence: args.calendarAdvisory?.evidence || null,
+    debugOCRRows: args.calendarAdvisory?.debugRows || null,
   });
 
   return [{ role: "system", content: system }, { role: "user", content: parts }];
@@ -984,7 +1011,43 @@ async function enforceQuickPlan(model: string, instrument: string, text: string)
   return callOpenAI(model, messages);
 }
 
-// ---------- Consistency guard ----------
+// ---------- Consistency + visibility guards ----------
+function ensureCalendarVisibilityInQuickPlan(text: string, args: { instrument: string; preReleaseOnly: boolean; biasLine: string | null }) {
+  if (!text) return text;
+  const hasQP = /Quick\s*Plan\s*\(Actionable\)/i.test(text);
+  if (!hasQP) return text;
+
+  const qpBlock = text.match(/Quick\s*Plan\s*\(Actionable\)[\s\S]*?(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i)?.[0] || "";
+  const hasCalendarMention = /Calendar\s*:/i.test(qpBlock) || /Calendar\s*bias\s*for\s*/i.test(qpBlock);
+  if (hasCalendarMention) return text; // already present
+
+  const inject = args.preReleaseOnly
+    ? `\n• Note: Pre-release only, no confirmed bias until data is out.`
+    : (args.biasLine ? `\n• Calendar bias for ${args.instrument}: ${args.biasLine.replace(/^Calendar bias for\s*[^:]+:\s*/i, "")}` : "");
+
+  if (!inject) return text;
+  return text.replace(/(Quick\s*Plan\s*\(Actionable\)[^\n]*\n)/i, `$1${inject}\n`);
+}
+
+function stampM5Used(text: string, used: boolean) {
+  if (!used) return text;
+  const stamp = "• Used Chart: 5M execution";
+  let out = text;
+  // Add to Quick Plan
+  if (/Quick\s*Plan\s*\(Actionable\)/i.test(out) && !/Used\s*Chart:\s*5M/i.test(out)) {
+    out = out.replace(/(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(\n\s*Option\s*1)/i, (m, a, b) => {
+      return /•\s*Used\s*Chart:\s*5M/i.test(a) ? m : `${a}\n${stamp}\n${b}`;
+    });
+  }
+  // Add to Option 1
+  if (/Option\s*1\s*\(?(Primary)?\)?/i.test(out) && !/Used\s*Chart:\s*5M/i.test(out)) {
+    out = out.replace(/(Option\s*1[\s\S]*?)(\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i, (m, a, b) => {
+      return /•\s*Used\s*Chart:\s*5M/i.test(a) ? m : `${a}\n${stamp}\n${b}`;
+    });
+  }
+  return out;
+}
+
 function applyConsistencyGuards(text: string, args: { instrument: string; headlinesSign: number; csmSign: number; calendarSign: number; }) {
   let out = text || "";
   const signs = [args.headlinesSign, args.csmSign, args.calendarSign].filter((s) => s !== 0);
@@ -1076,6 +1139,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     const urlMode = String((req.query.mode as string) || "").toLowerCase();
     let mode: "full" | "fast" | "expand" = urlMode === "fast" ? "fast" : urlMode === "expand" ? "expand" : "full";
+    const debugQuery = String(req.query.debug || "").trim() === "1";
 
     // ---------- expand ----------
     if (mode === "expand") {
@@ -1090,7 +1154,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
       const messages = messagesFull({
         instrument: c.instrument, dateStr,
-        m15: c.m15, h1: c.h1, h4: c.h4,
+        m15: c.m15, h1: c.h1, h4: c.h4, m5: c.m5 || null,
         calendarDataUrl: c.calendar || undefined,
         headlinesText: c.headlinesText || undefined,
         sentimentText: c.sentimentText || undefined,
@@ -1102,6 +1166,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       text = await enforceQuickPlan(modelExpand, c.instrument, text);
       text = await enforceOption1(modelExpand, c.instrument, text);
       text = await enforceOption2(modelExpand, c.instrument, text);
+
+      // Visibility and stamping
+      text = ensureCalendarVisibilityInQuickPlan(text, { instrument: c.instrument, preReleaseOnly: false, biasLine: calAdv.text || null });
+      const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
+      text = stampM5Used(text, usedM5);
 
       const footer = buildServerProvenanceFooter({
         headlines_provider: "expand-uses-stage1",
@@ -1118,7 +1187,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     // ---------- multipart ----------
     if (!isMultipart(req)) {
-      return res.status(400).json({ ok: false, reason: "Use multipart/form-data with files: m15, h1, h4 and optional 'calendar'. Or pass m15Url/h1Url/h4Url and optional 'calendarUrl'. Include 'instrument'." });
+      return res.status(400).json({ ok: false, reason: "Use multipart/form-data with files: m15, h1, h4 and optional 'calendar'/'m5'. Or pass m15Url/h1Url/h4Url and optional 'calendarUrl'/'m5Url'. Include 'instrument'." });
     }
 
     const { fields, files } = await parseMultipart(req);
@@ -1128,35 +1197,44 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const requestedMode = String(fields.mode || "").toLowerCase();
     if (requestedMode === "fast") mode = "fast";
 
+    // debug toggle
+    const debugField = String(pickFirst(fields.debug) || "").trim() === "1";
+    const debugOCR = debugQuery || debugField;
+
     // files + urls
+    const m5f = pickFirst(files.m5);
     const m15f = pickFirst(files.m15);
     const h1f = pickFirst(files.h1);
     const h4f = pickFirst(files.h4);
     const calF = pickFirst(files.calendar);
 
+    const m5Url = String(pickFirst(fields.m5Url) || "").trim();
     const m15Url = String(pickFirst(fields.m15Url) || "").trim();
     const h1Url = String(pickFirst(fields.h1Url) || "").trim();
     const h4Url = String(pickFirst(fields.h4Url) || "").trim();
     const calendarUrlField = String(pickFirst(fields.calendarUrl) || "").trim();
 
-    const [m15FromFile, h1FromFile, h4FromFile, calFromFile] = await Promise.all([
+    const [m5FromFile, m15FromFile, h1FromFile, h4FromFile, calFromFile] = await Promise.all([
+      m5f ? fileToDataUrl(m5f) : Promise.resolve(null),
       fileToDataUrl(m15f), fileToDataUrl(h1f), fileToDataUrl(h4f),
       calF ? fileToDataUrl(calF) : Promise.resolve(null),
     ]);
-    const [m15FromUrl, h1FromUrl, h4FromUrl, calFromUrl] = await Promise.all([
+    const [m5FromUrl, m15FromUrl, h1FromUrl, h4FromUrl, calFromUrl] = await Promise.all([
+      m5FromFile ? Promise.resolve(null) : linkToDataUrl(m5Url),
       m15FromFile ? Promise.resolve(null) : linkToDataUrl(m15Url),
       h1FromFile ? Promise.resolve(null) : linkToDataUrl(h1Url),
       h4FromFile ? Promise.resolve(null) : linkToDataUrl(h4Url),
       calFromFile ? Promise.resolve(null) : linkToDataUrl(calendarUrlField),
     ]);
 
+    const m5 = m5FromFile || m5FromUrl || null;
     const m15 = m15FromFile || m15FromUrl;
     const h1 = h1FromFile || h1FromUrl;
     const h4 = h4FromFile || h4FromUrl;
     const calUrlOrig = calFromFile || calFromUrl || null;
 
     if (!m15 || !h1 || !h4) {
-      return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either files or TV/Gyazo image links." });
+      return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either files or TV/Gyazo image links. (5m optional)" });
     }
 
     // Headlines
@@ -1182,7 +1260,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
     const hBias = computeHeadlinesBias(headlineItems);
 
-    // Calendar (OCR-first with pre-release support, fallback to API)
+    // Calendar (OCR-first STRICT pre-release handling, fallback to API)
     let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
     let calendarProvider: string | null = null;
     let calendarText: string | null = null;
@@ -1190,6 +1268,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let warningMinutes: number | null = null;
     let biasNote: string | null = null;
     let advisoryText: string | null = null;
+    let debugRows: any[] | null = null;
+    let preReleaseOnly = false;
 
     let calDataUrlForPrompt: string | null = calUrlOrig;
 
@@ -1202,11 +1282,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         calendarProvider = "image-ocr";
         if (usableForInstr) {
           const analyzed = analyzeCalendarOCR(ocr, instrument);
-          calendarText = analyzed.biasLine;
-          calendarEvidence = analyzed.evidenceLines; // may be empty if pre-release only
+          calendarText = analyzed.biasLine;                    // will be pre-release line or bias line
+          calendarEvidence = analyzed.evidenceLines;           // only post-result rows (≤72h)
           warningMinutes = analyzed.warningMinutes;
-          biasNote = analyzed.biasNote;
+          biasNote = analyzed.preReleaseOnly ? null : analyzed.biasNote; // no biasNote if pre-release
+          preReleaseOnly = analyzed.preReleaseOnly;
+          debugRows = analyzed.rowsForDebug || null;
           calDataUrlForPrompt = calUrlOrig; // keep image in prompt
+          if (preReleaseOnly) {
+            advisoryText = calendarText; // surface pre-release line in prompt too
+          }
         } else {
           calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
           calDataUrlForPrompt = null;
@@ -1260,12 +1345,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     // ---------- Stage-1 (fast) ----------
     if (mode === "fast") {
       const messages = messagesFastStage1({
-        instrument, dateStr, m15, h1, h4,
+        instrument, dateStr, m15, h1, h4, m5,
         calendarDataUrl: calDataUrlForPrompt || undefined,
         calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
         headlinesText: headlinesText || undefined,
         sentimentText: sentimentText,
-        calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [] },
+        calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
         provenance: provForModel,
       });
       if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
@@ -1285,6 +1370,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       text = await enforceOption1(MODEL, instrument, text);
       text = await enforceOption2(MODEL, instrument, text);
 
+      // Ensure calendar visibility in Quick Plan
+      text = ensureCalendarVisibilityInQuickPlan(text, { instrument, preReleaseOnly, biasLine: calendarText });
+
+      // Stamp 5M execution if used
+      const usedM5 = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
+      text = stampM5Used(text, usedM5);
+
       text = applyConsistencyGuards(text, {
         instrument,
         headlinesSign: computeHeadlinesSign(hBias),
@@ -1292,14 +1384,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         calendarSign: parseInstrumentBiasFromNote(biasNote)
       });
 
-      const cacheKey = setCache({ instrument, m15, h1, h4, calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
+      const cacheKey = setCache({ instrument, m5: m5 || null, m15, h1, h4, calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
 
       const footer = buildServerProvenanceFooter({
         headlines_provider: headlinesProvider || "unknown",
         calendar_status: calendarStatus,
         calendar_provider: calendarProvider,
         csm_time: csm.tsISO,
-        extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict },
+        extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR },
       });
       text = `${text}\n${footer}`;
 
@@ -1326,12 +1418,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     // ---------- FULL ----------
     const messages = messagesFull({
-      instrument, dateStr, m15, h1, h4,
+      instrument, dateStr, m15, h1, h4, m5,
       calendarDataUrl: calDataUrlForPrompt || undefined,
       calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
       headlinesText: headlinesText || undefined,
       sentimentText,
-      calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [] },
+      calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
       provenance: provForModel,
     });
     if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
@@ -1345,6 +1437,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
 
+    // Ensure calendar visibility in Quick Plan
+    textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
+
+    // Stamp 5M execution if used
+    const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
+    textFull = stampM5Used(textFull, usedM5Full);
+
     textFull = applyConsistencyGuards(textFull, {
       instrument,
       headlinesSign: computeHeadlinesSign(hBias),
@@ -1357,7 +1456,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       calendar_status: calendarStatus,
       calendar_provider: calendarProvider,
       csm_time: csm.tsISO,
-      extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict },
+      extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR },
     });
     textFull = `${textFull}\n${footer}`;
 
