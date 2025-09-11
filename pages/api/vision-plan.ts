@@ -620,14 +620,22 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     const signed = (dir ? Math.sign(clamped) : -Math.sign(clamped)) * lineScore;
 
     // Build evidence line with score
-    const f = it.forecast; const p = it.previous;
-    let comp: string[] = [];
-    if (f != null) comp.push(Number(it.actual) < f ? "< forecast" : Number(it.actual) > f ? "> forecast" : "= forecast");
-    if (p != null) comp.push(Number(it.actual) < p ? "< previous" : Number(it.actual) > p ? "> previous" : "= previous");
-    const comps = comp.join(" & ");
-    const impactTag = it.impact ? ` (${it.impact})` : "";
-    const signWord = signed > 0 ? "bullish" : signed < 0 ? "bearish" : "neutral";
-    lines.push(`${cur} — ${it.title}: ${Number(it.actual)}${comps ? " " + comps : ""} → ${signWord} ${cur} (+/−${Math.abs(signed)}/10${impactTag})`);
+   // Ensure numeric before comparisons (OCR types can be string|number|null)
+const fRaw = it.forecast;
+const pRaw = it.previous;
+const aNum = Number(it.actual);
+const fNum = fRaw != null ? Number(fRaw) : null;
+const pNum = pRaw != null ? Number(pRaw) : null;
+
+let comp: string[] = [];
+if (fNum != null) comp.push(aNum < fNum ? "< forecast" : aNum > fNum ? "> forecast" : "= forecast");
+if (pNum != null) comp.push(aNum < pNum ? "< previous" : aNum > pNum ? "> previous" : "= previous");
+
+const comps = comp.join(" & ");
+const impactTag = it.impact ? ` (${it.impact})` : "";
+const signWord = signed > 0 ? "bullish" : signed < 0 ? "bearish" : "neutral";
+lines.push(`${cur} — ${it.title}: ${aNum}${comps ? " " + comps : ""} → ${signWord} ${cur} (+/−${Math.abs(signed)}/10${impactTag})`);
+
 
     add(cur, signed);
   }
