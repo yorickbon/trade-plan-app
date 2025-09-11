@@ -439,16 +439,22 @@ function evidenceLine(it: any, cur: string): string | null {
   const f = parseNumberLoose(it.forecast);
   const p = parseNumberLoose(it.previous);
   if (a == null || (f == null && p == null)) return null;
+
   const dir = goodIfHigher(String(it.title || ""));
   let comp: string[] = [];
   if (f != null) comp.push(a < f ? "< forecast" : a > f ? "> forecast" : "= forecast");
   if (p != null) comp.push(a < p ? "< previous" : a > p ? "> previous" : "= previous");
+
+  // No "mixed" wording — collapse to bullish/bearish/neutral
   let verdict = "neutral";
   if (dir === true) {
-    verdict = (a > (f ?? a) && a > (p ?? a)) ? "bullish" : (a < (f ?? a) && a < (p ?? a)) ? "bearish" : "mixed";
+    if ((f != null && a > f) || (p != null && a > p)) verdict = "bullish";
+    if ((f != null && a < f) && (p != null && a < p)) verdict = "bearish";
   } else if (dir === false) {
-    verdict = (a < (f ?? a) && a < (p ?? a)) ? "bullish" : (a > (f ?? a) && a > (p ?? a)) ? "bearish" : "mixed";
+    if ((f != null && a < f) || (p != null && a < p)) verdict = "bullish";
+    if ((f != null && a > f) && (p != null && a > p)) verdict = "bearish";
   }
+
   const comps = comp.join(" and ");
   return `${cur} — ${it.title}: actual ${a}${f!=null||p!=null ? ` ${comps}` : ""} → ${verdict} ${cur}`;
 }
@@ -649,18 +655,22 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     add(cur, signed);
   }
 
-  // Net per-currency and instrument bias
+    // Net per-currency and instrument bias
   const sumBase = Math.round(scoreByCur[base] ?? 0);
   const sumQuote = Math.round(scoreByCur[quote] ?? 0);
+
+  // Instrument metric: base - quote (positive → base stronger → bullish instrument)
   const netInstr = sumBase - sumQuote;
 
-  const absNet = Math.abs(netInstr);
+  // Force bullish/bearish unless BOTH sums are exactly zero
   let instrLabel: string;
-  if (absNet >= 6) instrLabel = netInstr > 0 ? "bullish" : "bearish";
-  else if (absNet >= 3) instrLabel = netInstr > 0 ? "mild bullish" : "mild bearish";
-  else instrLabel = "neutral";
+  if (sumBase === 0 && sumQuote === 0) {
+    instrLabel = "neutral";
+  } else {
+    instrLabel = netInstr > 0 ? "bullish" : "bearish";
+  }
 
-   const biasLine = `Calendar bias for ${pair}: ${instrLabel} (${base}:${sumBase >= 0 ? "+" : ""}${sumBase} / ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}, Net ${netInstr >= 0 ? "+" : ""}${netInstr}).`;
+  const biasLine = `Calendar bias for ${pair}: ${instrLabel} (${base}:${sumBase >= 0 ? "+" : ""}${sumBase} / ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}, Net ${netInstr >= 0 ? "+" : ""}${netInstr}).`;
   const biasNote = `Per-currency totals → ${base}:${sumBase >= 0 ? "+" : ""}${sumBase}, ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}; Net = ${netInstr >= 0 ? "+" : ""}${netInstr} (${instrLabel})`;
 
   return {
@@ -866,12 +876,16 @@ function systemCore(instrument: string, calendarAdvisory?: { warningMinutes?: nu
     "- If Calendar/Headlines/CSM align, do not say 'contradicting'; say 'aligning'.",
     "- 'Tech vs Fundy Alignment' must be Match when aligned, Mismatch when conflicted.",
     "",
+    "NO 'mixed' LABELS:",
+    "- In all outputs, do NOT use the word 'mixed' to describe fundamentals. Use only 'bullish', 'bearish', or 'neutral'.",
+    "- Calendar bias must be 'bullish' or 'bearish' unless both per-currency sums are exactly 0, in which case use 'neutral'.",
+    "",
     `Keep instrument alignment with ${instrument}.`,
     warn !== null ? `\nCALENDAR WARNING: High-impact event within ~${warn} min → avoid new Market entries right before; cap ≤35%.` : "",
     bias ? `\nPOST-RESULT ALIGNMENT: ${bias}.` : "",
     "",
     "Under **Fundamental View**, if Calendar is unavailable, write exactly 'Calendar: unavailable'.",
-    "If Calendar is pre-release only, write exactly 'Pre-release only, no confirmed bias until data is out.' and do NOT claim a bullish/bearish/mixed calendar bias.",
+    "If Calendar is pre-release only, write exactly 'Pre-release only, no confirmed bias until data is out.' and do NOT claim a bullish/bearish bias until results print.",
   ].join("\n");
 }
 
