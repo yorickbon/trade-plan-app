@@ -1311,11 +1311,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const h4f = pickFirst(files.h4);
     const calF = pickFirst(files.calendar);
 
-    const m5Url = String(pickFirst(fields.m5Url) || "").trim();
-    const m15Url = String(pickFirst(fields.m15Url) || "").trim();
-    const h1Url = String(pickFirst(fields.h1Url) || "").trim();
-    const h4Url = String(pickFirst(fields.h4Url) || "").trim();
-    const calendarUrlField = String(pickFirst(fields.calendarUrl) || "").trim();
+    const m5Url = String(pickFirst(fields.m5Url || fields.m5) || "").trim();
+const m15Url = String(pickFirst(fields.m15Url || fields.m15) || "").trim();
+const h1Url = String(pickFirst(fields.h1Url || fields.h1) || "").trim();
+const h4Url = String(pickFirst(fields.h4Url || fields.h4) || "").trim();
+const calendarUrlField = String(pickFirst(fields.calendarUrl || fields.calendar) || "").trim();
+
 
     const [m5FromFile, m15FromFile, h1FromFile, h4FromFile, calFromFile] = await Promise.all([
       m5f ? fileToDataUrl(m5f) : Promise.resolve(null),
