@@ -439,22 +439,16 @@ function evidenceLine(it: any, cur: string): string | null {
   const f = parseNumberLoose(it.forecast);
   const p = parseNumberLoose(it.previous);
   if (a == null || (f == null && p == null)) return null;
-
   const dir = goodIfHigher(String(it.title || ""));
   let comp: string[] = [];
   if (f != null) comp.push(a < f ? "< forecast" : a > f ? "> forecast" : "= forecast");
   if (p != null) comp.push(a < p ? "< previous" : a > p ? "> previous" : "= previous");
-
-  // No "mixed" wording — collapse to bullish/bearish/neutral
   let verdict = "neutral";
   if (dir === true) {
-    if ((f != null && a > f) || (p != null && a > p)) verdict = "bullish";
-    if ((f != null && a < f) && (p != null && a < p)) verdict = "bearish";
+    verdict = (a > (f ?? a) && a > (p ?? a)) ? "bullish" : (a < (f ?? a) && a < (p ?? a)) ? "bearish" : "mixed";
   } else if (dir === false) {
-    if ((f != null && a < f) || (p != null && a < p)) verdict = "bullish";
-    if ((f != null && a > f) && (p != null && a > p)) verdict = "bearish";
+    verdict = (a < (f ?? a) && a < (p ?? a)) ? "bullish" : (a > (f ?? a) && a > (p ?? a)) ? "bearish" : "mixed";
   }
-
   const comps = comp.join(" and ");
   return `${cur} — ${it.title}: actual ${a}${f!=null||p!=null ? ` ${comps}` : ""} → ${verdict} ${cur}`;
 }
@@ -467,52 +461,19 @@ async function callOpenAI(model: string, messages: any[]) {
     body.temperature = 0;
   }
 
-  const url = `${OPENAI_API_BASE}/chat/completions`;
-  const headers = { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` };
-
-  // Retry on transient errors (429/5xx) with backoff
-  const shouldRetry = (status: number) => status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
-
-  let lastErr: any = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const rsp = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-        // keep a hard timeout per attempt
-        signal: AbortSignal.timeout(20000),
-      });
-
-      const text = await rsp.text(); // read raw first to avoid double body reads
-      let json: any = {};
-      try { json = text ? JSON.parse(text) : {}; } catch { json = {}; }
-
-      if (!rsp.ok) {
-        if (shouldRetry(rsp.status) && attempt < 2) {
-          await new Promise(r => setTimeout(r, 600 * Math.pow(2, attempt))); // 600ms, 1200ms
-          continue;
-        }
-        throw new Error(`OpenAI request failed: ${rsp.status} ${text || "{}"}`);
-      }
-
-      const out =
-        json?.choices?.[0]?.message?.content ??
-        (Array.isArray(json?.choices?.[0]?.message?.content)
-          ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
-          : "");
-
-      return String(out || "");
-    } catch (e: any) {
-      lastErr = e;
-      // network/timeout → retry
-      if (attempt < 2) {
-        await new Promise(r => setTimeout(r, 600 * Math.pow(2, attempt)));
-        continue;
-      }
-    }
-  }
-  throw new Error(lastErr?.message || "OpenAI request failed after retries");
+  const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: JSON.stringify(body),
+  });
+  const json = await rsp.json().catch(() => ({} as any));
+  if (!rsp.ok) throw new Error(`OpenAI request failed: ${rsp.status} ${JSON.stringify(json)}`);
+  const out =
+    json?.choices?.[0]?.message?.content ??
+    (Array.isArray(json?.choices?.[0]?.message?.content)
+      ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
+      : "");
+  return String(out || "");
 }
 
 function tryParseJsonBlock(s: string): any | null {
@@ -688,22 +649,18 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     add(cur, signed);
   }
 
-    // Net per-currency and instrument bias
+  // Net per-currency and instrument bias
   const sumBase = Math.round(scoreByCur[base] ?? 0);
   const sumQuote = Math.round(scoreByCur[quote] ?? 0);
-
-  // Instrument metric: base - quote (positive → base stronger → bullish instrument)
   const netInstr = sumBase - sumQuote;
 
-  // Force bullish/bearish unless BOTH sums are exactly zero
+  const absNet = Math.abs(netInstr);
   let instrLabel: string;
-  if (sumBase === 0 && sumQuote === 0) {
-    instrLabel = "neutral";
-  } else {
-    instrLabel = netInstr > 0 ? "bullish" : "bearish";
-  }
+  if (absNet >= 6) instrLabel = netInstr > 0 ? "bullish" : "bearish";
+  else if (absNet >= 3) instrLabel = netInstr > 0 ? "mild bullish" : "mild bearish";
+  else instrLabel = "neutral";
 
-  const biasLine = `Calendar bias for ${pair}: ${instrLabel} (${base}:${sumBase >= 0 ? "+" : ""}${sumBase} / ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}, Net ${netInstr >= 0 ? "+" : ""}${netInstr}).`;
+   const biasLine = `Calendar bias for ${pair}: ${instrLabel} (${base}:${sumBase >= 0 ? "+" : ""}${sumBase} / ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}, Net ${netInstr >= 0 ? "+" : ""}${netInstr}).`;
   const biasNote = `Per-currency totals → ${base}:${sumBase >= 0 ? "+" : ""}${sumBase}, ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}; Net = ${netInstr >= 0 ? "+" : ""}${netInstr} (${instrLabel})`;
 
   return {
@@ -909,16 +866,12 @@ function systemCore(instrument: string, calendarAdvisory?: { warningMinutes?: nu
     "- If Calendar/Headlines/CSM align, do not say 'contradicting'; say 'aligning'.",
     "- 'Tech vs Fundy Alignment' must be Match when aligned, Mismatch when conflicted.",
     "",
-    "NO 'mixed' LABELS:",
-    "- In all outputs, do NOT use the word 'mixed' to describe fundamentals. Use only 'bullish', 'bearish', or 'neutral'.",
-    "- Calendar bias must be 'bullish' or 'bearish' unless both per-currency sums are exactly 0, in which case use 'neutral'.",
-    "",
     `Keep instrument alignment with ${instrument}.`,
     warn !== null ? `\nCALENDAR WARNING: High-impact event within ~${warn} min → avoid new Market entries right before; cap ≤35%.` : "",
     bias ? `\nPOST-RESULT ALIGNMENT: ${bias}.` : "",
     "",
     "Under **Fundamental View**, if Calendar is unavailable, write exactly 'Calendar: unavailable'.",
-    "If Calendar is pre-release only, write exactly 'Pre-release only, no confirmed bias until data is out.' and do NOT claim a bullish/bearish bias until results print.",
+    "If Calendar is pre-release only, write exactly 'Pre-release only, no confirmed bias until data is out.' and do NOT claim a bullish/bearish/mixed calendar bias.",
   ].join("\n");
 }
 
@@ -1311,12 +1264,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const h4f = pickFirst(files.h4);
     const calF = pickFirst(files.calendar);
 
-    const m5Url = String(pickFirst(fields.m5Url || fields.m5) || "").trim();
-const m15Url = String(pickFirst(fields.m15Url || fields.m15) || "").trim();
-const h1Url = String(pickFirst(fields.h1Url || fields.h1) || "").trim();
-const h4Url = String(pickFirst(fields.h4Url || fields.h4) || "").trim();
-const calendarUrlField = String(pickFirst(fields.calendarUrl || fields.calendar) || "").trim();
-
+    const m5Url = String(pickFirst(fields.m5Url) || "").trim();
+    const m15Url = String(pickFirst(fields.m15Url) || "").trim();
+    const h1Url = String(pickFirst(fields.h1Url) || "").trim();
+    const h4Url = String(pickFirst(fields.h4Url) || "").trim();
+    const calendarUrlField = String(pickFirst(fields.calendarUrl) || "").trim();
 
     const [m5FromFile, m15FromFile, h1FromFile, h4FromFile, calFromFile] = await Promise.all([
       m5f ? fileToDataUrl(m5f) : Promise.resolve(null),
