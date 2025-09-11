@@ -475,8 +475,9 @@ async function callOpenAI(model: string, messages: any[]) {
       : "");
   return String(out || "");
 }
-}
+
 function tryParseJsonBlock(s: string): any | null {
+
   if (!s) return null;
   const fence = s.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   const raw = fence ? fence[1] : s;
