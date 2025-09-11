@@ -673,10 +673,6 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
   };
 }
 
- 
-  return { biasLine, biasNote, warningMinutes: warn, evidenceLines: lines, preReleaseOnly: false, rowsForDebug };
-}
-
 // Helpers to determine instrument-relevant currencies for OCR usability checks
 const CURRENCIES = new Set(G8);
 function relevantCurrenciesFromInstrument(instr: string): string[] {
