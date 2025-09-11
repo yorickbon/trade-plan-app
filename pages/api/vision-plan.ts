@@ -4,7 +4,7 @@
  * - Accepts forecast-vs-previous (no actual yet) to derive expected bias.
  * - Only shows "Calendar provided, but no relevant info for <INSTRUMENT>." when OCR has zero rows for the pair’s currencies.
  * - Keeps API calendar fallback, but OCR should satisfy most cases now.
- * - Preserves section enforcement, consistency guard, conviction caps, caching, and provenance.
+ * - Preserves section enforcement, consistency guard, conviction (0–100, no hard caps), caching, and provenance.
  */
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -17,7 +17,7 @@ export const config = { api: { bodyParser: false, sizeLimit: "25mb" } };
 type Ok = { ok: true; text: string; meta?: any };
 type Err = { ok: false; reason: string };
 
-const VP_VERSION = "2025-09-09-ocrv9-prerelease-strict+M5+debug";
+const VP_VERSION = "2025-09-11-ocrv10-fund0to100+tournament+no-mixed";
 
 // ---------- OpenAI / Model pick ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
@@ -220,7 +220,7 @@ function headlinesToPromptLines(items: AnyHeadline[], limit = 6): string | null 
     const t = String(it?.title || "").slice(0, 200);
     const src = it?.source || "";
     const when = it?.ago || "";
-    return `• ${t} — ${src}${when ? `, ${when}` : ""} — ${lab};`;
+    return `• ${t} — ${src}${when ? `, ${when}` : ""} — lab:${lab};`;
   });
   return lines.join("\n");
 }
@@ -434,6 +434,8 @@ function goodIfHigher(title: string): boolean | null {
   if (/interest rate|rate decision|refi rate|deposit facility|bank rate|cash rate|ocr/.test(t)) return true;
   return null;
 }
+
+// (A) Evidence line — verdict strictly bullish/bearish/neutral (never "mixed")
 function evidenceLine(it: any, cur: string): string | null {
   const a = parseNumberLoose(it.actual);
   const f = parseNumberLoose(it.forecast);
@@ -443,11 +445,19 @@ function evidenceLine(it: any, cur: string): string | null {
   let comp: string[] = [];
   if (f != null) comp.push(a < f ? "< forecast" : a > f ? "> forecast" : "= forecast");
   if (p != null) comp.push(a < p ? "< previous" : a > p ? "> previous" : "= previous");
-  let verdict = "neutral";
+  let verdict: "bullish" | "bearish" | "neutral" = "neutral";
   if (dir === true) {
-    verdict = (a > (f ?? a) && a > (p ?? a)) ? "bullish" : (a < (f ?? a) && a < (p ?? a)) ? "bearish" : "mixed";
+    const gtRef = (f != null && a > f) || (p != null && a > p);
+    const ltBoth = (f != null ? a < f : true) && (p != null ? a < p : true);
+    const gtBoth = (f != null ? a > f : true) && (p != null ? a > p : true);
+    verdict = gtBoth ? "bullish" : ltBoth ? "bearish" : "neutral";
   } else if (dir === false) {
-    verdict = (a < (f ?? a) && a < (p ?? a)) ? "bullish" : (a > (f ?? a) && a > (p ?? a)) ? "bearish" : "mixed";
+    const ltRef = (f != null && a < f) || (p != null && a < p);
+    const gtBoth = (f != null ? a > f : true) && (p != null ? a > p : true);
+    const ltBoth = (f != null ? a < f : true) && (p != null ? a < p : true);
+    verdict = ltBoth ? "bullish" : gtBoth ? "bearish" : "neutral";
+  } else {
+    verdict = "neutral";
   }
   const comps = comp.join(" and ");
   return `${cur} — ${it.title}: actual ${a}${f!=null||p!=null ? ` ${comps}` : ""} → ${verdict} ${cur}`;
@@ -477,7 +487,6 @@ async function callOpenAI(model: string, messages: any[]) {
 }
 
 function tryParseJsonBlock(s: string): any | null {
-
   if (!s) return null;
   const fence = s.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   const raw = fence ? fence[1] : s;
@@ -531,7 +540,7 @@ async function ocrCalendarFromImage(model: string, calendarDataUrl: string): Pro
   return { items };
 }
 
-// -------- Enhanced OCR analysis: STRICT pre-release handling --------
+// -------- Enhanced OCR analysis: STRICT pre-release handling + final bias rule --------
 function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
   biasLine: string | null;
   biasNote: string | null;
@@ -634,7 +643,7 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     // Signed score (goodIfHigher flips)
     const signed = (dir ? Math.sign(clamped) : -Math.sign(clamped)) * lineScore;
 
-    // Evidence line
+    // Evidence line (never "mixed")
     const fNum = it.forecast != null ? Number(it.forecast) : null;
     const pNum = it.previous != null ? Number(it.previous) : null;
     let comp: string[] = [];
@@ -643,25 +652,23 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     const comps = comp.join(" & ");
 
     const impactTag = it.impact ? ` (${it.impact})` : "";
-    const signWord = signed > 0 ? "bullish" : signed < 0 ? "bearish" : "neutral";
+    const signWord: "bullish" | "bearish" | "neutral" = signed > 0 ? "bullish" : signed < 0 ? "bearish" : "neutral";
     lines.push(`${cur} — ${it.title}: ${aNum}${comps ? " " + comps : ""} → ${signWord} ${cur} (${signed >= 0 ? "+" : ""}${signed}/10${impactTag})`);
 
     add(cur, signed);
   }
 
-  // Net per-currency and instrument bias
+  // Net per-currency and instrument bias — baseMinusQuote rule with strict labels
   const sumBase = Math.round(scoreByCur[base] ?? 0);
   const sumQuote = Math.round(scoreByCur[quote] ?? 0);
   const netInstr = sumBase - sumQuote;
 
-  const absNet = Math.abs(netInstr);
-  let instrLabel: string;
-  if (absNet >= 6) instrLabel = netInstr > 0 ? "bullish" : "bearish";
-  else if (absNet >= 3) instrLabel = netInstr > 0 ? "mild bullish" : "mild bearish";
-  else instrLabel = "neutral";
+  let instrLabel: "bullish" | "bearish" | "neutral";
+  if (sumBase === 0 && sumQuote === 0) instrLabel = "neutral";
+  else instrLabel = netInstr > 0 ? "bullish" : netInstr < 0 ? "bearish" : "neutral";
 
-   const biasLine = `Calendar bias for ${pair}: ${instrLabel} (${base}:${sumBase >= 0 ? "+" : ""}${sumBase} / ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}, Net ${netInstr >= 0 ? "+" : ""}${netInstr}).`;
-  const biasNote = `Per-currency totals → ${base}:${sumBase >= 0 ? "+" : ""}${sumBase}, ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}; Net = ${netInstr >= 0 ? "+" : ""}${netInstr} (${instrLabel})`;
+  const biasLine = `Calendar bias for ${pair}: ${instrLabel} (${base}:${sumBase >= 0 ? "+" : ""}${sumBase} / ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}, Net ${netInstr >= 0 ? "+" : ""}${netInstr}).`;
+  const biasNote = `Per-currency totals → ${base}:${sumBase >= 0 ? "+" : ""}${sumBase}, ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}; Net = ${netInstr >= 0 ? "+" : ""}${netInstr} (Instrument bias: ${instrLabel})`;
 
   return {
     biasLine,
@@ -783,7 +790,7 @@ async function fetchCalendarForAdvisory(req: NextApiRequest, instrument: string)
   }
 }
 
-// ---------- Composite bias (calendar + headlines + CSM) ----------
+// ---------- Composite bias (legacy for provenance only) ----------
 function splitFXPair(instr: string): { base: string|null; quote: string|null } {
   const U = (instr || "").toUpperCase();
   if (U.length >= 6) {
@@ -794,8 +801,8 @@ function splitFXPair(instr: string): { base: string|null; quote: string|null } {
 }
 function parseInstrumentBiasFromNote(biasNote: string | null | undefined): number {
   if (!biasNote) return 0;
-  const m = biasNote.match(/instrument[^:]*:\s*(bullish|bearish)/i);
-  if (m?.[1]) return m[1].toLowerCase() === "bullish" ? 1 : -1;
+  const m = biasNote.match(/instrument[^:]*:\s*(bullish|bearish|neutral)/i);
+  if (m?.[1]) return m[1].toLowerCase() === "bullish" ? 1 : m[1].toLowerCase() === "bearish" ? -1 : 0;
   return 0;
 }
 function computeCSMInstrumentSign(csm: CsmSnapshot, instr: string): { sign: number; zdiff: number | null } {
@@ -830,14 +837,15 @@ function computeCompositeBias(args: {
   const align = (pos && !neg) || (neg && !pos);
   const conflict = pos && neg;
 
-  let cap = 70; // base cap
+  // Retained only for provenance/debug (no conviction caps applied anymore)
+  let cap = 70;
   if (conflict) cap = 35;
   if (args.warningMinutes != null) cap = Math.min(cap, 35);
 
   return { calendarSign: calSign, headlinesSign: hSign, csmSign, csmZDiff: zdiff, align, conflict, cap };
 }
 
-// ---------- prompts (NO-GUESS + forced order + consistency) ----------
+// ---------- prompts (Updated per ALLOWED CHANGES A–E) ----------
 function systemCore(instrument: string, calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null }) {
   const warn = (calendarAdvisory?.warningMinutes ?? null) != null ? calendarAdvisory!.warningMinutes : null;
   const bias = calendarAdvisory?.biasNote || null;
@@ -849,29 +857,70 @@ function systemCore(instrument: string, calendarAdvisory?: { warningMinutes?: nu
     "- Only mention **Headlines** if a headlines snapshot is provided.",
     "- Do not invent events, figures, or quotes. If something is missing, write 'unavailable'.",
     "- Use the Sentiment snapshot exactly as given (CSM + Headlines bias + optional COT cue).",
+    "- Never use the word 'mixed' for calendar verdicts — use bullish/bearish/neutral only.",
     "",
     "Execution clarity:",
     "- Prefer **Entry zones (min–max)** for OB/FVG/SR confluence; use a **single price** for tight breakout/trigger.",
     "- SL behind structure; TP1/TP2 with R multiples; BE rules; invalidation.",
     "",
-    "Multi-timeframe: 4H HTF → 1H context → 15m execution. 5m may be used for scalp execution if supplied.",
-    "Tournament: evaluate strategies; Option 2 must be a distinct viable alternative.",
-    "Breakout discipline: if proof not confirmed, mark Pending with explicit trigger sequence.",
+    "Multi-timeframe roles (fixed):",
+    "- 4H = HTF bias & key zones (trend, SD zones, macro S/R, structure).",
+    "- 1H = context & setup construction (refine zones, structure state, trigger conditions).",
+    "- 15m = execution map (exact entry zone or trigger level, invalidation, TP structure).",
+    "- 5m (optional) = entry timing/confirmation only; do not let 5m override HTF bias.",
     "",
-    "Conviction governance (use provenance_hint.composite):",
-    "- If composite.conflict === true → cap conviction ≤35% and mark Tech vs Fundy: Mismatch.",
-    "- If composite.align === true → conviction may reach composite.cap (≤70%) subject to technical clarity.",
+    "Strategy Tournament (broad library & scoring):",
+    "- Evaluate these candidates by fit to visible charts (do not invent):",
+    "  • Market Structure (BOS/CHOCH; continuation vs reversal)",
+    "  • Order Blocks (OB) demand/supply; mitigations",
+    "  • Fair Value Gaps (FVG)/Imbalance; gap fills",
+    "  • Breakers/Breaker blocks",
+    "  • Support/Resistance (HTF + intraday), Round numbers/psych levels",
+    "  • Trendline breaks + retests; channels; wedges; triangles",
+    "  • Liquidity sweeps/stop hunts; equal highs/lows raids; session liquidity (London/NY)",
+    "  • Pullbacks (to MA/OB/FVG); 50%/61.8% fib retracements",
+    "  • Moving average regime/cross; momentum ignition/breakout",
+    "  • RSI divergence (regular/hidden); MACD impulse; Bollinger squeeze/expansion",
+    "  • Mean reversion/range rotations; range high/low plays; session “kill zones” confluence",
+    "- Score each candidate T_candidate = clamp( 0.5*HTF_fit(4H) + 0.3*Context_fit(1H) + 0.2*Trigger_fit(15m & optional 5m), 0, 100 ).",
+    "- Penalize conflicts with HTF (-15 to -30). Reward multi-signal confluence (+10 to +20) and clean invalidation/asymmetric R:R (+5 to +15).",
+    "- Pick TOP 1 as 'Option 1 (Primary)' and a DISTINCT runner-up for 'Option 2 (Alternative)'.",
+    "- Provide a compact tournament table (name — score — reason).",
+    "",
+    "Fundamentals Scoring (0–100, no hard caps):",
+    "- Determine calendar instrument sign from the calendar bias (bearish:-1, neutral:0, bullish:+1).",
+    "- Compute:",
+    "  • S_cal = 50 + 50*sign",
+    "  • Headlines (48h): S_head = 25 (bearish) / 50 (neutral) / 75 (bullish); if unavailable, use 50",
+    "  • CSM diff = z(base) - z(quote); S_csm = 50 + 25 * clamp(diff, -2, +2)/2",
+    "  • COT (if cues detected): bump +5 if aligns with calendar sign, -5 if conflicts, 0 if none",
+    "- Weights: w_cal=0.45, w_head=0.20, w_csm=0.30, w_cot=0.05",
+    "- RawF = w_cal*S_cal + w_head*S_head + w_csm*S_csm + w_cot*(50+cotBump)",
+    "- If a high-impact event is within ≤60 min, reduce by 25%: F = clamp( RawF * (1 - 0.25*proximityFlag), 0, 100 ), where proximityFlag=1 if warning ≤60 min else 0.",
+    "- Unavailable components fall back to 50 (except calendar sign, which may be neutral).",
+    "",
+    "Conviction (0–100) from TECH & FUND alignment:",
+    "- Compute T as the best tournament score (0–100).",
+    "- Use the fundamentals F above (0–100).",
+    "- Determine direction sign from technical primary vs fundamentals net sign; alignment bonus: +8 if same sign, else -8.",
+    "- If a high-impact event is within ≤60 min, apply final scaling 15%: Conv = clamp( (0.55*T + 0.45*F + align) * (1 - 0.15*proximityFlag), 0, 100 ).",
+    "- Do not apply any other caps.",
     "",
     "Consistency rule:",
     "- If Calendar/Headlines/CSM align, do not say 'contradicting'; say 'aligning'.",
     "- 'Tech vs Fundy Alignment' must be Match when aligned, Mismatch when conflicted.",
     "",
     `Keep instrument alignment with ${instrument}.`,
-    warn !== null ? `\nCALENDAR WARNING: High-impact event within ~${warn} min → avoid new Market entries right before; cap ≤35%.` : "",
+    warn !== null ? `\nCALENDAR WARNING: High-impact event within ~${warn} min. Avoid impulsive market entries right before release.` : "",
     bias ? `\nPOST-RESULT ALIGNMENT: ${bias}.` : "",
     "",
+    "Calendar verdict rules:",
+    "- Per event: compute verdict using domain direction (goodIfHigher); output only bullish/bearish/neutral.",
+    "- Final calendar bias uses baseMinusQuote: net = baseSum - quoteSum; net>0 → bullish instrument; net<0 → bearish; only when BOTH currency sums are exactly 0 → neutral.",
+    "- If no actuals in the last 72h for the pair’s currencies: 'Pre-release only, no confirmed bias until data is out.'",
+    "",
     "Under **Fundamental View**, if Calendar is unavailable, write exactly 'Calendar: unavailable'.",
-    "If Calendar is pre-release only, write exactly 'Pre-release only, no confirmed bias until data is out.' and do NOT claim a bullish/bearish/mixed calendar bias.",
+    "If Calendar is pre-release only, write exactly 'Pre-release only, no confirmed bias until data is out.' and do NOT claim a bullish/bearish/neutral calendar bias.",
   ].join("\n");
 }
 
@@ -1338,7 +1387,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         calendarProvider = "image-ocr";
         if (usableForInstr) {
           const analyzed = analyzeCalendarOCR(ocr, instrument);
-          calendarText = analyzed.biasLine;                    // will be pre-release line or bias line
+          calendarText = analyzed.biasLine;                    // pre-release line or bias line
           calendarEvidence = analyzed.evidenceLines;           // only post-result rows (≤72h)
           warningMinutes = analyzed.warningMinutes;
           biasNote = analyzed.preReleaseOnly ? null : analyzed.biasNote; // no biasNote if pre-release
@@ -1383,7 +1432,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const livePrice = await fetchLivePrice(instrument);
     const dateStr = new Date().toISOString().slice(0, 10);
 
-    // Composite bias
+    // Composite bias (provenance only)
     const composite = computeCompositeBias({
       instrument,
       calendarBiasNote: biasNote,
@@ -1395,7 +1444,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const provForModel = {
       headlines_present: !!headlinesText,
       calendar_status: calendarStatus,
-      composite
+      composite,
+      // Fundamentals hint inputs for LLM scoring per B-D:
+      fundamentals_hint: {
+        calendar_sign: parseInstrumentBiasFromNote(biasNote),
+        headlines_label: hBias.label,
+        csm_diff: computeCSMInstrumentSign(csm, instrument).zdiff,
+        cot_cue_present: !!cotCue
+      },
+      proximity_flag: warningMinutes != null ? 1 : 0
     };
 
     // ---------- Stage-1 (fast) ----------
