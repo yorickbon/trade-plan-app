@@ -660,8 +660,8 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
   else if (absNet >= 3) instrLabel = netInstr > 0 ? "mild bullish" : "mild bearish";
   else instrLabel = "neutral";
 
-  const biasLine = `Calendar bias for ${pair}: ${instrLabel} (${base}:${sumBase} / ${quote}:${sumQuote}, Net ${netInstr >= 0 ? "+" : ""}${netInstr}).`;
-  const biasNote = `Per-currency totals → ${base}:${sumBase}, ${quote}:${sumQuote}; Net = ${netInstr >= 0 ? "+" : ""}${netInstr} (${instrLabel})`;
+   const biasLine = `Calendar bias for ${pair}: ${instrLabel} (${base}:${sumBase >= 0 ? "+" : ""}${sumBase} / ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}, Net ${netInstr >= 0 ? "+" : ""}${netInstr}).`;
+  const biasNote = `Per-currency totals → ${base}:${sumBase >= 0 ? "+" : ""}${sumBase}, ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}; Net = ${netInstr >= 0 ? "+" : ""}${netInstr} (${instrLabel})`;
 
   return {
     biasLine,
