@@ -455,10 +455,16 @@ function evidenceLine(it: any, cur: string): string | null {
 
 // ---------- OpenAI core ----------
 async function callOpenAI(model: string, messages: any[]) {
+  // GPT-5 rejects non-default temperature. Keep temp=0 for 4o; omit for GPT-5.
+  const body: any = { model, messages };
+  if (!/^gpt-5/i.test(model)) {
+    body.temperature = 0;
+  }
+
   const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: JSON.stringify({ model, messages, temperature: 0 }), // deterministic Fast ↔ Full parity
+    body: JSON.stringify(body),
   });
   const json = await rsp.json().catch(() => ({} as any));
   if (!rsp.ok) throw new Error(`OpenAI request failed: ${rsp.status} ${JSON.stringify(json)}`);
@@ -468,6 +474,7 @@ async function callOpenAI(model: string, messages: any[]) {
       ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
       : "");
   return String(out || "");
+}
 }
 function tryParseJsonBlock(s: string): any | null {
   if (!s) return null;
@@ -562,16 +569,14 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     const f = parseNumberLoose(it.forecast);
     const p = parseNumberLoose(it.previous);
 
-   // Post-result evidence only if actual exists and row is within last ~72h.
-// If OCR didn't give timeISO, assume it's recent (treat as within 72h).
-const ts = it.timeISO ? Date.parse(it.timeISO) : NaN;
-const isWithin72h = isFinite(ts) ? (ts <= nowMs && (nowMs - ts) <= H72) : true;
+    // Post-result evidence only if actual exists and row is within last ~72h.
+    // If OCR didn't give timeISO, assume it's recent (treat as within 72h).
+    const ts = it.timeISO ? Date.parse(it.timeISO) : NaN;
+    const isWithin72h = isFinite(ts) ? (ts <= nowMs && (nowMs - ts) <= H72) : true;
 
-if (a != null && (f != null || p != null) && isWithin72h) {
-  const ev = evidenceLine(it, cur);
-  if (ev) lines.push(ev);
-  postRows.push(it);
-}
+    if (a != null && (f != null || p != null) && isWithin72h) {
+      postRows.push({ ...it, actual: a, forecast: f, previous: p });
+    }
   }
 
   // If NO post-result rows → pre-release only (no bias; explicit phrasing)
@@ -587,34 +592,60 @@ if (a != null && (f != null || p != null) && isWithin72h) {
     };
   }
 
-  // If we have post-result rows: derive per-currency bias from actual vs forecast/previous surprises
+  // Per-line 0–10 scoring (impact-weighted), then per-currency sums
   const scoreByCur: Record<string, number> = {};
   function add(cur: string, v: number) { scoreByCur[cur] = (scoreByCur[cur] ?? 0) + v; }
+
+  const impactW: Record<string, number> = { Low: 0.5, Medium: 0.8, High: 1.0 };
 
   for (const it of postRows) {
     const cur = (it.currency || "").toUpperCase();
     const dir = goodIfHigher(String(it.title || "")); // true=higher good; false=lower good
-    const a = parseNumberLoose(it.actual)!;
-    const f = parseNumberLoose(it.forecast);
-    const p = parseNumberLoose(it.previous);
-    const ref = f ?? p;
-    if (ref == null || dir == null) continue;
-    const rawDelta = (a - ref) / (Math.abs(ref) || 1);
-    const signed = dir ? rawDelta : -rawDelta;
-    const score = Math.max(-1, Math.min(1, signed * 4)); // squash
-    add(cur, score);
+    if (dir == null) continue;
+
+    const ref = (it.forecast ?? it.previous) as number | null;
+    if (ref == null) continue;
+
+    // Surprise normalized and clamped to ±0.25 (25%)
+    const raw = (Number(it.actual) - ref) / Math.max(Math.abs(ref), 1e-9);
+    const clamped = Math.max(-0.25, Math.min(0.25, raw));
+
+    // Base 0..10, impact weighting
+    const unsigned0to10 = Math.round((Math.abs(clamped) / 0.25) * 10);
+    const w = impactW[it.impact as keyof typeof impactW] ?? 1.0;
+    const lineScore = Math.round(unsigned0to10 * w);
+
+    // Signed according to 'goodIfHigher'
+    const signed = (dir ? Math.sign(clamped) : -Math.sign(clamped)) * lineScore;
+
+    // Build evidence line with score
+    const f = it.forecast; const p = it.previous;
+    let comp: string[] = [];
+    if (f != null) comp.push(Number(it.actual) < f ? "< forecast" : Number(it.actual) > f ? "> forecast" : "= forecast");
+    if (p != null) comp.push(Number(it.actual) < p ? "< previous" : Number(it.actual) > p ? "> previous" : "= previous");
+    const comps = comp.join(" & ");
+    const impactTag = it.impact ? ` (${it.impact})` : "";
+    const signWord = signed > 0 ? "bullish" : signed < 0 ? "bearish" : "neutral";
+    lines.push(`${cur} — ${it.title}: ${Number(it.actual)}${comps ? " " + comps : ""} → ${signWord} ${cur} (+/−${Math.abs(signed)}/10${impactTag})`);
+
+    add(cur, signed);
   }
 
-  const label = (s: number) => s > 0.05 ? "bullish" : s < -0.05 ? "bearish" : "neutral";
-  const bLab = label(scoreByCur[base] ?? 0);
-  const qLab = label(scoreByCur[quote] ?? 0);
+  // Net instrument call from per-currency sums
+  const sumBase = Math.round(scoreByCur[base] ?? 0);
+  const sumQuote = Math.round(scoreByCur[quote] ?? 0);
 
-  let instr: string | null = null;
-  if (bLab === "bullish" && qLab === "bearish") instr = "bullish (base stronger than quote)";
-  else if (bLab === "bearish" && qLab === "bullish") instr = "bearish (quote stronger than base)";
+  // Instrument metric: base - quote (positive → bullish instrument)
+  const netInstr = sumBase - sumQuote;
+  let instrLabel: string;
+  const absNet = Math.abs(netInstr);
+  if (absNet >= 4) instrLabel = netInstr > 0 ? "bullish" : "bearish";
+  else if (absNet >= 2) instrLabel = netInstr > 0 ? "mild bullish" : "mild bearish";
+  else instrLabel = "neutral";
 
-  const biasLine = `Calendar bias for ${pair}: ${instr ? `Instrument: ${instr}; ` : ""}Per-currency: ${base}:${bLab} / ${quote}:${qLab}`;
-  const biasNote = `Per-currency: ${base} ${bLab} vs ${quote} ${qLab}${instr ? `; Instrument bias: ${instr}` : ""}`;
+  const biasLine = `Calendar bias for ${pair}: ${instrLabel} (${base}:${sumBase} / ${quote}:${sumQuote}).`;
+  const biasNote = `Per-currency sums → ${base} ${sumBase >= 0 ? "+" : ""}${sumBase}, ${quote} ${sumQuote >= 0 ? "+" : ""}${sumQuote}; Net ${pair} = ${netInstr >= 0 ? "+" : ""}${netInstr} → ${instrLabel}`;
+
   return { biasLine, biasNote, warningMinutes: warn, evidenceLines: lines, preReleaseOnly: false, rowsForDebug };
 }
 
