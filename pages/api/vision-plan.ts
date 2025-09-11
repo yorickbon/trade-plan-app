@@ -538,22 +538,36 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
   warningMinutes: number | null;
   evidenceLines: string[];
   preReleaseOnly: boolean;
-  rowsForDebug: { timeISO: string | null; title: string | null; currency: string | null; impact: any; actual: any; forecast: any; previous: any }[];
+  rowsForDebug: {
+    timeISO: string | null;
+    title: string | null;
+    currency: string | null;
+    impact: any;
+    actual: any;
+    forecast: any;
+    previous: any;
+  }[];
 } {
-  const base = pair.slice(0,3), quote = pair.slice(3);
+  const base = pair.slice(0, 3),
+    quote = pair.slice(3);
   const nowMs = Date.now();
   const H72 = 72 * 3600 * 1000;
 
   const lines: string[] = [];
   const postRows: OcrCalendarRow[] = [];
-  const rowsForDebug = (ocr.items || []).slice(0, 3).map(r => ({
-    timeISO: r.timeISO || null, title: r.title || null, currency: r.currency || null,
-    impact: r.impact || null, actual: r.actual ?? null, forecast: r.forecast ?? null, previous: r.previous ?? null
+  const rowsForDebug = (ocr.items || []).slice(0, 3).map((r) => ({
+    timeISO: r.timeISO || null,
+    title: r.title || null,
+    currency: r.currency || null,
+    impact: r.impact || null,
+    actual: r.actual ?? null,
+    forecast: r.forecast ?? null,
+    previous: r.previous ?? null,
   }));
 
   let warn: number | null = null;
 
-  for (const it of (ocr.items || [])) {
+  for (const it of ocr.items || []) {
     const cur = (it?.currency || "").toUpperCase();
     if (!cur) continue;
 
@@ -562,7 +576,8 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
       const tt = Date.parse(it.timeISO);
       if (isFinite(tt) && tt >= nowMs) {
         const mins = Math.floor((tt - nowMs) / 60000);
-        if (mins <= 60) warn = warn == null ? mins : Math.min(warn, mins);
+        if (mins <= 60)
+          warn = warn == null ? mins : Math.min(warn, mins);
       }
     }
 
@@ -570,19 +585,24 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     const f = parseNumberLoose(it.forecast);
     const p = parseNumberLoose(it.previous);
 
-    // Post-result evidence only if actual exists and row is within last ~72h.
-    // If OCR didn't give timeISO, assume it's recent (treat as within 72h).
+    // Post-result only if actual exists and row is within last ~72h.
     const ts = it.timeISO ? Date.parse(it.timeISO) : NaN;
-    const isWithin72h = isFinite(ts) ? (ts <= nowMs && (nowMs - ts) <= H72) : true;
+    const isWithin72h = isFinite(ts)
+      ? ts <= nowMs && nowMs - ts <= H72
+      : true;
 
     if (a != null && (f != null || p != null) && isWithin72h) {
       postRows.push({ ...it, actual: a, forecast: f, previous: p });
     }
   }
 
-  // If NO post-result rows → pre-release only (no bias; explicit phrasing)
+  // If no post-result rows → pre-release only
   if (postRows.length === 0) {
-    const preLine = `Calendar: ${warn != null ? `High-impact events scheduled (≤${warn} min). ` : ""}Pre-release only, no confirmed bias until data is out.`;
+    const preLine = `Calendar: ${
+      warn != null
+        ? `High-impact events scheduled (≤${warn} min). `
+        : ""
+    }Pre-release only, no confirmed bias until data is out.`;
     return {
       biasLine: preLine,
       biasNote: null,
@@ -592,6 +612,118 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
       rowsForDebug,
     };
   }
+
+  // --- Scoring setup ---
+  const scoreByCur: Record<string, number> = {};
+  const impactW: Record<string, number> = {
+    Low: 0.5,
+    Medium: 0.8,
+    High: 1.0,
+  };
+  function add(cur: string, v: number) {
+    scoreByCur[cur] = (scoreByCur[cur] ?? 0) + v;
+  }
+
+  for (const it of postRows) {
+    const cur = (it.currency || "").toUpperCase();
+    const dir = goodIfHigher(String(it.title || "")); // true = higher good, false = lower good
+    if (dir == null) continue;
+
+    const ref =
+      (it.forecast as number | null) ??
+      (it.previous as number | null);
+    if (ref == null) continue;
+
+    const aNum = Number(it.actual);
+    const raw = (aNum - ref) / Math.max(Math.abs(ref), 1e-9);
+    const clamped = Math.max(-0.25, Math.min(0.25, raw)); // limit ±25%
+
+    // Score 0–10 scaled, impact-weighted
+    const unsigned0to10 = Math.round(
+      (Math.abs(clamped) / 0.25) * 10
+    );
+    const w =
+      impactW[it.impact as keyof typeof impactW] ?? 1.0;
+    const lineScore = Math.round(unsigned0to10 * w);
+
+    // Signed score (flip if lower=better)
+    const signed =
+      (dir ? Math.sign(clamped) : -Math.sign(clamped)) *
+      lineScore;
+
+    // Build evidence line
+    const fNum =
+      it.forecast != null ? Number(it.forecast) : null;
+    const pNum =
+      it.previous != null ? Number(it.previous) : null;
+
+    let comp: string[] = [];
+    if (fNum != null)
+      comp.push(
+        aNum < fNum
+          ? "< forecast"
+          : aNum > fNum
+          ? "> forecast"
+          : "= forecast"
+      );
+    if (pNum != null)
+      comp.push(
+        aNum < pNum
+          ? "< previous"
+          : aNum > pNum
+          ? "> previous"
+          : "= previous"
+      );
+
+    const comps = comp.join(" & ");
+    const impactTag = it.impact ? ` (${it.impact})` : "";
+    const signWord =
+      signed > 0
+        ? "bullish"
+        : signed < 0
+        ? "bearish"
+        : "neutral";
+    lines.push(
+      `${cur} — ${it.title}: ${aNum}${
+        comps ? " " + comps : ""
+      } → ${signWord} ${cur} (${
+        signed >= 0 ? "+" : ""
+      }${signed}/10${impactTag})`
+    );
+
+    add(cur, signed);
+  }
+
+  // --- Net per-currency and instrument bias ---
+  const sumBase = Math.round(scoreByCur[base] ?? 0);
+  const sumQuote = Math.round(scoreByCur[quote] ?? 0);
+  const netInstr = sumBase - sumQuote;
+
+  const absNet = Math.abs(netInstr);
+  let instrLabel: string;
+  if (absNet >= 6)
+    instrLabel = netInstr > 0 ? "bullish" : "bearish";
+  else if (absNet >= 3)
+    instrLabel = netInstr > 0 ? "mild bullish" : "mild bearish";
+  else instrLabel = "neutral";
+
+  const biasLine = `Calendar bias for ${pair}: ${instrLabel} (${base}:${sumBase} / ${quote}:${sumQuote}, Net ${
+    netInstr >= 0 ? "+" : ""
+  }${netInstr}).`;
+  const biasNote = `Per-currency totals → ${base}:${sumBase}, ${quote}:${sumQuote}; Net = ${
+    netInstr >= 0 ? "+" : ""
+  }${netInstr} (${instrLabel})`;
+
+  return {
+    biasLine,
+    biasNote,
+    warningMinutes: warn,
+    evidenceLines: lines,
+    preReleaseOnly: false,
+    rowsForDebug,
+  };
+}
+
 
   // Per-line 0–10 scoring (impact-weighted), then per-currency sums
   const scoreByCur: Record<string, number> = {};
