@@ -467,19 +467,52 @@ async function callOpenAI(model: string, messages: any[]) {
     body.temperature = 0;
   }
 
-  const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: JSON.stringify(body),
-  });
-  const json = await rsp.json().catch(() => ({} as any));
-  if (!rsp.ok) throw new Error(`OpenAI request failed: ${rsp.status} ${JSON.stringify(json)}`);
-  const out =
-    json?.choices?.[0]?.message?.content ??
-    (Array.isArray(json?.choices?.[0]?.message?.content)
-      ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
-      : "");
-  return String(out || "");
+  const url = `${OPENAI_API_BASE}/chat/completions`;
+  const headers = { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` };
+
+  // Retry on transient errors (429/5xx) with backoff
+  const shouldRetry = (status: number) => status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+
+  let lastErr: any = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const rsp = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        // keep a hard timeout per attempt
+        signal: AbortSignal.timeout(20000),
+      });
+
+      const text = await rsp.text(); // read raw first to avoid double body reads
+      let json: any = {};
+      try { json = text ? JSON.parse(text) : {}; } catch { json = {}; }
+
+      if (!rsp.ok) {
+        if (shouldRetry(rsp.status) && attempt < 2) {
+          await new Promise(r => setTimeout(r, 600 * Math.pow(2, attempt))); // 600ms, 1200ms
+          continue;
+        }
+        throw new Error(`OpenAI request failed: ${rsp.status} ${text || "{}"}`);
+      }
+
+      const out =
+        json?.choices?.[0]?.message?.content ??
+        (Array.isArray(json?.choices?.[0]?.message?.content)
+          ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
+          : "");
+
+      return String(out || "");
+    } catch (e: any) {
+      lastErr = e;
+      // network/timeout → retry
+      if (attempt < 2) {
+        await new Promise(r => setTimeout(r, 600 * Math.pow(2, attempt)));
+        continue;
+      }
+    }
+  }
+  throw new Error(lastErr?.message || "OpenAI request failed after retries");
 }
 
 function tryParseJsonBlock(s: string): any | null {
