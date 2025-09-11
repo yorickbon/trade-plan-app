@@ -673,68 +673,7 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
   };
 }
 
-  // Per-line 0–10 scoring (impact-weighted), then per-currency sums
-  const scoreByCur: Record<string, number> = {};
-  function add(cur: string, v: number) { scoreByCur[cur] = (scoreByCur[cur] ?? 0) + v; }
-
-  const impactW: Record<string, number> = { Low: 0.5, Medium: 0.8, High: 1.0 };
-
-  for (const it of postRows) {
-    const cur = (it.currency || "").toUpperCase();
-    const dir = goodIfHigher(String(it.title || "")); // true=higher good; false=lower good
-    if (dir == null) continue;
-
-    const ref = (it.forecast ?? it.previous) as number | null;
-    if (ref == null) continue;
-
-    // Surprise normalized and clamped to ±0.25 (25%)
-    const raw = (Number(it.actual) - ref) / Math.max(Math.abs(ref), 1e-9);
-    const clamped = Math.max(-0.25, Math.min(0.25, raw));
-
-    // Base 0..10, impact weighting
-    const unsigned0to10 = Math.round((Math.abs(clamped) / 0.25) * 10);
-    const w = impactW[it.impact as keyof typeof impactW] ?? 1.0;
-    const lineScore = Math.round(unsigned0to10 * w);
-
-    // Signed according to 'goodIfHigher'
-    const signed = (dir ? Math.sign(clamped) : -Math.sign(clamped)) * lineScore;
-
-    // Build evidence line with score
-   // Ensure numeric before comparisons (OCR types can be string|number|null)
-const fRaw = it.forecast;
-const pRaw = it.previous;
-const aNum = Number(it.actual);
-const fNum = fRaw != null ? Number(fRaw) : null;
-const pNum = pRaw != null ? Number(pRaw) : null;
-
-let comp: string[] = [];
-if (fNum != null) comp.push(aNum < fNum ? "< forecast" : aNum > fNum ? "> forecast" : "= forecast");
-if (pNum != null) comp.push(aNum < pNum ? "< previous" : aNum > pNum ? "> previous" : "= previous");
-
-const comps = comp.join(" & ");
-const impactTag = it.impact ? ` (${it.impact})` : "";
-const signWord = signed > 0 ? "bullish" : signed < 0 ? "bearish" : "neutral";
-lines.push(`${cur} — ${it.title}: ${aNum}${comps ? " " + comps : ""} → ${signWord} ${cur} (+/−${Math.abs(signed)}/10${impactTag})`);
-
-
-    add(cur, signed);
-  }
-
-  // Net instrument call from per-currency sums
-  const sumBase = Math.round(scoreByCur[base] ?? 0);
-  const sumQuote = Math.round(scoreByCur[quote] ?? 0);
-
-  // Instrument metric: base - quote (positive → bullish instrument)
-  const netInstr = sumBase - sumQuote;
-  let instrLabel: string;
-  const absNet = Math.abs(netInstr);
-  if (absNet >= 4) instrLabel = netInstr > 0 ? "bullish" : "bearish";
-  else if (absNet >= 2) instrLabel = netInstr > 0 ? "mild bullish" : "mild bearish";
-  else instrLabel = "neutral";
-
-  const biasLine = `Calendar bias for ${pair}: ${instrLabel} (${base}:${sumBase} / ${quote}:${sumQuote}).`;
-  const biasNote = `Per-currency sums → ${base} ${sumBase >= 0 ? "+" : ""}${sumBase}, ${quote} ${sumQuote >= 0 ? "+" : ""}${sumQuote}; Net ${pair} = ${netInstr >= 0 ? "+" : ""}${netInstr} → ${instrLabel}`;
-
+ 
   return { biasLine, biasNote, warningMinutes: warn, evidenceLines: lines, preReleaseOnly: false, rowsForDebug };
 }
 
