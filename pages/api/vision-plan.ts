@@ -846,7 +846,8 @@ function computeCompositeBias(args: {
 function systemCore(
   instrument: string,
   calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null },
-  scalping?: boolean
+  scalping?: boolean,
+  scalpingHard?: boolean
 ) {
   const warn = (calendarAdvisory?.warningMinutes ?? null) != null ? calendarAdvisory!.warningMinutes : null;
   const bias = calendarAdvisory?.biasNote || null;
@@ -929,14 +930,31 @@ function systemCore(
     "SCALPING MODE (guardrails only; sections unchanged):",
     "- Treat 4H/1H as guardrails; build setups on 15m, confirm timing on 5m (and 1m if provided). 1m must not override HTF bias.",
     "- Adjust candidate scoring weights: T_candidate = clamp( 0.35*HTF_fit(1H/4H) + 0.40*Context_fit(15m) + 0.25*Trigger_fit(5m & optional 1m), 0, 100 ).",
-    "- Prefer session confluence (London/NY kill zones), OR high/low, prior day high/low, Asia range. Reward +10 for session confluence and clean invalidation (≤0.35× ATR15) with ≥1.8R potential.",
+    "- Prefer session confluence (London/NY kill zones), OR prior day H/L, Asia range. Reward +10 for session confluence and clean invalidation (≤0.35× ATR15) with ≥1.8R potential.",
     "- Near red news ±30m: do not initiate new market orders; consider only pre-planned limit orders with structure protection.",
     "- Management suggestions may include: partial at 1R, BE after 1R, time-stop within ~20 min if no follow-through.",
+    "- EMA 21/50 may be referenced for added conviction but are optional and must not override price/structure; a strong push can break them temporarily.",
+    "- VWAP may be referenced; if referenced, include vwap_used=true in ai_meta.",
     "",
     "ai_meta (append fields for downstream tools): include {'mode':'scalping', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'max_attempts': 3} in the existing ai_meta JSON."
   ];
 
-  return [...baseLines, ...scalpingLines].join("\n");
+  const scalpingHardLines = !scalpingHard ? [] : [
+    "",
+    "SCALPING HARD (enforced micro-structure entries):",
+    "- Only produce a **scalping** trade or explicitly 'Stay Flat' if no compliant scalp exists.",
+    "- Entry must be built from 15m structure with **5m confirmation**; if a 1m chart is provided, use 1m for timing confirmation.",
+    "- Mandatory micro-structure: liquidity sweep or FVG/OB tap + immediate shift (CHOCH/BOS) on 5m/1m before trigger.",
+    "- SL must be tight: behind the 1m/5m swing that defines the setup; typical 0.15×–0.40× ATR15.",
+    "- Time-stop: if no progress within 15 minutes, recommend exit or reduce risk; state this explicitly.",
+    "- Max attempts: 2 per level/session; state remaining attempts if re-entry is suggested.",
+    "- Near red news ±20m: output 'Stay Flat' unless the setup is already resting as a limit with structure-protected invalidation.",
+    "- EMA 21/50 and VWAP remain optional references only; never a trigger on their own.",
+    "",
+    "ai_meta (override/add): set {'mode':'scalping-hard', 'time_stop_minutes': 15, 'max_attempts': 2} and include 'vwap_used' if VWAP is referenced."
+  ];
+
+  return [...baseLines, ...scalpingLines, ...scalpingHardLines].join("\n");
 }
 
 function buildUserPartsBase(args: {
@@ -985,57 +1003,78 @@ function messagesFull(args: {
   calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null; debugRows?: any[] | null; preReleaseOnly?: boolean | null };
   provenance?: any;
   scalping?: boolean;
+  scalpingHard?: boolean;
 }) {
-  const system = [
-    systemCore(args.instrument, args.calendarAdvisory, args.scalping), "",
-    "OUTPUT format (in this exact order):",
-    "Quick Plan (Actionable)",
-    "• Direction: Long | Short | Stay Flat",
-    "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-    "• Trigger:",
-    "• Entry (zone or single):",
-    "• Stop Loss:",
-    "• Take Profit(s): TP1 / TP2 (approx R multiples)",
-    "• Conviction: <0–100>%",
-    "• Setup:",
-    "• Short Reasoning:",
-    "",
-    "Option 1 (Primary)",
-    "• Direction: ...",
-    "• Order Type: ...",
-    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%", "• Why this is primary:",
-    "",
-    "Option 2 (Alternative)",
-    "• Direction: ...",
-    "• Order Type: ...",
-    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%", "• Why this alternative:",
-    "",
-    "Full Breakdown",
-    "• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m/1m if used)",
-    "• Fundamental View (Calendar + Sentiment + Headlines) — include explicit Calendar bias for <PAIR> when available; if pre-release, say: 'Pre-release only, no confirmed bias until data is out.'",
-    "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
-    "• Conditional Scenarios:",
-    "• Surprise Risk:",
-    "• Invalidation:",
-    "• One-liner Summary:",
-    "",
-    "Detected Structures (X-ray):",
-    "• 4H:", "• 1H:", "• 15m:", "• 5m (if used):", "• 1m (if used):",
-    "",
-    "Candidate Scores (tournament):",
-    "- name — score — reason",
-    "",
-    "Final Table Summary:",
-    `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |`,
-    `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
-    "",
-    "Append a fenced JSON block labeled ai_meta at the very end.",
-    "",
-    "provenance_hint:",
-    JSON.stringify(args.provenance || {}, null, 2),
-  ].join("\n");
+
+ const system = [
+  systemCore(
+    args.instrument,
+    args.calendarAdvisory,
+    args.scalping,
+    args.scalpingHard
+  ),
+  "",
+  "OUTPUT format (in this exact order):",
+  "Quick Plan (Actionable)",
+  "• Direction: Long | Short | Stay Flat",
+  "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
+  "• Trigger:",
+  "• Entry (zone or single):",
+  "• Stop Loss:",
+  "• Take Profit(s): TP1 / TP2 (approx R multiples)",
+  "• Conviction: <0–100>%",
+  "• Setup:",
+  "• Short Reasoning:",
+  "",
+  "Option 1 (Primary)",
+  "• Direction: ...",
+  "• Order Type: ...",
+  "• Trigger:",
+  "• Entry (zone or single):",
+  "• Stop Loss:",
+  "• Take Profit(s): TP1 / TP2",
+  "• Conviction: <0–100>%",
+  "• Why this is primary:",
+  "",
+  "Option 2 (Alternative)",
+  "• Direction: ...",
+  "• Order Type: ...",
+  "• Trigger:",
+  "• Entry (zone or single):",
+  "• Stop Loss:",
+  "• Take Profit(s): TP1 / TP2",
+  "• Conviction: <0–100>%",
+  "• Why this alternative:",
+  "",
+  "Full Breakdown",
+  "• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m/1m if used)",
+  "• Fundamental View (Calendar + Sentiment + Headlines) — include explicit Calendar bias for <PAIR> when available; if pre-release, say: 'Pre-release only, no confirmed bias until data is out.'",
+  "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
+  "• Conditional Scenarios:",
+  "• Surprise Risk:",
+  "• Invalidation:",
+  "• One-liner Summary:",
+  "",
+  "Detected Structures (X-ray):",
+  "• 4H:",
+  "• 1H:",
+  "• 15m:",
+  "• 5m (if used):",
+  "• 1m (if used):",
+  "",
+  "Candidate Scores (tournament):",
+  "- name — score — reason",
+  "",
+  "Final Table Summary:",
+  `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |`,
+  `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
+  "",
+  "Append a fenced JSON block labeled ai_meta at the very end.",
+  "",
+  "provenance_hint:",
+  JSON.stringify(args.provenance || {}, null, 2),
+].join("\n");
+
 
   return [
     { role: "system", content: system },
@@ -1057,35 +1096,56 @@ function messagesFastStage1(args: {
   calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null; debugRows?: any[] | null; preReleaseOnly?: boolean | null };
   provenance?: any;
   scalping?: boolean;
+  scalpingHard?: boolean;
 }) {
-  const system = [
-    systemCore(args.instrument, args.calendarAdvisory, args.scalping), "",
-    "OUTPUT ONLY:",
-    "Quick Plan (Actionable)",
-    "• Direction: Long | Short | Stay Flat",
-    "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%", "• Setup:", "• Short Reasoning:",
-    "",
-    "Option 1 (Primary)",
-    "• Direction: ...",
-    "• Order Type: ...",
-    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%", "• Why this is primary:",
-    "",
-    "Option 2 (Alternative)",
-    "• Direction: ...",
-    "• Order Type: ...",
-    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%", "• Why this alternative:",
-    "",
-    "Management: Brief actionable playbook.",
-    "",
-    "Append ONLY a fenced JSON block labeled ai_meta.",
-    "",
-    "provenance_hint:",
-    JSON.stringify(args.provenance || {}, null, 2),
-  ].join("\n");
+
+ const system = [
+  systemCore(
+    args.instrument,
+    args.calendarAdvisory,
+    args.scalping,
+    args.scalpingHard
+  ),
+  "",
+  "OUTPUT ONLY:",
+  "Quick Plan (Actionable)",
+  "• Direction: Long | Short | Stay Flat",
+  "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
+  "• Trigger:",
+  "• Entry (zone or single):",
+  "• Stop Loss:",
+  "• Take Profit(s): TP1 / TP2",
+  "• Conviction: <0–100>%",
+  "• Setup:",
+  "• Short Reasoning:",
+  "",
+  "Option 1 (Primary)",
+  "• Direction: ...",
+  "• Order Type: ...",
+  "• Trigger:",
+  "• Entry (zone or single):",
+  "• Stop Loss:",
+  "• Take Profit(s): TP1 / TP2",
+  "• Conviction: <0–100>%",
+  "• Why this is primary:",
+  "",
+  "Option 2 (Alternative)",
+  "• Direction: ...",
+  "• Order Type: ...",
+  "• Trigger:",
+  "• Entry (zone or single):",
+  "• Stop Loss:",
+  "• Take Profit(s): TP1 / TP2",
+  "• Conviction: <0–100>%",
+  "• Why this alternative:",
+  "",
+  "Management: Brief actionable playbook.",
+  "",
+  "Append ONLY a fenced JSON block labeled ai_meta.",
+  "",
+  "provenance_hint:",
+  JSON.stringify(args.provenance || {}, null, 2),
+].join("\n");
 
   const parts = buildUserPartsBase({
     instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4, m5: args.m5 || null, m1: args.m1 || null,
@@ -1292,15 +1352,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const provHint = { headlines_present: !!c.headlinesText, calendar_status: c.calendar ? "image-ocr" : (calAdv.status || "unavailable") };
 
       const messages = messagesFull({
-        instrument: c.instrument, dateStr,
-        m15: c.m15, h1: c.h1, h4: c.h4, m5: c.m5 || null, m1: null,
-        calendarDataUrl: c.calendar || undefined,
-        headlinesText: c.headlinesText || undefined,
-        sentimentText: c.sentimentText || undefined,
-        calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText, evidence: calAdv.evidence || [] },
-        provenance: provHint,
-        scalping: false,
-      });
+  instrument: c.instrument, dateStr,
+  m15: c.m15, h1: c.h1, h4: c.h4, m5: c.m5 || null, m1: null,
+  calendarDataUrl: c.calendar || undefined,
+  headlinesText: c.headlinesText || undefined,
+  sentimentText: c.sentimentText || undefined,
+  calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText, evidence: calAdv.evidence || [] },
+  provenance: provHint,
+  scalping: false,
+  scalpingHard: false
+});
+
 
       let text = await callOpenAI(modelExpand, messages);
       text = await enforceQuickPlan(modelExpand, c.instrument, text);
@@ -1337,10 +1399,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const requestedMode = String(fields.mode || "").toLowerCase();
     if (requestedMode === "fast") mode = "fast";
 
-    // NEW: scalping toggle (default off). Safe: when off, behavior is unchanged.
-    const scalpingRaw = String(pickFirst(fields.scalping) || "").trim().toLowerCase();
-    const scalping =
-      scalpingRaw === "1" || scalpingRaw === "true" || scalpingRaw === "on" || scalpingRaw === "yes";
+    // NEW: scalping toggles (default off). Safe: when off, behavior is unchanged.
+const scalpingRaw = String(pickFirst(fields.scalping) || "").trim().toLowerCase();
+const scalping =
+  scalpingRaw === "1" || scalpingRaw === "true" || scalpingRaw === "on" || scalpingRaw === "yes";
+
+const scalpingHardRaw = String(pickFirst(fields.scalping_hard) || "").trim().toLowerCase();
+const scalpingHard =
+  scalpingHardRaw === "1" || scalpingHardRaw === "true" || scalpingHardRaw === "on" || scalpingHardRaw === "yes";
+
 
     // debug toggle
     const debugField = String(pickFirst(fields.debug) || "").trim() === "1";
@@ -1386,6 +1453,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (!m15 || !h1 || !h4) {
       return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either files or TV/Gyazo image links. (5m/1m optional)" });
     }
+
+    // Hard scalping requires both 5m and 1m charts.
+if (scalpingHard && (!m5 || !m1)) {
+  return res.status(400).json({ ok: false, reason: "Hard scalping requires BOTH 5m and 1m charts. Please upload 5m + 1m along with 15m/1H/4H." });
+}
 
     // Headlines
     let headlineItems: AnyHeadline[] = [];
@@ -1486,108 +1558,111 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       warningMinutes
     });
 
-    const provForModel = {
-      headlines_present: !!headlinesText,
-      calendar_status: calendarStatus,
-      composite,
-      fundamentals_hint: {
-        calendar_sign: parseInstrumentBiasFromNote(biasNote),
-        headlines_label: hBias.label,
-        csm_diff: computeCSMInstrumentSign(csm, instrument).zdiff,
-        cot_cue_present: !!cotCue
-      },
-      proximity_flag: warningMinutes != null ? 1 : 0,
-      scalping_mode: !!scalping
-    };
+   const provForModel = {
+  headlines_present: !!headlinesText,
+  calendar_status: calendarStatus,
+  composite,
+  fundamentals_hint: {
+    calendar_sign: parseInstrumentBiasFromNote(biasNote),
+    headlines_label: hBias.label,
+    csm_diff: computeCSMInstrumentSign(csm, instrument).zdiff,
+    cot_cue_present: !!cotCue
+  },
+  proximity_flag: warningMinutes != null ? 1 : 0,
+  scalping_mode: !!scalping,
+  scalping_hard_mode: !!scalpingHard
+};
 
-    // ---------- Stage-1 (fast) ----------
-    if (mode === "fast") {
-      const messages = messagesFastStage1({
-        instrument, dateStr, m15, h1, h4, m5, m1,
-        calendarDataUrl: calDataUrlForPrompt || undefined,
-        calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
-        headlinesText: headlinesText || undefined,
-        sentimentText: sentimentText,
-        calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
-        provenance: provForModel,
-        scalping,
-      });
-      if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
+   // ---------- Stage-1 (fast) ----------
+if (mode === "fast") {
+  const messages = messagesFastStage1({
+    instrument, dateStr, m15, h1, h4, m5, m1,
+    calendarDataUrl: calDataUrlForPrompt || undefined,
+    calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
+    headlinesText: headlinesText || undefined,
+    sentimentText: sentimentText,
+    calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
+    provenance: provForModel,
+    scalping,
+    scalpingHard
+  });
+  if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
 
-      let text = await callOpenAI(MODEL, messages);
-      let aiMeta = extractAiMeta(text) || {};
-      if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
+  let text = await callOpenAI(MODEL, messages);
+  let aiMeta = extractAiMeta(text) || {};
+  if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
 
-      const bad = invalidOrderRelativeToPrice(aiMeta);
-      if (bad) {
-        text = await enforceOption1(MODEL, instrument, text);
-        text = await enforceOption2(MODEL, instrument, text);
-        aiMeta = extractAiMeta(text) || aiMeta;
-      }
+  const bad = invalidOrderRelativeToPrice(aiMeta);
+  if (bad) {
+    text = await enforceOption1(MODEL, instrument, text);
+    text = await enforceOption2(MODEL, instrument, text);
+    aiMeta = extractAiMeta(text) || aiMeta;
+  }
 
-      text = await enforceQuickPlan(MODEL, instrument, text);
-      text = await enforceOption1(MODEL, instrument, text);
-      text = await enforceOption2(MODEL, instrument, text);
+  text = await enforceQuickPlan(MODEL, instrument, text);
+  text = await enforceOption1(MODEL, instrument, text);
+  text = await enforceOption2(MODEL, instrument, text);
 
-      // Ensure calendar visibility in Quick Plan
-      text = ensureCalendarVisibilityInQuickPlan(text, { instrument, preReleaseOnly, biasLine: calendarText });
+  text = ensureCalendarVisibilityInQuickPlan(text, { instrument, preReleaseOnly, biasLine: calendarText });
 
-      // Stamp 5M/1M execution if used
-      const usedM5 = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
-      text = stampM5Used(text, usedM5);
-      const usedM1 = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(text);
-      text = stampM1Used(text, usedM1);
+  const usedM5 = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
+  text = stampM5Used(text, usedM5);
+  const usedM1 = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(text);
+  text = stampM1Used(text, usedM1);
 
-      text = applyConsistencyGuards(text, {
-        instrument,
-        headlinesSign: computeHeadlinesSign(hBias),
-        csmSign: computeCSMInstrumentSign(csm, instrument).sign,
-        calendarSign: parseInstrumentBiasFromNote(biasNote)
-      });
+  text = applyConsistencyGuards(text, {
+    instrument,
+    headlinesSign: computeHeadlinesSign(hBias),
+    csmSign: computeCSMInstrumentSign(csm, instrument).sign,
+    calendarSign: parseInstrumentBiasFromNote(biasNote)
+  });
 
-      const cacheKey = setCache({ instrument, m5: m5 || null, m15, h1, h4, calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
+  const cacheKey = setCache({ instrument, m5: m5 || null, m15, h1, h4, calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
 
-      const footer = buildServerProvenanceFooter({
+  const footer = buildServerProvenanceFooter({
+    headlines_provider: headlinesProvider || "unknown",
+    calendar_status: calendarStatus,
+    calendar_provider: calendarProvider,
+    csm_time: csm.tsISO,
+    extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard },
+  });
+  text = `${text}\n${footer}`;
+
+  res.setHeader("Cache-Control", "no-store");
+  return res.status(200).json({
+    ok: true,
+    text,
+    meta: {
+      instrument, mode, cacheKey, vp_version: VP_VERSION, model: MODEL,
+      sources: {
+        headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
+        headlines_instrument: instrument,
         headlines_provider: headlinesProvider || "unknown",
+        calendar_used: calendarStatus !== "unavailable",
         calendar_status: calendarStatus,
         calendar_provider: calendarProvider,
+        csm_used: true,
         csm_time: csm.tsISO,
-        extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping },
-      });
-      text = `${text}\n${footer}`;
+      },
+      aiMeta,
+    },
+  });
+}
 
-      res.setHeader("Cache-Control", "no-store");
-      return res.status(200).json({
-        ok: true,
-        text,
-        meta: {
-          instrument, mode, cacheKey, vp_version: VP_VERSION, model: MODEL,
-          sources: {
-            headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
-            headlines_instrument: instrument,
-            headlines_provider: headlinesProvider || "unknown",
-            calendar_used: calendarStatus !== "unavailable",
-            calendar_status: calendarStatus,
-            calendar_provider: calendarProvider,
-            csm_used: true,
-            csm_time: csm.tsISO,
-          },
-          aiMeta,
-        },
-      });
-    }
 
     // ---------- FULL ----------
     const messages = messagesFull({
-      instrument, dateStr, m15, h1, h4, m5, m1,
-      calendarDataUrl: calDataUrlForPrompt || undefined,
-      calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
-      headlinesText: headlinesText || undefined,
-      sentimentText,
-      calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
-      provenance: provForModel,
-      scalping,
-    });
+  instrument, dateStr, m15, h1, h4, m5, m1,
+  calendarDataUrl: calDataUrlForPrompt || undefined,
+  calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
+  headlinesText: headlinesText || undefined,
+  sentimentText,
+  calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
+  provenance: provForModel,
+  scalping,
+  scalpingHard
+});
+
     if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
 
     let textFull = await callOpenAI(MODEL, messages);
@@ -1615,13 +1690,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       calendarSign: parseInstrumentBiasFromNote(biasNote)
     });
 
-    const footer = buildServerProvenanceFooter({
-      headlines_provider: headlinesProvider || "unknown",
-      calendar_status: calendarStatus,
-      calendar_provider: calendarProvider,
-      csm_time: csm.tsISO,
-      extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping },
-    });
+   const footer = buildServerProvenanceFooter({
+  headlines_provider: headlinesProvider || "unknown",
+  calendar_status: calendarStatus,
+  calendar_provider: calendarProvider,
+  csm_time: csm.tsISO,
+  extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard },
+});
+
     textFull = `${textFull}\n${footer}`;
 
     res.setHeader("Cache-Control", "no-store");
