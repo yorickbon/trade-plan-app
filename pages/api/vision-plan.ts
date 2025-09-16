@@ -425,16 +425,39 @@ function sentimentSummary(csm: CsmSnapshot, cotCue: CotCue | null, headlineBias:
 
 // ---------- Calendar helpers (OCR + API fallback) ----------
 function goodIfHigher(title: string): boolean | null {
-  const t = title.toLowerCase();
-  if (/(cpi|core cpi|ppi|inflation)/.test(t)) return true;
-  if (/(gdp|retail sales|industrial production|manufacturing production|consumer credit|housing starts|building permits|durable goods)/.test(t)) return true;
-  if (/(pmi|ism|confidence|sentiment)/.test(t)) return true;
-  if (/unemployment|jobless|initial claims|continuing claims/.test(t)) return false;
-  if (/(nonfarm|nfp|employment change|payrolls|jobs)/.test(t)) return true;
-  if (/trade balance|current account/.test(t)) return true;
-  if (/interest rate|rate decision|refi rate|deposit facility|bank rate|cash rate|ocr/.test(t)) return true;
+  // Normalize once
+  const t = (title || "").toLowerCase();
+
+  // Explicit, unambiguous mappings first (covers your case):
+  // Retail Sales (headline & core): higher is good (bullish) for the currency.
+  if (/\b(core\s+)?retail\s+sales\b/.test(t)) return true;
+
+  // CPI / inflation family
+  if (/\b(core\s+)?(cpi|ppi|inflation)\b/.test(t)) return true;
+
+  // Growth / activity
+  if (/\b(gdp|retail\s+trade|industrial\s+production|manufacturing\s+production|durable\s+goods|housing\s+starts|building\s+permits|consumer\s+credit)\b/.test(t)) return true;
+
+  // Surveys / diffusion indexes
+  if (/\b(pmi|ism|confidence|sentiment|zew)\b/.test(t)) return true;
+
+  // Labor market: lower unemployment/claims is “good”, but “higher” values are bad.
+  // So for jobless/claims, higher is bad → return false.
+  if (/\b(unemployment|jobless|initial\s+claims|continuing\s+claims)\b/.test(t)) return false;
+
+  // Employment change / payrolls: higher is good
+  if (/\b(nonfarm|nfp|employment\s+change|payrolls|jobs)\b/.test(t)) return true;
+
+  // Trade/current account: higher (surplus / less negative balance) is good
+  if (/\b(trade\s+balance|current\s+account)\b/.test(t)) return true;
+
+  // Policy rates: higher is usually supportive for the currency (hawkish)
+  if (/\b(interest\s+rate|rate\s+decision|refi\s+rate|deposit\s+facility|bank\s+rate|cash\s+rate|ocr)\b/.test(t)) return true;
+
+  // If not recognized, don’t guess
   return null;
 }
+
 
 // (A) Evidence line — verdict strictly bullish/bearish/neutral (never "mixed")
 function evidenceLine(it: any, cur: string): string | null {
