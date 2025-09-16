@@ -31,36 +31,41 @@ export default function VisionUpload({
   onBusyChange,
   resetSignal = 0,
 }: Props) {
-  // Files
-  const [m1, setM1] = useState<File | null>(null);      // NEW (optional)
-  const [m5, setM5] = useState<File | null>(null);      // optional
-  const [m15, setM15] = useState<File | null>(null);    // required (file or URL)
-  const [h1, setH1] = useState<File | null>(null);      // required (file or URL)
-  const [h4, setH4] = useState<File | null>(null);      // required (file or URL)
-  const [calendar, setCalendar] = useState<File | null>(null); // optional
+  // -------- Files --------
+  const [m1, setM1] = useState<File | null>(null);       // NEW (1m optional)
+  const [m5, setM5] = useState<File | null>(null);
+  const [m15, setM15] = useState<File | null>(null);
+  const [h1, setH1] = useState<File | null>(null);
+  const [h4, setH4] = useState<File | null>(null);
+  const [calendar, setCalendar] = useState<File | null>(null);
 
-  // URLs
-  const [m1Url, setM1Url] = useState("");               // NEW (optional)
-  const [m5Url, setM5Url] = useState("");               // optional
-  const [m15Url, setM15Url] = useState("");             // required (file or URL)
-  const [h1Url, setH1Url] = useState("");               // required (file or URL)
-  const [h4Url, setH4Url] = useState("");               // required (file or URL)
-  const [calendarUrl, setCalendarUrl] = useState("");   // optional
+  // -------- URLs --------
+  const [m1Url, setM1Url] = useState("");                // NEW (1m optional)
+  const [m5Url, setM5Url] = useState("");
+  const [m15Url, setM15Url] = useState("");
+  const [h1Url, setH1Url] = useState("");
+  const [h4Url, setH4Url] = useState("");
+  const [calendarUrl, setCalendarUrl] = useState("");
 
-  // Mode & flow
+  // -------- Mode & model --------
   const [mode, setMode] = useState<"fast" | "full">("fast");
   const [model, setModel] = useState<"gpt-4o" | "gpt-5">("gpt-4o");
-  const [scalping, setScalping] = useState<boolean>(false); // NEW
+
+  // -------- Scalping toggles --------
+  const [scalping, setScalping] = useState(false);       // soft scalping (existing behavior flag: scalping=1)
+  const [scalpingHard, setScalpingHard] = useState(false); // NEW hard scalping (flag: scalping_hard=1)
+
+  // -------- Flow / API metadata --------
   const [cacheKey, setCacheKey] = useState<string | null>(null);
   const [stage1Text, setStage1Text] = useState<string>("");
 
-  // UI
+  // -------- UI --------
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [bundledHeadlines, setBundledHeadlines] = useState<number>(0);
 
-  // Refs
-  const refM1 = useRef<HTMLInputElement>(null);          // NEW
+  // -------- Refs --------
+  const refM1 = useRef<HTMLInputElement>(null);           // NEW (1m optional)
   const refM5 = useRef<HTMLInputElement>(null);
   const refM15 = useRef<HTMLInputElement>(null);
   const refH1 = useRef<HTMLInputElement>(null);
@@ -73,17 +78,31 @@ export default function VisionUpload({
   }
 
   function clearAll() {
-    setM1(null); setM1Url(""); if (refM1.current) refM1.current.value = "";   // NEW
-    setM5(null); setM5Url(""); if (refM5.current) refM5.current.value = "";
-    setM15(null); setM15Url(""); if (refM15.current) refM15.current.value = "";
-    setH1(null); setH1Url(""); if (refH1.current) refH1.current.value = "";
-    setH4(null); setH4Url(""); if (refH4.current) refH4.current.value = "";
-    setCalendar(null); setCalendarUrl(""); if (refCal.current) refCal.current.value = "";
+    // files
+    setM1(null);  if (refM1.current) refM1.current.value = "";      // NEW
+    setM5(null);  if (refM5.current) refM5.current.value = "";
+    setM15(null); if (refM15.current) refM15.current.value = "";
+    setH1(null);  if (refH1.current) refH1.current.value = "";
+    setH4(null);  if (refH4.current) refH4.current.value = "";
+    setCalendar(null); if (refCal.current) refCal.current.value = "";
+
+    // urls
+    setM1Url("");                                                // NEW
+    setM5Url("");
+    setM15Url("");
+    setH1Url("");
+    setH4Url("");
+    setCalendarUrl("");
+
+    // flags
+    setScalping(false);
+    setScalpingHard(false);                                      // NEW
+
+    // flow
     setCacheKey(null);
     setStage1Text("");
     setError(null);
     setBundledHeadlines(0);
-    // do NOT change scalping/model/mode on clear
   }
 
   useEffect(() => { clearAll(); /* eslint-disable-next-line */ }, [instrument, resetSignal]);
@@ -109,25 +128,30 @@ export default function VisionUpload({
       fd.append("instrument", instrument);
       fd.append("model", model);
       if (mode === "fast") fd.append("mode", "fast");
-      if (scalping) fd.append("scalping", "true"); // NEW (toggle → backend flag)
 
-      // Files (optional/required as noted)
-      if (m1) fd.append("m1", m1);                 // NEW
+      // soft scalping flag (existing)
+      if (scalping) fd.append("scalping", "1");
+
+      // hard scalping flag (NEW)
+      if (scalpingHard) fd.append("scalping_hard", "1");
+
+      // Files
+      if (m1) fd.append("m1", m1);                  // NEW
       if (m5) fd.append("m5", m5);
       if (m15) fd.append("m15", m15);
       if (h1) fd.append("h1", h1);
       if (h4) fd.append("h4", h4);
       if (calendar) fd.append("calendar", calendar);
 
-      // URLs (optional/required as noted)
-      if (m1Url) fd.append("m1Url", m1Url.trim()); // NEW
+      // URLs
+      if (m1Url) fd.append("m1Url", m1Url.trim());  // NEW
       if (m5Url) fd.append("m5Url", m5Url.trim());
       if (m15Url) fd.append("m15Url", m15Url.trim());
       if (h1Url) fd.append("h1Url", h1Url.trim());
       if (h4Url) fd.append("h4Url", h4Url.trim());
       if (calendarUrl) fd.append("calendarUrl", calendarUrl.trim());
 
-      // Headlines (bundle on client as before)
+      // Headlines
       const headlines = await fetchHeadlinesForInstrument(instrument);
       if (headlines.length) {
         fd.append("headlinesJson", JSON.stringify(headlines));
@@ -185,11 +209,25 @@ export default function VisionUpload({
         <div className="flex items-center gap-3">
           <label className="text-sm font-medium">Mode:</label>
           <label className="flex items-center gap-1 text-sm">
-            <input type="radio" name="mode" value="fast" checked={mode === "fast"} onChange={() => setMode("fast")} disabled={busy} />
+            <input
+              type="radio"
+              name="mode"
+              value="fast"
+              checked={mode === "fast"}
+              onChange={() => setMode("fast")}
+              disabled={busy}
+            />
             Fast (Stage-1)
           </label>
           <label className="flex items-center gap-1 text-sm">
-            <input type="radio" name="mode" value="full" checked={mode === "full"} onChange={() => setMode("full")} disabled={busy} />
+            <input
+              type="radio"
+              name="mode"
+              value="full"
+              checked={mode === "full"}
+              onChange={() => setMode("full")}
+              disabled={busy}
+            />
             Full (one shot)
           </label>
         </div>
@@ -197,81 +235,204 @@ export default function VisionUpload({
         <div className="flex items-center gap-3">
           <label className="text-sm font-medium">Model:</label>
           <label className="flex items-center gap-1 text-sm">
-            <input type="radio" name="modelToggle" value="gpt-4o" checked={model === "gpt-4o"} onChange={() => setModel("gpt-4o")} disabled={busy} />
+            <input
+              type="radio"
+              name="modelToggle"
+              value="gpt-4o"
+              checked={model === "gpt-4o"}
+              onChange={() => setModel("gpt-4o")}
+              disabled={busy}
+            />
             gpt-4o
           </label>
           <label className="flex items-center gap-1 text-sm">
-            <input type="radio" name="modelToggle" value="gpt-5" checked={model === "gpt-5"} onChange={() => setModel("gpt-5")} disabled={busy} />
+            <input
+              type="radio"
+              name="modelToggle"
+              value="gpt-5"
+              checked={model === "gpt-5"}
+              onChange={() => setModel("gpt-5")}
+              disabled={busy}
+            />
             gpt-5
           </label>
         </div>
 
-        {/* NEW: Scalping toggle */}
-        <div className="flex items-center gap-2">
+        {/* Soft scalping (existing behavior) */}
+        <div className="flex items-center gap-3">
           <label className="text-sm font-medium">Scalping:</label>
-          <label className="relative inline-flex items-center cursor-pointer">
+          <label className="flex items-center gap-2 text-sm">
             <input
               type="checkbox"
-              className="sr-only peer"
               checked={scalping}
-              onChange={() => setScalping((v) => !v)}
+              onChange={(e) => setScalping(e.target.checked)}
               disabled={busy}
             />
-            <div className="w-10 h-5 bg-neutral-700 peer-focus:outline-none rounded-full peer
-                            peer-checked:bg-emerald-600 transition-colors"></div>
-            <span className="ml-2 text-xs opacity-80">{scalping ? "On" : "Off"}</span>
+            On (soft)
+          </label>
+        </div>
+
+        {/* Hard scalping (new) */}
+        <div className="flex items-center gap-3">
+          <label className="text-sm font-medium">Hard scalping:</label>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={scalpingHard}
+              onChange={(e) => setScalpingHard(e.target.checked)}
+              disabled={busy}
+            />
+            On (strict)
           </label>
         </div>
       </div>
 
       {/* URL row */}
       <div className="grid grid-cols-1 md:grid-cols-5 gap-2">
-        <input className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700" placeholder="1m image URL (optional)" value={m1Url} onChange={(e) => setM1Url(e.target.value)} disabled={busy} />
-        <input className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700" placeholder="5m image URL (optional)" value={m5Url} onChange={(e) => setM5Url(e.target.value)} disabled={busy} />
-        <input className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700" placeholder="15m image URL (required if no file)" value={m15Url} onChange={(e) => setM15Url(e.target.value)} disabled={busy} />
-        <input className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700" placeholder="1H image URL (required if no file)" value={h1Url} onChange={(e) => setH1Url(e.target.value)} disabled={busy} />
-        <input className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700" placeholder="4H image URL (required if no file)" value={h4Url} onChange={(e) => setH4Url(e.target.value)} disabled={busy} />
+        <input
+          className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700"
+          placeholder="1m image URL (TradingView/Gyazo)"
+          value={m1Url}
+          onChange={(e) => setM1Url(e.target.value)}
+          disabled={busy}
+        />
+        <input
+          className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700"
+          placeholder="5m image URL (TradingView/Gyazo)"
+          value={m5Url}
+          onChange={(e) => setM5Url(e.target.value)}
+          disabled={busy}
+        />
+        <input
+          className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700"
+          placeholder="15m image URL (TradingView/Gyazo)"
+          value={m15Url}
+          onChange={(e) => setM15Url(e.target.value)}
+          disabled={busy}
+        />
+        <input
+          className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700"
+          placeholder="1H image URL (TradingView/Gyazo)"
+          value={h1Url}
+          onChange={(e) => setH1Url(e.target.value)}
+          disabled={busy}
+        />
+        <input
+          className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700"
+          placeholder="4H image URL (TradingView/Gyazo)"
+          value={h4Url}
+          onChange={(e) => setH4Url(e.target.value)}
+          disabled={busy}
+        />
       </div>
 
       {/* Calendar URL */}
       <div>
-        <input className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700 w-full" placeholder="Calendar image URL (optional)" value={calendarUrl} onChange={(e) => setCalendarUrl(e.target.value)} disabled={busy} />
+        <input
+          className="px-2 py-1 rounded bg-neutral-900 border border-neutral-700 w-full"
+          placeholder="Calendar image URL (TradingView/Gyazo)"
+          value={calendarUrl}
+          onChange={(e) => setCalendarUrl(e.target.value)}
+          disabled={busy}
+        />
       </div>
 
       {/* File row */}
       <div className="grid grid-cols-1 md:grid-cols-5 gap-2">
-        <input type="file" ref={refM1} accept="image/*" onChange={(e) => setM1(e.target.files?.[0] || null)} disabled={busy} />   {/* NEW */}
-        <input type="file" ref={refM5} accept="image/*" onChange={(e) => setM5(e.target.files?.[0] || null)} disabled={busy} />
-        <input type="file" ref={refM15} accept="image/*" onChange={(e) => setM15(e.target.files?.[0] || null)} disabled={busy} />
-        <input type="file" ref={refH1} accept="image/*" onChange={(e) => setH1(e.target.files?.[0] || null)} disabled={busy} />
-        <input type="file" ref={refH4} accept="image/*" onChange={(e) => setH4(e.target.files?.[0] || null)} disabled={busy} />
+        <input
+          type="file"
+          ref={refM1}
+          accept="image/*"
+          onChange={(e) => setM1(e.target.files?.[0] || null)}
+          disabled={busy}
+        />
+        <input
+          type="file"
+          ref={refM5}
+          accept="image/*"
+          onChange={(e) => setM5(e.target.files?.[0] || null)}
+          disabled={busy}
+        />
+        <input
+          type="file"
+          ref={refM15}
+          accept="image/*"
+          onChange={(e) => setM15(e.target.files?.[0] || null)}
+          disabled={busy}
+        />
+        <input
+          type="file"
+          ref={refH1}
+          accept="image/*"
+          onChange={(e) => setH1(e.target.files?.[0] || null)}
+          disabled={busy}
+        />
+        <input
+          type="file"
+          ref={refH4}
+          accept="image/*"
+          onChange={(e) => setH4(e.target.files?.[0] || null)}
+          disabled={busy}
+        />
       </div>
 
       {/* Calendar file */}
       <div>
-        <input type="file" ref={refCal} accept="image/*" onChange={(e) => setCalendar(e.target.files?.[0] || null)} disabled={busy} />
+        <input
+          type="file"
+          ref={refCal}
+          accept="image/*"
+          onChange={(e) => setCalendar(e.target.files?.[0] || null)}
+          disabled={busy}
+        />
       </div>
 
       {/* Actions */}
       <div className="flex items-center gap-2">
-        <button onClick={handleGenerate} disabled={busy} className="px-3 py-1 rounded bg-blue-600 hover:bg-blue-700 disabled:opacity-60">
+        <button
+          onClick={handleGenerate}
+          disabled={busy}
+          className="px-3 py-1 rounded bg-blue-600 hover:bg-blue-700 disabled:opacity-60"
+        >
           {mode === "fast" ? "Generate (Stage-1)" : "Generate Full"}
         </button>
-        <button onClick={handleExpand} disabled={busy || !cacheKey} className="px-3 py-1 rounded border border-neutral-700 hover:bg-neutral-800 disabled:opacity-50" title={!cacheKey ? "Run Stage-1 first" : "Expand the rest"}>
+        <button
+          onClick={handleExpand}
+          disabled={busy || !cacheKey}
+          className="px-3 py-1 rounded border border-neutral-700 hover:bg-neutral-800 disabled:opacity-50"
+          title={!cacheKey ? "Run Stage-1 first" : "Expand the rest"}
+        >
           Expand Full Breakdown
         </button>
-        <button onClick={clearAll} disabled={busy} className="px-3 py-1 text-sm rounded border border-neutral-700 hover:bg-neutral-800">
+        <button
+          onClick={clearAll}
+          disabled={busy}
+          className="px-3 py-1 text-sm rounded border border-neutral-700 hover:bg-neutral-800"
+        >
           Clear All
         </button>
         {cacheKey && <span className="text-xs opacity-70">cache: {cacheKey.slice(0, 10)}…</span>}
       </div>
 
+      {/* Optional helper when hard scalping is on */}
+      {scalpingHard && (
+        <div className="text-xs text-amber-300">
+          Hard scalping on: upload 1m + 5m for best results (15m/1H/4H still required).
+        </div>
+      )}
+
       {/* Helpers */}
-      {bundledHeadlines > 0 && <div className="text-xs text-emerald-400">Headlines bundled: {bundledHeadlines}</div>}
-      {error && <div className="text-sm text-red-400 whitespace-pre-wrap border border-red-800/60 bg-red-900/10 rounded p-2">{error}</div>}
+      {bundledHeadlines > 0 && (
+        <div className="text-xs text-emerald-400">Headlines bundled: {bundledHeadlines}</div>
+      )}
+      {error && (
+        <div className="text-sm text-red-400 whitespace-pre-wrap border border-red-800/60 bg-red-900/10 rounded p-2">
+          {error}
+        </div>
+      )}
 
       <div className="text-xs opacity-70">
-        Required: 15m + 1H + 4H (files or URLs). 5m + 1m + Calendar are optional. Scalping toggle simply adds <code>scalping=true</code> in the request.
+        Required: 15m + 1H + 4H (files or URLs). 5m, 1m, Calendar are optional (recommended for scalping).
       </div>
     </div>
   );
