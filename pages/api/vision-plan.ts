@@ -953,7 +953,7 @@ function systemCore(
     "If Calendar is pre-release only, write exactly 'Pre-release only, no confirmed bias until data is out.' and do NOT claim a bullish/bearish/neutral calendar bias.",
   ];
 
-  const scalpingLines = !scalping ? [] : [
+   const scalpingLines = !scalping ? [] : [
     "",
     "SCALPING MODE (guardrails only; sections unchanged):",
     "- Treat 4H/1H as guardrails; build setups on 15m, confirm timing on 5m (and 1m if provided). 1m must not override HTF bias.",
@@ -963,16 +963,21 @@ function systemCore(
     "- Management suggestions may include: partial at 1R, BE after 1R, time-stop within ~20 min if no follow-through.",
     "- EMA 21/50 may be referenced for added conviction but are optional and must not override price/structure; a strong push can break them temporarily.",
     "- VWAP may be referenced; if referenced, include vwap_used=true in ai_meta.",
+    "- TIMEFRAME ATTRIBUTION FOR WORDING: Attribute sweeps to **5m**; attribute CHOCH/BOS to **1m** when detected there. Do not merge into a single timeframe label.",
+    "- TRIGGER WORDING RULE: Write triggers with explicit timeframes, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)'.",
     "",
     "ai_meta (append fields for downstream tools): include {'mode':'scalping', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'max_attempts': 3} in the existing ai_meta JSON."
   ];
 
-  const scalpingHardLines = !scalpingHard ? [] : [
+
+   const scalpingHardLines = !scalpingHard ? [] : [
     "",
     "SCALPING HARD (enforced micro-structure entries):",
     "- Only produce a **scalping** trade or explicitly 'Stay Flat' if no compliant scalp exists.",
     "- Entry must be built from 15m structure with **5m confirmation**; if a 1m chart is provided, use 1m for timing confirmation.",
-    "- Mandatory micro-structure: liquidity sweep or FVG/OB tap + immediate shift (CHOCH/BOS) on 5m/1m before trigger.",
+    "- Mandatory micro-structure: liquidity sweep or FVG/OB tap + immediate shift (CHOCH/BOS).",
+    "- TIMEFRAME ATTRIBUTION FOR WORDING (MANDATORY): Sweeps are credited to **5m**; CHOCH/BOS are credited to **1m** if detected there (else 5m).",
+    "- TRIGGER WORDING RULE (MANDATORY): Write the trigger with explicit timeframes, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)'. Never write '5m sweep and BOS' if BOS is on 1m.",
     "- SL must be tight: behind the 1m/5m swing that defines the setup; typical 0.15×–0.40× ATR15.",
     "- Time-stop: if no progress within 15 minutes, recommend exit or reduce risk; state this explicitly.",
     "- Max attempts: 2 per level/session; state remaining attempts if re-entry is suggested.",
@@ -981,6 +986,7 @@ function systemCore(
     "",
     "ai_meta (override/add): set {'mode':'scalping-hard', 'time_stop_minutes': 15, 'max_attempts': 2} and include 'vwap_used' if VWAP is referenced."
   ];
+
 
   return [...baseLines, ...scalpingLines, ...scalpingHardLines].join("\n");
 }
@@ -1046,7 +1052,7 @@ function messagesFull(args: {
   "Quick Plan (Actionable)",
   "• Direction: Long | Short | Stay Flat",
   "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-  "• Trigger:",
+  "• Trigger: (state timeframes explicitly, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)')",
   "• Entry (zone or single):",
   "• Stop Loss:",
   "• Take Profit(s): TP1 / TP2 (approx R multiples)",
@@ -1139,7 +1145,7 @@ function messagesFastStage1(args: {
   "Quick Plan (Actionable)",
   "• Direction: Long | Short | Stay Flat",
   "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-  "• Trigger:",
+  "• Trigger: (state timeframes explicitly, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)')",
   "• Entry (zone or single):",
   "• Stop Loss:",
   "• Take Profit(s): TP1 / TP2",
