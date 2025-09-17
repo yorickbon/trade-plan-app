@@ -1698,6 +1698,119 @@ function enforceFinalTableSummary(text: string, instrument: string) {
   return `${text}\n${stub}`;
 }
 
+/** Compute Conviction (0–100) and inject into Quick Plan / Option 1 / Option 2.
+ * Conv = clamp( (0.55*T + 0.45*F + align) * (1 - 0.15*proximityFlag), 0, 100 )
+ * - T = top tournament score (0–100)
+ * - F = fundamentals final score (0–100)
+ * - align = +8 if fundamentals sign matches Quick Plan direction, -8 if conflicts, else 0
+ * - Option 2 Conviction = ~85% of Option 1 (clamped 10–95)
+ */
+function computeAndInjectConviction(
+  text: string,
+  args: { fundamentals: { final: { score: number; sign: number } }, proximityFlag?: boolean }
+) {
+  if (!text) return text;
+
+  // T from tournament section
+  const tSect =
+    text.match(/Candidate\s*Scores\s*\(tournament\):[\s\S]*?(?=\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i)?.[0] || "";
+  const tMatches = [...tSect.matchAll(/—\s*(\d{1,3})\s*—/g)];
+  const tNums = tMatches.map(m => Number(m[1])).filter(n => Number.isFinite(n));
+  const T = tNums.length ? Math.max(...tNums.map(n => Math.max(0, Math.min(100, n)))) : 0;
+
+  const F = Math.max(0, Math.min(100, Number(args.fundamentals?.final?.score) || 0));
+  const fSign = Number(args.fundamentals?.final?.sign) || 0;
+
+  function dirSignFromQuickPlan(src: string): number {
+    const m = src.match(/Quick\s*Plan\s*\(Actionable\)[\s\S]*?Direction:\s*(Long|Short|Stay\s*Flat)/i);
+    if (!m) return 0;
+    const d = m[1].toLowerCase();
+    if (d.startsWith("long")) return +1;
+    if (d.startsWith("short")) return -1;
+    return 0;
+  }
+  const dSign = dirSignFromQuickPlan(text);
+  const align = (fSign !== 0 && dSign !== 0) ? (fSign === dSign ? 8 : -8) : 0;
+
+  let conv = 0.55 * T + 0.45 * F + align;
+  if (args.proximityFlag) conv *= 0.85;
+  conv = Math.max(0, Math.min(100, Math.round(conv)));
+
+  function replaceConvInBlock(src: string, blockRe: RegExp, pct: number) {
+    const m = src.match(blockRe);
+    if (!m) return src;
+    const block = m[0];
+    const hasLine = /(^\s*[-•]\s*Conviction:\s*)(\d+)%/mi.test(block);
+    const updated = hasLine
+      ? block.replace(/(^\s*[-•]\s*Conviction:\s*)(\d+)%/mi, `$1${pct}%`)
+      : block.replace(/(^\s*[-•]\s*Take\s*Profit\(s\):[^\n]*\n)/mi, `$1- **Conviction:** ${pct}%\n`);
+    return src.replace(block, updated);
+  }
+
+  let out = replaceConvInBlock(text,
+    /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i,
+    conv
+  );
+  out = replaceConvInBlock(out,
+    /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i,
+    conv
+  );
+
+  const conv2 = Math.max(10, Math.min(95, Math.round(conv * 0.85)));
+  out = replaceConvInBlock(out,
+    /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i,
+    conv2
+  );
+
+  return out;
+}
+
+/** Fill the Final Table Summary row from Quick Plan so it’s never empty. */
+function fillFinalTableSummaryRow(text: string, instrument: string) {
+  if (!text) return text;
+
+  function grab(re: RegExp): string | null {
+    const m = text.match(re);
+    return m ? String(m[1]).trim() : null;
+  }
+
+  const bias = grab(/Quick\s*Plan[\s\S]*?Direction:\s*(Long|Short|Stay\s*Flat)/i) || "...";
+  const entry = grab(/Quick\s*Plan[\s\S]*?Entry\s*\(zone\s*or\s*single\)\s*:\s*([^\n]+)/i) || "...";
+  const sl    = grab(/Quick\s*Plan[\s\S]*?Stop\s*Loss\s*:\s*([^\n]+)/i) || "...";
+  const tps   = grab(/Quick\s*Plan[\s\S]*?Take\s*Profit\(s\)\s*:\s*([^\n]+)/i) || "";
+  const conv  = grab(/Quick\s*Plan[\s\S]*?Conviction:\s*(\d+)%/i) || "...";
+
+  let tp1 = "...", tp2 = "...";
+  const m1 = tps.match(/TP1[:\s]*([0-9.\-]+)/i);
+  const m2 = tps.match(/TP2[:\s]*([0-9.\-]+)/i);
+  if (m1) tp1 = m1[1];
+  if (m2) tp2 = m2[1];
+  if (tp1 === "..." || tp2 === "...") {
+    const nums = (tps.match(/[0-9.]+/g) || []);
+    if (tp1 === "..." && nums[0]) tp1 = nums[0];
+    if (tp2 === "..." && nums[1]) tp2 = nums[1];
+  }
+
+  const headerRe = /Final\s*Table\s*Summary:\s*\n\|\s*Instrument\s*\|\s*Bias\s*\|\s*Entry Zone\s*\|\s*SL\s*\|\s*TP1\s*\|\s*TP2\s*\|\s*Conviction %\s*\|\n/i;
+  const rowRe = new RegExp(`^\\|\\s*${instrument}\\s*\\|[^\\n]*$`, "im");
+  const newRow = `| ${instrument} | ${bias} | ${entry} | ${sl} | ${tp1} | ${tp2} | ${conv} |`;
+
+  if (!headerRe.test(text)) {
+    const block =
+`\nFinal Table Summary:
+| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |
+${newRow}\n`;
+    return `${text}\n${block}`;
+  }
+
+  if (rowRe.test(text)) {
+    return text.replace(rowRe, newRow);
+  }
+
+  return text.replace(headerRe, (m) => m + newRow + "\n");
+}
+
+
 /** Ensure ai_meta JSON exists and carries required keys; merge live fields if available. */
 function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
   const meta = extractAiMeta(text) || {};
@@ -2182,13 +2295,25 @@ if (mode === "fast") {
     calendarLine: calendarText || null
   });
 
-  // === Tournament & Trigger Enforcement ===
-  // Ensure ≥5 candidates with ≥3 non-sweep/BOS; fix generic triggers with timeframe-specific wording
-   text = await enforceTournamentDiversity(MODEL, instrument, text);
-  text = await enforceTriggerSpecificity(MODEL, instrument, text);
-  text = enforceScalpHardStopLossLines(text, scalpingHard);
-  text = enforceScalpRiskLines(text, scalping, scalpingHard);
-  text = ensureNewsProximityNote(text, warningMinutes, instrument);
+ // === Tournament & Trigger Enforcement ===
+// Ensure ≥5 candidates with ≥3 non-sweep/BOS; fix generic triggers with timeframe-specific wording
+ text = await enforceTournamentDiversity(MODEL, instrument, text);
+text = await enforceTriggerSpecificity(MODEL, instrument, text);
+text = enforceScalpHardStopLossLines(text, scalpingHard);
+text = enforceScalpRiskLines(text, scalping, scalpingHard);
+text = ensureNewsProximityNote(text, warningMinutes, instrument);
+
+// Ensure Full Breakdown has all required subsections and Final Table Summary exists
+text = await enforceFullBreakdownSkeleton(MODEL, instrument, text);
+text = enforceFinalTableSummary(text, instrument);
+
+// === Conviction (0–100) based on T & F, then fill table row ===
+text = computeAndInjectConviction(text, {
+  fundamentals: fundamentalsSnapshot,
+  proximityFlag: warningMinutes != null
+});
+text = fillFinalTableSummaryRow(text, instrument);
+
 
 
   // Ensure Full Breakdown has all required subsections and Final Table Summary exists
@@ -2311,11 +2436,23 @@ if (mode === "fast") {
     });
 
     // === Tournament & Trigger Enforcement ===
-       textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
-    textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
-    textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
-    textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
-    textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
+textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
+textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
+textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
+textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
+textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
+
+// Ensure Full Breakdown skeleton + Final Table Summary
+textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
+textFull = enforceFinalTableSummary(textFull, instrument);
+
+// === Conviction (0–100) based on T & F, then fill table row ===
+textFull = computeAndInjectConviction(textFull, {
+  fundamentals: fundamentalsSnapshotFull,
+  proximityFlag: warningMinutes != null
+});
+textFull = fillFinalTableSummaryRow(textFull, instrument);
+
 
 
     // Ensure Full Breakdown skeleton + Final Table Summary
