@@ -894,37 +894,23 @@ function systemCore(
     "- 15m = execution map (exact entry zone or trigger level, invalidation, TP structure).",
     "- 5m (optional) = entry timing/confirmation only; do not let 5m override HTF bias.",
     "",
-        "Strategy Tournament (evidence-driven & non-defaulting):",
-    "- Evaluate ALL candidates strictly from what is VISIBLE on 4H/1H/15m (+5m/1m if provided). Do NOT assume missing timeframes.",
+    "Strategy Tournament (broad library & scoring):",
+    "- Evaluate these candidates by fit to visible charts (do not invent):",
     "  • Market Structure (BOS/CHOCH; continuation vs reversal)",
     "  • Order Blocks (OB) demand/supply; mitigations",
     "  • Fair Value Gaps (FVG)/Imbalance; gap fills",
     "  • Breakers/Breaker blocks",
-    "  • Support/Resistance (HTF + intraday), round numbers/psych levels",
+    "  • Support/Resistance (HTF + intraday), Round numbers/psych levels",
     "  • Trendline breaks + retests; channels; wedges; triangles",
-    "  • Liquidity sweeps/stop hunts; equal highs/lows raids; session liquidity",
+    "  • Liquidity sweeps/stop hunts; equal highs/lows raids; session liquidity (London/NY)",
     "  • Pullbacks (to MA/OB/FVG); 50%/61.8% fib retracements",
-    "  • Momentum ignition/breakout; MA regime/cross",
+    "  • Moving average regime/cross; momentum ignition/breakout",
     "  • RSI divergence (regular/hidden); MACD impulse; Bollinger squeeze/expansion",
-    "  • Mean reversion/range rotations; prior day H/L interactions; Asia range behavior",
-    "",
-    "- Scoring (no auto-preference):",
-    "  T_candidate = clamp(",
-    "    0.45*HTF_fit(4H,1H) + 0.35*Context_fit(15m) + 0.20*Trigger_fit(5m & optional 1m),",
-    "    0, 100",
-    "  ).",
-    "  • +10 to +20 for multi-signal confluence (e.g., OB+FVG+SR with clean invalidation).",
-    "  • -15 to -30 if direction conflicts with HTF or if the setup lacks a clear invalidation.",
-    "  • -20 if the trigger references a timeframe that was NOT provided (e.g., mentions 1m when no 1m chart is present).",
-    "  • -15 if the trigger is generic or copy-paste (e.g., always 'sweep + BOS') without explicit, chart-backed levels.",
-    "",
-    "- Selection policy (professional):",
-    "  • Choose the HIGHEST-SCORING candidate as 'Option 1 (Primary)'.",
-    "  • Provide a DISTINCT runner-up as 'Option 2 (Alternative)' (different trigger logic or opposite scenario).",
-    "  • If a liquidity-sweep+BOS is NOT the top score, do NOT output it. Only include it when it truly wins.",
-    "  • If 1m is NOT provided, do NOT reference 1m; confirm on 5m only.",
-    "",
-    "- Tournament table: include 'name — score — reason' with one-line evidence for why it scored higher than alternatives.",
+    "  • Mean reversion/range rotations; range high/low plays; session “kill zones” confluence",
+    "- Score each candidate T_candidate = clamp( 0.5*HTF_fit(4H) + 0.3*Context_fit(1H) + 0.2*Trigger_fit(15m & optional 5m), 0, 100 ).",
+    "- Penalize conflicts with HTF (-15 to -30). Reward multi-signal confluence (+10 to +20) and clean invalidation/asymmetric R:R (+5 to +15).",
+    "- Pick TOP 1 as 'Option 1 (Primary)' and a DISTINCT runner-up for 'Option 2 (Alternative)'.",
+    "- Provide a compact tournament table (name — score — reason).",
     "",
     "Fundamentals Scoring (0–100, no hard caps):",
     "- Determine calendar instrument sign from the calendar bias (bearish:-1, neutral:0, bullish:+1).",
@@ -967,40 +953,40 @@ function systemCore(
     "If Calendar is pre-release only, write exactly 'Pre-release only, no confirmed bias until data is out.' and do NOT claim a bullish/bearish/neutral calendar bias.",
   ];
 
-    const scalpingLines = !scalping ? [] : [
+   const scalpingLines = !scalping ? [] : [
     "",
-    "SCALPING MODE (evidence-first; no generic triggers):",
-    "- 4H/1H = guardrails; construct on 15m; confirm on 5m; use 1m ONLY if a 1m chart is actually provided. Never override HTF bias.",
-    "- Adjusted scoring: T_candidate = clamp( 0.40*HTF_fit(4H,1H) + 0.40*Context_fit(15m) + 0.20*Trigger_fit(5m & optional 1m), 0, 100 ).",
-    "- Enforce variety: if multiple candidates tie ±3 points, prefer the setup with clearer invalidation and better asymmetric R:R.",
-    "- Session awareness: add +10 if aligned with session liquidity (London/NY) or prior day high/low and Asia range context.",
-    "- Red news ±30m: avoid new market orders; only pre-planned limits with structure-protected invalidation.",
-    "- Management: partial at 1R, BE after 1R, time-stop ≈20 min if no follow-through.",
-    "- Indicators (optional): EMA 21/50, VWAP can be referenced but never used as standalone triggers.",
-    "- Do NOT mention 1m if the user did not provide a 1m chart.",
+    "SCALPING MODE (guardrails only; sections unchanged):",
+    "- Treat 4H/1H as guardrails; build setups on 15m, confirm timing on 5m (and 1m if provided). 1m must not override HTF bias.",
+    "- Adjust candidate scoring weights: T_candidate = clamp( 0.35*HTF_fit(1H/4H) + 0.40*Context_fit(15m) + 0.25*Trigger_fit(5m & optional 1m), 0, 100 ).",
+    "- Prefer session confluence (London/NY kill zones), OR prior day H/L, Asia range. Reward +10 for session confluence and clean invalidation (≤0.35× ATR15) with ≥1.8R potential.",
+    "- Near red news ±30m: do not initiate new market orders; consider only pre-planned limit orders with structure protection.",
+    "- Management suggestions may include: partial at 1R, BE after 1R, time-stop within ~20 min if no follow-through.",
+    "- EMA 21/50 may be referenced for added conviction but are optional and must not override price/structure; a strong push can break them temporarily.",
+    "- VWAP may be referenced; if referenced, include vwap_used=true in ai_meta.",
+    "- TIMEFRAME ATTRIBUTION FOR WORDING: Attribute sweeps to **5m**; attribute CHOCH/BOS to **1m** when detected there. Do not merge into a single timeframe label.",
+    "- TRIGGER WORDING RULE: Write triggers with explicit timeframes, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)'.",
     "",
-    "ai_meta: append {'mode':'scalping','vwap_used': <bool if VWAP referenced>,'time_stop_minutes': 20,'max_attempts': 3}."
+    "ai_meta (append fields for downstream tools): include {'mode':'scalping', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'max_attempts': 3} in the existing ai_meta JSON."
   ];
 
-     const scalpingHardLines = !scalpingHard ? [] : [
+
+   const scalpingHardLines = !scalpingHard ? [] : [
     "",
-    "SCALPING HARD (micro-structure enforced, no auto-sweep default):",
-    "- Output a scalp ONLY if a compliant, **evidence-backed** setup exists; otherwise 'Stay Flat'.",
-    "- Entry is derived from 15m structure; confirmation on 5m is mandatory; 1m confirmation ONLY if a 1m chart is provided.",
-    "- Candidate triggers (choose BEST by score, not by default):",
-    "  • Liquidity sweep + BOS/CHOCH",
-    "  • OB mitigation + shift",
-    "  • Micro FVG fill + shift",
-    "  • Range edge rejection + shift",
-    "  • Breakout–retest (momentum ignition) with structure protection",
-    "- Tight risk: SL behind defining 5m/1m swing (≈0.15×–0.40× ATR15).",
-    "- Time-stop: if no progress in 15 minutes, recommend exit or reduce risk; state it explicitly.",
-    "- Max attempts: 2 per level/session; track remaining attempts if re-entry suggested.",
-    "- Red news ±20m: 'Stay Flat' unless a resting, structure-protected limit exists.",
-    "- Do NOT reference 1m if it was not provided.",
+    "SCALPING HARD (enforced micro-structure entries):",
+    "- Only produce a **scalping** trade or explicitly 'Stay Flat' if no compliant scalp exists.",
+    "- Entry must be built from 15m structure with **5m confirmation**; if a 1m chart is provided, use 1m for timing confirmation.",
+    "- Mandatory micro-structure: liquidity sweep or FVG/OB tap + immediate shift (CHOCH/BOS).",
+    "- TIMEFRAME ATTRIBUTION FOR WORDING (MANDATORY): Sweeps are credited to **5m**; CHOCH/BOS are credited to **1m** if detected there (else 5m).",
+    "- TRIGGER WORDING RULE (MANDATORY): Write the trigger with explicit timeframes, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)'. Never write '5m sweep and BOS' if BOS is on 1m.",
+    "- SL must be tight: behind the 1m/5m swing that defines the setup; typical 0.15×–0.40× ATR15.",
+    "- Time-stop: if no progress within 15 minutes, recommend exit or reduce risk; state this explicitly.",
+    "- Max attempts: 2 per level/session; state remaining attempts if re-entry is suggested.",
+    "- Near red news ±20m: output 'Stay Flat' unless the setup is already resting as a limit with structure-protected invalidation.",
+    "- EMA 21/50 and VWAP remain optional references only; never a trigger on their own.",
     "",
-    "ai_meta: set {'mode':'scalping-hard','time_stop_minutes': 15,'max_attempts': 2, 'vwap_used': <bool if VWAP referenced>}."
+    "ai_meta (override/add): set {'mode':'scalping-hard', 'time_stop_minutes': 15, 'max_attempts': 2} and include 'vwap_used' if VWAP is referenced."
   ];
+
 
   return [...baseLines, ...scalpingLines, ...scalpingHardLines].join("\n");
 }
@@ -1210,81 +1196,20 @@ function messagesFastStage1(args: {
 }
 
 // ---------- Enforcement helpers ----------
-function hasCompliantOptionBlock(text: string, label: "Option 1" | "Option 2"): boolean {
-  const re = label === "Option 1"
-    ? /Option\s*1\s*\(?(Primary)?\)?([\s\S]{0,1000})/i
-    : /Option\s*2\s*\(?(Alternative)?\)?([\s\S]{0,1000})/i;
-  const m = text.match(re);
-  if (!m) return false;
-  const block = (m[0] || "").toLowerCase();
+function hasCompliantOption2(text: string): boolean {
+  if (!/Option\s*2/i.test(text || "")) return false;
+  const block = (text.match(/Option\s*2[\s\S]{0,800}/i)?.[0] || "").toLowerCase();
   const must = ["direction", "order type", "trigger", "entry", "stop", "tp", "conviction"];
   return must.every((k) => block.includes(k));
 }
-
-/* helper presence */
-function hasOption2(text: string): boolean { return /Option\s*2\s*\(?(Alternative)?\)?/i.test(text || ""); }
-/* duplicate helper stubs removed — originals are defined later:
-   hasOption1, enforceOption1, hasQuickPlan, enforceQuickPlan */
-
 async function enforceOption2(model: string, instrument: string, text: string) {
-  if (hasCompliantOptionBlock(text, "Option 2")) return text;
+  if (hasCompliantOption2(text)) return text;
   const messages = [
-    { role: "system", content: "Add a compliant **Option 2 (Alternative)** BELOW Option 1. It must be DISTINCT from Option 1 (different trigger or price logic: e.g., range edge rejection vs breakout-retest vs OB mitigation vs sweep+BOS vs FVG tap). Include: Direction, Order Type, explicit Trigger, Entry (zone or single), Stop Loss, TP1/TP2, Conviction %. Keep other content unchanged." },
-    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd a DISTINCT 'Option 2 (Alternative)' below Option 1 as specified.` },
+    { role: "system", content: "Add a compliant **Option 2 (Alternative)**. Keep everything else unchanged. Include Direction, Order Type, explicit Trigger, Entry (zone or single), SL, TP1/TP2, Conviction %." },
+    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd Option 2 (Alternative) below Option 1.` },
   ];
   return callOpenAI(model, messages);
 }
-
-/* (duplicate removed) hasQuickPlan/enforceQuickPlan are defined later */
-
-
-/**
- * If only Option 2 exists (or options are duplicated), fix:
- *  - If only Option 2: promote it to Option 1 (Primary) and synthesize a DISTINCT Option 2.
- *  - If both exist but too similar: rewrite Option 2 to be meaningfully different.
- */
-async function enforceBothOptionsDistinct(model: string, instrument: string, text: string) {
-  const onlyOption2 = !hasOption1(text) && hasOption2(text);
-  if (onlyOption2) {
-    const messages = [
-      { role: "system", content:
-        "You will transform the plan so BOTH options exist and are distinct.\n" +
-        "1) Convert the current 'Option 2 (Alternative)' into 'Option 1 (Primary)' (keep its details intact, just relabel and ensure compliance).\n" +
-        "2) Create a NEW 'Option 2 (Alternative)' that is DISTINCT from Option 1 in trigger logic (e.g., breakout-retest vs sweep+BOS vs OB mitigation vs micro-FVG vs range edge rejection). Include all required fields.\n" +
-        "3) Keep every other section unchanged. Preserve ordering: Quick Plan, Option 1, Option 2, etc."
-      },
-      { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nPerform the relabel + add distinct Option 2 exactly as instructed.` },
-    ];
-    return callOpenAI(model, messages);
-  }
-
-  // If both exist but Option 2 is too similar or missing fields, regenerate Option 2 distinctly
-  if (hasOption1(text) && (!hasCompliantOptionBlock(text, "Option 2") || areOptionsTooSimilar(text))) {
-    const messages = [
-      { role: "system", content:
-        "Rewrite ONLY 'Option 2 (Alternative)' to ensure it is DISTINCT from Option 1 in both trigger logic and structure (e.g., different entry mechanism or scenario). Include the full required fields: Direction, Order Type, explicit Trigger, Entry, SL, TP1/TP2, Conviction %. Keep everything else unchanged."
-      },
-      { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nRewrite Option 2 to be distinct and compliant.` },
-    ];
-    return callOpenAI(model, messages);
-  }
-
-  return text;
-}
-
-// Simple similarity heuristic (coarse, text-based)
-function areOptionsTooSimilar(text: string): boolean {
-  const m1 = text.match(/Option\s*1[\s\S]*?(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i)?.[0] || "";
-  const m2 = text.match(/Option\s*2[\s\S]*?(?=\n\s*Full\s*Breakdown|$)/i)?.[0] || "";
-  if (!m1 || !m2) return false;
-  const k = (s: string) => s.toLowerCase().replace(/\s+/g, " ").slice(0, 500);
-  const a = k(m1), b = k(m2);
-  // If triggers or order types look identical and entries are within same wording, flag
-  const sameTrigger = /trigger:\s*([^\n]+)/i.exec(a)?.[1]?.trim() === /trigger:\s*([^\n]+)/i.exec(b)?.[1]?.trim();
-  const sameOrder = /order\s*type:\s*([^\n]+)/i.exec(a)?.[1]?.trim() === /order\s*type:\s*([^\n]+)/i.exec(b)?.[1]?.trim();
-  return !!(sameTrigger && sameOrder);
-}
-
 function hasOption1(text: string): boolean { return /Option\s*1\s*\(?(Primary)?\)?/i.test(text || ""); }
 async function enforceOption1(model: string, instrument: string, text: string) {
   if (hasOption1(text)) return text;
@@ -1708,10 +1633,9 @@ if (mode === "fast") {
     aiMeta = extractAiMeta(text) || aiMeta;
   }
 
-    text = await enforceQuickPlan(MODEL, instrument, text);
+  text = await enforceQuickPlan(MODEL, instrument, text);
   text = await enforceOption1(MODEL, instrument, text);
   text = await enforceOption2(MODEL, instrument, text);
-  text = await enforceBothOptionsDistinct(MODEL, instrument, text);
 
   text = ensureCalendarVisibilityInQuickPlan(text, { instrument, preReleaseOnly, biasLine: calendarText });
 
@@ -1780,11 +1704,9 @@ if (mode === "fast") {
 
     if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
-        textFull = await enforceQuickPlan(MODEL, instrument, textFull);
+    textFull = await enforceQuickPlan(MODEL, instrument, textFull);
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
-    textFull = await enforceBothOptionsDistinct(MODEL, instrument, textFull);
-
 
     // Ensure calendar visibility in Quick Plan
     textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
