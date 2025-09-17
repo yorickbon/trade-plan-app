@@ -2459,15 +2459,7 @@ if (mode === "fast") {
   const usedM1 = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(text);
   text = stampM1Used(text, usedM1);
 
-    // Consistency pass on alignment wording
-  text = applyConsistencyGuards(text, {
-    instrument,
-    headlinesSign: computeHeadlinesSign(hBias),
-    csmSign: computeCSMInstrumentSign(csm, instrument).sign,
-    calendarSign: parseInstrumentBiasFromNote(biasNote)
-  });
-
-  // === Independent Fundamentals Snapshot (Calendar, Headlines, CSM, COT) ===
+   // === Independent Fundamentals Snapshot (Calendar, Headlines, CSM, COT) ===
   const calendarSignFast = parseInstrumentBiasFromNote(biasNote);
   const fundamentalsSnapshot = computeIndependentFundamentals({
     instrument,
@@ -2485,6 +2477,15 @@ if (mode === "fast") {
     preReleaseOnly,
     calendarLine: calendarText || null
   });
+
+  // Consistency pass on alignment wording (run AFTER fundamentals snapshot so neutral forces Match)
+  text = applyConsistencyGuards(text, {
+    instrument,
+    headlinesSign: computeHeadlinesSign(hBias),
+    csmSign: computeCSMInstrumentSign(csm, instrument).sign,
+    calendarSign: parseInstrumentBiasFromNote(biasNote)
+  });
+
 
  // === Tournament & Trigger Enforcement ===
 // Ensure ≥5 candidates with ≥3 non-sweep/BOS; fix generic triggers with timeframe-specific wording
@@ -2599,32 +2600,33 @@ text = fillFinalTableSummaryRow(text, instrument);
     const usedM1Full = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(textFull);
     textFull = stampM1Used(textFull, usedM1Full);
 
-       // Consistency pass on alignment wording
-    textFull = applyConsistencyGuards(textFull, {
-      instrument,
-      headlinesSign: computeHeadlinesSign(hBias),
-      csmSign: computeCSMInstrumentSign(csm, instrument).sign,
-      calendarSign: parseInstrumentBiasFromNote(biasNote)
-    });
+        // === Independent Fundamentals Snapshot (Calendar, Headlines, CSM, COT) ===
+  const calendarSignFull = parseInstrumentBiasFromNote(biasNote);
+  const fundamentalsSnapshotFull = computeIndependentFundamentals({
+    instrument,
+    calendarSign: calendarSignFull,
+    headlinesBias,
+    csm,
+    cotCue,
+    warningMinutes
+  });
 
-    // === Independent Fundamentals Snapshot (Calendar, Headlines, CSM, COT) ===
-    const calendarSignFull = parseInstrumentBiasFromNote(biasNote);
-    const fundamentalsSnapshotFull = computeIndependentFundamentals({
-      instrument,
-      calendarSign: calendarSignFull,
-      headlinesBias: hBias,
-      csm,
-      cotCue,
-      warningMinutes
-    });
+  // Inject standardized Fundamentals block under Full Breakdown
+  text = ensureFundamentalsSnapshot(text, {
+    instrument,
+    snapshot: fundamentalsSnapshotFull,
+    preReleaseOnly,
+    calendarLine: calendarText || null
+  });
 
-    // Inject standardized Fundamentals block under Full Breakdown
-    textFull = ensureFundamentalsSnapshot(textFull, {
-      instrument,
-      snapshot: fundamentalsSnapshotFull,
-      preReleaseOnly,
-      calendarLine: calendarText || null
-    });
+  // Consistency pass on alignment wording (run AFTER fundamentals snapshot so neutral forces Match)
+  text = applyConsistencyGuards(text, {
+    instrument,
+    headlinesSign: computeHeadlinesSign(headlinesBias),
+    csmSign: computeCSMInstrumentSign(csm, instrument).sign,
+    calendarSign: parseInstrumentBiasFromNote(biasNote)
+  });
+
 
     // === Tournament & Trigger Enforcement ===
 textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
