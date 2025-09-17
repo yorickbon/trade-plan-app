@@ -1004,12 +1004,18 @@ function computeIndependentFundamentals(args: {
     cotSign,
   ].filter((s) => s !== 0);
 
-   let signNet = 0;
+  let signNet = 0;
   if (compSigns.length) {
     const sum = compSigns.reduce((a, b) => a + b, 0);
     signNet = sum > 0 ? 1 : sum < 0 ? -1 : 0;
   }
   const label = signNet > 0 ? "bullish" : signNet < 0 ? "bearish" : (F > 55 ? "bullish" : F < 45 ? "bearish" : "neutral");
+
+  // --- NEW: ensure internal sign matches the printed label when label is non-neutral ---
+  let finalSign = signNet;
+  if (finalSign === 0 && label !== "neutral") {
+    finalSign = label === "bullish" ? 1 : -1;
+  }
 
   return {
     components: {
@@ -1019,10 +1025,8 @@ function computeIndependentFundamentals(args: {
       cot: { sign: cotSign, detail: cotDetail, score: S_cot },
       proximity_penalty_applied: proximityFlag === 1
     },
-    // ensure internal sign always matches the printed label to keep alignment/conviction consistent
-    final: { score: F, label, sign: signFromLabel(label) }
+    final: { score: F, label, sign: finalSign }
   };
-
 }
 
 /** Ensure a standardized “Fundamental Bias Snapshot” block appears under Full Breakdown.
