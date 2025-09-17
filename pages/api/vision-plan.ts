@@ -1588,7 +1588,10 @@ function stampM1Used(text: string, used: boolean) {
   return out;
 }
 
-function applyConsistencyGuards(text: string, args: { instrument: string; headlinesSign: number; csmSign: number; calendarSign: number; }) {
+function applyConsistencyGuards(
+  text: string,
+  args: { instrument: string; headlinesSign: number; csmSign: number; calendarSign: number; }
+) {
   let out = text || "";
   const signs = [args.headlinesSign, args.csmSign, args.calendarSign].filter((s) => s !== 0);
   const hasPos = signs.some((s) => s > 0);
@@ -1596,13 +1599,27 @@ function applyConsistencyGuards(text: string, args: { instrument: string; headli
   const aligned = signs.length > 0 && ((hasPos && !hasNeg) || (hasNeg && !hasPos));
   const mismatch = hasPos && hasNeg;
 
+  // Prefer "aligning" wording when aligned.
   if (aligned) out = out.replace(/contradict(?:ion|ing|s)?/gi, "aligning");
-  const reTF = /(Tech\s*vs\s*Fundy\s*Alignment:\s*)(Match|Mismatch)/i;
+
+  const reTF = /(Tech\s*vs\s*Fundy\s*Alignment:\s*)(Match|Mismatch)([^\n]*)/i;
+
+  // If Final Fundamental Bias is explicitly neutral → force Match with explanation.
+  const isNeutralFinal = /Final\s*Fundamental\s*Bias\s*:\s*neutral/i.test(out);
+  if (isNeutralFinal) {
+    if (reTF.test(out)) {
+      out = out.replace(reTF, (_m, p1) => `${p1}Match (Fundamentals neutral — trade managed by technicals)`);
+    }
+    return out;
+  }
+
+  // Otherwise use aligned/mismatch logic.
   if (reTF.test(out)) {
-    out = out.replace(reTF, (_, p1) => `${p1}${aligned ? "Match" : mismatch ? "Mismatch" : "Match"}`);
+    out = out.replace(reTF, (_m, p1) => `${p1}${aligned ? "Match" : mismatch ? "Mismatch" : "Match"}`);
   }
   return out;
 }
+
 
 /** Ensure ≥5 candidates and ≥3 non-sweep/BOS strategies in the tournament table. */
 async function enforceTournamentDiversity(model: string, instrument: string, text: string) {
