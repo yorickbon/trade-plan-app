@@ -965,12 +965,13 @@ function ensureFundamentalsSnapshot(
         cot: { sign: number; detail: string; score: number };
         proximity_penalty_applied: boolean;
       };
-      final: { score: number; label: "bullish" | "bearish" | "neutral"; sign: number };
+      final: { score: number; label: string; sign: number };
     };
     preReleaseOnly: boolean;
     calendarLine: string | null; // already instrument-mapped line if available
   }
 ) {
+
   if (!text) return text;
 
   const hasFull = /Full\s*Breakdown/i.test(text);
@@ -1580,10 +1581,9 @@ function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
     return text.replace(re2, `\nai_meta ${json}`);
   }
 
-  // Append at the very end
-  return `${text}\n\na i_meta ${json}\n`;
+   // Append at the very end
+  return `${text}\n\nai_meta ${json}\n`;
 }
-
 
 // ---------- Live price ----------
 async function fetchLivePrice(pair: string): Promise<number | null> {
