@@ -53,23 +53,41 @@ function dataUrlSizeBytes(s: string | null | undefined): number {
   const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
   return Math.floor((b64.length * 3) / 4) - padding;
 }
-// tolerant numeric parser for %, K/M/B, commas, Unicode minus
-// tolerant numeric parser for %, K/M/B, commas, Unicode minus
+// tolerant numeric parser for %, K/M/B, commas, Unicode minus, and OCR suffixes like "m/m", "y/y", "mom", "yoy"
 function parseNumberLoose(v: any): number | null {
   if (v == null) return null;
   if (typeof v === "number" && Number.isFinite(v)) return v;
+
   let s = String(v).trim().toLowerCase();
   if (!s || s === "n/a" || s === "na" || s === "-" || s === "—") return null;
-  s = s.replace(/,/g, "").replace(/\s+/g, "");
-  s = s.replace(/\u2212/g, "-"); // Unicode minus
+
+  // Normalize unicode and strip common noise the OCR calendar produces
+  s = s.replace(/\u2212/g, "-");      // Unicode minus → hyphen
+  s = s.replace(/[()\u00A0]/g, "");   // parentheses & non-breaking spaces
+  s = s.replace(/,/g, "");            // thousands separators
+  s = s.replace(/\s+/g, "");          // all spaces
+
+  // Drop common econ qualifiers that trail numbers (do not change the value):
+  // e.g. "0.4%m/m", "1.2%y/y", "0.2mom", "0.2yoy", "q/q", "sa", "nsa"
+  s = s.replace(/(m\/m|y\/y|q\/q|mom|yoy|qoq|sa|nsa)$/i, "");
+  s = s.replace(/(m\/m|y\/y|q\/q|mom|yoy|qoq|sa|nsa)(?=%|$)/ig, "");
+
+  // Allow leading "+" and trailing percent
   let mult = 1;
   if (s.endsWith("%")) { s = s.slice(0, -1); }
+
+  // Suffix multipliers
   if (s.endsWith("k")) { mult = 1_000; s = s.slice(0, -1); }
   else if (s.endsWith("m")) { mult = 1_000_000; s = s.slice(0, -1); }
   else if (s.endsWith("b")) { mult = 1_000_000_000; s = s.slice(0, -1); }
+
+  // If there's still trailing non-numeric junk (e.g., "0.4pp"), strip it safely
+  s = s.replace(/[^0-9eE+.\-]+$/g, "");
+
   const n = parseFloat(s);
   return Number.isFinite(n) ? n * mult : null;
 }
+
 
 // --- keep label and sign consistent for fundamentals ---
 function signFromLabel(label?: string): -1 | 0 | 1 {
