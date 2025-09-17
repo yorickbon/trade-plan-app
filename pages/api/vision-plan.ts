@@ -18,7 +18,7 @@ export const config = { api: { bodyParser: false, sizeLimit: "25mb" } };
 type Ok = { ok: true; text: string; meta?: any };
 type Err = { ok: false; reason: string };
 
-const VP_VERSION = "2025-09-12-ocrv10-fund0to100+tournament+no-mixed+scalp-flag";
+const VP_VERSION = "2025-09-17-ocrv10-fundIndependent+finalBias+snapshotEnforced";
 
 // ---------- OpenAI / Model pick ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
