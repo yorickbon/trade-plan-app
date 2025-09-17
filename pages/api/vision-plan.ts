@@ -2047,6 +2047,7 @@ if (mode === "fast") {
     const usedM1Full = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(textFull);
     textFull = stampM1Used(textFull, usedM1Full);
 
+       // Consistency pass on alignment wording
     textFull = applyConsistencyGuards(textFull, {
       instrument,
       headlinesSign: computeHeadlinesSign(hBias),
@@ -2054,14 +2055,53 @@ if (mode === "fast") {
       calendarSign: parseInstrumentBiasFromNote(biasNote)
     });
 
-   const footer = buildServerProvenanceFooter({
-  headlines_provider: headlinesProvider || "unknown",
-  calendar_status: calendarStatus,
-  calendar_provider: calendarProvider,
-  csm_time: csm.tsISO,
-  extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard },
-});
+    // === Independent Fundamentals Snapshot (Calendar, Headlines, CSM, COT) ===
+    const calendarSignFull = parseInstrumentBiasFromNote(biasNote);
+    const fundamentalsSnapshotFull = computeIndependentFundamentals({
+      instrument,
+      calendarSign: calendarSignFull,
+      headlinesBias: hBias,
+      csm,
+      cotCue,
+      warningMinutes
+    });
 
+    // Inject standardized Fundamentals block under Full Breakdown
+    textFull = ensureFundamentalsSnapshot(textFull, {
+      instrument,
+      snapshot: fundamentalsSnapshotFull,
+      preReleaseOnly,
+      calendarLine: calendarText || null
+    });
+
+    // === Tournament & Trigger Enforcement ===
+    textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
+    textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
+
+    // Ensure Full Breakdown skeleton + Final Table Summary
+    textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
+    textFull = enforceFinalTableSummary(textFull, instrument);
+
+    // Ensure ai_meta exists and is enriched with runtime fields
+    const aiPatchFull = {
+      mode,
+      vwap_used: /vwap/i.test(textFull),
+      time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
+      max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
+      currentPrice: livePrice ?? undefined,
+      vp_version: VP_VERSION
+    };
+    textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
+    aiMetaFull = extractAiMeta(textFull) || aiMetaFull;
+
+    // Provenance footer
+    const footer = buildServerProvenanceFooter({
+      headlines_provider: headlinesProvider || "unknown",
+      calendar_status: calendarStatus,
+      calendar_provider: calendarProvider,
+      csm_time: csm.tsISO,
+      extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard },
+    });
     textFull = `${textFull}\n${footer}`;
 
     res.setHeader("Cache-Control", "no-store");
@@ -2083,6 +2123,7 @@ if (mode === "fast") {
         aiMeta: aiMetaFull,
       },
     });
+
   } catch (err: any) {
     return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
   }
