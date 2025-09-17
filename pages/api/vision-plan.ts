@@ -968,45 +968,53 @@ function ensureFundamentalsSnapshot(
       final: { score: number; label: string; sign: number };
     };
     preReleaseOnly: boolean;
-    calendarLine: string | null; // already instrument-mapped line if available
+    calendarLine: string | null; // may be "Calendar bias for <PAIR>: ...", "Calendar unavailable.", etc.
   }
 ) {
-
   if (!text) return text;
 
   const hasFull = /Full\s*Breakdown/i.test(text);
   const hasSnapshot = /Fundamental\s*Bias\s*Snapshot/i.test(text);
   if (hasFull && hasSnapshot) return text;
 
-  const calLine = args.preReleaseOnly
-    ? "Calendar: Pre-release only, no confirmed bias until data is out."
-    : (args.calendarLine || "Calendar: unavailable");
+  // Normalize Calendar line to always start with "Calendar:"
+  let calLineNorm: string;
+  if (args.preReleaseOnly) {
+    calLineNorm = "Calendar: Pre-release only, no confirmed bias until data is out.";
+  } else if (typeof args.calendarLine === "string" && args.calendarLine.trim()) {
+    const raw = args.calendarLine.trim();
+    if (/unavailable/i.test(raw)) {
+      calLineNorm = "Calendar: unavailable";
+    } else if (/^Calendar\s*:/i.test(raw)) {
+      // Already a "Calendar:" style line
+      calLineNorm = raw.replace(/\.$/, "");
+    } else if (/^Calendar\s*bias\s*for/i.test(raw)) {
+      // Wrap instrument-level line
+      calLineNorm = `Calendar: ${raw.replace(/\.$/, "")}`;
+    } else {
+      // Fallback to explicit wrapper
+      calLineNorm = `Calendar: ${raw.replace(/\.$/, "")}`;
+    }
+  } else {
+    calLineNorm = "Calendar: unavailable";
+  }
 
-  const calSignWord = args.snapshot.components.calendar.sign > 0 ? "bullish" :
-                      args.snapshot.components.calendar.sign < 0 ? "bearish" : "neutral";
-
-  const cotSignWord = args.snapshot.components.cot.sign > 0 ? "bullish" :
-                      args.snapshot.components.cot.sign < 0 ? "bearish" : "neutral";
-
+  const cotSignWord = args.snapshot.components.cot.sign > 0 ? "bullish"
+                     : args.snapshot.components.cot.sign < 0 ? "bearish" : "neutral";
   const proxNote = args.snapshot.components.proximity_penalty_applied ? " (proximity penalty applied)" : "";
 
   const block =
 `\nFundamental Bias Snapshot:
-• ${calLine}
+• ${calLineNorm}
 • Headlines bias (48h): ${args.snapshot.components.headlines.label} (score ~${Math.round(args.snapshot.components.headlines.score)})
 • CSM z-diff ${args.snapshot.components.csm.diff == null ? "(n/a)" : args.snapshot.components.csm.diff.toFixed(2)} ⇒ CSM score ~${Math.round(args.snapshot.components.csm.score)}
 • COT: ${cotSignWord}; ${args.snapshot.components.cot.detail} (score ~${Math.round(args.snapshot.components.cot.score)})
 • Final Fundamental Bias: ${args.snapshot.final.label} (score ~${Math.round(args.snapshot.final.score)})${proxNote}
 `;
 
-  // Inject right after "Full Breakdown" header
   if (hasFull) {
-    return text.replace(
-      /(Full\s*Breakdown[^\n]*\n)/i,
-      `$1${block}`
-    );
+    return text.replace(/(Full\s*Breakdown[^\n]*\n)/i, `$1${block}`);
   }
-  // If Full Breakdown missing (edge), append at end
   return `${text}\n${block}`;
 }
 
@@ -1415,13 +1423,25 @@ function ensureCalendarVisibilityInQuickPlan(text: string, args: { instrument: s
   const hasCalendarMention = /Calendar\s*:/i.test(qpBlock) || /Calendar\s*bias\s*for\s*/i.test(qpBlock);
   if (hasCalendarMention) return text; // already present
 
-  const inject = args.preReleaseOnly
-    ? `\n• Note: Pre-release only, no confirmed bias until data is out.`
-    : (args.biasLine ? `\n• Calendar bias for ${args.instrument}: ${args.biasLine.replace(/^Calendar bias for\s*[^:]+:\s*/i, "")}` : "");
+  let inject = "";
+  if (args.preReleaseOnly) {
+    inject = `\n• Note: Pre-release only, no confirmed bias until data is out.`;
+  } else if (args.biasLine) {
+    if (/unavailable/i.test(args.biasLine)) {
+      inject = `\n• Note: Calendar: unavailable`;
+    } else {
+      const trimmed = args.biasLine.replace(/^Calendar\s*:\s*/i, "").replace(/\.$/, "");
+      const normalized = /^Calendar\s*bias\s*for/i.test(trimmed) ? trimmed : `Calendar bias for ${args.instrument}: ${trimmed}`;
+      // Strip duplicate instrument if present
+      const finalLine = normalized.replace(new RegExp(`^Calendar\\s*bias\\s*for\\s*${args.instrument}\\s*:\\s*`, "i"), `Calendar bias for ${args.instrument}: `);
+      inject = `\n• ${finalLine}`;
+    }
+  }
 
   if (!inject) return text;
   return text.replace(/(Quick\s*Plan\s*\(Actionable\)[^\n]*\n)/i, `$1${inject}\n`);
 }
+
 
 function stampM5Used(text: string, used: boolean) {
   if (!used) return text;
