@@ -2607,13 +2607,14 @@ text = fillFinalTableSummaryRow(text, instrument);
   });
 
 
-  // Consistency pass on alignment wording (run AFTER fundamentals snapshot so neutral forces Match)
-  text = applyConsistencyGuards(text, {
+   // Consistency pass on alignment wording (run AFTER fundamentals snapshot so neutral forces Match)
+  textFull = applyConsistencyGuards(textFull, {
     instrument,
     headlinesSign: computeHeadlinesSign(hBias),
     csmSign: computeCSMInstrumentSign(csm, instrument).sign,
     calendarSign: parseInstrumentBiasFromNote(biasNote)
   });
+
 
 
     // === Tournament & Trigger Enforcement ===
