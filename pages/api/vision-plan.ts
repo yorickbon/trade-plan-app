@@ -54,6 +54,7 @@ function dataUrlSizeBytes(s: string | null | undefined): number {
   return Math.floor((b64.length * 3) / 4) - padding;
 }
 // tolerant numeric parser for %, K/M/B, commas, Unicode minus
+// tolerant numeric parser for %, K/M/B, commas, Unicode minus
 function parseNumberLoose(v: any): number | null {
   if (v == null) return null;
   if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -69,6 +70,15 @@ function parseNumberLoose(v: any): number | null {
   const n = parseFloat(s);
   return Number.isFinite(n) ? n * mult : null;
 }
+
+// --- keep label and sign consistent for fundamentals ---
+function signFromLabel(label?: string): -1 | 0 | 1 {
+  const s = (label || "").toLowerCase();
+  if (s === "bullish") return 1;
+  if (s === "bearish") return -1;
+  return 0; // neutral / unknown
+}
+
 
 // ---------- in-memory image cache ----------
 type CacheEntry = {
@@ -994,7 +1004,7 @@ function computeIndependentFundamentals(args: {
     cotSign,
   ].filter((s) => s !== 0);
 
-  let signNet = 0;
+   let signNet = 0;
   if (compSigns.length) {
     const sum = compSigns.reduce((a, b) => a + b, 0);
     signNet = sum > 0 ? 1 : sum < 0 ? -1 : 0;
@@ -1009,8 +1019,10 @@ function computeIndependentFundamentals(args: {
       cot: { sign: cotSign, detail: cotDetail, score: S_cot },
       proximity_penalty_applied: proximityFlag === 1
     },
-    final: { score: F, label, sign: signNet }
+    // ensure internal sign always matches the printed label to keep alignment/conviction consistent
+    final: { score: F, label, sign: signFromLabel(label) }
   };
+
 }
 
 /** Ensure a standardized “Fundamental Bias Snapshot” block appears under Full Breakdown.
