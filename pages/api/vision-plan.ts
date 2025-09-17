@@ -1397,17 +1397,28 @@ async function enforceOption2(model: string, instrument: string, text: string) {
 }
 function hasOption1(text: string): boolean {
   if (!text) return false;
+  // Accept bullet/bold forms and markdown headers like "### Option 1 (Primary)"
   const re =
-    /(^|\n)[>\s]*[*\-•]?\s*(?:\*\*|__|_)?\s*Option[ \t\u00A0\u202F]*1(?!\d)\s*(?:\(\s*Primary\s*\))?(?:\s*[:\-–—])?(?:\s*(?:\*\*|__|_))?/im;
+    /(^|\n)\s{0,3}#{0,6}\s*[>\s]*[*\-•]?\s*(?:\*\*|__|_)?\s*Option[ \t\u00A0\u202F]*1(?!\d)\s*(?:\(\s*Primary\s*\))?(?:\s*[:\-–—])?(?:\s*(?:\*\*|__|_))?/im;
   return re.test(text);
 }
 
 /** Deterministically build & insert "Option 1 (Primary)" without calling the model.
  * Priority for fields: Quick Plan → Option 2 → placeholders.
  * Placement: immediately BEFORE Option 2 if present; else after Quick Plan; else before Full Breakdown; else append.
+ * Also de-duplicates multiple "Option 1" blocks by keeping the first and removing subsequent ones.
  */
 async function enforceOption1(_model: string, instrument: string, text: string) {
-  if (!text || hasOption1(text)) return text;
+  if (!text) return text;
+
+  // --- Dedupe: keep first "Option 1" block, remove any subsequent duplicates (idempotent)
+  const RE_O1_BLOCK_G = /(Option\s*1(?!\d)[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/gi;
+  let o1Count = 0;
+  const deduped = text.replace(RE_O1_BLOCK_G, (m) => (++o1Count === 1 ? m : ""));
+  if (o1Count > 1) text = deduped;
+
+  // If an Option 1 exists after dedupe, nothing to add.
+  if (hasOption1(text)) return text;
 
   const RE_QP_BLOCK = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
   const RE_O2_BLOCK = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
@@ -1498,6 +1509,7 @@ ${bullet}${L("Why this is primary")} ${fields.why}
   }
   return out;
 }
+
 
 function hasQuickPlan(text: string): boolean { return /Quick\s*Plan\s*\(Actionable\)/i.test(text || ""); }
 async function enforceQuickPlan(model: string, instrument: string, text: string) {
