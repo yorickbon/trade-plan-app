@@ -1832,34 +1832,48 @@ function computeAndInjectConviction(
 }
 
 
-/** Fill the Final Table Summary row from Quick Plan so it’s never empty. */
+/** Fill the Final Table Summary row from Quick Plan, stripping markdown and tolerating bold labels. */
 function fillFinalTableSummaryRow(text: string, instrument: string) {
   if (!text) return text;
 
+  const stripMd = (s: string) =>
+    String(s || "")
+      .replace(/[*_`~]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
   function grab(re: RegExp): string | null {
     const m = text.match(re);
-    return m ? String(m[1]).trim() : null;
+    return m ? stripMd(m[1]) : null;
   }
 
-  const bias = grab(/Quick\s*Plan[\s\S]*?Direction:\s*(Long|Short|Stay\s*Flat)/i) || "...";
-  const entry = grab(/Quick\s*Plan[\s\S]*?Entry\s*\(zone\s*or\s*single\)\s*:\s*([^\n]+)/i) || "...";
-  const sl    = grab(/Quick\s*Plan[\s\S]*?Stop\s*Loss\s*:\s*([^\n]+)/i) || "...";
-  const tps   = grab(/Quick\s*Plan[\s\S]*?Take\s*Profit\(s\)\s*:\s*([^\n]+)/i) || "";
-  const conv  = grab(/Quick\s*Plan[\s\S]*?Conviction:\s*(\d+)%/i) || "...";
+  // Tolerant to "**Label:** value" (optional ** right after the colon)
+  const bias = grab(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(?:\*\*)?\s*(Long|Short|Stay\s*Flat)/i) || "...";
+  const entry = grab(/Quick\s*Plan[\s\S]*?Entry\s*\(zone\s*or\s*single\)\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
+             || grab(/Quick\s*Plan[\s\S]*?Entry\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
+             || "...";
+  const sl    = grab(/Quick\s*Plan[\s\S]*?Stop\s*Loss\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "...";
+  const tps   = grab(/Quick\s*Plan[\s\S]*?Take\s*Profit\(s\)\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
+             || grab(/Quick\s*Plan[\s\S]*?TPs?\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
+             || "";
+  const conv  = grab(/Quick\s*Plan[\s\S]*?Conviction\s*:\s*(?:\*\*)?\s*(\d{1,3})\s*%/i) || "...";
 
+  // Parse TP1/TP2 from the TP line, tolerate various formats.
   let tp1 = "...", tp2 = "...";
-  const m1 = tps.match(/TP1[:\s]*([0-9.\-]+)/i);
-  const m2 = tps.match(/TP2[:\s]*([0-9.\-]+)/i);
-  if (m1) tp1 = m1[1];
-  if (m2) tp2 = m2[1];
-  if (tp1 === "..." || tp2 === "...") {
-    const nums = (tps.match(/[0-9.]+/g) || []);
-    if (tp1 === "..." && nums[0]) tp1 = nums[0];
-    if (tp2 === "..." && nums[1]) tp2 = nums[1];
+  if (tps) {
+    const mm1 = tps.match(/TP1[:\s]*([0-9.]+)/i);
+    const mm2 = tps.match(/TP2[:\s]*([0-9.]+)/i);
+    if (mm1) tp1 = stripMd(mm1[1]);
+    if (mm2) tp2 = stripMd(mm2[1]);
+    if (tp1 === "..." || tp2 === "...") {
+      const nums = (tps.match(/[0-9.]+/g) || []).map(stripMd);
+      if (tp1 === "..." && nums[0]) tp1 = nums[0];
+      if (tp2 === "..." && nums[1]) tp2 = nums[1];
+    }
   }
 
   const headerRe = /Final\s*Table\s*Summary:\s*\n\|\s*Instrument\s*\|\s*Bias\s*\|\s*Entry Zone\s*\|\s*SL\s*\|\s*TP1\s*\|\s*TP2\s*\|\s*Conviction %\s*\|\n/i;
-  const rowRe = new RegExp(`^\\|\\s*${instrument}\\s*\\|[^\\n]*$`, "im");
+  const rowRe = new RegExp(`^\\|\\s*${instrument.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\|[^\\n]*$`, "im");
   const newRow = `| ${instrument} | ${bias} | ${entry} | ${sl} | ${tp1} | ${tp2} | ${conv} |`;
 
   if (!headerRe.test(text)) {
