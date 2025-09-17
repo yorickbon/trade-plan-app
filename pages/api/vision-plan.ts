@@ -1395,7 +1395,17 @@ async function enforceOption2(model: string, instrument: string, text: string) {
   ];
   return callOpenAI(model, messages);
 }
-function hasOption1(text: string): boolean { return /Option\s*1\s*\(?(Primary)?\)?/i.test(text || ""); }
+function hasOption1(text: string): boolean {
+  if (!text) return false;
+  // Tolerant detector:
+  // - accepts "**Option 1 (Primary)**", "- Option 1", "Option 1: ...", extra spaces
+  // - handles NBSP/thin spaces, bullets, bold/italic markers, colons/dashes
+  // - ensures we match "Option 1" (not "Option 10")
+  const re =
+    /(^|\n)[>\s]*[*\-•]?\s*(?:\*\*|__|_)?\s*Option[ \t\u00A0\u202F]*1(?!\d)\s*(?:\(\s*Primary\s*\))?(?:\s*[:\-–—])?(?:\s*(?:\*\*|__|_))?/im;
+  return re.test(text);
+}
+
 async function enforceOption1(model: string, instrument: string, text: string) {
   if (hasOption1(text)) return text;
   const messages = [
