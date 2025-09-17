@@ -1585,6 +1585,93 @@ function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
   return `${text}\n\nai_meta ${json}\n`;
 }
 
+/** Normalize Order Type for Quick Plan & Option 1 based on currentPrice vs entry zone (from ai_meta). */
+function normalizeOrderTypeLines(text: string, aiMeta: any) {
+  const dir = String(aiMeta?.direction || "").toLowerCase();
+  const p = Number(aiMeta?.currentPrice);
+  const zmin = Number(aiMeta?.zone?.min);
+  const zmax = Number(aiMeta?.zone?.max);
+  if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return text;
+
+  function wantOrder(): string | null {
+    if (dir === "long") {
+      if (Math.max(zmin, zmax) < p) return "Buy Limit";
+      if (Math.min(zmin, zmax) > p) return "Buy Stop";
+      return "Market";
+    } else if (dir === "short") {
+      if (Math.min(zmin, zmax) > p) return "Sell Limit";
+      if (Math.max(zmin, zmax) < p) return "Sell Stop";
+      return "Market";
+    }
+    return null;
+  }
+
+  const desired = wantOrder();
+  if (!desired) return text;
+
+  function setOrderInBlock(src: string, blockRe: RegExp) {
+    const m = src.match(blockRe);
+    if (!m) return src;
+    const block = m[0];
+    const updated = block.replace(/(^\s*•\s*Order\s*Type:\s*)(.+)$/mi, `$1${desired}`);
+    return src.replace(block, updated);
+  }
+
+  // Adjust Quick Plan and Option 1 only (Option 2 may intentionally differ)
+  let out = text;
+  out = setOrderInBlock(out, /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
+  out = setOrderInBlock(out, /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
+  return out;
+}
+
+/** Ensure Option 2 uses a DISTINCT strategy/trigger from Option 1. */
+async function enforceDistinctAlternative(model: string, instrument: string, text: string) {
+  const m1 = text.match(/(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
+  const m2 = text.match(/(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i);
+  if (!m1 || !m2) return text;
+
+  const o1 = m1[0], o2 = m2[0];
+  const t1 = (o1.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase();
+  const t2 = (o2.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase();
+  if (!t1 || !t2) return text;
+
+  // Rough strategy buckets
+  const buckets: Record<string, RegExp> = {
+    sweep: /(sweep|liquidity|raid|stop\s*hunt|bos|choch)/i,
+    ob_fvg: /(order\s*block|\bob\b|fvg|fair\s*value|breaker)/i,
+    tl_break: /(trendline|channel|wedge|triangle)/i,
+    range: /(range|rotation|mean\s*reversion|eq\s*of\s*range)/i,
+    vwap: /\bvwap\b/i,
+    momentum: /(ignition|breakout|squeeze|bollinger|macd|divergence)/i,
+  };
+  function bucketOf(s: string): string | null {
+    for (const [k, re] of Object.entries(buckets)) if (re.test(s)) return k;
+    return null;
+  }
+  const b1 = bucketOf(t1);
+  const b2 = bucketOf(t2);
+
+  const tooSimilar = (b1 && b2 && b1 === b2) || t1.replace(/\s+/g,"") === t2.replace(/\s+/g,"");
+  if (!tooSimilar) return text;
+
+  const sys = "Rewrite ONLY the 'Option 2 (Alternative)' block so it is a DISTINCT strategy from Option 1, with a different trigger type and explicit timeframes.";
+  const rules = [
+    "Choose a different play from the library (e.g., if Option 1 is sweep/BOS, make Option 2 a TL break+retest, range rotation, OB/FVG pullback, VWAP, or momentum breakout).",
+    "Keep direction if justified by HTF, but change the strategy & Trigger wording.",
+    "Include Direction, Order Type, Trigger (with timeframes), Entry (zone/single), Stop Loss, TP1/TP2, Conviction, Why this alternative."
+  ].join("\n- ");
+  const out = await callOpenAI(model, [
+    { role: "system", content: "Return ONLY a full, corrected 'Option 2 (Alternative)' block. Do not alter other sections." },
+    { role: "user", content: `Instrument: ${instrument}\n\nOPTION 1:\n${o1}\n\nOPTION 2 (to be rewritten):\n${o2}\n\nRules:\n- ${rules}` }
+  ]);
+
+  if (!out || out.length < 30) return text;
+
+  // Replace Option 2 block
+  return text.replace(m2[0], out.trim());
+}
+
+
 
 // ---------- Live price ----------
 async function fetchLivePrice(pair: string): Promise<number | null> {
@@ -1978,9 +2065,16 @@ if (mode === "fast") {
     currentPrice: livePrice ?? undefined,
     vp_version: VP_VERSION
   };
-   text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatchFast).filter(([,v]) => v !== undefined)));
+     text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatchFast).filter(([,v]) => v !== undefined)));
   aiMeta = extractAiMeta(text) || aiMeta;
 
+  // Normalize conflicting Order Type for primary plan if needed
+  if (aiMeta && invalidOrderRelativeToPrice(aiMeta)) {
+    text = normalizeOrderTypeLines(text, aiMeta);
+  }
+
+  // Ensure Option 2 is a truly distinct strategy
+  text = await enforceDistinctAlternative(MODEL, instrument, text);
 
   // Cache & provenance footer
   const cacheKey = setCache({ instrument, m5: m5 || null, m15, h1, h4, calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
@@ -2094,8 +2188,17 @@ if (mode === "fast") {
       currentPrice: livePrice ?? undefined,
       vp_version: VP_VERSION
     };
-    textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
+       textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
     aiMetaFull = extractAiMeta(textFull) || aiMetaFull;
+
+    // Normalize conflicting Order Type for primary plan if needed
+    if (aiMetaFull && invalidOrderRelativeToPrice(aiMetaFull)) {
+      textFull = normalizeOrderTypeLines(textFull, aiMetaFull);
+    }
+
+    // Ensure Option 2 is a truly distinct strategy
+    textFull = await enforceDistinctAlternative(MODEL, instrument, textFull);
+
 
     // Provenance footer
     const footer = buildServerProvenanceFooter({
