@@ -1397,23 +1397,111 @@ async function enforceOption2(model: string, instrument: string, text: string) {
 }
 function hasOption1(text: string): boolean {
   if (!text) return false;
-  // Tolerant detector:
-  // - accepts "**Option 1 (Primary)**", "- Option 1", "Option 1: ...", extra spaces
-  // - handles NBSP/thin spaces, bullets, bold/italic markers, colons/dashes
-  // - ensures we match "Option 1" (not "Option 10")
   const re =
     /(^|\n)[>\s]*[*\-•]?\s*(?:\*\*|__|_)?\s*Option[ \t\u00A0\u202F]*1(?!\d)\s*(?:\(\s*Primary\s*\))?(?:\s*[:\-–—])?(?:\s*(?:\*\*|__|_))?/im;
   return re.test(text);
 }
 
-async function enforceOption1(model: string, instrument: string, text: string) {
-  if (hasOption1(text)) return text;
-  const messages = [
-    { role: "system", content: "Insert a labeled 'Option 1 (Primary)' block BEFORE 'Option 2'. Use the primary trade details already present. Include Direction, Order Type, Trigger, Entry (zone or single), SL, TP1/TP2, Conviction %. Keep other content unchanged." },
-    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd/normalize 'Option 1 (Primary)' as specified.` },
-  ];
-  return callOpenAI(model, messages);
+/** Deterministically build & insert "Option 1 (Primary)" without calling the model.
+ * Priority for fields: Quick Plan → Option 2 → placeholders.
+ * Placement: immediately BEFORE Option 2 if present; else after Quick Plan; else before Full Breakdown; else append.
+ */
+async function enforceOption1(_model: string, instrument: string, text: string) {
+  if (!text || hasOption1(text)) return text;
+
+  const RE_QP_BLOCK = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
+  const RE_O2_BLOCK = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
+  const RE_FULL     = /(\n\s*Full\s*Breakdown)/i;
+
+  const qpBlock = text.match(RE_QP_BLOCK)?.[0] || "";
+  const o2Block = text.match(RE_O2_BLOCK)?.[0] || "";
+
+  function detectBulletChar(block: string): string {
+    if (/^\s*•\s/m.test(block)) return "• ";
+    if (/^\s*-\s/m.test(block)) return "- ";
+    return "• ";
+  }
+  function blockUsesBoldLabels(block: string): boolean {
+    return /\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:\s*\*\*/i.test(block)
+        || /(?:^|\n)\s*(?:[-•]\s*)?\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:/i.test(block);
+  }
+  function pick(re: RegExp, src: string): string | null {
+    const m = src.match(re);
+    return m ? String(m[1]).trim() : null;
+  }
+  function parseFields(src: string) {
+    return {
+      direction: pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Direction\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
+      orderType: pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Order\s*Type\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
+      trigger:   pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Trigger\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
+      entry:     pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Entry\s*\(zone\s*or\s*single\)\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src)
+              || pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Entry\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
+      stop:      pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Stop\s*Loss\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
+      tps:       pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Take\s*Profit\(s\)\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src)
+              || pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*TPs?\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
+      conv:      pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Conviction\s*:\s*(?:\*\*)?\s*(\d{1,3})\s*%/mi, src),
+      setup:     pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Setup\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
+      shortWhy:  pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Short\s*Reasoning\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src)
+    };
+  }
+
+  const qp = parseFields(qpBlock);
+  const o2 = parseFields(o2Block);
+
+  const choose = (a?: string | null, b?: string | null, ph = "...") =>
+    (a && a.trim()) || (b && b.trim()) || ph;
+
+  const bullet = detectBulletChar(qpBlock || o2Block || text);
+  const bold = blockUsesBoldLabels(qpBlock || o2Block || "");
+
+  const fields = {
+    direction: choose(qp.direction, o2.direction, "Long"),
+    orderType: choose(qp.orderType, o2.orderType, "Market"),
+    trigger:   choose(qp.trigger,   o2.trigger,   "Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)"),
+    entry:     choose(qp.entry,     o2.entry,     "zone ..."),
+    stop:      choose(qp.stop,      o2.stop,      "behind recent swing"),
+    tps:       choose(qp.tps,       o2.tps,       "TP1 1.0R / TP2 2.0R"),
+    conv:      choose(qp.conv,      o2.conv,      "60"),
+    why:       choose(qp.shortWhy, qp.setup, "Primary due to HTF alignment, clean invalidation, and superior R:R.")
+  };
+
+  const L = (label: string) => (bold ? `**${label}:**` : `${label}:`);
+
+  const option1Block =
+`Option 1 (Primary)
+${bullet}${L("Direction")} ${fields.direction}
+${bullet}${L("Order Type")} ${fields.orderType}
+${bullet}${L("Trigger")} ${fields.trigger}
+${bullet}${L("Entry (zone or single)")} ${fields.entry}
+${bullet}${L("Stop Loss")} ${fields.stop}
+${bullet}${L("Take Profit(s)")} ${fields.tps}
+${bullet}${L("Conviction")} ${fields.conv}%
+${bullet}${L("Why this is primary")} ${fields.why}
+`;
+
+  let out = text;
+
+  if (o2Block) {
+    // Insert immediately before Option 2
+    out = out.replace(RE_O2_BLOCK, `${option1Block}\n$&`);
+    return out;
+  }
+
+  if (qpBlock) {
+    // Insert after Quick Plan
+    out = out.replace(RE_QP_BLOCK, (m) => `${m}\n${option1Block}\n`);
+    return out;
+  }
+
+  // Fallback positions
+  if (RE_FULL.test(out)) {
+    out = out.replace(RE_FULL, `\n${option1Block}\n$1`);
+  } else {
+    out = `${out}\n\n${option1Block}\n`;
+  }
+  return out;
 }
+
 function hasQuickPlan(text: string): boolean { return /Quick\s*Plan\s*\(Actionable\)/i.test(text || ""); }
 async function enforceQuickPlan(model: string, instrument: string, text: string) {
   if (hasQuickPlan(text)) return text;
