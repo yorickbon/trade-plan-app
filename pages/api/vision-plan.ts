@@ -18,7 +18,7 @@ export const config = { api: { bodyParser: false, sizeLimit: "25mb" } };
 type Ok = { ok: true; text: string; meta?: any };
 type Err = { ok: false; reason: string };
 
-const VP_VERSION = "2025-09-17-ocrv10-fundIndependent+finalBias+snapshotEnforced";
+const VP_VERSION = "2025-09-12-ocrv10-fund0to100+tournament+no-mixed+scalp-flag";
 
 // ---------- OpenAI / Model pick ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
@@ -54,7 +54,6 @@ function dataUrlSizeBytes(s: string | null | undefined): number {
   return Math.floor((b64.length * 3) / 4) - padding;
 }
 // tolerant numeric parser for %, K/M/B, commas, Unicode minus
-// tolerant numeric parser for %, K/M/B, commas, Unicode minus
 function parseNumberLoose(v: any): number | null {
   if (v == null) return null;
   if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -70,15 +69,6 @@ function parseNumberLoose(v: any): number | null {
   const n = parseFloat(s);
   return Number.isFinite(n) ? n * mult : null;
 }
-
-// --- keep label and sign consistent for fundamentals ---
-function signFromLabel(label?: string): -1 | 0 | 1 {
-  const s = (label || "").toLowerCase();
-  if (s === "bullish") return 1;
-  if (s === "bearish") return -1;
-  return 0; // neutral / unknown
-}
-
 
 // ---------- in-memory image cache ----------
 type CacheEntry = {
@@ -593,9 +583,6 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
 
   const lines: string[] = [];
   const postRows: OcrCalendarRow[] = [];
-  const preRows: OcrCalendarRow[] = [];
-  let hasActualOnlyRecent = false;
-
   const rowsForDebug = (ocr.items || []).slice(0, 3).map(r => ({
     timeISO: r.timeISO || null,
     title: r.title || null,
@@ -625,75 +612,17 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     const f = parseNumberLoose(it.forecast);
     const p = parseNumberLoose(it.previous);
 
-    // Only consider rows within last 72h when time is known; if time missing, allow but don't score far history
+    // Only include rows with actuals in the last 72h
     const ts = it.timeISO ? Date.parse(it.timeISO) : NaN;
     const isWithin72h = isFinite(ts) ? ts <= nowMs && nowMs - ts <= H72 : true;
 
-    if (!isWithin72h) continue;
-
-    // Classify
-    if (a != null && (f != null || p != null)) {
+    if (a != null && (f != null || p != null) && isWithin72h) {
       postRows.push({ ...it, actual: a, forecast: f, previous: p });
-    } else if (a != null && f == null && p == null) {
-      // Post-release present but insufficient refs to score — remember for acknowledgement
-      hasActualOnlyRecent = true;
-    } else if (a == null && f != null && p != null) {
-      preRows.push({ ...it, actual: null, forecast: f, previous: p });
     }
   }
 
-  // If no post-result rows, handle expected/pre-release and actual-only acknowledgement
+  // If no post-result rows → pre-release only
   if (postRows.length === 0) {
-    if (preRows.length > 0) {
-      // Compute expected bias from forecast vs previous using goodIfHigher
-      const scoreByCur: Record<string, number> = {};
-      for (const it of preRows) {
-        const cur = (it.currency || "").toUpperCase();
-        const dir = goodIfHigher(String(it.title || "")); // true=higher good; false=lower good
-        if (dir == null) continue;
-        const f = Number(it.forecast);
-        const p = Number(it.previous);
-        if (!isFinite(f) || !isFinite(p)) continue;
-        const raw = (f - p) / Math.max(Math.abs(p), 1e-9);
-        const clamped = Math.max(-0.25, Math.min(0.25, raw));
-        const signed = (dir ? Math.sign(clamped) : -Math.sign(clamped)) * Math.round((Math.abs(clamped) / 0.25) * 10);
-        scoreByCur[cur] = (scoreByCur[cur] ?? 0) + signed;
-      }
-
-      const sumBase = Math.round(scoreByCur[base] ?? 0);
-      const sumQuote = Math.round(scoreByCur[quote] ?? 0);
-      const netInstr = sumBase - sumQuote;
-
-      let expected: "bullish" | "bearish" | "neutral";
-      if (sumBase === 0 && sumQuote === 0) expected = "neutral";
-      else expected = netInstr > 0 ? "bullish" : netInstr < 0 ? "bearish" : "neutral";
-
-      const biasLine = `Calendar expected bias for ${pair}: ${expected} (pre-release; awaiting actual).`;
-      const biasNote = `Expected (forecast vs previous) → ${base}:${sumBase >= 0 ? "+" : ""}${sumBase}, ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}; Net ${netInstr >= 0 ? "+" : ""}${netInstr}`;
-
-      return {
-        biasLine,
-        biasNote,
-        warningMinutes: warn,
-        evidenceLines: [], // evidence only after actuals print
-        preReleaseOnly: true,
-        rowsForDebug,
-      };
-    }
-
-    if (hasActualOnlyRecent) {
-      // Post-release present but cannot score — acknowledge without pre-release label
-      const note = `Calendar for ${pair}: post-release figures detected but insufficient refs to score (missing forecast/previous).`;
-      return {
-        biasLine: note,
-        biasNote: null,
-        warningMinutes: warn,
-        evidenceLines: [],
-        preReleaseOnly: false,
-        rowsForDebug,
-      };
-    }
-
     const preLine = `Calendar: ${
       warn != null ? `High-impact events scheduled (≤${warn} min). ` : ""
     }Pre-release only, no confirmed bias until data is out.`;
@@ -707,7 +636,7 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     };
   }
 
-  // --- Scoring setup for post-result rows ---
+  // --- Scoring setup ---
   const scoreByCur: Record<string, number> = {};
   const impactW: Record<string, number> = { Low: 0.5, Medium: 0.8, High: 1.0 };
   function add(cur: string, v: number) {
@@ -770,7 +699,6 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     rowsForDebug,
   };
 }
-
 
 // Helpers to determine instrument-relevant currencies for OCR usability checks
 const CURRENCIES = new Set(G8);
@@ -937,167 +865,6 @@ function computeCompositeBias(args: {
   return { calendarSign: calSign, headlinesSign: hSign, csmSign, csmZDiff: zdiff, align, conflict, cap };
 }
 
-/** Derive COT instrument sign from headline cues (independent component).
- * Uses cotCue.net per-currency signals: +1 net long, -1 net short. Maps to pair via baseMinusQuote. */
-function computeCOTInstrumentSign(cot: CotCue | null, instr: string): { sign: number; detail: string } {
-  if (!cot || !cot.net) return { sign: 0, detail: "unavailable" };
-  const { base, quote } = splitFXPair(instr);
-  if (!base || !quote) return { sign: 0, detail: "non-fx or unavailable" };
-  const b = typeof cot.net[base] === "number" ? cot.net[base] : 0;
-  const q = typeof cot.net[quote] === "number" ? cot.net[quote] : 0;
-  const diff = b - q; // >0 ⇒ bullish instrument; <0 ⇒ bearish
-  const sign = diff > 0 ? 1 : diff < 0 ? -1 : 0;
-  const toWord = (s: number) => (s > 0 ? "bullish" : s < 0 ? "bearish" : "neutral");
-  return { sign, detail: `COT ${toWord(b)} ${base} vs ${toWord(q)} ${quote} ⇒ ${toWord(sign)} ${instr}` };
-}
-
-/** Compute independent fundamentals components + final Fundamental Bias score/label (0–100).
- * Calendar, Headlines, CSM, COT are independent inputs. */
-function computeIndependentFundamentals(args: {
-  instrument: string;
-  calendarSign: number;      // -1 / 0 / +1 (instrument-mapped)
-  headlinesBias: HeadlineBias;
-  csm: CsmSnapshot;
-  cotCue: CotCue | null;
-  warningMinutes: number | null;
-}) {
-  // Calendar component (independent)
-  const S_cal = 50 + 50 * (args.calendarSign || 0);
-
-  // Headlines component (independent)
-  const S_head =
-    args.headlinesBias.label === "bullish" ? 75 :
-    args.headlinesBias.label === "bearish" ? 25 :
-    args.headlinesBias.label === "neutral" ? 50 : 50;
-
-  // CSM component (independent)
-  const { base, quote } = splitFXPair(args.instrument);
-  let S_csm = 50;
-  let csmDiff: number | null = null;
-  if (base && quote) {
-    const zb = args.csm.scores[base];
-    const zq = args.csm.scores[quote];
-    if (typeof zb === "number" && typeof zq === "number") {
-      csmDiff = zb - zq; // >0 ⇒ bullish instrument
-      const clamped = Math.max(-2, Math.min(2, csmDiff));
-      S_csm = 50 + 25 * (clamped / 2);
-    }
-  }
-
-  // COT component (independent) as alignment bump around a neutral 50 anchor
-  const { sign: cotSign, detail: cotDetail } = computeCOTInstrumentSign(args.cotCue, args.instrument);
-  const cotBump = cotSign === 0 ? 0 : (cotSign > 0 ? +5 : -5);
-  const S_cot = 50 + cotBump;
-
-  // Weights (independent aggregation)
-  const w_cal = 0.45, w_head = 0.20, w_csm = 0.30, w_cot = 0.05;
-  const RawF = w_cal * S_cal + w_head * S_head + w_csm * S_csm + w_cot * S_cot;
-
-  const proximityFlag = args.warningMinutes != null ? 1 : 0;
-  const F = Math.max(0, Math.min(100, RawF * (1 - 0.25 * proximityFlag)));
-
-  // Final label (keep sign logic consistent with majority direction)
-  const compSigns = [
-    args.calendarSign,
-    computeHeadlinesSign(args.headlinesBias),
-    computeCSMInstrumentSign(args.csm, args.instrument).sign,
-    cotSign,
-  ].filter((s) => s !== 0);
-
-  let signNet = 0;
-  if (compSigns.length) {
-    const sum = compSigns.reduce((a, b) => a + b, 0);
-    signNet = sum > 0 ? 1 : sum < 0 ? -1 : 0;
-  }
-  const label = signNet > 0 ? "bullish" : signNet < 0 ? "bearish" : (F > 55 ? "bullish" : F < 45 ? "bearish" : "neutral");
-
-  // --- NEW: ensure internal sign matches the printed label when label is non-neutral ---
-  let finalSign = signNet;
-  if (finalSign === 0 && label !== "neutral") {
-    finalSign = label === "bullish" ? 1 : -1;
-  }
-
-  return {
-    components: {
-      calendar: { sign: args.calendarSign, score: S_cal },
-      headlines: { label: args.headlinesBias.label, score: S_head },
-      csm: { diff: csmDiff, score: S_csm },
-      cot: { sign: cotSign, detail: cotDetail, score: S_cot },
-      proximity_penalty_applied: proximityFlag === 1
-    },
-    final: { score: F, label, sign: finalSign }
-  };
-}
-
-/** Ensure a standardized “Fundamental Bias Snapshot” block appears under Full Breakdown.
- * Injects independent components (Calendar, Headlines, CSM, COT) + Final Fundamental Bias. */
-function ensureFundamentalsSnapshot(
-  text: string,
-  args: {
-    instrument: string;
-    snapshot: {
-      components: {
-        calendar: { sign: number; score: number };
-        headlines: { label: string; score: number };
-        csm: { diff: number | null; score: number };
-        cot: { sign: number; detail: string; score: number };
-        proximity_penalty_applied: boolean;
-      };
-      final: { score: number; label: string; sign: number };
-    };
-    preReleaseOnly: boolean;
-    calendarLine: string | null; // may be "Calendar bias for <PAIR>: ...", "Calendar unavailable.", etc.
-  }
-) {
-  if (!text) return text;
-
-  const hasFull = /Full\s*Breakdown/i.test(text);
-  const hasSnapshot = /Fundamental\s*Bias\s*Snapshot/i.test(text);
-  if (hasFull && hasSnapshot) return text;
-
-  // Normalize Calendar line to always start with "Calendar:"
-  let calLineNorm: string;
-   if (args.preReleaseOnly) {
-    calLineNorm = "Calendar: Pre-release only, no confirmed bias until data is out.";
-  } else if (typeof args.calendarLine === "string" && args.calendarLine.trim()) {
-    const raw = args.calendarLine.trim();
-    if (/unavailable/i.test(raw)) {
-      calLineNorm = "Calendar: unavailable.";
-    } else if (/^Calendar\s*:/i.test(raw)) {
-      // Already a "Calendar:" style line
-      calLineNorm = raw.replace(/\.$/, "");
-    } else if (/^Calendar\s*bias\s*for/i.test(raw)) {
-      // Wrap instrument-level line
-      calLineNorm = `Calendar: ${raw.replace(/\.$/, "")}`;
-    } else {
-      // Fallback to explicit wrapper
-      calLineNorm = `Calendar: ${raw.replace(/\.$/, "")}`;
-    }
-  } else {
-    calLineNorm = "Calendar: unavailable.";
-  }
-
-
-  const cotSignWord = args.snapshot.components.cot.sign > 0 ? "bullish"
-                     : args.snapshot.components.cot.sign < 0 ? "bearish" : "neutral";
-  const proxNote = args.snapshot.components.proximity_penalty_applied ? " (proximity penalty applied)" : "";
-
-  const block =
-`\nFundamental Bias Snapshot:
-• ${calLineNorm}
-• Headlines bias (48h): ${args.snapshot.components.headlines.label} (score ~${Math.round(args.snapshot.components.headlines.score)})
-• CSM z-diff ${args.snapshot.components.csm.diff == null ? "(n/a)" : args.snapshot.components.csm.diff.toFixed(2)} ⇒ CSM score ~${Math.round(args.snapshot.components.csm.score)}
-• COT: ${cotSignWord}; ${args.snapshot.components.cot.detail} (score ~${Math.round(args.snapshot.components.cot.score)})
-• Final Fundamental Bias: ${args.snapshot.final.label} (score ~${Math.round(args.snapshot.final.score)})${proxNote}
-`;
-
-  if (hasFull) {
-    return text.replace(/(Full\s*Breakdown[^\n]*\n)/i, `$1${block}`);
-  }
-  return `${text}\n${block}`;
-}
-
-
 // ---------- prompts (Updated per ALLOWED CHANGES A–E) ----------
 function systemCore(
   instrument: string,
@@ -1114,7 +881,7 @@ function systemCore(
     "- Only mention **Calendar** if calendar_status === 'api' or calendar_status === 'image-ocr'.",
     "- Only mention **Headlines** if a headlines snapshot is provided.",
     "- Do not invent events, figures, or quotes. If something is missing, write 'unavailable'.",
-    "- Treat **Calendar**, **Headlines/Articles**, **CSM**, and **COT** as **independent** fundamental components.",
+    "- Use the Sentiment snapshot exactly as given (CSM + Headlines bias + optional COT cue).",
     "- Never use the word 'mixed' for calendar verdicts — use bullish/bearish/neutral only.",
     "",
     "Execution clarity:",
@@ -1130,72 +897,63 @@ function systemCore(
     "Strategy Tournament (broad library & scoring):",
     "- Evaluate these candidates by fit to visible charts (do not invent):",
     "  • Market Structure (BOS/CHOCH; continuation vs reversal)",
-    "  • Order Blocks (OB) demand/supply; mitigations; breaker blocks",
+    "  • Order Blocks (OB) demand/supply; mitigations",
     "  • Fair Value Gaps (FVG)/Imbalance; gap fills",
-    "  • Support/Resistance (HTF + intraday), Round/Quarter levels, psych levels",
+    "  • Breakers/Breaker blocks",
+    "  • Support/Resistance (HTF + intraday), Round numbers/psych levels",
     "  • Trendline breaks + retests; channels; wedges; triangles",
-    "  • Liquidity mechanics (sweeps/raids/stop hunts; equal highs/lows; session liquidity, kill zones)",
-    "  • Pullbacks to OB/FVG/MA; Fib 0.382/0.5/0.618/0.786; EQ of range",
-    "  • Moving averages (EMA21/50 regime/cross); momentum ignition/breakout",
-    "  • RSI (regular/hidden divergence), MACD impulse, Bollinger squeeze/expansion",
-    "  • Mean reversion / range rotations (prior day/week H/L, session opens)",
-    "  • VWAP / Anchored VWAP (optional)",
-    "- **MANDATES**:",
-    "  • Consider **at least 5 candidates** on every run.",
-    "  • Ensure **≥3 candidates are NOT liquidity-sweep/BOS** plays (e.g., OB/FVG pullback, TL break+retest, range rotation, mean reversion, MA momentum, VWAP, etc.).",
-    "  • TRIGGERS MUST BE STRATEGY-SPECIFIC AND TIMEFRAME-SPECIFIC. Examples:",
-    "    - OB/FVG confluence: 'Tap of 15m demand OB + 15m FVG fill → 5m CHOCH; entry on 5m retest of FVG midpoint.'",
-    "    - Trendline break: 'Break of 1H descending TL → 15m retest + 5m BOS; entry on 5m break/retest of prior LH.'",
-    "    - Range rotation: 'Reject 1H range high with 15m bearish engulfing; 5m sweep of minor high then BOS; sell stop below 5m BOS.'",
-    "    - Momentum breakout: '1H squeeze resolves down; 15m base → 5m ignition; sell stop below ignition low after micro pullback.'",
-    "    - VWAP: 'Failing above session VWAP; 5m sweep above VWAP then 1m BOS; entry on 1m retest; SL beyond sweep high.'",
+    "  • Liquidity sweeps/stop hunts; equal highs/lows raids; session liquidity (London/NY)",
+    "  • Pullbacks (to MA/OB/FVG); 50%/61.8% fib retracements",
+    "  • Moving average regime/cross; momentum ignition/breakout",
+    "  • RSI divergence (regular/hidden); MACD impulse; Bollinger squeeze/expansion",
+    "  • Mean reversion/range rotations; range high/low plays; session “kill zones” confluence",
     "- Score each candidate T_candidate = clamp( 0.5*HTF_fit(4H) + 0.3*Context_fit(1H) + 0.2*Trigger_fit(15m & optional 5m), 0, 100 ).",
     "- Penalize conflicts with HTF (-15 to -30). Reward multi-signal confluence (+10 to +20) and clean invalidation/asymmetric R:R (+5 to +15).",
-    "- Pick TOP 1 as 'Option 1 (Primary)' and a DISTINCT runner-up for 'Option 2 (Alternative)'. Provide a compact tournament table (name — score — reason).",
+    "- Pick TOP 1 as 'Option 1 (Primary)' and a DISTINCT runner-up for 'Option 2 (Alternative)'.",
+    "- Provide a compact tournament table (name — score — reason).",
     "",
-    "Fundamentals Scoring (independent components; 0–100, no hard caps):",
-    "- Compute independently:",
-    "  • Calendar (instrument sign: bearish:-1 / neutral:0 / bullish:+1) ⇒ S_cal = 50 + 50*sign",
-    "  • Headlines (48h) ⇒ S_head = 25 (bearish) / 50 (neutral/unavailable) / 75 (bullish)",
-    "  • CSM diff = z(base) - z(quote) ⇒ S_csm = 50 + 25 * clamp(diff, -2, +2)/2",
-    "  • COT cue (if present) ⇒ S_cot = 50 ± 5 (align:+5 / conflict:-5 / none:0)",
+    "Fundamentals Scoring (0–100, no hard caps):",
+    "- Determine calendar instrument sign from the calendar bias (bearish:-1, neutral:0, bullish:+1).",
+    "- Compute:",
+    "  • S_cal = 50 + 50*sign",
+    "  • Headlines (48h): S_head = 25 (bearish) / 50 (neutral) / 75 (bullish); if unavailable, use 50",
+    "  • CSM diff = z(base) - z(quote); S_csm = 50 + 25 * clamp(diff, -2, +2)/2",
+    "  • COT (if cues detected): bump +5 if aligns with calendar sign, -5 if conflicts, 0 if none",
     "- Weights: w_cal=0.45, w_head=0.20, w_csm=0.30, w_cot=0.05",
-    "- RawF = w_cal*S_cal + w_head*S_head + w_csm*S_csm + w_cot*S_cot",
-    "- Proximity (≤60m high-impact) penalty: F = clamp(RawF * 0.75, 0, 100) when active.",
+    "- RawF = w_cal*S_cal + w_head*S_head + w_csm*S_csm + w_cot*(50+cotBump)",
+    "- If a high-impact event is within ≤60 min, reduce by 25%: F = clamp( RawF * (1 - 0.25*proximityFlag), 0, 100 ), where proximityFlag=1 if warning ≤60 min else 0.",
+    "- Unavailable components fall back to 50 (except calendar sign, which may be neutral).",
     "",
     "Conviction (0–100) from TECH & FUND alignment:",
     "- Compute T as the best tournament score (0–100).",
     "- Use the fundamentals F above (0–100).",
-    "- Alignment bonus: +8 if technical primary direction matches the fundamentals net sign; else -8.",
+    "- Determine direction sign from technical primary vs fundamentals net sign; alignment bonus: +8 if same sign, else -8.",
     "- If a high-impact event is within ≤60 min, apply final scaling 15%: Conv = clamp( (0.55*T + 0.45*F + align) * (1 - 0.15*proximityFlag), 0, 100 ).",
+    "- Do not apply any other caps.",
     "",
     "Consistency rule:",
-    "- If Calendar/Headlines/CSM align, say 'aligning'.",
+    "- If Calendar/Headlines/CSM align, do not say 'contradicting'; say 'aligning'.",
     "- 'Tech vs Fundy Alignment' must be Match when aligned, Mismatch when conflicted.",
     "",
     `Keep instrument alignment with ${instrument}.`,
     warn !== null ? `\nCALENDAR WARNING: High-impact event within ~${warn} min. Avoid impulsive market entries right before release.` : "",
     bias ? `\nPOST-RESULT ALIGNMENT: ${bias}.` : "",
     "",
-    "Calendar verdict rules:",
+        "Calendar verdict rules:",
     "- Per event: compute verdict using domain direction (goodIfHigher); output only bullish/bearish/neutral.",
     "- Final calendar bias uses baseMinusQuote: net = baseSum - quoteSum; net>0 → bullish instrument; net<0 → bearish; only when BOTH currency sums are exactly 0 → neutral.",
     "- Mapping reminder (examples):",
-    "  • USD bearish ⇒ XAUUSD bullish, EURUSD/GBPUSD bullish.",
-    "  • USD bearish ⇒ USDJPY/USDCHF/USDCAD bearish.",
-    "  • USD bullish ⇒ XAUUSD/EURUSD/GBPUSD bearish; USDJPY/USDCHF/USDCAD bullish.",
-    "- Always state the instrument-level calendar line (e.g., 'Calendar bias for XAUUSD: bullish').",
+    "  • USD bearish ⇒ XAUUSD bullish, EURUSD bullish, GBPUSD bullish (base stronger than USD).",
+    "  • USD bearish ⇒ USDJPY bearish, USDCHF bearish, USDCAD bearish (USD is base, so bearish USD → bearish instrument).",
+    "  • USD bullish ⇒ XAUUSD bearish, EURUSD bearish, GBPUSD bearish; USD bullish ⇒ USDJPY bullish, USDCHF bullish, USDCAD bullish.",
+    "- Always state the instrument-level calendar line (e.g., 'Calendar bias for XAUUSD: bullish') — do NOT leave a bare 'USD bearish' without mapping.",
     "- If no actuals in the last 72h for the pair’s currencies: 'Pre-release only, no confirmed bias until data is out.'",
     "",
-    "Under **Fundamental View**, present **independent** lines:",
-    "- Calendar: <instrument-level line or 'unavailable' / pre-release rule>",
-    "- Headlines bias (48h): bullish/bearish/neutral (or 'unavailable')",
-    "- CSM: z(base)-z(quote) diff value and interpretation",
-    "- COT: bullish/bearish/neutral (or 'unavailable')",
-    "- Then state: **Final Fundamental Bias: <label> (score ~X)**",
+    "Under **Fundamental View**, if Calendar is unavailable, write exactly 'Calendar: unavailable'.",
+    "If Calendar is pre-release only, write exactly 'Pre-release only, no confirmed bias until data is out.' and do NOT claim a bullish/bearish/neutral calendar bias.",
   ];
 
-  const scalpingLines = !scalping ? [] : [
+   const scalpingLines = !scalping ? [] : [
     "",
     "SCALPING MODE (guardrails only; sections unchanged):",
     "- Treat 4H/1H as guardrails; build setups on 15m, confirm timing on 5m (and 1m if provided). 1m must not override HTF bias.",
@@ -1203,30 +961,32 @@ function systemCore(
     "- Prefer session confluence (London/NY kill zones), OR prior day H/L, Asia range. Reward +10 for session confluence and clean invalidation (≤0.35× ATR15) with ≥1.8R potential.",
     "- Near red news ±30m: do not initiate new market orders; consider only pre-planned limit orders with structure protection.",
     "- Management suggestions may include: partial at 1R, BE after 1R, time-stop within ~20 min if no follow-through.",
-    "- EMA 21/50 may be referenced; optional only.",
+    "- EMA 21/50 may be referenced for added conviction but are optional and must not override price/structure; a strong push can break them temporarily.",
     "- VWAP may be referenced; if referenced, include vwap_used=true in ai_meta.",
-    "- TIMEFRAME ATTRIBUTION FOR WORDING: Attribute sweeps to **5m**; CHOCH/BOS to **1m** when detected there.",
-    "- TRIGGER WORDING RULE: 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)'.",
+    "- TIMEFRAME ATTRIBUTION FOR WORDING: Attribute sweeps to **5m**; attribute CHOCH/BOS to **1m** when detected there. Do not merge into a single timeframe label.",
+    "- TRIGGER WORDING RULE: Write triggers with explicit timeframes, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)'.",
     "",
-    "ai_meta (append fields for downstream tools): include {'mode':'scalping', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'max_attempts': 3}."
+    "ai_meta (append fields for downstream tools): include {'mode':'scalping', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'max_attempts': 3} in the existing ai_meta JSON."
   ];
 
-  const scalpingHardLines = !scalpingHard ? [] : [
+
+   const scalpingHardLines = !scalpingHard ? [] : [
     "",
     "SCALPING HARD (enforced micro-structure entries):",
     "- Only produce a **scalping** trade or explicitly 'Stay Flat' if no compliant scalp exists.",
     "- Entry must be built from 15m structure with **5m confirmation**; if a 1m chart is provided, use 1m for timing confirmation.",
     "- Mandatory micro-structure: liquidity sweep or FVG/OB tap + immediate shift (CHOCH/BOS).",
-    "- TIMEFRAME ATTRIBUTION FOR WORDING (MANDATORY): Sweeps credited to **5m**; CHOCH/BOS credited to **1m** if detected there (else 5m).",
-    "- TRIGGER WORDING RULE (MANDATORY): 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)'.",
-    "- SL tight: behind the 1m/5m swing; typical 0.15×–0.40× ATR15.",
-    "- Time-stop: 15 minutes; state explicitly.",
-    "- Max attempts: 2; state explicitly.",
-    "- Near red news ±20m: 'Stay Flat' unless a protected limit is resting.",
-    "- EMA/VWAP optional only.",
+    "- TIMEFRAME ATTRIBUTION FOR WORDING (MANDATORY): Sweeps are credited to **5m**; CHOCH/BOS are credited to **1m** if detected there (else 5m).",
+    "- TRIGGER WORDING RULE (MANDATORY): Write the trigger with explicit timeframes, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)'. Never write '5m sweep and BOS' if BOS is on 1m.",
+    "- SL must be tight: behind the 1m/5m swing that defines the setup; typical 0.15×–0.40× ATR15.",
+    "- Time-stop: if no progress within 15 minutes, recommend exit or reduce risk; state this explicitly.",
+    "- Max attempts: 2 per level/session; state remaining attempts if re-entry is suggested.",
+    "- Near red news ±20m: output 'Stay Flat' unless the setup is already resting as a limit with structure-protected invalidation.",
+    "- EMA 21/50 and VWAP remain optional references only; never a trigger on their own.",
     "",
     "ai_meta (override/add): set {'mode':'scalping-hard', 'time_stop_minutes': 15, 'max_attempts': 2} and include 'vwap_used' if VWAP is referenced."
   ];
+
 
   return [...baseLines, ...scalpingLines, ...scalpingHardLines].join("\n");
 }
@@ -1320,20 +1080,14 @@ function messagesFull(args: {
   "• Conviction: <0–100>%",
   "• Why this alternative:",
   "",
-    "Full Breakdown",
+  "Full Breakdown",
   "• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m/1m if used)",
-  "• Fundamental View:",
-  "   - Calendar: explicit instrument-level calendar line (or 'Calendar: unavailable'). If pre-release, write exactly: 'Pre-release only, no confirmed bias until data is out.'",
-  "   - Headlines bias (48h): bullish/bearish/neutral (or 'unavailable')",
-  "   - CSM: z(base)-z(quote) diff and interpretation",
-  "   - COT: bullish/bearish/neutral (or 'unavailable')",
-  "   - Final Fundamental Bias: <label> (score ~X)",
+  "• Fundamental View (Calendar + Sentiment + Headlines) — include explicit Calendar bias for <PAIR> when available; if pre-release, say: 'Pre-release only, no confirmed bias until data is out.'",
   "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
   "• Conditional Scenarios:",
   "• Surprise Risk:",
   "• Invalidation:",
   "• One-liner Summary:",
-
   "",
   "Detected Structures (X-ray):",
   "• 4H:",
@@ -1419,30 +1173,13 @@ function messagesFastStage1(args: {
   "• Conviction: <0–100>%",
   "• Why this alternative:",
   "",
-     "Management: Brief actionable playbook.",
-  "",
-  "Under Full Breakdown, include 'Fundamental Bias Snapshot' with Calendar, Headlines, CSM, COT, and the Final Fundamental Bias (score + label).",
-  "",
-  "Detected Structures (X-ray):",
-  "• 4H: ...",
-  "• 1H: ...",
-  "• 15m: ...",
-  "• 5m (if used): ...",
-  "• 1m (if used): ...",
-  "",
-  "Candidate Scores (tournament):",
-  "- name — score — reason",
-  "",
-  "Final Table Summary:",
-  `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |`,
-  `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
+  "Management: Brief actionable playbook.",
   "",
   "Append ONLY a fenced JSON block labeled ai_meta.",
   "",
   "provenance_hint:",
   JSON.stringify(args.provenance || {}, null, 2),
 ].join("\n");
-
 
   const parts = buildUserPartsBase({
     instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4, m5: args.m5 || null, m1: args.m1 || null,
@@ -1473,122 +1210,15 @@ async function enforceOption2(model: string, instrument: string, text: string) {
   ];
   return callOpenAI(model, messages);
 }
-function hasOption1(text: string): boolean {
-  if (!text) return false;
-  // Accept bullet/bold forms and markdown headers like "### Option 1 (Primary)"
-  const re =
-    /(^|\n)\s{0,3}#{0,6}\s*[>\s]*[*\-•]?\s*(?:\*\*|__|_)?\s*Option[ \t\u00A0\u202F]*1(?!\d)\s*(?:\(\s*Primary\s*\))?(?:\s*[:\-–—])?(?:\s*(?:\*\*|__|_))?/im;
-  return re.test(text);
-}
-
-/** Deterministically build & insert "Option 1 (Primary)" without calling the model.
- * Priority for fields: Quick Plan → Option 2 → placeholders.
- * Placement: immediately BEFORE Option 2 if present; else after Quick Plan; else before Full Breakdown; else append.
- * Also de-duplicates multiple "Option 1" blocks by keeping the first and removing subsequent ones.
- */
-async function enforceOption1(_model: string, instrument: string, text: string) {
-  if (!text) return text;
-
-  // --- Dedupe: keep first "Option 1" block, remove any subsequent duplicates (idempotent)
-  const RE_O1_BLOCK_G = /(Option\s*1(?!\d)[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/gi;
-  let o1Count = 0;
-  const deduped = text.replace(RE_O1_BLOCK_G, (m) => (++o1Count === 1 ? m : ""));
-  if (o1Count > 1) text = deduped;
-
-  // If an Option 1 exists after dedupe, nothing to add.
+function hasOption1(text: string): boolean { return /Option\s*1\s*\(?(Primary)?\)?/i.test(text || ""); }
+async function enforceOption1(model: string, instrument: string, text: string) {
   if (hasOption1(text)) return text;
-
-  const RE_QP_BLOCK = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
-  const RE_O2_BLOCK = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
-  const RE_FULL     = /(\n\s*Full\s*Breakdown)/i;
-
-  const qpBlock = text.match(RE_QP_BLOCK)?.[0] || "";
-  const o2Block = text.match(RE_O2_BLOCK)?.[0] || "";
-
-  function detectBulletChar(block: string): string {
-    if (/^\s*•\s/m.test(block)) return "• ";
-    if (/^\s*-\s/m.test(block)) return "- ";
-    return "• ";
-  }
-  function blockUsesBoldLabels(block: string): boolean {
-    return /\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:\s*\*\*/i.test(block)
-        || /(?:^|\n)\s*(?:[-•]\s*)?\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:/i.test(block);
-  }
-  function pick(re: RegExp, src: string): string | null {
-    const m = src.match(re);
-    return m ? String(m[1]).trim() : null;
-  }
-  function parseFields(src: string) {
-    return {
-      direction: pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Direction\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
-      orderType: pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Order\s*Type\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
-      trigger:   pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Trigger\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
-      entry:     pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Entry\s*\(zone\s*or\s*single\)\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src)
-              || pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Entry\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
-      stop:      pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Stop\s*Loss\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
-      tps:       pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Take\s*Profit\(s\)\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src)
-              || pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*TPs?\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
-      conv:      pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Conviction\s*:\s*(?:\*\*)?\s*(\d{1,3})\s*%/mi, src),
-      setup:     pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Setup\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
-      shortWhy:  pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Short\s*Reasoning\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src)
-    };
-  }
-
-  const qp = parseFields(qpBlock);
-  const o2 = parseFields(o2Block);
-
-  const choose = (a?: string | null, b?: string | null, ph = "...") =>
-    (a && a.trim()) || (b && b.trim()) || ph;
-
-  const bullet = detectBulletChar(qpBlock || o2Block || text);
-  const bold = blockUsesBoldLabels(qpBlock || o2Block || "");
-
-  const fields = {
-    direction: choose(qp.direction, o2.direction, "Long"),
-    orderType: choose(qp.orderType, o2.orderType, "Market"),
-    trigger:   choose(qp.trigger,   o2.trigger,   "Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)"),
-    entry:     choose(qp.entry,     o2.entry,     "zone ..."),
-    stop:      choose(qp.stop,      o2.stop,      "behind recent swing"),
-    tps:       choose(qp.tps,       o2.tps,       "TP1 1.0R / TP2 2.0R"),
-    conv:      choose(qp.conv,      o2.conv,      "60"),
-    why:       choose(qp.shortWhy, qp.setup, "Primary due to HTF alignment, clean invalidation, and superior R:R.")
-  };
-
-  const L = (label: string) => (bold ? `**${label}:**` : `${label}:`);
-
-  const option1Block =
-`Option 1 (Primary)
-${bullet}${L("Direction")} ${fields.direction}
-${bullet}${L("Order Type")} ${fields.orderType}
-${bullet}${L("Trigger")} ${fields.trigger}
-${bullet}${L("Entry (zone or single)")} ${fields.entry}
-${bullet}${L("Stop Loss")} ${fields.stop}
-${bullet}${L("Take Profit(s)")} ${fields.tps}
-${bullet}${L("Conviction")} ${fields.conv}%
-${bullet}${L("Why this is primary")} ${fields.why}
-`;
-
-  let out = text;
-
-  if (o2Block) {
-    out = out.replace(RE_O2_BLOCK, `${option1Block}\n$&`);
-    return out;
-  }
-
-  if (qpBlock) {
-    out = out.replace(RE_QP_BLOCK, (m) => `${m}\n${option1Block}\n`);
-    return out;
-  }
-
-  if (RE_FULL.test(out)) {
-    out = out.replace(RE_FULL, `\n${option1Block}\n$1`);
-  } else {
-    out = `${out}\n\n${option1Block}\n`;
-  }
-  return out;
+  const messages = [
+    { role: "system", content: "Insert a labeled 'Option 1 (Primary)' block BEFORE 'Option 2'. Use the primary trade details already present. Include Direction, Order Type, Trigger, Entry (zone or single), SL, TP1/TP2, Conviction %. Keep other content unchanged." },
+    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd/normalize 'Option 1 (Primary)' as specified.` },
+  ];
+  return callOpenAI(model, messages);
 }
-
-
 function hasQuickPlan(text: string): boolean { return /Quick\s*Plan\s*\(Actionable\)/i.test(text || ""); }
 async function enforceQuickPlan(model: string, instrument: string, text: string) {
   if (hasQuickPlan(text)) return text;
@@ -1597,106 +1227,6 @@ async function enforceQuickPlan(model: string, instrument: string, text: string)
     { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd the Quick Plan section at the top.` },
   ];
   return callOpenAI(model, messages);
-}
-
-// Enforce micro SL wording for scalping-hard (1m/5m swing + ATR15 band)
-function enforceScalpHardStopLossLines(text: string, scalpingHard: boolean) {
-  if (!scalpingHard || !text) return text;
-
-  const blocks = [
-    { name: "Quick Plan (Actionable)", re: /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
-    { name: "Option 1", re: /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
-    { name: "Option 2", re: /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i },
-  ];
-
-  const lineRe = /(^\s*•\s*Stop\s*Loss:\s*)(.*)$/mi;
-  const needsRewrite = (s: string) => {
-    const l = (s || "").toLowerCase();
-    const mentions15m = /\b(15m|15\s*min|15\s*minute)\b/i.test(l);
-    const hasMicroTF = /\b(1m|5m)\b/i.test(l);
-    const hasSpec = /(swing|choch|bos|atr)/i.test(l);
-    return mentions15m || !hasMicroTF || !hasSpec;
-  };
-
-  function rewriteBlock(block: string): string {
-    const m = block.match(lineRe);
-    if (!m) return block;
-    const current = m[2] || "";
-    if (!needsRewrite(current)) return block;
-    const newLine = "• Stop Loss: beyond 1m/5m swing of the entry leg (tight), typical 0.15×–0.40× ATR15; if 1m prints opposite CHOCH/BOS, exit (time-stop 15m).";
-    return block.replace(lineRe, (_full, p1) => `${p1}${newLine.replace(/^•\s*Stop\s*Loss:\s*/i, "")}`);
-  }
-
-  let out = text;
-  for (const b of blocks) {
-    const m = out.match(b.re);
-    if (!m) continue;
-    const patched = rewriteBlock(m[0]);
-    out = out.replace(m[0], patched);
-  }
-  return out;
-}
-
-// Enforce explicit time-stop & max-attempts lines when scalping/scalping-hard
-function enforceScalpRiskLines(text: string, scalping: boolean, scalpingHard: boolean) {
-  if (!text || (!scalping && !scalpingHard)) return text;
-  const timeStop = scalpingHard ? 15 : 20;
-  const attempts = scalpingHard ? 2 : 3;
-
-  const blocks = [
-    { name: "Quick Plan (Actionable)", re: /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
-    { name: "Option 1", re: /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
-    { name: "Option 2", re: /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i },
-  ];
-
-  function injectLines(block: string): string {
-    let out = block;
-
-    // Insert before Conviction if possible, else append at block end
-    const anchorRe = /(^\s*•\s*Conviction\s*:\s*.*$)/mi;
-
-    const hasTimeStop = /•\s*Time-?Stop\s*:/i.test(out);
-    const hasAttempts = /•\s*Max\s*Attempts\s*:/i.test(out);
-
-    const addTimeStop = `• Time-Stop: ${timeStop} minutes if no follow-through or opposite micro-shift (CHOCH/BOS).`;
-    const addAttempts = `• Max Attempts: ${attempts}.`;
-
-    if (!hasTimeStop || !hasAttempts) {
-      if (anchorRe.test(out)) {
-        out = out.replace(anchorRe, (m) => {
-          const insert = `${!hasTimeStop ? addTimeStop + "\n" : ""}${!hasAttempts ? addAttempts + "\n" : ""}`;
-          return `${insert}${m}`;
-        });
-      } else {
-        out = out.replace(/$/, `\n${!hasTimeStop ? addTimeStop + "\n" : ""}${!hasAttempts ? addAttempts + "\n" : ""}`);
-      }
-    }
-    return out;
-  }
-
-  let out = text;
-  for (const b of blocks) {
-    const m = out.match(b.re);
-    if (!m) continue;
-    const patched = injectLines(m[0]);
-    out = out.replace(m[0], patched);
-  }
-  return out;
-}
-
-// Add a News Proximity bullet in Quick Plan when red news ≤60m
-function ensureNewsProximityNote(text: string, warnMins: number | null, instrument: string) {
-  if (!text || warnMins == null) return text;
-  const qpRe = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
-  const m = text.match(qpRe);
-  if (!m) return text;
-  let block = m[0];
-  if (/News\s*Proximity\s*:/i.test(block)) return text;
-
-  const note = `• News Proximity: High-impact event in ~${warnMins} min — prefer protected limit orders; consider staying flat until after release.`;
-  // Place right after the Quick Plan header line
-  block = block.replace(/(Quick\s*Plan\s*\(Actionable\)[^\n]*\n)/i, `$1${note}\n`);
-  return text.replace(m[0], block);
 }
 
 // ---------- Consistency + visibility guards ----------
@@ -1709,25 +1239,13 @@ function ensureCalendarVisibilityInQuickPlan(text: string, args: { instrument: s
   const hasCalendarMention = /Calendar\s*:/i.test(qpBlock) || /Calendar\s*bias\s*for\s*/i.test(qpBlock);
   if (hasCalendarMention) return text; // already present
 
-  let inject = "";
-  if (args.preReleaseOnly) {
-    inject = `\n• Note: Pre-release only, no confirmed bias until data is out.`;
-   } else if (args.biasLine) {
-    if (/unavailable/i.test(args.biasLine)) {
-      inject = `\n• Calendar: unavailable.`;
-    } else {
-      const trimmed = args.biasLine.replace(/^Calendar\s*:\s*/i, "").replace(/\.$/, "");
-      const normalized = /^Calendar\s*bias\s*for/i.test(trimmed) ? trimmed : `Calendar bias for ${args.instrument}: ${trimmed}`;
-      // Strip duplicate instrument if present
-      const finalLine = normalized.replace(new RegExp(`^Calendar\\s*bias\\s*for\\s*${args.instrument}\\s*:\\s*`, "i"), `Calendar bias for ${args.instrument}: `);
-      inject = `\n• ${finalLine}`;
-    }
-  }
+  const inject = args.preReleaseOnly
+    ? `\n• Note: Pre-release only, no confirmed bias until data is out.`
+    : (args.biasLine ? `\n• Calendar bias for ${args.instrument}: ${args.biasLine.replace(/^Calendar bias for\s*[^:]+:\s*/i, "")}` : "");
 
   if (!inject) return text;
   return text.replace(/(Quick\s*Plan\s*\(Actionable\)[^\n]*\n)/i, `$1${inject}\n`);
 }
-
 
 function stampM5Used(text: string, used: boolean) {
   if (!used) return text;
@@ -1763,10 +1281,7 @@ function stampM1Used(text: string, used: boolean) {
   return out;
 }
 
-function applyConsistencyGuards(
-  text: string,
-  args: { instrument: string; headlinesSign: number; csmSign: number; calendarSign: number; }
-) {
+function applyConsistencyGuards(text: string, args: { instrument: string; headlinesSign: number; csmSign: number; calendarSign: number; }) {
   let out = text || "";
   const signs = [args.headlinesSign, args.csmSign, args.calendarSign].filter((s) => s !== 0);
   const hasPos = signs.some((s) => s > 0);
@@ -1774,421 +1289,13 @@ function applyConsistencyGuards(
   const aligned = signs.length > 0 && ((hasPos && !hasNeg) || (hasNeg && !hasPos));
   const mismatch = hasPos && hasNeg;
 
-  // Prefer "aligning" wording when aligned.
   if (aligned) out = out.replace(/contradict(?:ion|ing|s)?/gi, "aligning");
-
-  const reTF = /(Tech\s*vs\s*Fundy\s*Alignment:\s*)(Match|Mismatch)([^\n]*)/i;
-
-  // If Final Fundamental Bias is explicitly neutral → force Match with explanation.
-  const isNeutralFinal = /Final\s*Fundamental\s*Bias\s*:\s*neutral/i.test(out);
-  if (isNeutralFinal) {
-    if (reTF.test(out)) {
-      out = out.replace(reTF, (_m, p1) => `${p1}Match (Fundamentals neutral — trade managed by technicals)`);
-    }
-    return out;
-  }
-
-  // Otherwise use aligned/mismatch logic.
+  const reTF = /(Tech\s*vs\s*Fundy\s*Alignment:\s*)(Match|Mismatch)/i;
   if (reTF.test(out)) {
-    out = out.replace(reTF, (_m, p1) => `${p1}${aligned ? "Match" : mismatch ? "Mismatch" : "Match"}`);
+    out = out.replace(reTF, (_, p1) => `${p1}${aligned ? "Match" : mismatch ? "Mismatch" : "Match"}`);
   }
   return out;
 }
-
-
-/** Ensure ≥5 candidates and ≥3 non-sweep/BOS strategies in the tournament table. */
-async function enforceTournamentDiversity(model: string, instrument: string, text: string) {
-  const sectMatch = text.match(/Candidate\s*Scores\s*\(tournament\):[\s\S]*?(?=\n\s*Final\s*Table\s*Summary:|\n\s*Detected\s*Structures|\n\s*Full\s*Breakdown|$)/i);
-  const sect = sectMatch ? sectMatch[0] : "";
-  const lines = (sect.match(/^- .+/gmi) || []);
-  const nonSweep = lines.filter(l => !/(sweep|liquidity|stop\s*hunt|bos\b|choch\b)/i.test(l));
-  const ok = lines.length >= 5 && nonSweep.length >= 3;
-  if (ok) return text;
-
-  const prompt = [
-    "Fix ONLY the 'Candidate Scores (tournament)' section to include at least 5 candidates total, with at least 3 that are NOT liquidity-sweep/BOS strategies.",
-    "Keep every other part of the document unchanged. Return only the corrected section content (header + bullet lines).",
-    "Each line format: '- name — score — reason' and reasons must reference visible structure/timeframes (4H/1H/15m/5m/1m).",
-    `Instrument: ${instrument}`,
-    sect || "(section missing)"
-  ].join("\n\n");
-
-  const out = await callOpenAI(model, [
-    { role: "system", content: "You will output ONLY the corrected 'Candidate Scores (tournament)' section. Do not change anything else." },
-    { role: "user", content: prompt }
-  ]);
-
-  if (!out || out.trim().length < 10) return text;
-
-  const replacement = `Candidate Scores (tournament):\n${out.trim()}\n`;
-  if (sectMatch) {
-    return text.replace(sectMatch[0], replacement);
-  }
-  // If section was missing, inject before Final Table or at end
-  if (/Final\s*Table\s*Summary:/i.test(text)) {
-    return text.replace(/Final\s*Table\s*Summary:/i, `${replacement}\nFinal Table Summary:`);
-  }
-  return `${text}\n\n${replacement}`;
-}
-
-/** Rewrite generic triggers to strategy- & timeframe-specific triggers for Quick Plan / Option 1 / Option 2. */
-async function enforceTriggerSpecificity(model: string, instrument: string, text: string) {
-  // We will process three blocks: Quick Plan, Option 1, Option 2
-  const blockSpecs = [
-    { name: "Quick Plan (Actionable)", re: /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
-    { name: "Option 1", re: /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
-    { name: "Option 2", re: /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i },
-  ];
-
-  let out = text;
-  for (const spec of blockSpecs) {
-    const m = out.match(spec.re);
-    if (!m) continue;
-    const block = m[0];
-    const trigMatch = block.match(/^\s*•\s*Trigger:\s*(.+)$/mi);
-    if (!trigMatch) continue;
-    const trig = trigMatch[1].trim();
-
-    // Heuristics for generic triggers
-    const hasTF = /(1m|5m|15m|1h|4h)/i.test(trig);
-    const hasStrat = /(ob|order\s*block|fvg|fair\s*value|trendline|range|vwap|sweep|bos|choch|divergence|squeeze|keltner|donchian|pullback|fib|breaker)/i.test(trig);
-    const isGeneric = !(hasTF && hasStrat) || /\b(price\s+breaks|break\s+(above|below)|crosses)\b/i.test(trig);
-
-    if (!isGeneric) continue;
-
-    const sys = "Rewrite only the Trigger line to be strategy-specific and timeframe-specific using the strategy implied in the block. Keep all other lines unchanged.";
-    const usr = `Instrument: ${instrument}\n\nBLOCK:\n${block}\n\nRules:\n- Explicit timeframes (e.g., '5m sweep; 1m BOS').\n- Use a concrete trigger matching the strategy (OB/FVG, TL break+retest, range rotation, momentum breakout, VWAP, etc.).\n- Keep everything else intact. Return ONLY the rewritten Trigger line, starting with '• Trigger:'`;
-
-    const newLine = await callOpenAI(model, [{ role: "system", content: sys }, { role: "user", content: usr }]);
-    if (newLine && /^(\s*•\s*Trigger:)/i.test(newLine.trim())) {
-      const updatedBlock = block.replace(/^\s*•\s*Trigger:\s*.+$/mi, newLine.trim());
-      out = out.replace(block, updatedBlock);
-    }
-  }
-  return out;
-}
-
-/** Ensure Full Breakdown has all required subsections (labels only if content missing). */
-async function enforceFullBreakdownSkeleton(model: string, instrument: string, text: string) {
-  const hasFB = /Full\s*Breakdown/i.test(text);
-  const need = [
-    /Technical\s*View/i, /Fundamental\s*View/i, /Tech\s*vs\s*Fundy\s*Alignment/i,
-    /Conditional\s*Scenarios/i, /Surprise\s*Risk/i, /Invalidation/i, /One-liner\s*Summary/i
-  ];
-  const ok = hasFB && need.every(re => re.test(text));
-  if (ok) return text;
-
-  if (!hasFB) {
-    return `${text}\n\nFull Breakdown\n• Technical View (HTF + Intraday): ...\n• Fundamental View: ...\n• Tech vs Fundy Alignment: ...\n• Conditional Scenarios: ...\n• Surprise Risk: ...\n• Invalidation: ...\n• One-liner Summary: ...\n`;
-  }
-
-  const prompt = `Add any missing Full Breakdown subsection labels (exact labels) without altering existing content. Instrument: ${instrument}\n\n${text}`;
-  const patched = await callOpenAI(model, [
-    { role: "system", content: "Ensure required Full Breakdown subsection labels exist. Do not modify existing content; only insert missing labeled lines under the Full Breakdown section." },
-    { role: "user", content: prompt }
-  ]);
-  return patched && patched.trim().length > 10 ? patched : text;
-}
-
-/** Ensure Final Table Summary exists with a row for the instrument. */
-function enforceFinalTableSummary(text: string, instrument: string) {
-  if (/Final\s*Table\s*Summary/i.test(text)) return text;
-  const stub =
-`\nFinal Table Summary:
-| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |
-| ${instrument} | ... | ... | ... | ... | ... | ... |\n`;
-  return `${text}\n${stub}`;
-}
-
-/** Compute Convictions (0–100) and inject separately into Quick Plan / Option 1 / Option 2.
- * Formula per option:
- *   Conv = clamp( (0.55*T + 0.45*F + align) * (1 - 0.15*proximityFlag), 0, 100 )
- * Where:
- *   - T = technical score from tournament (O1 = top; O2 = runner-up). If runner-up absent, T2 = max(T1-12, 0).
- *   - F = independent fundamentals final score (0–100).
- *   - align = +8 if fundamentals sign matches that option’s Direction, -8 if conflicts, else 0.
- * Also de-dupes any duplicate “Conviction:” lines by rewriting the block with a single line.
- */
-function computeAndInjectConviction(
-  text: string,
-  args: { fundamentals: { final: { score: number; sign: number } }, proximityFlag?: boolean }
-) {
-  if (!text) return text;
-
-  // === Tournament extraction (get top2 unique scores) ===
-  const tSect = text.match(
-    /Candidate\s*Scores\s*\(tournament\):[\s\S]*?(?=\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i
-  )?.[0] || "";
-  const tMatches = [...tSect.matchAll(/—\s*(\d{1,3})\s*—/g)];
-  const uniqSorted = [...new Set(tMatches
-    .map((m) => Number(m[1]))
-    .filter((n) => Number.isFinite(n))
-    .map((n) => Math.max(0, Math.min(100, n)))
-  )].sort((a, b) => b - a);
-
-  const T1 = uniqSorted[0] ?? 0;
-  const T2 = uniqSorted[1] ?? Math.max(0, T1 - 12); // fallback if only one candidate score present
-
-  // === Fundamentals (F, sign) ===
-  const F = Math.max(0, Math.min(100, Number(args.fundamentals?.final?.score) || 0));
-  const fSign = Number(args.fundamentals?.final?.sign) || 0;
-  const prox = !!args.proximityFlag;
-
-  // === Block helpers ===
-  const RE_QP_BLOCK = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
-  const RE_O1_BLOCK = /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
-  const RE_O2_BLOCK = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
-
-  function dirSign(block: string): number {
-    const m = block.match(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Direction\s*:\s*(Long|Short|Stay\s*Flat)/im);
-    if (!m) return 0;
-    const v = m[1].toLowerCase();
-    if (v.startsWith("long")) return 1;
-    if (v.startsWith("short")) return -1;
-    return 0;
-  }
-
-  function pickBlock(src: string, re: RegExp): string {
-    const m = src.match(re);
-    return m ? m[0] : "";
-  }
-
-  const qpBlock = pickBlock(text, RE_QP_BLOCK);
-  const o1Block = pickBlock(text, RE_O1_BLOCK);
-  const o2Block = pickBlock(text, RE_O2_BLOCK);
-
-  // Direction per section (QP falls back to O1)
-  let dQP = dirSign(qpBlock);
-  const dO1 = dirSign(o1Block);
-  const dO2 = dirSign(o2Block);
-  if (dQP === 0) dQP = dO1;
-
-  // Alignment bonus per section
-  const alignQP = (fSign !== 0 && dQP !== 0) ? (fSign === dQP ? 8 : -8) : 0;
-  const alignO1 = (fSign !== 0 && dO1 !== 0) ? (fSign === dO1 ? 8 : -8) : 0;
-  const alignO2 = (fSign !== 0 && dO2 !== 0) ? (fSign === dO2 ? 8 : -8) : 0;
-
-  // Convictions
-  const convQP = Math.max(0, Math.min(100, Math.round((0.55 * T1 + 0.45 * F + alignQP) * (prox ? 0.85 : 1))));
-  const convO1 = Math.max(0, Math.min(100, Math.round((0.55 * T1 + 0.45 * F + alignO1) * (prox ? 0.85 : 1))));
-  const convO2 = Math.max(0, Math.min(100, Math.round((0.55 * T2 + 0.45 * F + alignO2) * (prox ? 0.85 : 1))));
-
-  // === Rewriter: remove ALL existing Conviction lines in a block, then insert one clean line ===
-  function detectBullet(block: string): string {
-    if (/^\s*•\s/m.test(block)) return "• ";
-    if (/^\s*-\s/m.test(block)) return "- ";
-    return "• ";
-  }
-  function usesBoldLabels(block: string): boolean {
-    return /\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:\s*\*\*/i.test(block)
-        || /(?:^|\n)\s*(?:[-•]\s*)?\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:/i.test(block);
-  }
-  function writeConv(src: string, blockRe: RegExp, pct: number) {
-    const m = src.match(blockRe);
-    if (!m) return src;
-    const block = m[0];
-
-    const bullet = detectBullet(block);
-    const bold = usesBoldLabels(block);
-    const label = bold ? "**Conviction:**" : "Conviction:";
-
-    // 1) Strip any existing Conviction lines (robust, multi-line, optional bold)
-    const stripped = block.replace(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Conviction\s*:[^\n]*\n?/gmi, "");
-
-    // 2) Prefer insertion after Take Profit(s), else after Stop Loss, else append
-    const reTP = /(^\s*(?:[-•]\s*)?(?:\*\*)?\s*Take\s*Profit\(s\)\s*:[^\n]*\n)/mi;
-    const reSL = /(^\s*(?:[-•]\s*)?(?:\*\*)?\s*Stop\s*Loss\s*:[^\n]*\n)/mi;
-    const insertion = `${bullet}${label} ${pct}%\n`;
-
-    let updated = stripped;
-    if (reTP.test(stripped)) {
-      updated = stripped.replace(reTP, (m) => m + insertion);
-    } else if (reSL.test(stripped)) {
-      updated = stripped.replace(reSL, (m) => m + insertion);
-    } else {
-      updated = stripped.replace(/$/, `\n${insertion}`);
-    }
-
-    return src.replace(block, updated);
-  }
-
-  let out = text;
-  out = writeConv(out, RE_QP_BLOCK, convQP);
-  out = writeConv(out, RE_O1_BLOCK, convO1);
-  out = writeConv(out, RE_O2_BLOCK, convO2);
-
-  return out;
-}
-
-/** Fill the Final Table Summary row from Quick Plan, stripping markdown and tolerating bold labels. */
-function fillFinalTableSummaryRow(text: string, instrument: string) {
-  if (!text) return text;
-
-  const stripMd = (s: string) =>
-    String(s || "")
-      .replace(/[*_`~]/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
-
-  function grab(re: RegExp): string | null {
-    const m = text.match(re);
-    return m ? stripMd(m[1]) : null;
-  }
-
-  // Tolerant to "**Label:** value" (optional ** right after the colon)
-  const bias = grab(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(?:\*\*)?\s*(Long|Short|Stay\s*Flat)/i) || "...";
-  const entry = grab(/Quick\s*Plan[\s\S]*?Entry\s*\(zone\s*or\s*single\)\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
-             || grab(/Quick\s*Plan[\s\S]*?Entry\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
-             || "...";
-  const sl    = grab(/Quick\s*Plan[\s\S]*?Stop\s*Loss\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "...";
-  const tps   = grab(/Quick\s*Plan[\s\S]*?Take\s*Profit\(s\)\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
-             || grab(/Quick\s*Plan[\s\S]*?TPs?\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
-             || "";
-  const conv  = grab(/Quick\s*Plan[\s\S]*?Conviction\s*:\s*(?:\*\*)?\s*(\d{1,3})\s*%/i) || "...";
-
-  // Parse TP1/TP2 from the TP line, tolerate various formats.
-  let tp1 = "...", tp2 = "...";
-  if (tps) {
-    const mm1 = tps.match(/TP1[:\s]*([0-9.]+)/i);
-    const mm2 = tps.match(/TP2[:\s]*([0-9.]+)/i);
-    if (mm1) tp1 = stripMd(mm1[1]);
-    if (mm2) tp2 = stripMd(mm2[1]);
-    if (tp1 === "..." || tp2 === "...") {
-      const nums = (tps.match(/[0-9.]+/g) || []).map(stripMd);
-      if (tp1 === "..." && nums[0]) tp1 = nums[0];
-      if (tp2 === "..." && nums[1]) tp2 = nums[1];
-    }
-  }
-
-  const headerRe = /Final\s*Table\s*Summary:\s*\n\|\s*Instrument\s*\|\s*Bias\s*\|\s*Entry Zone\s*\|\s*SL\s*\|\s*TP1\s*\|\s*TP2\s*\|\s*Conviction %\s*\|\n/i;
-  const rowRe = new RegExp(`^\\|\\s*${instrument.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\|[^\\n]*$`, "im");
-  const newRow = `| ${instrument} | ${bias} | ${entry} | ${sl} | ${tp1} | ${tp2} | ${conv} |`;
-
-  if (!headerRe.test(text)) {
-    const block =
-`\nFinal Table Summary:
-| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |
-${newRow}\n`;
-    return `${text}\n${block}`;
-  }
-
-  if (rowRe.test(text)) {
-    return text.replace(rowRe, newRow);
-  }
-
-  return text.replace(headerRe, (m) => m + newRow + "\n");
-}
-
-
-/** Ensure ai_meta JSON exists and carries required keys; merge live fields if available. */
-function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
-  const meta = extractAiMeta(text) || {};
-  const merged = { ...meta, ...patch };
-  const json = JSON.stringify(merged, null, 2);
-
-  // Replace existing ai_meta fenced block if present
-  const reFence = /\nai_meta\s*```json[\s\S]*?```\s*$/i;
-  if (reFence.test(text)) {
-    return text.replace(reFence, `\nai_meta ${json}\n`);
-  }
-
-  // Replace existing ai_meta { ... } block if present
-  const reBraces = /\nai_meta\s*{[\s\S]*?}\s*$/i;
-  if (reBraces.test(text)) {
-    return text.replace(reBraces, `\nai_meta ${json}\n`);
-  }
-
-  // Append at the very end as plain-brace JSON (parser expects this form)
-  return `${text}\n\nai_meta ${json}\n`;
-}
-
-/** Normalize Order Type for Quick Plan & Option 1 based on currentPrice vs entry zone (from ai_meta). */
-function normalizeOrderTypeLines(text: string, aiMeta: any) {
-  const dir = String(aiMeta?.direction || "").toLowerCase();
-  const p = Number(aiMeta?.currentPrice);
-  const zmin = Number(aiMeta?.zone?.min);
-  const zmax = Number(aiMeta?.zone?.max);
-  if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return text;
-
-  function wantOrder(): string | null {
-    if (dir === "long") {
-      if (Math.max(zmin, zmax) < p) return "Buy Limit";
-      if (Math.min(zmin, zmax) > p) return "Buy Stop";
-      return "Market";
-    } else if (dir === "short") {
-      if (Math.min(zmin, zmax) > p) return "Sell Limit";
-      if (Math.max(zmin, zmax) < p) return "Sell Stop";
-      return "Market";
-    }
-    return null;
-  }
-
-  const desired = wantOrder();
-  if (!desired) return text;
-
-  function setOrderInBlock(src: string, blockRe: RegExp) {
-    const m = src.match(blockRe);
-    if (!m) return src;
-    const block = m[0];
-    const updated = block.replace(/(^\s*•\s*Order\s*Type:\s*)(.+)$/mi, `$1${desired}`);
-    return src.replace(block, updated);
-  }
-
-  // Adjust Quick Plan and Option 1 only (Option 2 may intentionally differ)
-  let out = text;
-  out = setOrderInBlock(out, /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
-  out = setOrderInBlock(out, /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
-  return out;
-}
-
-/** Ensure Option 2 uses a DISTINCT strategy/trigger from Option 1. */
-async function enforceDistinctAlternative(model: string, instrument: string, text: string) {
-  const m1 = text.match(/(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
-  const m2 = text.match(/(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i);
-  if (!m1 || !m2) return text;
-
-  const o1 = m1[0], o2 = m2[0];
-  const t1 = (o1.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase();
-  const t2 = (o2.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase();
-  if (!t1 || !t2) return text;
-
-  // Rough strategy buckets
-  const buckets: Record<string, RegExp> = {
-    sweep: /(sweep|liquidity|raid|stop\s*hunt|bos|choch)/i,
-    ob_fvg: /(order\s*block|\bob\b|fvg|fair\s*value|breaker)/i,
-    tl_break: /(trendline|channel|wedge|triangle)/i,
-    range: /(range|rotation|mean\s*reversion|eq\s*of\s*range)/i,
-    vwap: /\bvwap\b/i,
-    momentum: /(ignition|breakout|squeeze|bollinger|macd|divergence)/i,
-  };
-  function bucketOf(s: string): string | null {
-    for (const [k, re] of Object.entries(buckets)) if (re.test(s)) return k;
-    return null;
-  }
-  const b1 = bucketOf(t1);
-  const b2 = bucketOf(t2);
-
-  const tooSimilar = (b1 && b2 && b1 === b2) || t1.replace(/\s+/g,"") === t2.replace(/\s+/g,"");
-  if (!tooSimilar) return text;
-
-  const sys = "Rewrite ONLY the 'Option 2 (Alternative)' block so it is a DISTINCT strategy from Option 1, with a different trigger type and explicit timeframes.";
-  const rules = [
-    "Choose a different play from the library (e.g., if Option 1 is sweep/BOS, make Option 2 a TL break+retest, range rotation, OB/FVG pullback, VWAP, or momentum breakout).",
-    "Keep direction if justified by HTF, but change the strategy & Trigger wording.",
-    "Include Direction, Order Type, Trigger (with timeframes), Entry (zone/single), Stop Loss, TP1/TP2, Conviction, Why this alternative."
-  ].join("\n- ");
-  const out = await callOpenAI(model, [
-    { role: "system", content: "Return ONLY a full, corrected 'Option 2 (Alternative)' block. Do not alter other sections." },
-    { role: "user", content: `Instrument: ${instrument}\n\nOPTION 1:\n${o1}\n\nOPTION 2 (to be rewritten):\n${o2}\n\nRules:\n- ${rules}` }
-  ]);
-
-  if (!out || out.length < 30) return text;
-
-  // Replace Option 2 block
-  return text.replace(m2[0], out.trim());
-}
-
-
 
 // ---------- Live price ----------
 async function fetchLivePrice(pair: string): Promise<number | null> {
@@ -2537,67 +1644,13 @@ if (mode === "fast") {
   const usedM1 = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(text);
   text = stampM1Used(text, usedM1);
 
-   // === Independent Fundamentals Snapshot (Calendar, Headlines, CSM, COT) ===
-  const calendarSignFast = parseInstrumentBiasFromNote(biasNote);
-  const fundamentalsSnapshot = computeIndependentFundamentals({
+  text = applyConsistencyGuards(text, {
     instrument,
-    calendarSign: calendarSignFast,
-    headlinesBias: hBias,
-    csm,
-    cotCue,
-    warningMinutes
+    headlinesSign: computeHeadlinesSign(hBias),
+    csmSign: computeCSMInstrumentSign(csm, instrument).sign,
+    calendarSign: parseInstrumentBiasFromNote(biasNote)
   });
 
-  // (moved: Fundamentals Snapshot + alignment guard run later, after textFull is initialized)
-
-
-
- // === Tournament & Trigger Enforcement ===
-// Ensure ≥5 candidates with ≥3 non-sweep/BOS; fix generic triggers with timeframe-specific wording
- text = await enforceTournamentDiversity(MODEL, instrument, text);
-text = await enforceTriggerSpecificity(MODEL, instrument, text);
-text = enforceScalpHardStopLossLines(text, scalpingHard);
-text = enforceScalpRiskLines(text, scalping, scalpingHard);
-text = ensureNewsProximityNote(text, warningMinutes, instrument);
-
-// Ensure Full Breakdown has all required subsections and Final Table Summary exists
-text = await enforceFullBreakdownSkeleton(MODEL, instrument, text);
-text = enforceFinalTableSummary(text, instrument);
-
-// === Conviction (0–100) based on T & F, then fill table row ===
-text = computeAndInjectConviction(text, {
-  fundamentals: fundamentalsSnapshot,
-  proximityFlag: warningMinutes != null
-});
-text = fillFinalTableSummaryRow(text, instrument);
-
-
-
-  // Ensure Full Breakdown has all required subsections and Final Table Summary exists
-  text = await enforceFullBreakdownSkeleton(MODEL, instrument, text);
-  text = enforceFinalTableSummary(text, instrument);
-
-  // Ensure ai_meta exists and is enriched with runtime fields
-  const aiPatchFast = {
-    mode,
-    vwap_used: /vwap/i.test(text),
-    time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
-    max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
-    currentPrice: livePrice ?? undefined,
-    vp_version: VP_VERSION
-  };
-     text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatchFast).filter(([,v]) => v !== undefined)));
-  aiMeta = extractAiMeta(text) || aiMeta;
-
-  // Normalize conflicting Order Type for primary plan if needed
-  if (aiMeta && invalidOrderRelativeToPrice(aiMeta)) {
-    text = normalizeOrderTypeLines(text, aiMeta);
-  }
-
-  // Ensure Option 2 is a truly distinct strategy
-  text = await enforceDistinctAlternative(MODEL, instrument, text);
-
-  // Cache & provenance footer
   const cacheKey = setCache({ instrument, m5: m5 || null, m15, h1, h4, calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
 
   const footer = buildServerProvenanceFooter({
@@ -2608,7 +1661,6 @@ text = fillFinalTableSummaryRow(text, instrument);
     extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard },
   });
   text = `${text}\n${footer}`;
-
 
   res.setHeader("Cache-Control", "no-store");
   return res.status(200).json({
@@ -2665,89 +1717,21 @@ text = fillFinalTableSummaryRow(text, instrument);
     const usedM1Full = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(textFull);
     textFull = stampM1Used(textFull, usedM1Full);
 
-        // === Independent Fundamentals Snapshot (Calendar, Headlines, CSM, COT) ===
-  const calendarSignFull = parseInstrumentBiasFromNote(biasNote);
-   const fundamentalsSnapshotFull = computeIndependentFundamentals({
-    instrument,
-    calendarSign: calendarSignFull,
-    headlinesBias: hBias,
-    csm,
-    cotCue,
-    warningMinutes
-  });
-
-   // Inject standardized Fundamentals block under Full Breakdown
-  textFull = ensureFundamentalsSnapshot(textFull, {
-    instrument,
-    snapshot: fundamentalsSnapshotFull,
-    preReleaseOnly,
-    calendarLine: calendarText || null
-  });
-
-
-   // Consistency pass on alignment wording (run AFTER fundamentals snapshot so neutral forces Match)
-  textFull = applyConsistencyGuards(textFull, {
-    instrument,
-    headlinesSign: computeHeadlinesSign(hBias),
-    csmSign: computeCSMInstrumentSign(csm, instrument).sign,
-    calendarSign: parseInstrumentBiasFromNote(biasNote)
-  });
-
-
-
-    // === Tournament & Trigger Enforcement ===
-textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
-textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
-textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
-textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
-textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
-
-// Ensure Full Breakdown skeleton + Final Table Summary
-textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
-textFull = enforceFinalTableSummary(textFull, instrument);
-
-// === Conviction (0–100) based on T & F, then fill table row ===
-textFull = computeAndInjectConviction(textFull, {
-  fundamentals: fundamentalsSnapshotFull,
-  proximityFlag: warningMinutes != null
-});
-textFull = fillFinalTableSummaryRow(textFull, instrument);
-
-
-
-    // Ensure Full Breakdown skeleton + Final Table Summary
-    textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
-    textFull = enforceFinalTableSummary(textFull, instrument);
-
-    // Ensure ai_meta exists and is enriched with runtime fields
-    const aiPatchFull = {
-      mode,
-      vwap_used: /vwap/i.test(textFull),
-      time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
-      max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
-      currentPrice: livePrice ?? undefined,
-      vp_version: VP_VERSION
-    };
-       textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
-    aiMetaFull = extractAiMeta(textFull) || aiMetaFull;
-
-    // Normalize conflicting Order Type for primary plan if needed
-    if (aiMetaFull && invalidOrderRelativeToPrice(aiMetaFull)) {
-      textFull = normalizeOrderTypeLines(textFull, aiMetaFull);
-    }
-
-    // Ensure Option 2 is a truly distinct strategy
-    textFull = await enforceDistinctAlternative(MODEL, instrument, textFull);
-
-
-    // Provenance footer
-    const footer = buildServerProvenanceFooter({
-      headlines_provider: headlinesProvider || "unknown",
-      calendar_status: calendarStatus,
-      calendar_provider: calendarProvider,
-      csm_time: csm.tsISO,
-      extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard },
+    textFull = applyConsistencyGuards(textFull, {
+      instrument,
+      headlinesSign: computeHeadlinesSign(hBias),
+      csmSign: computeCSMInstrumentSign(csm, instrument).sign,
+      calendarSign: parseInstrumentBiasFromNote(biasNote)
     });
+
+   const footer = buildServerProvenanceFooter({
+  headlines_provider: headlinesProvider || "unknown",
+  calendar_status: calendarStatus,
+  calendar_provider: calendarProvider,
+  csm_time: csm.tsISO,
+  extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard },
+});
+
     textFull = `${textFull}\n${footer}`;
 
     res.setHeader("Cache-Control", "no-store");
@@ -2769,7 +1753,6 @@ textFull = fillFinalTableSummaryRow(textFull, instrument);
         aiMeta: aiMetaFull,
       },
     });
-
   } catch (err: any) {
     return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
   }
