@@ -583,6 +583,9 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
 
   const lines: string[] = [];
   const postRows: OcrCalendarRow[] = [];
+  const preRows: OcrCalendarRow[] = [];
+  let hasActualOnlyRecent = false;
+
   const rowsForDebug = (ocr.items || []).slice(0, 3).map(r => ({
     timeISO: r.timeISO || null,
     title: r.title || null,
@@ -612,17 +615,75 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     const f = parseNumberLoose(it.forecast);
     const p = parseNumberLoose(it.previous);
 
-    // Only include rows with actuals in the last 72h
+    // Only consider rows within last 72h when time is known; if time missing, allow but don't score far history
     const ts = it.timeISO ? Date.parse(it.timeISO) : NaN;
     const isWithin72h = isFinite(ts) ? ts <= nowMs && nowMs - ts <= H72 : true;
 
-    if (a != null && (f != null || p != null) && isWithin72h) {
+    if (!isWithin72h) continue;
+
+    // Classify
+    if (a != null && (f != null || p != null)) {
       postRows.push({ ...it, actual: a, forecast: f, previous: p });
+    } else if (a != null && f == null && p == null) {
+      // Post-release present but insufficient refs to score — remember for acknowledgement
+      hasActualOnlyRecent = true;
+    } else if (a == null && f != null && p != null) {
+      preRows.push({ ...it, actual: null, forecast: f, previous: p });
     }
   }
 
-  // If no post-result rows → pre-release only
+  // If no post-result rows, handle expected/pre-release and actual-only acknowledgement
   if (postRows.length === 0) {
+    if (preRows.length > 0) {
+      // Compute expected bias from forecast vs previous using goodIfHigher
+      const scoreByCur: Record<string, number> = {};
+      for (const it of preRows) {
+        const cur = (it.currency || "").toUpperCase();
+        const dir = goodIfHigher(String(it.title || "")); // true=higher good; false=lower good
+        if (dir == null) continue;
+        const f = Number(it.forecast);
+        const p = Number(it.previous);
+        if (!isFinite(f) || !isFinite(p)) continue;
+        const raw = (f - p) / Math.max(Math.abs(p), 1e-9);
+        const clamped = Math.max(-0.25, Math.min(0.25, raw));
+        const signed = (dir ? Math.sign(clamped) : -Math.sign(clamped)) * Math.round((Math.abs(clamped) / 0.25) * 10);
+        scoreByCur[cur] = (scoreByCur[cur] ?? 0) + signed;
+      }
+
+      const sumBase = Math.round(scoreByCur[base] ?? 0);
+      const sumQuote = Math.round(scoreByCur[quote] ?? 0);
+      const netInstr = sumBase - sumQuote;
+
+      let expected: "bullish" | "bearish" | "neutral";
+      if (sumBase === 0 && sumQuote === 0) expected = "neutral";
+      else expected = netInstr > 0 ? "bullish" : netInstr < 0 ? "bearish" : "neutral";
+
+      const biasLine = `Calendar expected bias for ${pair}: ${expected} (pre-release; awaiting actual).`;
+      const biasNote = `Expected (forecast vs previous) → ${base}:${sumBase >= 0 ? "+" : ""}${sumBase}, ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}; Net ${netInstr >= 0 ? "+" : ""}${netInstr}`;
+
+      return {
+        biasLine,
+        biasNote,
+        warningMinutes: warn,
+        evidenceLines: [], // evidence only after actuals print
+        preReleaseOnly: true,
+        rowsForDebug,
+      };
+    }
+
+    if (hasActualOnlyRecent) {
+      // Post-release present but cannot score — acknowledge without pre-release label
+      const note = `Calendar for ${pair}: post-release figures detected but insufficient refs to score (missing forecast/previous).`;
+      return {
+        biasLine: note,
+        biasNote: null,
+        warningMinutes: warn,
+        evidenceLines: [],
+        preReleaseOnly: false,
+        rowsForDebug,
+      };
+    }
+
     const preLine = `Calendar: ${
       warn != null ? `High-impact events scheduled (≤${warn} min). ` : ""
     }Pre-release only, no confirmed bias until data is out.`;
@@ -636,7 +697,7 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     };
   }
 
-  // --- Scoring setup ---
+  // --- Scoring setup for post-result rows ---
   const scoreByCur: Record<string, number> = {};
   const impactW: Record<string, number> = { Low: 0.5, Medium: 0.8, High: 1.0 };
   function add(cur: string, v: number) {
@@ -699,6 +760,7 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     rowsForDebug,
   };
 }
+
 
 // Helpers to determine instrument-relevant currencies for OCR usability checks
 const CURRENCIES = new Set(G8);
