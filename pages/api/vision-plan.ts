@@ -1221,21 +1221,9 @@ function hasCompliantOptionBlock(text: string, label: "Option 1" | "Option 2"): 
   return must.every((k) => block.includes(k));
 }
 
-function hasOption1(text: string): boolean {
-  return /Option\s*1\s*\(?(Primary)?\)?/i.test(text || "");
-}
-function hasOption2(text: string): boolean {
-  return /Option\s*2\s*\(?(Alternative)?\)?/i.test(text || "");
-}
+/* duplicate helper stubs removed — originals are defined earlier:
+   hasOption1, enforceOption1, hasQuickPlan, enforceQuickPlan */
 
-async function enforceOption1(model: string, instrument: string, text: string) {
-  if (hasCompliantOptionBlock(text, "Option 1")) return text;
-  const messages = [
-    { role: "system", content: "Normalize or insert a labeled 'Option 1 (Primary)' block BEFORE 'Option 2'. Use the best primary trade details already present. Include: Direction, Order Type, explicit Trigger, Entry (zone or single), Stop Loss, TP1/TP2, Conviction %. Keep other content unchanged." },
-    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nEnsure a compliant 'Option 1 (Primary)' exists as specified.` },
-  ];
-  return callOpenAI(model, messages);
-}
 
 async function enforceOption2(model: string, instrument: string, text: string) {
   if (hasCompliantOptionBlock(text, "Option 2")) return text;
