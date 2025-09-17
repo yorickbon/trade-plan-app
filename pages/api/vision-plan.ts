@@ -1332,16 +1332,30 @@ function messagesFastStage1(args: {
   "• Conviction: <0–100>%",
   "• Why this alternative:",
   "",
-    "Management: Brief actionable playbook.",
+     "Management: Brief actionable playbook.",
   "",
   "Under Full Breakdown, include 'Fundamental Bias Snapshot' with Calendar, Headlines, CSM, COT, and the Final Fundamental Bias (score + label).",
   "",
+  "Detected Structures (X-ray):",
+  "• 4H: ...",
+  "• 1H: ...",
+  "• 15m: ...",
+  "• 5m (if used): ...",
+  "• 1m (if used): ...",
+  "",
+  "Candidate Scores (tournament):",
+  "- name — score — reason",
+  "",
+  "Final Table Summary:",
+  `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |`,
+  `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
+  "",
   "Append ONLY a fenced JSON block labeled ai_meta.",
-
   "",
   "provenance_hint:",
   JSON.stringify(args.provenance || {}, null, 2),
 ].join("\n");
+
 
   const parts = buildUserPartsBase({
     instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4, m5: args.m5 || null, m1: args.m1 || null,
