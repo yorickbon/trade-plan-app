@@ -2602,10 +2602,10 @@ text = fillFinalTableSummaryRow(text, instrument);
 
         // === Independent Fundamentals Snapshot (Calendar, Headlines, CSM, COT) ===
   const calendarSignFull = parseInstrumentBiasFromNote(biasNote);
-  const fundamentalsSnapshotFull = computeIndependentFundamentals({
+   const fundamentalsSnapshotFull = computeIndependentFundamentals({
     instrument,
     calendarSign: calendarSignFull,
-    headlinesBias,
+    headlinesBias: hBias,
     csm,
     cotCue,
     warningMinutes
@@ -2622,7 +2622,7 @@ text = fillFinalTableSummaryRow(text, instrument);
   // Consistency pass on alignment wording (run AFTER fundamentals snapshot so neutral forces Match)
   text = applyConsistencyGuards(text, {
     instrument,
-    headlinesSign: computeHeadlinesSign(headlinesBias),
+    headlinesSign: computeHeadlinesSign(hBias),
     csmSign: computeCSMInstrumentSign(csm, instrument).sign,
     calendarSign: parseInstrumentBiasFromNote(biasNote)
   });
