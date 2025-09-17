@@ -1414,6 +1414,106 @@ async function enforceQuickPlan(model: string, instrument: string, text: string)
   return callOpenAI(model, messages);
 }
 
+// Enforce micro SL wording for scalping-hard (1m/5m swing + ATR15 band)
+function enforceScalpHardStopLossLines(text: string, scalpingHard: boolean) {
+  if (!scalpingHard || !text) return text;
+
+  const blocks = [
+    { name: "Quick Plan (Actionable)", re: /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
+    { name: "Option 1", re: /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
+    { name: "Option 2", re: /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i },
+  ];
+
+  const lineRe = /(^\s*•\s*Stop\s*Loss:\s*)(.*)$/mi;
+  const needsRewrite = (s: string) => {
+    const l = (s || "").toLowerCase();
+    const mentions15m = /\b(15m|15\s*min|15\s*minute)\b/i.test(l);
+    const hasMicroTF = /\b(1m|5m)\b/i.test(l);
+    const hasSpec = /(swing|choch|bos|atr)/i.test(l);
+    return mentions15m || !hasMicroTF || !hasSpec;
+  };
+
+  function rewriteBlock(block: string): string {
+    const m = block.match(lineRe);
+    if (!m) return block;
+    const current = m[2] || "";
+    if (!needsRewrite(current)) return block;
+    const newLine = "• Stop Loss: beyond 1m/5m swing of the entry leg (tight), typical 0.15×–0.40× ATR15; if 1m prints opposite CHOCH/BOS, exit (time-stop 15m).";
+    return block.replace(lineRe, (_full, p1) => `${p1}${newLine.replace(/^•\s*Stop\s*Loss:\s*/i, "")}`);
+  }
+
+  let out = text;
+  for (const b of blocks) {
+    const m = out.match(b.re);
+    if (!m) continue;
+    const patched = rewriteBlock(m[0]);
+    out = out.replace(m[0], patched);
+  }
+  return out;
+}
+
+// Enforce explicit time-stop & max-attempts lines when scalping/scalping-hard
+function enforceScalpRiskLines(text: string, scalping: boolean, scalpingHard: boolean) {
+  if (!text || (!scalping && !scalpingHard)) return text;
+  const timeStop = scalpingHard ? 15 : 20;
+  const attempts = scalpingHard ? 2 : 3;
+
+  const blocks = [
+    { name: "Quick Plan (Actionable)", re: /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
+    { name: "Option 1", re: /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
+    { name: "Option 2", re: /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i },
+  ];
+
+  function injectLines(block: string): string {
+    let out = block;
+
+    // Insert before Conviction if possible, else append at block end
+    const anchorRe = /(^\s*•\s*Conviction\s*:\s*.*$)/mi;
+
+    const hasTimeStop = /•\s*Time-?Stop\s*:/i.test(out);
+    const hasAttempts = /•\s*Max\s*Attempts\s*:/i.test(out);
+
+    const addTimeStop = `• Time-Stop: ${timeStop} minutes if no follow-through or opposite micro-shift (CHOCH/BOS).`;
+    const addAttempts = `• Max Attempts: ${attempts}.`;
+
+    if (!hasTimeStop || !hasAttempts) {
+      if (anchorRe.test(out)) {
+        out = out.replace(anchorRe, (m) => {
+          const insert = `${!hasTimeStop ? addTimeStop + "\n" : ""}${!hasAttempts ? addAttempts + "\n" : ""}`;
+          return `${insert}${m}`;
+        });
+      } else {
+        out = out.replace(/$/, `\n${!hasTimeStop ? addTimeStop + "\n" : ""}${!hasAttempts ? addAttempts + "\n" : ""}`);
+      }
+    }
+    return out;
+  }
+
+  let out = text;
+  for (const b of blocks) {
+    const m = out.match(b.re);
+    if (!m) continue;
+    const patched = injectLines(m[0]);
+    out = out.replace(m[0], patched);
+  }
+  return out;
+}
+
+// Add a News Proximity bullet in Quick Plan when red news ≤60m
+function ensureNewsProximityNote(text: string, warnMins: number | null, instrument: string) {
+  if (!text || warnMins == null) return text;
+  const qpRe = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
+  const m = text.match(qpRe);
+  if (!m) return text;
+  let block = m[0];
+  if (/News\s*Proximity\s*:/i.test(block)) return text;
+
+  const note = `• News Proximity: High-impact event in ~${warnMins} min — prefer protected limit orders; consider staying flat until after release.`;
+  // Place right after the Quick Plan header line
+  block = block.replace(/(Quick\s*Plan\s*\(Actionable\)[^\n]*\n)/i, `$1${note}\n`);
+  return text.replace(m[0], block);
+}
+
 // ---------- Consistency + visibility guards ----------
 function ensureCalendarVisibilityInQuickPlan(text: string, args: { instrument: string; preReleaseOnly: boolean; biasLine: string | null }) {
   if (!text) return text;
@@ -2084,8 +2184,12 @@ if (mode === "fast") {
 
   // === Tournament & Trigger Enforcement ===
   // Ensure ≥5 candidates with ≥3 non-sweep/BOS; fix generic triggers with timeframe-specific wording
-  text = await enforceTournamentDiversity(MODEL, instrument, text);
+   text = await enforceTournamentDiversity(MODEL, instrument, text);
   text = await enforceTriggerSpecificity(MODEL, instrument, text);
+  text = enforceScalpHardStopLossLines(text, scalpingHard);
+  text = enforceScalpRiskLines(text, scalping, scalpingHard);
+  text = ensureNewsProximityNote(text, warningMinutes, instrument);
+
 
   // Ensure Full Breakdown has all required subsections and Final Table Summary exists
   text = await enforceFullBreakdownSkeleton(MODEL, instrument, text);
@@ -2207,8 +2311,12 @@ if (mode === "fast") {
     });
 
     // === Tournament & Trigger Enforcement ===
-    textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
+       textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
     textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
+    textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
+    textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
+    textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
+
 
     // Ensure Full Breakdown skeleton + Final Table Summary
     textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
