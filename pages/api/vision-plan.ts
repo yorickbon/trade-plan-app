@@ -1482,18 +1482,15 @@ ${bullet}${L("Why this is primary")} ${fields.why}
   let out = text;
 
   if (o2Block) {
-    // Insert immediately before Option 2
     out = out.replace(RE_O2_BLOCK, `${option1Block}\n$&`);
     return out;
   }
 
   if (qpBlock) {
-    // Insert after Quick Plan
     out = out.replace(RE_QP_BLOCK, (m) => `${m}\n${option1Block}\n`);
     return out;
   }
 
-  // Fallback positions
   if (RE_FULL.test(out)) {
     out = out.replace(RE_FULL, `\n${option1Block}\n$1`);
   } else {
