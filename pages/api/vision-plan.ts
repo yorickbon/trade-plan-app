@@ -2470,16 +2470,16 @@ if (mode === "fast") {
     warningMinutes
   });
 
-  // Inject standardized Fundamentals block under Full Breakdown
-  text = ensureFundamentalsSnapshot(text, {
+    // Inject standardized Fundamentals block under Full Breakdown
+  textFull = ensureFundamentalsSnapshot(textFull, {
     instrument,
-    snapshot: fundamentalsSnapshot,
+    snapshot: fundamentalsSnapshotFull,
     preReleaseOnly,
     calendarLine: calendarText || null
   });
 
   // Consistency pass on alignment wording (run AFTER fundamentals snapshot so neutral forces Match)
-  text = applyConsistencyGuards(text, {
+  textFull = applyConsistencyGuards(textFull, {
     instrument,
     headlinesSign: computeHeadlinesSign(hBias),
     csmSign: computeCSMInstrumentSign(csm, instrument).sign,
