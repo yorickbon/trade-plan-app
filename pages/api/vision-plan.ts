@@ -865,6 +865,151 @@ function computeCompositeBias(args: {
   return { calendarSign: calSign, headlinesSign: hSign, csmSign, csmZDiff: zdiff, align, conflict, cap };
 }
 
+/** Derive COT instrument sign from headline cues (independent component).
+ * Uses cotCue.net per-currency signals: +1 net long, -1 net short. Maps to pair via baseMinusQuote. */
+function computeCOTInstrumentSign(cot: CotCue | null, instr: string): { sign: number; detail: string } {
+  if (!cot || !cot.net) return { sign: 0, detail: "unavailable" };
+  const { base, quote } = splitFXPair(instr);
+  if (!base || !quote) return { sign: 0, detail: "non-fx or unavailable" };
+  const b = typeof cot.net[base] === "number" ? cot.net[base] : 0;
+  const q = typeof cot.net[quote] === "number" ? cot.net[quote] : 0;
+  const diff = b - q; // >0 ⇒ bullish instrument; <0 ⇒ bearish
+  const sign = diff > 0 ? 1 : diff < 0 ? -1 : 0;
+  const toWord = (s: number) => (s > 0 ? "bullish" : s < 0 ? "bearish" : "neutral");
+  return { sign, detail: `COT ${toWord(b)} ${base} vs ${toWord(q)} ${quote} ⇒ ${toWord(sign)} ${instr}` };
+}
+
+/** Compute independent fundamentals components + final Fundamental Bias score/label (0–100).
+ * Calendar, Headlines, CSM, COT are independent inputs. */
+function computeIndependentFundamentals(args: {
+  instrument: string;
+  calendarSign: number;      // -1 / 0 / +1 (instrument-mapped)
+  headlinesBias: HeadlineBias;
+  csm: CsmSnapshot;
+  cotCue: CotCue | null;
+  warningMinutes: number | null;
+}) {
+  // Calendar component (independent)
+  const S_cal = 50 + 50 * (args.calendarSign || 0);
+
+  // Headlines component (independent)
+  const S_head =
+    args.headlinesBias.label === "bullish" ? 75 :
+    args.headlinesBias.label === "bearish" ? 25 :
+    args.headlinesBias.label === "neutral" ? 50 : 50;
+
+  // CSM component (independent)
+  const { base, quote } = splitFXPair(args.instrument);
+  let S_csm = 50;
+  let csmDiff: number | null = null;
+  if (base && quote) {
+    const zb = args.csm.scores[base];
+    const zq = args.csm.scores[quote];
+    if (typeof zb === "number" && typeof zq === "number") {
+      csmDiff = zb - zq; // >0 ⇒ bullish instrument
+      const clamped = Math.max(-2, Math.min(2, csmDiff));
+      S_csm = 50 + 25 * (clamped / 2);
+    }
+  }
+
+  // COT component (independent) as alignment bump around a neutral 50 anchor
+  const { sign: cotSign, detail: cotDetail } = computeCOTInstrumentSign(args.cotCue, args.instrument);
+  const cotBump = cotSign === 0 ? 0 : (cotSign > 0 ? +5 : -5);
+  const S_cot = 50 + cotBump;
+
+  // Weights (independent aggregation)
+  const w_cal = 0.45, w_head = 0.20, w_csm = 0.30, w_cot = 0.05;
+  const RawF = w_cal * S_cal + w_head * S_head + w_csm * S_csm + w_cot * S_cot;
+
+  const proximityFlag = args.warningMinutes != null ? 1 : 0;
+  const F = Math.max(0, Math.min(100, RawF * (1 - 0.25 * proximityFlag)));
+
+  // Final label (keep sign logic consistent with majority direction)
+  const compSigns = [
+    args.calendarSign,
+    computeHeadlinesSign(args.headlinesBias),
+    computeCSMInstrumentSign(args.csm, args.instrument).sign,
+    cotSign,
+  ].filter((s) => s !== 0);
+
+  let signNet = 0;
+  if (compSigns.length) {
+    const sum = compSigns.reduce((a, b) => a + b, 0);
+    signNet = sum > 0 ? 1 : sum < 0 ? -1 : 0;
+  }
+  const label = signNet > 0 ? "bullish" : signNet < 0 ? "bearish" : (F > 55 ? "bullish" : F < 45 ? "bearish" : "neutral");
+
+  return {
+    components: {
+      calendar: { sign: args.calendarSign, score: S_cal },
+      headlines: { label: args.headlinesBias.label, score: S_head },
+      csm: { diff: csmDiff, score: S_csm },
+      cot: { sign: cotSign, detail: cotDetail, score: S_cot },
+      proximity_penalty_applied: proximityFlag === 1
+    },
+    final: { score: F, label, sign: signNet }
+  };
+}
+
+/** Ensure a standardized “Fundamental Bias Snapshot” block appears under Full Breakdown.
+ * Injects independent components (Calendar, Headlines, CSM, COT) + Final Fundamental Bias. */
+function ensureFundamentalsSnapshot(
+  text: string,
+  args: {
+    instrument: string;
+    snapshot: {
+      components: {
+        calendar: { sign: number; score: number };
+        headlines: { label: string; score: number };
+        csm: { diff: number | null; score: number };
+        cot: { sign: number; detail: string; score: number };
+        proximity_penalty_applied: boolean;
+      };
+      final: { score: number; label: "bullish" | "bearish" | "neutral"; sign: number };
+    };
+    preReleaseOnly: boolean;
+    calendarLine: string | null; // already instrument-mapped line if available
+  }
+) {
+  if (!text) return text;
+
+  const hasFull = /Full\s*Breakdown/i.test(text);
+  const hasSnapshot = /Fundamental\s*Bias\s*Snapshot/i.test(text);
+  if (hasFull && hasSnapshot) return text;
+
+  const calLine = args.preReleaseOnly
+    ? "Calendar: Pre-release only, no confirmed bias until data is out."
+    : (args.calendarLine || "Calendar: unavailable");
+
+  const calSignWord = args.snapshot.components.calendar.sign > 0 ? "bullish" :
+                      args.snapshot.components.calendar.sign < 0 ? "bearish" : "neutral";
+
+  const cotSignWord = args.snapshot.components.cot.sign > 0 ? "bullish" :
+                      args.snapshot.components.cot.sign < 0 ? "bearish" : "neutral";
+
+  const proxNote = args.snapshot.components.proximity_penalty_applied ? " (proximity penalty applied)" : "";
+
+  const block =
+`\nFundamental Bias Snapshot:
+• ${calLine}
+• Headlines bias (48h): ${args.snapshot.components.headlines.label} (score ~${Math.round(args.snapshot.components.headlines.score)})
+• CSM z-diff ${args.snapshot.components.csm.diff == null ? "(n/a)" : args.snapshot.components.csm.diff.toFixed(2)} ⇒ CSM score ~${Math.round(args.snapshot.components.csm.score)}
+• COT: ${cotSignWord}; ${args.snapshot.components.cot.detail} (score ~${Math.round(args.snapshot.components.cot.score)})
+• Final Fundamental Bias: ${args.snapshot.final.label} (score ~${Math.round(args.snapshot.final.score)})${proxNote}
+`;
+
+  // Inject right after "Full Breakdown" header
+  if (hasFull) {
+    return text.replace(
+      /(Full\s*Breakdown[^\n]*\n)/i,
+      `$1${block}`
+    );
+  }
+  // If Full Breakdown missing (edge), append at end
+  return `${text}\n${block}`;
+}
+
+
 // ---------- prompts (Updated per ALLOWED CHANGES A–E) ----------
 function systemCore(
   instrument: string,
