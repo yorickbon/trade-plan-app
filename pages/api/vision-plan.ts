@@ -1889,10 +1889,11 @@ function computeAndInjectConviction(
     const bold = blockUsesBoldLabels(block);
 
     // Replace if present (accept optional bold)
-    const reConvLine = new RegExp(
-      String.raw`(^\s*(?:[-•]\s*)?)(?:\*\*)?\s*Conviction\s*:\s*)(\d+)(%)`,
-      "mi"
-    );
+  const reConvLine = new RegExp(
+  String.raw`(^\s*(?:[-•]\s*)?)(?:\*\*)?\s*Conviction\s*:\s*(\d+)(%)`,
+  "mi"
+);
+
     if (reConvLine.test(block)) {
       const updated = block.replace(reConvLine, (_full, p1) => `${p1}${bold ? "**Conviction:**" : "Conviction:"} ${pct}%`);
       return src.replace(block, updated);
