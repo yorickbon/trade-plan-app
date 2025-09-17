@@ -979,12 +979,12 @@ function ensureFundamentalsSnapshot(
 
   // Normalize Calendar line to always start with "Calendar:"
   let calLineNorm: string;
-  if (args.preReleaseOnly) {
+   if (args.preReleaseOnly) {
     calLineNorm = "Calendar: Pre-release only, no confirmed bias until data is out.";
   } else if (typeof args.calendarLine === "string" && args.calendarLine.trim()) {
     const raw = args.calendarLine.trim();
     if (/unavailable/i.test(raw)) {
-      calLineNorm = "Calendar: unavailable";
+      calLineNorm = "Calendar: unavailable.";
     } else if (/^Calendar\s*:/i.test(raw)) {
       // Already a "Calendar:" style line
       calLineNorm = raw.replace(/\.$/, "");
@@ -996,8 +996,9 @@ function ensureFundamentalsSnapshot(
       calLineNorm = `Calendar: ${raw.replace(/\.$/, "")}`;
     }
   } else {
-    calLineNorm = "Calendar: unavailable";
+    calLineNorm = "Calendar: unavailable.";
   }
+
 
   const cotSignWord = args.snapshot.components.cot.sign > 0 ? "bullish"
                      : args.snapshot.components.cot.sign < 0 ? "bearish" : "neutral";
@@ -1426,9 +1427,9 @@ function ensureCalendarVisibilityInQuickPlan(text: string, args: { instrument: s
   let inject = "";
   if (args.preReleaseOnly) {
     inject = `\n• Note: Pre-release only, no confirmed bias until data is out.`;
-  } else if (args.biasLine) {
+   } else if (args.biasLine) {
     if (/unavailable/i.test(args.biasLine)) {
-      inject = `\n• Note: Calendar: unavailable`;
+      inject = `\n• Calendar: unavailable.`;
     } else {
       const trimmed = args.biasLine.replace(/^Calendar\s*:\s*/i, "").replace(/\.$/, "");
       const normalized = /^Calendar\s*bias\s*for/i.test(trimmed) ? trimmed : `Calendar bias for ${args.instrument}: ${trimmed}`;
