@@ -2470,21 +2470,8 @@ if (mode === "fast") {
     warningMinutes
   });
 
-    // Inject standardized Fundamentals block under Full Breakdown
-  textFull = ensureFundamentalsSnapshot(textFull, {
-    instrument,
-    snapshot: fundamentalsSnapshotFull,
-    preReleaseOnly,
-    calendarLine: calendarText || null
-  });
+  // (moved: Fundamentals Snapshot + alignment guard run later, after textFull is initialized)
 
-  // Consistency pass on alignment wording (run AFTER fundamentals snapshot so neutral forces Match)
-  textFull = applyConsistencyGuards(textFull, {
-    instrument,
-    headlinesSign: computeHeadlinesSign(hBias),
-    csmSign: computeCSMInstrumentSign(csm, instrument).sign,
-    calendarSign: parseInstrumentBiasFromNote(biasNote)
-  });
 
 
  // === Tournament & Trigger Enforcement ===
