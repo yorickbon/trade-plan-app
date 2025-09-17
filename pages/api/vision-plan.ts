@@ -2598,13 +2598,14 @@ text = fillFinalTableSummaryRow(text, instrument);
     warningMinutes
   });
 
-  // Inject standardized Fundamentals block under Full Breakdown
-  text = ensureFundamentalsSnapshot(text, {
+   // Inject standardized Fundamentals block under Full Breakdown
+  textFull = ensureFundamentalsSnapshot(textFull, {
     instrument,
     snapshot: fundamentalsSnapshotFull,
     preReleaseOnly,
     calendarLine: calendarText || null
   });
+
 
   // Consistency pass on alignment wording (run AFTER fundamentals snapshot so neutral forces Match)
   text = applyConsistencyGuards(text, {
