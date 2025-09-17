@@ -1221,9 +1221,10 @@ function hasCompliantOptionBlock(text: string, label: "Option 1" | "Option 2"): 
   return must.every((k) => block.includes(k));
 }
 
-/* duplicate helper stubs removed — originals are defined earlier:
+/* helper presence */
+function hasOption2(text: string): boolean { return /Option\s*2\s*\(?(Alternative)?\)?/i.test(text || ""); }
+/* duplicate helper stubs removed — originals are defined later:
    hasOption1, enforceOption1, hasQuickPlan, enforceQuickPlan */
-
 
 async function enforceOption2(model: string, instrument: string, text: string) {
   if (hasCompliantOptionBlock(text, "Option 2")) return text;
@@ -1234,17 +1235,8 @@ async function enforceOption2(model: string, instrument: string, text: string) {
   return callOpenAI(model, messages);
 }
 
-function hasQuickPlan(text: string): boolean {
-  return /Quick\s*Plan\s*\(Actionable\)/i.test(text || "");
-}
-async function enforceQuickPlan(model: string, instrument: string, text: string) {
-  if (hasQuickPlan(text)) return text;
-  const messages = [
-    { role: "system", content: "Add a 'Quick Plan (Actionable)' section at the very top, copying the primary trade details. Keep all other sections unchanged and in order." },
-    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd the Quick Plan section at the top.` },
-  ];
-  return callOpenAI(model, messages);
-}
+/* (duplicate removed) hasQuickPlan/enforceQuickPlan are defined later */
+
 
 /**
  * If only Option 2 exists (or options are duplicated), fix:
