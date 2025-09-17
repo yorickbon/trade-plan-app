@@ -1567,23 +1567,24 @@ function enforceFinalTableSummary(text: string, instrument: string) {
 function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
   const meta = extractAiMeta(text) || {};
   const merged = { ...meta, ...patch };
-  const json = "```json\n" + JSON.stringify(merged, null, 2) + "\n```";
+  const json = JSON.stringify(merged, null, 2);
 
   // Replace existing ai_meta fenced block if present
-  const re = /\nai_meta\s*```json[\s\S]*?```\s*$/i;
-  if (re.test(text)) {
-    return text.replace(re, `\nai_meta ${json}`);
+  const reFence = /\nai_meta\s*```json[\s\S]*?```\s*$/i;
+  if (reFence.test(text)) {
+    return text.replace(reFence, `\nai_meta ${json}\n`);
   }
 
-  // Legacy pattern: ai_meta { ... }
-  const re2 = /\nai_meta\s*{[\s\S]*?}\s*$/i;
-  if (re2.test(text)) {
-    return text.replace(re2, `\nai_meta ${json}`);
+  // Replace existing ai_meta { ... } block if present
+  const reBraces = /\nai_meta\s*{[\s\S]*?}\s*$/i;
+  if (reBraces.test(text)) {
+    return text.replace(reBraces, `\nai_meta ${json}\n`);
   }
 
-   // Append at the very end
+  // Append at the very end as plain-brace JSON (parser expects this form)
   return `${text}\n\nai_meta ${json}\n`;
 }
+
 
 // ---------- Live price ----------
 async function fetchLivePrice(pair: string): Promise<number | null> {
@@ -1977,7 +1978,9 @@ if (mode === "fast") {
     currentPrice: livePrice ?? undefined,
     vp_version: VP_VERSION
   };
-  text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatchFast).filter(([,v]) => v !== undefined)));
+   text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatchFast).filter(([,v]) => v !== undefined)));
+  aiMeta = extractAiMeta(text) || aiMeta;
+
 
   // Cache & provenance footer
   const cacheKey = setCache({ instrument, m5: m5 || null, m15, h1, h4, calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
