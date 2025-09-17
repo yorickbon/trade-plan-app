@@ -1458,6 +1458,133 @@ function applyConsistencyGuards(text: string, args: { instrument: string; headli
   return out;
 }
 
+/** Ensure ≥5 candidates and ≥3 non-sweep/BOS strategies in the tournament table. */
+async function enforceTournamentDiversity(model: string, instrument: string, text: string) {
+  const sectMatch = text.match(/Candidate\s*Scores\s*\(tournament\):[\s\S]*?(?=\n\s*Final\s*Table\s*Summary:|\n\s*Detected\s*Structures|\n\s*Full\s*Breakdown|$)/i);
+  const sect = sectMatch ? sectMatch[0] : "";
+  const lines = (sect.match(/^- .+/gmi) || []);
+  const nonSweep = lines.filter(l => !/(sweep|liquidity|stop\s*hunt|bos\b|choch\b)/i.test(l));
+  const ok = lines.length >= 5 && nonSweep.length >= 3;
+  if (ok) return text;
+
+  const prompt = [
+    "Fix ONLY the 'Candidate Scores (tournament)' section to include at least 5 candidates total, with at least 3 that are NOT liquidity-sweep/BOS strategies.",
+    "Keep every other part of the document unchanged. Return only the corrected section content (header + bullet lines).",
+    "Each line format: '- name — score — reason' and reasons must reference visible structure/timeframes (4H/1H/15m/5m/1m).",
+    `Instrument: ${instrument}`,
+    sect || "(section missing)"
+  ].join("\n\n");
+
+  const out = await callOpenAI(model, [
+    { role: "system", content: "You will output ONLY the corrected 'Candidate Scores (tournament)' section. Do not change anything else." },
+    { role: "user", content: prompt }
+  ]);
+
+  if (!out || out.trim().length < 10) return text;
+
+  const replacement = `Candidate Scores (tournament):\n${out.trim()}\n`;
+  if (sectMatch) {
+    return text.replace(sectMatch[0], replacement);
+  }
+  // If section was missing, inject before Final Table or at end
+  if (/Final\s*Table\s*Summary:/i.test(text)) {
+    return text.replace(/Final\s*Table\s*Summary:/i, `${replacement}\nFinal Table Summary:`);
+  }
+  return `${text}\n\n${replacement}`;
+}
+
+/** Rewrite generic triggers to strategy- & timeframe-specific triggers for Quick Plan / Option 1 / Option 2. */
+async function enforceTriggerSpecificity(model: string, instrument: string, text: string) {
+  // We will process three blocks: Quick Plan, Option 1, Option 2
+  const blockSpecs = [
+    { name: "Quick Plan (Actionable)", re: /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
+    { name: "Option 1", re: /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
+    { name: "Option 2", re: /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i },
+  ];
+
+  let out = text;
+  for (const spec of blockSpecs) {
+    const m = out.match(spec.re);
+    if (!m) continue;
+    const block = m[0];
+    const trigMatch = block.match(/^\s*•\s*Trigger:\s*(.+)$/mi);
+    if (!trigMatch) continue;
+    const trig = trigMatch[1].trim();
+
+    // Heuristics for generic triggers
+    const hasTF = /(1m|5m|15m|1h|4h)/i.test(trig);
+    const hasStrat = /(ob|order\s*block|fvg|fair\s*value|trendline|range|vwap|sweep|bos|choch|divergence|squeeze|keltner|donchian|pullback|fib|breaker)/i.test(trig);
+    const isGeneric = !(hasTF && hasStrat) || /\b(price\s+breaks|break\s+(above|below)|crosses)\b/i.test(trig);
+
+    if (!isGeneric) continue;
+
+    const sys = "Rewrite only the Trigger line to be strategy-specific and timeframe-specific using the strategy implied in the block. Keep all other lines unchanged.";
+    const usr = `Instrument: ${instrument}\n\nBLOCK:\n${block}\n\nRules:\n- Explicit timeframes (e.g., '5m sweep; 1m BOS').\n- Use a concrete trigger matching the strategy (OB/FVG, TL break+retest, range rotation, momentum breakout, VWAP, etc.).\n- Keep everything else intact. Return ONLY the rewritten Trigger line, starting with '• Trigger:'`;
+
+    const newLine = await callOpenAI(model, [{ role: "system", content: sys }, { role: "user", content: usr }]);
+    if (newLine && /^(\s*•\s*Trigger:)/i.test(newLine.trim())) {
+      const updatedBlock = block.replace(/^\s*•\s*Trigger:\s*.+$/mi, newLine.trim());
+      out = out.replace(block, updatedBlock);
+    }
+  }
+  return out;
+}
+
+/** Ensure Full Breakdown has all required subsections (labels only if content missing). */
+async function enforceFullBreakdownSkeleton(model: string, instrument: string, text: string) {
+  const hasFB = /Full\s*Breakdown/i.test(text);
+  const need = [
+    /Technical\s*View/i, /Fundamental\s*View/i, /Tech\s*vs\s*Fundy\s*Alignment/i,
+    /Conditional\s*Scenarios/i, /Surprise\s*Risk/i, /Invalidation/i, /One-liner\s*Summary/i
+  ];
+  const ok = hasFB && need.every(re => re.test(text));
+  if (ok) return text;
+
+  if (!hasFB) {
+    return `${text}\n\nFull Breakdown\n• Technical View (HTF + Intraday): ...\n• Fundamental View: ...\n• Tech vs Fundy Alignment: ...\n• Conditional Scenarios: ...\n• Surprise Risk: ...\n• Invalidation: ...\n• One-liner Summary: ...\n`;
+  }
+
+  const prompt = `Add any missing Full Breakdown subsection labels (exact labels) without altering existing content. Instrument: ${instrument}\n\n${text}`;
+  const patched = await callOpenAI(model, [
+    { role: "system", content: "Ensure required Full Breakdown subsection labels exist. Do not modify existing content; only insert missing labeled lines under the Full Breakdown section." },
+    { role: "user", content: prompt }
+  ]);
+  return patched && patched.trim().length > 10 ? patched : text;
+}
+
+/** Ensure Final Table Summary exists with a row for the instrument. */
+function enforceFinalTableSummary(text: string, instrument: string) {
+  if (/Final\s*Table\s*Summary/i.test(text)) return text;
+  const stub =
+`\nFinal Table Summary:
+| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |
+| ${instrument} | ... | ... | ... | ... | ... | ... |\n`;
+  return `${text}\n${stub}`;
+}
+
+/** Ensure ai_meta JSON exists and carries required keys; merge live fields if available. */
+function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
+  const meta = extractAiMeta(text) || {};
+  const merged = { ...meta, ...patch };
+  const json = "```json\n" + JSON.stringify(merged, null, 2) + "\n```";
+
+  // Replace existing ai_meta fenced block if present
+  const re = /\nai_meta\s*```json[\s\S]*?```\s*$/i;
+  if (re.test(text)) {
+    return text.replace(re, `\nai_meta ${json}`);
+  }
+
+  // Legacy pattern: ai_meta { ... }
+  const re2 = /\nai_meta\s*{[\s\S]*?}\s*$/i;
+  if (re2.test(text)) {
+    return text.replace(re2, `\nai_meta ${json}`);
+  }
+
+  // Append at the very end
+  return `${text}\n\na i_meta ${json}\n`;
+}
+
+
 // ---------- Live price ----------
 async function fetchLivePrice(pair: string): Promise<number | null> {
   if (TD_KEY) {
