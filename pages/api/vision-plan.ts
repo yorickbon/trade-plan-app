@@ -1702,8 +1702,9 @@ function enforceFinalTableSummary(text: string, instrument: string) {
  * Conv = clamp( (0.55*T + 0.45*F + align) * (1 - 0.15*proximityFlag), 0, 100 )
  * - T = top tournament score (0–100)
  * - F = fundamentals final score (0–100)
- * - align = +8 if fundamentals sign matches Quick Plan direction, -8 if conflicts, else 0
+ * - align = +8 if fundamentals sign matches plan direction, -8 if conflicts, else 0
  * - Option 2 Conviction = ~85% of Option 1 (clamped 10–95)
+ * Robust to bold (**Direction:**) and bullet variations.
  */
 function computeAndInjectConviction(
   text: string,
@@ -1711,59 +1712,98 @@ function computeAndInjectConviction(
 ) {
   if (!text) return text;
 
-  // T from tournament section
+  // --- derive T from tournament (0–100) ---
   const tSect =
     text.match(/Candidate\s*Scores\s*\(tournament\):[\s\S]*?(?=\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i)?.[0] || "";
   const tMatches = [...tSect.matchAll(/—\s*(\d{1,3})\s*—/g)];
   const tNums = tMatches.map(m => Number(m[1])).filter(n => Number.isFinite(n));
   const T = tNums.length ? Math.max(...tNums.map(n => Math.max(0, Math.min(100, n)))) : 0;
 
+  // --- fundamentals (F, sign) ---
   const F = Math.max(0, Math.min(100, Number(args.fundamentals?.final?.score) || 0));
   const fSign = Number(args.fundamentals?.final?.sign) || 0;
 
-  function dirSignFromQuickPlan(src: string): number {
-    const m = src.match(/Quick\s*Plan\s*\(Actionable\)[\s\S]*?Direction:\s*(Long|Short|Stay\s*Flat)/i);
-    if (!m) return 0;
-    const d = m[1].toLowerCase();
-    if (d.startsWith("long")) return +1;
-    if (d.startsWith("short")) return -1;
+  // --- helpers for robust parsing/insertion ---
+  const RE_QP_BLOCK = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
+  const RE_O1_BLOCK = /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
+  const RE_O2_BLOCK = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
+
+  function extractDirectionSignFrom(src: string, sectionRe: RegExp): number {
+    const mBlock = src.match(sectionRe);
+    const block = mBlock ? mBlock[0] : "";
+    // Accept bullets + optional bold label
+    const mDir = block.match(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Direction\s*:\s*(Long|Short|Stay\s*Flat)/im);
+    if (!mDir) return 0;
+    const v = mDir[1].toLowerCase();
+    if (v.startsWith("long")) return 1;
+    if (v.startsWith("short")) return -1;
     return 0;
   }
-  const dSign = dirSignFromQuickPlan(text);
+
+  // Choose Quick Plan direction; fallback to Option 1 if missing
+  let dSign = extractDirectionSignFrom(text, RE_QP_BLOCK);
+  if (dSign === 0) dSign = extractDirectionSignFrom(text, RE_O1_BLOCK);
+
   const align = (fSign !== 0 && dSign !== 0) ? (fSign === dSign ? 8 : -8) : 0;
 
   let conv = 0.55 * T + 0.45 * F + align;
   if (args.proximityFlag) conv *= 0.85;
   conv = Math.max(0, Math.min(100, Math.round(conv)));
 
+  const conv2 = Math.max(10, Math.min(95, Math.round(conv * 0.85)));
+
+  function detectBulletChar(block: string): string {
+    // Prefer whatever the block already uses; default to "• "
+    if (/^\s*•\s/m.test(block)) return "• ";
+    if (/^\s*-\s/m.test(block)) return "- ";
+    return "• ";
+    }
+
+  function blockUsesBoldLabels(block: string): boolean {
+    // If any standard label appears bold, we mirror bold for Conviction
+    return /\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:\s*\*\*/i.test(block)
+        || /(?:^|\n)\s*(?:[-•]\s*)?\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:/i.test(block);
+  }
+
   function replaceConvInBlock(src: string, blockRe: RegExp, pct: number) {
     const m = src.match(blockRe);
     if (!m) return src;
     const block = m[0];
-    const hasLine = /(^\s*[-•]\s*Conviction:\s*)(\d+)%/mi.test(block);
-    const updated = hasLine
-      ? block.replace(/(^\s*[-•]\s*Conviction:\s*)(\d+)%/mi, `$1${pct}%`)
-      : block.replace(/(^\s*[-•]\s*Take\s*Profit\(s\):[^\n]*\n)/mi, `$1- **Conviction:** ${pct}%\n`);
+
+    const bullet = detectBulletChar(block);
+    const bold = blockUsesBoldLabels(block);
+
+    // Replace if present (accept optional bold)
+    const reConvLine = new RegExp(
+      String.raw`(^\s*(?:[-•]\s*)?)(?:\*\*)?\s*Conviction\s*:\s*)(\d+)(%)`,
+      "mi"
+    );
+    if (reConvLine.test(block)) {
+      const updated = block.replace(reConvLine, (_full, p1) => `${p1}${bold ? "**Conviction:**" : "Conviction:"} ${pct}%`);
+      return src.replace(block, updated);
+    }
+
+    // Otherwise insert after Take Profit(s) line; if not found, append at end of block.
+    const reTP = /(^\s*(?:[-•]\s*)?(?:\*\*)?\s*Take\s*Profit\(s\)\s*:[^\n]*\n)/mi;
+    const label = bold ? "**Conviction:**" : "Conviction:";
+    const insertion = `${bullet}${label} ${pct}%\n`;
+
+    let updated: string;
+    if (reTP.test(block)) {
+      updated = block.replace(reTP, (m) => m + insertion);
+    } else {
+      updated = block.replace(/$/, `\n${insertion}`);
+    }
     return src.replace(block, updated);
   }
 
-  let out = replaceConvInBlock(text,
-    /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i,
-    conv
-  );
-  out = replaceConvInBlock(out,
-    /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i,
-    conv
-  );
-
-  const conv2 = Math.max(10, Math.min(95, Math.round(conv * 0.85)));
-  out = replaceConvInBlock(out,
-    /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i,
-    conv2
-  );
+  let out = replaceConvInBlock(text, RE_QP_BLOCK, conv);
+  out = replaceConvInBlock(out, RE_O1_BLOCK, conv);
+  out = replaceConvInBlock(out, RE_O2_BLOCK, conv2);
 
   return out;
 }
+
 
 /** Fill the Final Table Summary row from Quick Plan so it’s never empty. */
 function fillFinalTableSummaryRow(text: string, instrument: string) {
