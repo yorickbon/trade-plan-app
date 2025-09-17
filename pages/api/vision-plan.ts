@@ -423,7 +423,72 @@ function sentimentSummary(csm: CsmSnapshot, cotCue: CotCue | null, headlineBias:
   return { text: `${ranksLine}\n${hBiasLine}\n${cotLine}`, provenance: prov };
 }
 
+// === Independent Fundamentals combiner (no mock data; calendar stays as read) ===
+function computeIndependentFundamentals(args: {
+  instrument: string;
+  calendarSign: number;                 // -1 | 0 | 1 (0 when unavailable)
+  headlinesBias: HeadlineBias;          // {label: 'bullish'|'bearish'|'neutral'|'unavailable', ...}
+  csm: CsmSnapshot;                     // has .scores and ranks
+  cotCue: CotCue | null;                // optional headline-detected cue
+  warningMinutes: number | null;        // proximity penalty if <=60
+}) {
+  const { instrument, calendarSign, headlinesBias, csm, cotCue, warningMinutes } = args;
+
+  // Calendar score (neutral=50 when unavailable or 0)
+  const signCal = Math.max(-1, Math.min(1, Number(calendarSign) || 0));
+  const S_cal = 50 + 50 * signCal;
+
+  // Headlines score
+  const hb = (headlinesBias && headlinesBias.label) ? String(headlinesBias.label).toLowerCase() : "unavailable";
+  const S_head = hb === "bullish" ? 75 : hb === "bearish" ? 25 : 50;
+
+  // CSM z-diff for instrument (base - quote)
+  const { zdiff } = computeCSMInstrumentSign(csm, instrument); // zdiff can be null for non-FX
+  const diffClamped = zdiff == null ? 0 : Math.max(-2, Math.min(2, zdiff));
+  const S_csm = 50 + 25 * (diffClamped / 2);
+
+  // COT (if cues present): map base/quote cues to instrument sign
+  let cotSign = 0;
+  let cotDetail = "no cues";
+  if (cotCue && typeof cotCue.summary === "string") {
+    const { base, quote } = splitFXPair(instrument);
+    if (base && quote) {
+      const nb = Number((cotCue as any).net?.[base] || 0); // +1 net long, -1 net short
+      const nq = Number((cotCue as any).net?.[quote] || 0);
+      const raw = nb - nq;
+      cotSign = raw > 0 ? 1 : raw < 0 ? -1 : 0;
+    } else {
+      cotSign = 0;
+    }
+    cotDetail = cotCue.summary || "cues detected";
+  }
+  const S_cot = 50 + 5 * cotSign;
+
+  // Blend (weights per spec)
+  const w_cal = 0.45, w_head = 0.20, w_csm = 0.30, w_cot = 0.05;
+  const RawF = w_cal * S_cal + w_head * S_head + w_csm * S_csm + w_cot * S_cot;
+
+  // Proximity penalty: reduce by 25% if a high-impact event is within ≤60m
+  const proximity = (warningMinutes != null) ? 1 : 0;
+  const F = Math.max(0, Math.min(100, proximity ? (RawF * 0.75) : RawF));
+
+  const label = F >= 55 ? "bullish" : F <= 45 ? "bearish" : "neutral";
+  const finalSign = label === "bullish" ? 1 : label === "bearish" ? -1 : 0;
+
+  return {
+    components: {
+      calendar: { sign: signCal, score: Math.round(S_cal) },
+      headlines: { label: hb, score: Math.round(S_head) },
+      csm: { diff: zdiff ?? null, score: Math.round(S_csm) },
+      cot: { sign: cotSign, detail: cotDetail, score: Math.round(S_cot) },
+      proximity_penalty_applied: !!proximity,
+    },
+    final: { score: Math.round(F), label, sign: finalSign }
+  };
+}
+
 // ---------- Calendar helpers (OCR + API fallback) ----------
+
 function goodIfHigher(title: string): boolean | null {
   // Normalize once
   const t = (title || "").toLowerCase();
