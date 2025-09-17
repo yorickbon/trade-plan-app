@@ -1932,6 +1932,7 @@ if (mode === "fast") {
   const usedM1 = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(text);
   text = stampM1Used(text, usedM1);
 
+    // Consistency pass on alignment wording
   text = applyConsistencyGuards(text, {
     instrument,
     headlinesSign: computeHeadlinesSign(hBias),
@@ -1939,6 +1940,46 @@ if (mode === "fast") {
     calendarSign: parseInstrumentBiasFromNote(biasNote)
   });
 
+  // === Independent Fundamentals Snapshot (Calendar, Headlines, CSM, COT) ===
+  const calendarSignFast = parseInstrumentBiasFromNote(biasNote);
+  const fundamentalsSnapshot = computeIndependentFundamentals({
+    instrument,
+    calendarSign: calendarSignFast,
+    headlinesBias: hBias,
+    csm,
+    cotCue,
+    warningMinutes
+  });
+
+  // Inject standardized Fundamentals block under Full Breakdown
+  text = ensureFundamentalsSnapshot(text, {
+    instrument,
+    snapshot: fundamentalsSnapshot,
+    preReleaseOnly,
+    calendarLine: calendarText || null
+  });
+
+  // === Tournament & Trigger Enforcement ===
+  // Ensure ≥5 candidates with ≥3 non-sweep/BOS; fix generic triggers with timeframe-specific wording
+  text = await enforceTournamentDiversity(MODEL, instrument, text);
+  text = await enforceTriggerSpecificity(MODEL, instrument, text);
+
+  // Ensure Full Breakdown has all required subsections and Final Table Summary exists
+  text = await enforceFullBreakdownSkeleton(MODEL, instrument, text);
+  text = enforceFinalTableSummary(text, instrument);
+
+  // Ensure ai_meta exists and is enriched with runtime fields
+  const aiPatchFast = {
+    mode,
+    vwap_used: /vwap/i.test(text),
+    time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
+    max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
+    currentPrice: livePrice ?? undefined,
+    vp_version: VP_VERSION
+  };
+  text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatchFast).filter(([,v]) => v !== undefined)));
+
+  // Cache & provenance footer
   const cacheKey = setCache({ instrument, m5: m5 || null, m15, h1, h4, calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
 
   const footer = buildServerProvenanceFooter({
@@ -1949,6 +1990,7 @@ if (mode === "fast") {
     extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard },
   });
   text = `${text}\n${footer}`;
+
 
   res.setHeader("Cache-Control", "no-store");
   return res.status(200).json({
