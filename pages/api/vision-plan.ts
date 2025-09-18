@@ -452,65 +452,46 @@ function sentimentSummary(csm: CsmSnapshot, cotCue: CotCue | null, headlineBias:
 }
 
 // ---------- Calendar helpers (OCR + API fallback) ----------
-function goodIfHigher(title: string): boolean | null {
-  // Normalize once
-  const t = (title || "").toLowerCase();
 
-  // Explicit, unambiguous mappings first (covers your case):
-  // Retail Sales (headline & core): higher is good (bullish) for the currency.
-  if (/\b(core\s+)?retail\s+sales\b/.test(t)) return true;
+/** OPTIONAL (PLUMBING ONLY, default OFF): explicit indicator polarity overrides.
+ * Not used for sign unless you later flip a flag to enable it.
+ * Kept here for future realism without touching core logic now. */
+const INDICATOR_POLARITY_MAP: Array<{ re: RegExp; higherGood: boolean }> = [
+  { re: /\b(core\s+)?cpi|ppi|inflation\b/i, higherGood: true },
+  { re: /\b(gdp|industrial\s+production|manufacturing\s+production|durable\s+goods|retail\s+sales)\b/i, higherGood: true },
+  { re: /\b(pmi|ism|confidence|sentiment|zew)\b/i, higherGood: true },
+  { re: /\b(unemployment|jobless|initial\s+claims|continuing\s+claims)\b/i, higherGood: false },
+  { re: /\b(nonfarm|nfp|employment\s+change|payrolls|jobs)\b/i, higherGood: true },
+  { re: /\b(trade\s+balance|current\s+account)\b/i, higherGood: true },
+  { re: /\b(interest\s+rate|rate\s+decision|refi\s+rate|deposit\s+facility|bank\s+rate|cash\s+rate|ocr)\b/i, higherGood: true },
+];
 
-  // CPI / inflation family
-  if (/\b(core\s+)?(cpi|ppi|inflation)\b/.test(t)) return true;
-
-  // Growth / activity
-  if (/\b(gdp|retail\s+trade|industrial\s+production|manufacturing\s+production|durable\s+goods|housing\s+starts|building\s+permits|consumer\s+credit)\b/.test(t)) return true;
-
-  // Surveys / diffusion indexes
-  if (/\b(pmi|ism|confidence|sentiment|zew)\b/.test(t)) return true;
-
-  // Labor market: lower unemployment/claims is “good”, but “higher” values are bad.
-  // So for jobless/claims, higher is bad → return false.
-  if (/\b(unemployment|jobless|initial\s+claims|continuing\s+claims)\b/.test(t)) return false;
-
-  // Employment change / payrolls: higher is good
-  if (/\b(nonfarm|nfp|employment\s+change|payrolls|jobs)\b/.test(t)) return true;
-
-  // Trade/current account: higher (surplus / less negative balance) is good
-  if (/\b(trade\s+balance|current\s+account)\b/.test(t)) return true;
-
-  // Policy rates: higher is usually supportive for the currency (hawkish)
-  if (/\b(interest\s+rate|rate\s+decision|refi\s+rate|deposit\s+facility|bank\s+rate|cash\s+rate|ocr)\b/.test(t)) return true;
-
-  // If not recognized, don’t guess
+/** INTERNAL: if we ever enable metric-aware polarity, this helper provides the mapping.
+ * For now, we DO NOT use it for calendar sign; sign comes ONLY from actual vs forecast. */
+function polarityHigherIsGood(title: string | null | undefined): boolean | null {
+  const t = String(title || "").toLowerCase();
+  for (const m of INDICATOR_POLARITY_MAP) if (m.re.test(t)) return m.higherGood;
   return null;
 }
 
-
-// (A) Evidence line — verdict strictly bullish/bearish/neutral (never "mixed")
+/** Evidence line — transparent comparisons; verdict strictly from actual vs forecast (if forecast present). */
 function evidenceLine(it: any, cur: string): string | null {
   const a = parseNumberLoose(it.actual);
   const f = parseNumberLoose(it.forecast);
   const p = parseNumberLoose(it.previous);
   if (a == null || (f == null && p == null)) return null;
-  const dir = goodIfHigher(String(it.title || ""));
-  let comp: string[] = [];
+
+  // Comparisons for transparency only
+  const comp: string[] = [];
   if (f != null) comp.push(a < f ? "< forecast" : a > f ? "> forecast" : "= forecast");
   if (p != null) comp.push(a < p ? "< previous" : a > p ? "> previous" : "= previous");
+
+  // Verdict: STRICT actual vs forecast rule
   let verdict: "bullish" | "bearish" | "neutral" = "neutral";
-  if (dir === true) {
-    const gtBoth = (f != null ? a > f : true) && (p != null ? a > p : true);
-    const ltBoth = (f != null ? a < f : true) && (p != null ? a < p : true);
-    verdict = gtBoth ? "bullish" : ltBoth ? "bearish" : "neutral";
-  } else if (dir === false) {
-    const ltBoth = (f != null ? a < f : true) && (p != null ? a < p : true);
-    const gtBoth = (f != null ? a > f : true) && (p != null ? a > p : true);
-    verdict = ltBoth ? "bullish" : gtBoth ? "bearish" : "neutral";
-  } else {
-    verdict = "neutral";
-  }
+  if (f != null) verdict = a > f ? "bullish" : a < f ? "bearish" : "neutral";
+
   const comps = comp.join(" and ");
-  return `${cur} — ${it.title}: actual ${a}${f!=null||p!=null ? ` ${comps}` : ""} → ${verdict} ${cur}`;
+  return `${cur} — ${it.title}: actual ${a}${comps ? " " + comps : ""} → ${verdict} ${cur}`;
 }
 
 // ---------- OpenAI core ----------
