@@ -3261,27 +3261,34 @@ textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
   };
 
 
+   // ai_meta patch (first pass)
   textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
 
-    aiMetaFull = extractAiMeta(textFull) || aiMetaFull;
+  // Normalize conflicting Order Type if needed
+  let aiMetaFullNow = extractAiMeta(textFull) || {};
+  if (aiMetaFullNow && invalidOrderRelativeToPrice(aiMetaFullNow)) {
+    textFull = normalizeOrderTypeLines(textFull, aiMetaFullNow);
+  }
 
-    // Normalize conflicting Order Type for primary plan if needed
-    if (aiMetaFull && invalidOrderRelativeToPrice(aiMetaFull)) {
-      textFull = normalizeOrderTypeLines(textFull, aiMetaFull);
-    }
+  // Hard-enforce Option 2 distinctness
+  textFull = await enforceOption2DistinctHard(MODEL, instrument, textFull);
 
-    // HARD-GATE: Ensure Option 2 is truly distinct (post-ai_meta)
-textFull = await hardGateOption2Distinctness(MODEL, instrument, textFull);
+  // Re-apply zone enforcement after any rewrites
+  textFull = enforceEntryZoneUsage(textFull, instrument);
 
-    // Provenance footer
-    const footer = buildServerProvenanceFooter({
-      headlines_provider: headlinesProvider || "unknown",
-      calendar_status: calendarStatus,
-      calendar_provider: calendarProvider,
-      csm_time: csm.tsISO,
-      extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard },
-    });
-    textFull = `${textFull}\n${footer}`;
+  // Rebuild ai_meta after changes
+  textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
+
+  // Provenance footer
+  const footer = buildServerProvenanceFooter({
+    headlines_provider: headlinesProvider || "unknown",
+    calendar_status: calendarStatus,
+    calendar_provider: calendarProvider,
+    csm_time: csm.tsISO,
+    extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard },
+  });
+  textFull = `${textFull}\n${footer}`;
+
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
