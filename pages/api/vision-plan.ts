@@ -2734,10 +2734,26 @@ if (mode === "fast") {
 
   text = ensureCalendarVisibilityInQuickPlan(text, { instrument, preReleaseOnly, biasLine: calendarText });
 
-  const usedM5 = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
+    const usedM5 = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
   text = stampM5Used(text, usedM5);
   const usedM1 = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(text);
   text = stampM1Used(text, usedM1);
+
+  // If no 1m chart is provided and we’re not scalping, scrub any 1m references.
+  if (!m1 && !scalping && !scalpingHard) {
+    // 1) Trigger lines: move any “... on 1m” confirmations to 5m
+    text = text
+      .replace(/(BOS|CHOCH)\s+on\s+1m/gi, "$1 on 5m")
+      .replace(/(\b5m)\s*\/\s*1m/gi, "$1")
+      .replace(/;\s*1m\s*(BOS|CHOCH)/gi, "; 5m $1");
+
+    // 2) Remove “Used Chart: 1M timing” stamp if it slipped in
+    text = text.replace(/^\s*•\s*Used\s*Chart:\s*1M\s*timing\s*$/gmi, "");
+
+    // 3) X-ray: force 1m line to “not used”
+    text = text.replace(/(^\s*[-•]\s*1m\s*(?:\(if\s*used\))?\s*:\s*)(.*)$/gmi, "$1not used");
+  }
+
 
   // === Independent Fundamentals Snapshot (Calendar, Headlines, CSM, COT) ===
   const calendarSignFast = parseInstrumentBiasFromNote(biasNote);
@@ -2942,10 +2958,25 @@ text = ensureNewsProximityNote(text, warningMinutes, instrument);
     textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
 
     // Stamp 5M/1M execution if used
-    const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
-    textFull = stampM5Used(textFull, usedM5Full);
-    const usedM1Full = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(textFull);
-    textFull = stampM1Used(textFull, usedM1Full);
+      const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
+  textFull = stampM5Used(textFull, usedM5Full);
+  const usedM1Full = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(textFull);
+  textFull = stampM1Used(textFull, usedM1Full);
+
+  // If no 1m chart is provided and we’re not scalping, scrub any 1m references.
+  if (!m1 && !scalping && !scalpingHard) {
+    // 1) Trigger lines: move any “... on 1m” confirmations to 5m
+    textFull = textFull
+      .replace(/(BOS|CHOCH)\s+on\s+1m/gi, "$1 on 5m")
+      .replace(/(\b5m)\s*\/\s*1m/gi, "$1")
+      .replace(/;\s*1m\s*(BOS|CHOCH)/gi, "; 5m $1");
+
+    // 2) Remove “Used Chart: 1M timing” stamp if it slipped in
+    textFull = textFull.replace(/^\s*•\s*Used\s*Chart:\s*1M\s*timing\s*$/gmi, "");
+
+    // 3) X-ray: force 1m line to “not used”
+    textFull = textFull.replace(/(^\s*[-•]\s*1m\s*(?:\(if\s*used\))?\s*:\s*)(.*)$/gmi, "$1not used");
+  }
 
         // === Independent Fundamentals Snapshot (Calendar, Headlines, CSM, COT) ===
   const calendarSignFull = parseInstrumentBiasFromNote(biasNote);
