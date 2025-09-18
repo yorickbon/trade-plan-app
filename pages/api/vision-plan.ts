@@ -3243,43 +3243,184 @@ text = ensureNewsProximityNote(text, warningMinutes, instrument);
 }
 
 
-    // ---------- FULL ----------
-    const messages = messagesFull({
+   // ---------- FULL ----------
+
+// Image-grounded extractors (no fabrication)
+async function extractChartSignals(model: string, dataUrl: string | null, tf: "4H" | "1H" | "15m" | "5m" | "1m") {
+  if (!dataUrl) return null;
+
+  const sys = [
+    "You are a trading chart analyst.",
+    "Read the SINGLE provided chart image and return STRICT JSON only.",
+    "If you cannot clearly tell, use 'unknown' and confidence 0.0–0.3. Never guess.",
+    "Do NOT fabricate numbers or structures that are not clearly visible.",
+  ].join(" ");
+
+  const schema = {
+    timeframe: "<'4H'|'1H'|'15m'|'5m'|'1m'>",
+    trend: "<'up'|'down'|'range'|'unknown'>",
+    cues: ["Array of short strings e.g. 'HH/HL', 'LH/LL', 'range', 'BOS down', 'CHOCH up', 'supply', 'demand', 'sweep'"],
+    bos: { dir: "<'up'|'down'|'none'>", noted: "<true|false>" },
+    zones: {
+      supply: ["strings (labels or price text if visible)"],
+      demand: ["strings (labels or price text if visible)"],
+      range: { low: "<string or null>", high: "<string or null>" }
+    },
+    sweep: { noted: "<true|false>" },
+    confidence: "<0.0..1.0>"
+  };
+
+  const userText = [
+    `Timeframe in image: ${tf}.`,
+    "Return JSON ONLY, minified. Keys exactly:",
+    JSON.stringify(schema, null, 2),
+    "Rules:",
+    "- If HH/HL clearly appears => trend='up'.",
+    "- If LH/LL clearly appears => trend='down'.",
+    "- If sideways box / range is clear => trend='range'.",
+    "- Otherwise trend='unknown'.",
+    "- 'confidence' is your certainty from 0.0 to 1.0.",
+    "- If any BOS/CHOCH arrow/text is visible, set bos.dir accordingly and bos.noted=true.",
+    "- If supply/demand boxes/labels visible, list in zones.supply/demand (free-text).",
+    "- If a range box/bounds is visible, put any visible text (even rough) into zones.range.low/high (else null).",
+    "- If stop hunts/liquidity sweeps are explicitly marked, sweep.noted=true.",
+    "Do not invent prices. If no prices visible, use labels or leave nulls.",
+  ].join("\n");
+
+  const msg = [
+    { role: "system", content: sys },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: userText },
+        { type: "image_url", image_url: { url: dataUrl } }
+      ]
+    }
+  ];
+
+  let raw = await callOpenAI(model, msg);
+  raw = String(raw || "").trim();
+
+  try {
+    const json = JSON.parse(raw.replace(/^```json\s*/i, "").replace(/```$/i, ""));
+    const norm = {
+      timeframe: tf,
+      trend: /^(up|down|range)$/i.test(json?.trend) ? json.trend.toLowerCase() : "unknown",
+      cues: Array.isArray(json?.cues) ? json.cues.slice(0, 12).map((s: any) => String(s).slice(0, 64)) : [],
+      bos: {
+        dir: /^(up|down)$/i.test(json?.bos?.dir) ? json.bos.dir.toLowerCase() : "none",
+        noted: !!json?.bos?.noted
+      },
+      zones: {
+        supply: Array.isArray(json?.zones?.supply) ? json.zones.supply.slice(0, 8).map((s: any) => String(s).slice(0, 48)) : [],
+        demand: Array.isArray(json?.zones?.demand) ? json.zones.demand.slice(0, 8).map((s: any) => String(s).slice(0, 48)) : [],
+        range: {
+          low: json?.zones?.range?.low ? String(json.zones.range.low).slice(0, 24) : null,
+          high: json?.zones?.range?.high ? String(json.zones.range.high).slice(0, 24) : null,
+        }
+      },
+      sweep: { noted: !!json?.sweep?.noted },
+      confidence: Math.max(0, Math.min(1, Number(json?.confidence) || 0))
+    };
+    return norm;
+  } catch {
+    return {
+      timeframe: tf,
+      trend: "unknown",
+      cues: [],
+      bos: { dir: "none", noted: false },
+      zones: { supply: [], demand: [], range: { low: null, high: null } },
+      sweep: { noted: false },
+      confidence: 0.0
+    };
+  }
+}
+
+async function extractChartsLock(model: string, imgs: { h4: string | null; h1: string | null; m15: string | null; m5: string | null; m1: string | null; }) {
+  const [s4, s1, s15, s5, s1m] = await Promise.all([
+    extractChartSignals(model, imgs.h4, "4H"),
+    extractChartSignals(model, imgs.h1, "1H"),
+    extractChartSignals(model, imgs.m15, "15m"),
+    extractChartSignals(model, imgs.m5, "5m"),
+    extractChartSignals(model, imgs.m1, "1m"),
+  ]);
+
+  const charts: any = {};
+  if (s4) charts["4H"] = s4;
+  if (s1) charts["1H"] = s1;
+  if (s15) charts["15m"] = s15;
+  if (s5) charts["5m"] = s5;
+  if (s1m) charts["1m"] = s1m;
+
+  const lock = {
+    trend_4h: s4?.trend || "unknown",
+    trend_1h: s1?.trend || "unknown",
+  };
+  return { charts, lock };
+}
+
+function ensureChartLocksSection(text: string, charts: Record<string, any>): string {
+  const lines: string[] = [];
+  const tfOrder = ["4H", "1H", "15m", "5m", "1m"];
+  for (const tf of tfOrder) {
+    const s = charts[tf];
+    if (!s) continue;
+    let phrase = "Unknown";
+    if (s.trend === "up") phrase = "Uptrend (HH/HL)";
+    else if (s.trend === "down") phrase = "Downtrend (LH/LL)";
+    else if (s.trend === "range") phrase = "Range / consolidation";
+    if (s.bos?.noted && s.bos.dir && s.bos.dir !== "none") {
+      phrase += `; BOS ${s.bos.dir}`;
+    }
+    if (s.sweep?.noted) {
+      phrase += `; sweep/liquidity event noted`;
+    }
+    lines.push(`- **${tf}:** ${phrase}`);
+  }
+
+  const block = lines.length ? `\nChart Locks (image-grounded — no fabrication):\n${lines.join("\n")}\n` : "";
+  let out = text.replace(/\nChart Locks \(image-grounded — no fabrication\):[\s\S]*?(?=\n\S|\n$)/i, "");
+  return out + block;
+}
+
+// === Pull image-grounded chart facts BEFORE write-up ===
+const { charts: chartSignals, lock: chartTrendLock } = await extractChartsLock(MODEL, {
+  h4, h1, m15, m5: m5 || null, m1: (scalping || scalpingHard) ? (m1 || null) : null
+});
+
+// Build messages for full plan, hinting the trend lock
+const messages = messagesFull({
   instrument, dateStr, m15, h1, h4, m5, m1,
   calendarDataUrl: calDataUrlForPrompt || undefined,
   calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
   headlinesText: headlinesText || undefined,
   sentimentText,
   calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
-  provenance: provForModel,
+  provenance: { ...provForModel, chart_trend_lock: chartTrendLock },
   scalping,
   scalpingHard
 });
 
-    if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
+if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
 
-    let textFull = await callOpenAI(MODEL, messages);
-    let aiMetaFull = extractAiMeta(textFull) || {};
+let textFull = await callOpenAI(MODEL, messages);
+let aiMetaFull = extractAiMeta(textFull) || {};
 
-    if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
+if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
-    textFull = await enforceQuickPlan(MODEL, instrument, textFull);
-    textFull = await enforceOption1(MODEL, instrument, textFull);
-    textFull = await enforceOption2(MODEL, instrument, textFull);
+// Core enforcers
+textFull = await enforceQuickPlan(MODEL, instrument, textFull);
+textFull = await enforceOption1(MODEL, instrument, textFull);
+textFull = await enforceOption2(MODEL, instrument, textFull);
 
-    // Ensure calendar visibility in Quick Plan
-    textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
+// Calendar line in Quick Plan
+textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
 
-    // Stamp 5M/1M execution if used
-   // Scalping guard + stamps (FULL)
+// Non-scalp 1m scrub + stamps
 {
   const allow1mFull = !!scalping && !!m1;
-
   if (!allow1mFull) {
-    // 1) Remove 1m line in X-ray
     textFull = textFull.replace(/^\s*[-•]\s*1m(?:\s*\(if\s*used\))?\s*:\s*[^\n]*\n/gmi, "");
-
-    // 2) Scrub 1m from Trigger lines
     textFull = textFull.replace(/(^\s*•\s*Trigger:\s*)([^\n]+)$/gmi, (_m, p1, p2) => {
       let s = String(p2)
         .replace(/\b1m\s*BOS\b/gi, "")
@@ -3293,12 +3434,8 @@ text = ensureNewsProximityNote(text, warningMinutes, instrument);
       if (!s) s = "15m/5m confirmation (no 1m in non-scalp mode)";
       return `${p1}${s}`;
     });
-
-    // 3) Remove any 1M stamp line
-    textFull = textFull.replace(/^\s*[-•]\s*Used\s*Chart:\s*1M[^\n]*\n/gmi, "");
+    textFull = textFull.replace(/^\s*•\s*Used\s*Chart:\s*1M[^\n]*\n/gmi, "");
   }
-
-  // 4) Stamps: always reflect 5m; only stamp 1m if allowed
   const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
   textFull = stampM5Used(textFull, usedM5Full);
   if (allow1mFull) {
@@ -3307,189 +3444,154 @@ text = ensureNewsProximityNote(text, warningMinutes, instrument);
   }
 }
 
+// Inject image-grounded Chart Locks so reconcilers “see” HH/HL tokens
+textFull = ensureChartLocksSection(textFull, chartSignals);
 
-  // If no 1m chart is provided and we’re not scalping, scrub any 1m references.
-  if (!m1 && !scalping && !scalpingHard) {
-    // 1) Trigger lines: move any “... on 1m” confirmations to 5m
-    textFull = textFull
-      .replace(/(BOS|CHOCH)\s+on\s+1m/gi, "$1 on 5m")
-      .replace(/(\b5m)\s*\/\s*1m/gi, "$1")
-      .replace(/;\s*1m\s*(BOS|CHOCH)/gi, "; 5m $1");
+// Fundamentals snapshot
+const calendarSignFull = parseInstrumentBiasFromNote(biasNote);
+const fundamentalsSnapshotFull = computeIndependentFundamentals({
+  instrument,
+  calendarSign: calendarSignFull,
+  headlinesBias: hBias,
+  csm,
+  cotCue,
+  warningMinutes
+});
 
-    // 2) Remove “Used Chart: 1M timing” stamp if it slipped in
-    textFull = textFull.replace(/^\s*•\s*Used\s*Chart:\s*1M\s*timing\s*$/gmi, "");
+textFull = ensureFundamentalsSnapshot(textFull, {
+  instrument,
+  snapshot: fundamentalsSnapshotFull,
+  preReleaseOnly,
+  calendarLine: calendarText || null
+});
 
-    // 3) X-ray: force 1m line to “not used”
-    textFull = textFull.replace(/(^\s*[-•]\s*1m\s*(?:\(if\s*used\))?\s*:\s*)(.*)$/gmi, "$1not used");
-  }
+// Alignment wording & order preference
+textFull = applyConsistencyGuards(textFull, { fundamentalsSign: fundamentalsSnapshotFull.final.sign as -1 | 0 | 1 });
+textFull = enforceOptionOrderByBias(textFull, fundamentalsSnapshotFull.final.sign);
 
-        // === Independent Fundamentals Snapshot (Calendar, Headlines, CSM, COT) ===
-  const calendarSignFull = parseInstrumentBiasFromNote(biasNote);
-   const fundamentalsSnapshotFull = computeIndependentFundamentals({
-    instrument,
-    calendarSign: calendarSignFull,
-    headlinesBias: hBias,
-    csm,
-    cotCue,
-    warningMinutes
-  });
-
-  // Inject standardized Fundamentals block under Full Breakdown
-  textFull = ensureFundamentalsSnapshot(textFull, {
-    instrument,
-    snapshot: fundamentalsSnapshotFull,
-    preReleaseOnly,
-    calendarLine: calendarText || null
-  });
-
-  // Consistency pass on alignment wording (run AFTER fundamentals snapshot so neutral forces Match)
-  textFull = applyConsistencyGuards(textFull, {
-    fundamentalsSign: fundamentalsSnapshotFull.final.sign as -1 | 0 | 1
-  });
-
-
-  // === Order Option 1/2 to align with Final Fundamental Bias ===
-  textFull = enforceOptionOrderByBias(textFull, fundamentalsSnapshotFull.final.sign);
-
-// === HTF swing reconciliation + Tournament & Trigger Enforcement ===
-// 1) Clarify BOS wording and reconcile 4H/1H across Technical View & X-ray (strict)
+// Clarify BOS + reconcile HTF (now forced by chart locks)
 textFull = _clarifyBOSWording(textFull);
 textFull = _reconcileHTFTrendFromText(textFull);
 
-// 2) Tournament diversity + trigger specificity; then dedupe any duplicate sections
+// Tournament, triggers, zones, scalp guards, news proximity
 textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
 textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
 textFull = dedupeTournamentSections(textFull);
-
-// 3) Enforce ENTRY ZONE (QP + Options)
 textFull = enforceEntryZoneUsage(textFull, instrument);
-
-// 4) Scalp guardrails + news proximity
 textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
 textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
 textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
 
-  // Ensure Full Breakdown skeleton + Final Table Summary
-  textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
-  textFull = enforceFinalTableSummary(textFull, instrument);
+// Skeletons + table
+textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
+textFull = enforceFinalTableSummary(textFull, instrument);
+textFull = computeAndInjectConviction(textFull, { fundamentals: fundamentalsSnapshotFull, proximityFlag: warningMinutes != null });
+textFull = fillFinalTableSummaryRow(textFull, instrument);
+textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
+textFull = enforceFinalTableSummary(textFull, instrument);
 
-  // === Conviction (0–100) based on T & F, then fill table row ===
-  textFull = computeAndInjectConviction(textFull, {
-    fundamentals: fundamentalsSnapshotFull,
-    proximityFlag: warningMinutes != null
-  });
-  textFull = fillFinalTableSummaryRow(textFull, instrument);
+// ai_meta patch includes image-grounded signals
+const lowFundReliabilityFull =
+  preReleaseOnly ||
+  parseInstrumentBiasFromNote(biasNote) === 0 ||
+  (warningMinutes != null);
 
-  // Ensure Full Breakdown skeleton + Final Table Summary
-  textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
-  textFull = enforceFinalTableSummary(textFull, instrument);
-
-  // Ensure ai_meta exists and is enriched with runtime fields
-  const lowFundReliabilityFull =
-    preReleaseOnly ||
-    parseInstrumentBiasFromNote(biasNote) === 0 ||
-    (warningMinutes != null);
-
-     const aiPatchFull = {
-    version: "vp-AtoL-1",
-    instrument,
-    mode,
-    vwap_used: /vwap/i.test(textFull),
-    time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
-    max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
-    currentPrice: livePrice ?? undefined,
-    scalping: !!scalping,
-    scalping_hard: !!scalpingHard,
-    fundamentals: {
-      calendar: { sign: fundamentalsSnapshotFull.components.calendar.sign, line: calendarText || null },
-      headlines: { label: fundamentalsSnapshotFull.components.headlines.label, avg: hBias.avg ?? null },
-      csm: { diff: fundamentalsSnapshotFull.components.csm.diff },
-      cot: { sign: fundamentalsSnapshotFull.components.cot.sign, detail: fundamentalsSnapshotFull.components.cot.detail },
-      final: {
-        score: Math.round(fundamentalsSnapshotFull.final.score),
-        label: fundamentalsSnapshotFull.final.label,
-        sign: fundamentalsSnapshotFull.final.sign
-      },
-      reliability: lowFundReliabilityFull ? "low" : "normal"
+const aiPatchFull = {
+  version: "vp-AtoL-1",
+  instrument,
+  mode,
+  vwap_used: /vwap/i.test(textFull),
+  time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
+  max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
+  currentPrice: livePrice ?? undefined,
+  scalping: !!scalping,
+  scalping_hard: !!scalpingHard,
+  fundamentals: {
+    calendar: { sign: fundamentalsSnapshotFull.components.calendar.sign, line: calendarText || null },
+    headlines: { label: fundamentalsSnapshotFull.components.headlines.label, avg: hBias.avg ?? null },
+    csm: { diff: fundamentalsSnapshotFull.components.csm.diff },
+    cot: { sign: fundamentalsSnapshotFull.components.cot.sign, detail: fundamentalsSnapshotFull.components.cot.detail },
+    final: {
+      score: Math.round(fundamentalsSnapshotFull.final.score),
+      label: fundamentalsSnapshotFull.final.label,
+      sign: fundamentalsSnapshotFull.final.sign
     },
-    proximity: { highImpactMins: warningMinutes ?? null },
-    compliance: {
-      option2Distinct: (() => {
-        try {
-          const { o1, o2 } = _pickBlocks(textFull);
-          const t1 = (o1.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase();
-          const t2 = (o2.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase();
-          if (!t1 || !t2) return false;
-          const buckets: Record<string, RegExp> = {
-            sweep: /(sweep|liquidity|raid|stop\s*hunt|bos\b|choch\b)/i,
-            ob_fvg: /(order\s*block|\bob\b|fvg|fair\s*value|breaker)/i,
-            tl_break: /(trendline|channel|wedge|triangle)/i,
-            range: /(range\s*rotation|range\b|mean\s*reversion|eq\s*of\s*range)/i,
-            vwap: /\bvwap\b/i,
-            momentum: /(ignition|breakout|squeeze|bollinger|macd|divergence)/i,
-          };
-          const bucketOf = (s: string) => {
-            for (const [k, re] of Object.entries(buckets)) if (re.test(s)) return k;
-            return "other";
-          };
-          return bucketOf(t1) !== bucketOf(t2) || t1.replace(/\s+/g,"") !== t2.replace(/\s+/g,"");
-        } catch { return false; }
-      })(),
-      tournamentMin: 5,
-      nonSweepMin: 3
+    reliability: lowFundReliabilityFull ? "low" : "normal"
+  },
+  proximity: { highImpactMins: warningMinutes ?? null },
+  compliance: {
+    option2Distinct: (() => {
+      try {
+        const { o1, o2 } = _pickBlocks(textFull);
+        const t1 = (o1.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase();
+        const t2 = (o2.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase();
+        const buckets: Record<string, RegExp> = {
+          sweep: /(sweep|liquidity|raid|stop\s*hunt|bos\b|choch\b)/i,
+          ob_fvg: /(order\s*block|\bob\b|fvg|fair\s*value|breaker)/i,
+          tl_break: /(trendline|channel|wedge|triangle)/i,
+          range: /(range\s*rotation|range\b|mean\s*reversion|eq\s*of\s*range)/i,
+          vwap: /\bvwap\b/i,
+          momentum: /(ignition|breakout|squeeze|bollinger|macd|divergence)/i,
+        };
+        const bucketOf = (s: string) => { for (const [k, re] of Object.entries(buckets)) if (re.test(s)) return k; return "other"; };
+        return !!t1 && !!t2 && (bucketOf(t1) !== bucketOf(t2) || t1.replace(/\s+/g,"") !== t2.replace(/\s+/g,""));
+      } catch { return false; }
+    })(),
+    tournamentMin: 5,
+    nonSweepMin: 3
+  },
+  charts: chartSignals,
+  chart_trend_lock: chartTrendLock,
+  vp_version: VP_VERSION
+};
+
+textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
+
+// Normalize order type if needed
+let aiMetaFullNow = extractAiMeta(textFull) || {};
+if (aiMetaFullNow && invalidOrderRelativeToPrice(aiMetaFullNow)) {
+  textFull = normalizeOrderTypeLines(textFull, aiMetaFullNow);
+}
+
+// Hard-enforce Option 2 distinctness
+textFull = await enforceOption2DistinctHard(MODEL, instrument, textFull);
+
+// Re-apply zone enforcement after rewrites
+textFull = enforceEntryZoneUsage(textFull, instrument);
+
+// Rebuild ai_meta after changes
+textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
+
+// Provenance footer
+const footer = buildServerProvenanceFooter({
+  headlines_provider: headlinesProvider || "unknown",
+  calendar_status: calendarStatus,
+  calendar_provider: calendarProvider,
+  csm_time: csm.tsISO,
+  extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard },
+});
+textFull = `${textFull}\n${footer}`;
+
+res.setHeader("Cache-Control", "no-store");
+return res.status(200).json({
+  ok: true,
+  text: textFull,
+  meta: {
+    instrument, mode, vp_version: VP_VERSION, model: MODEL,
+    sources: {
+      headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
+      headlines_instrument: instrument,
+      headlines_provider: headlinesProvider || "unknown",
+      calendar_used: calendarStatus !== "unavailable",
+      calendar_status: calendarStatus,
+      calendar_provider: calendarProvider,
+      csm_used: true,
+      csm_time: csm.tsISO,
     },
-    vp_version: VP_VERSION
-  };
+    aiMeta: aiMetaFull,
+  },
+});
 
-
-   // ai_meta patch (first pass)
-  textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
-
-  // Normalize conflicting Order Type if needed
-  let aiMetaFullNow = extractAiMeta(textFull) || {};
-  if (aiMetaFullNow && invalidOrderRelativeToPrice(aiMetaFullNow)) {
-    textFull = normalizeOrderTypeLines(textFull, aiMetaFullNow);
-  }
-
-  // Hard-enforce Option 2 distinctness
-  textFull = await enforceOption2DistinctHard(MODEL, instrument, textFull);
-
-  // Re-apply zone enforcement after any rewrites
-  textFull = enforceEntryZoneUsage(textFull, instrument);
-
-  // Rebuild ai_meta after changes
-  textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
-
-  // Provenance footer
-  const footer = buildServerProvenanceFooter({
-    headlines_provider: headlinesProvider || "unknown",
-    calendar_status: calendarStatus,
-    calendar_provider: calendarProvider,
-    csm_time: csm.tsISO,
-    extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard },
-  });
-  textFull = `${textFull}\n${footer}`;
-
-
-    res.setHeader("Cache-Control", "no-store");
-    return res.status(200).json({
-      ok: true,
-      text: textFull,
-      meta: {
-        instrument, mode, vp_version: VP_VERSION, model: MODEL,
-        sources: {
-          headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
-          headlines_instrument: instrument,
-          headlines_provider: headlinesProvider || "unknown",
-          calendar_used: calendarStatus !== "unavailable",
-          calendar_status: calendarStatus,
-          calendar_provider: calendarProvider,
-          csm_used: true,
-          csm_time: csm.tsISO,
-        },
-        aiMeta: aiMetaFull,
-      },
-    });
 
   } catch (err: any) {
     return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
