@@ -142,8 +142,16 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null { if (!x) r
 
 // ---------- image processing ----------
 async function toJpeg(buf: Buffer, width: number, quality: number): Promise<Buffer> {
-  return sharp(buf).rotate().resize({ width, withoutEnlargement: true }).jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
+  // Mild sharpening + normalize improves text/line clarity on uploaded charts without bloating size
+  return sharp(buf)
+    .rotate()
+    .resize({ width, withoutEnlargement: true })
+    .normalize()             // expands contrast range; helps tiny markings/labels
+    .sharpen(0.6)            // gentle sharpening; avoids halos
+    .jpeg({ quality, progressive: true, mozjpeg: true })
+    .toBuffer();
 }
+
 async function processAdaptiveToDataUrl(buf: Buffer): Promise<string> {
   let width = BASE_W, quality = 74;
   let out = await toJpeg(buf, width, quality);
