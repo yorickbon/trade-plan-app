@@ -1787,14 +1787,23 @@ async function enforceTournamentDiversity(model: string, instrument: string, tex
   const sectMatch = text.match(/Candidate\s*Scores\s*\(tournament\):[\s\S]*?(?=\n\s*Final\s*Table\s*Summary:|\n\s*Detected\s*Structures|\n\s*Full\s*Breakdown|$)/i);
   const sect = sectMatch ? sectMatch[0] : "";
   const lines = (sect.match(/^- .+/gmi) || []);
+
+  // Deterministic checks
   const nonSweep = lines.filter(l => !/(sweep|liquidity|stop\s*hunt|bos\b|choch\b)/i.test(l));
-  const ok = lines.length >= 5 && nonSweep.length >= 3;
+  const tfRe = /\b(4H|1H|15m|5m|1m)\b/i;
+  const hasTFs = lines.every(l => tfRe.test(l));
+
+  const ok = lines.length >= 5 && nonSweep.length >= 3 && hasTFs;
   if (ok) return text;
 
   const prompt = [
-    "Fix ONLY the 'Candidate Scores (tournament)' section to include at least 5 candidates total, with at least 3 that are NOT liquidity-sweep/BOS strategies.",
+    "Fix ONLY the 'Candidate Scores (tournament)' section to satisfy ALL of the following:",
+    "1) Include at least 5 candidates total.",
+    "2) Include at least 3 candidates that are NOT liquidity-sweep/BOS strategies.",
+    "3) Each bullet MUST cite explicit timeframe(s) (e.g., 4H/1H/15m/5m/1m) in the reason.",
+    "",
     "Keep every other part of the document unchanged. Return only the corrected section content (header + bullet lines).",
-    "Each line format: '- name — score — reason' and reasons must reference visible structure/timeframes (4H/1H/15m/5m/1m).",
+    "Each line format: '- name — score — reason' and reasons must reference visible structure/timeframes.",
     `Instrument: ${instrument}`,
     sect || "(section missing)"
   ].join("\n\n");
@@ -1815,6 +1824,7 @@ async function enforceTournamentDiversity(model: string, instrument: string, tex
   }
   return `${text}\n\n${replacement}`;
 }
+
 
 /** Trigger specificity (unchanged behavior). */
 async function enforceTriggerSpecificity(model: string, instrument: string, text: string) {
