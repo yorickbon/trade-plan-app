@@ -2760,7 +2760,18 @@ text = ensureNewsProximityNote(text, warningMinutes, instrument);
 
   // Ensure Full Breakdown has all required subsections and Final Table Summary exists
   text = await enforceFullBreakdownSkeleton(MODEL, instrument, text);
+
+  // Inject standardized Fundamentals block (Calendar, Headlines, CSM, COT, Final Fundamental Bias)
+  text = ensureFundamentalsSnapshot(text, {
+    instrument,
+    snapshot: fundamentalsSnapshot,
+    preReleaseOnly,
+    calendarLine: calendarText || null
+  });
+
+  // Final table scaffold
   text = enforceFinalTableSummary(text, instrument);
+
 
   // === Conviction (0–100) based on T & F, then fill table row ===
   text = computeAndInjectConviction(text, {
