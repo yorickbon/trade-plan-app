@@ -2399,23 +2399,32 @@ function _reconcileHTFTrendFromText(text: string): string {
                  || (raw.match(/Technical\s*View[\s\S]{0,800}/i)?.[0] || "");
   const t4Line = (techBlock.match(/4H\s*:\s*([^\n]+)/i)?.[1] || "").toLowerCase();
 
-  // --- Cue detectors (strict) ---
-  const HHHL_RX   = /\b(hh\s*\/\s*hl|hh\s*-\s*hl|hhhl|higher\s*highs?\b.*\bhigher\s*lows?\b|uptrend|bullish\s*structure)\b/i;
-  const LhLl_RX   = /\b(lh\s*\/\s*ll|lh\s*-\s*ll|lhll|lower\s*highs?\b.*\blower\s*lows?\b|downtrend|bearish\s*structure)\b/i;
-  const RANGE_RX  = /\b(range|consolidation|sideways)\b/i;
+  // Also read existing X-ray 4H line (if already present in the doc)
+  const xrayBlock = (raw.match(/Detected\s*Structures\s*\(X-ray\):[\s\S]*?(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i)?.[0] || "");
+  const xr4Line   = (xrayBlock.match(/^\s*[-•]\s*4H:\s*([^\n]+)/mi)?.[1] || "").toLowerCase();
 
-  // Hard override: if ANY HH/HL cue appears anywhere in the doc or in the current 4H line, it's UP.
-  const hasHHHL_global = HHHL_RX.test(raw) || /hh\s*\/\s*hl/i.test(t4Line);
-  const hasLhLl_global = LhLl_RX.test(raw) || /lh\s*\/\s*ll/i.test(t4Line);
-  const hasRange_global= RANGE_RX.test(raw);
+  // --- Cue detectors (strict + couplet fallback) ---
+  const HHHL_RX  = /\b(hh\s*[\/\-]\s*hl|hhhl|higher\s*highs?\b.*\bhigher\s*lows?\b|uptrend|bullish\s*structure)\b/i;
+  const LHLL_RX  = /\b(lh\s*[\/\-]\s*ll|lhll|lower\s*highs?\b.*\blower\s*lows?\b|downtrend|bearish\s*structure)\b/i;
+  const HHHL_COUPLET = /\bhh\b[^\n]{0,12}\bhl\b/i; // catches "HH … HL" without a slash/dash
+  const LHLL_COUPLET = /\blh\b[^\n]{0,12}\bll\b/i; // catches "LH … LL" without a slash/dash
+  const RANGE_RX = /\b(range|consolidation|sideways)\b/i;
+
+  const hasHHHL = (s: string) => HHHL_RX.test(s) || HHHL_COUPLET.test(s);
+  const hasLHLL = (s: string) => LHLL_RX.test(s) || LHLL_COUPLET.test(s);
+
+  // Hard override: if ANY HH/HL cue appears anywhere (doc, TV line, or X-ray 4H), it MUST be UP.
+  const upAny   = hasHHHL(raw) || hasHHHL(t4Line) || hasHHHL(xr4Line);
+  const downAny = hasLHLL(raw) || hasLHLL(t4Line) || hasLHLL(xr4Line);
+  const rngAny  = RANGE_RX.test(raw) || RANGE_RX.test(xr4Line);
 
   let d4: "up" | "down" | "range";
 
-  if (hasHHHL_global) {
+  if (upAny) {
     d4 = "up";
-  } else if (hasLhLl_global && !hasHHHL_global) {
+  } else if (downAny) {
     d4 = "down";
-  } else if (hasRange_global) {
+  } else if (rngAny) {
     d4 = "range";
   } else {
     // Fallback: count soft cues if explicit tokens not found
@@ -2483,7 +2492,7 @@ function _reconcileHTFTrendFromText(text: string): string {
 
   return text;
 }
-// ---- END _reconcileHTFTrendFromText (v3) ----
+// ---- END _reconcileHTFTrendFromText (v4) ----
 
 /** Ensure Option 1 aligns with fundamentals when possible; also prefers confirmation-based option when Option 1 uses Limit but trigger says BOS. */
 function enforceOptionOrderByBias(text: string, fundamentalsSign: number): string {
