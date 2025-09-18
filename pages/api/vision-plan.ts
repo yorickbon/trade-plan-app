@@ -2120,6 +2120,41 @@ function _clarifyBOSWording(text: string): string {
     .replace(/BOS\s*needed\s*for\s*confirmation/gi, "BOS needed for confirmation (break/close of recent swing)");
 }
 
+/** NEW: Reconcile 4H trend in X-ray with swing cues read from your uploaded charts (Technical View text). */
+function _reconcileHTFTrendFromText(text: string): string {
+  if (!text) return text;
+
+  // 1) Extract any 4H description inside "Technical View"
+  const tech4hMatch = text.match(/Technical\s*View[\s\S]{0,800}?4H\s*:\s*([^\n]+)/i);
+  const tech4hLine = tech4hMatch ? String(tech4hMatch[1]).toLowerCase() : "";
+
+  // Heuristics from image-read text (HH/HL → uptrend, LH/LL → downtrend, range/consolidation)
+  let desired: "up" | "down" | "range" | null = null;
+  if (/(uptrend|higher\s+high|higher\s+low|hh\s*\/?\s*hl|bullish\s+structure)/i.test(tech4hLine)) desired = "up";
+  else if (/(downtrend|lower\s+high|lower\s+low|lh\s*\/?\s*ll|bearish\s+structure)/i.test(tech4hLine)) desired = "down";
+  else if (/(range|ranging|consolidation|sideways)/i.test(tech4hLine)) desired = "range";
+
+  if (!desired) return text;
+
+  // 2) Patch the 4H line under "Detected Structures (X-ray)" only (don’t rewrite your free-form notes)
+  const xraySectRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
+  const xrayMatch = text.match(xraySectRe);
+  if (!xrayMatch) return text;
+
+  const xray = xrayMatch[0];
+  const fourHLineRe = /(^\s*[-•]\s*4H:\s*)([^\n]*)/mi;
+  if (!fourHLineRe.test(xray)) return text; // nothing to normalize
+
+  const newDesc =
+    desired === "up"    ? "Uptrend (HH/HL), bullish structure"
+  : desired === "down"  ? "Downtrend (LH/LL), bearish structure"
+  :                       "Consolidation / range";
+
+  const patchedXray = xray.replace(fourHLineRe, (_m, p1) => `${p1}${newDesc}`);
+  return text.replace(xray, patchedXray);
+}
+
+
 /** Ensure Option 1 aligns with fundamentals when possible; also prefers confirmation-based option when Option 1 uses Limit but trigger says BOS. */
 function enforceOptionOrderByBias(text: string, fundamentalsSign: number): string {
   if (!text) return text;
@@ -2575,13 +2610,20 @@ if (mode === "fast") {
   // === Order Option 1/2 to align with Final Fundamental Bias ===
   text = enforceOptionOrderByBias(text, fundamentalsSnapshot.final.sign);
 
-  // === Tournament & Trigger Enforcement ===
-  // Ensure ≥5 candidates with ≥3 non-sweep/BOS; fix generic triggers with timeframe-specific wording
-  text = await enforceTournamentDiversity(MODEL, instrument, text);
-  text = await enforceTriggerSpecificity(MODEL, instrument, text);
-  text = enforceScalpHardStopLossLines(text, scalpingHard);
-  text = enforceScalpRiskLines(text, scalping, scalpingHard);
-  text = ensureNewsProximityNote(text, warningMinutes, instrument);
+// === HTF swing reconciliation + Tournament & Trigger Enforcement ===
+// 1) Clarify BOS wording and reconcile 4H X-ray with swing cues from your uploaded charts
+text = _clarifyBOSWording(text);
+text = _reconcileHTFTrendFromText(text);
+
+// 2) Ensure ≥5 candidates with ≥3 non-sweep/BOS; fix generic triggers with timeframe-specific wording
+text = await enforceTournamentDiversity(MODEL, instrument, text);
+text = await enforceTriggerSpecificity(MODEL, instrument, text);
+
+// 3) Scalp guardrails + news proximity note
+text = enforceScalpHardStopLossLines(text, scalpingHard);
+text = enforceScalpRiskLines(text, scalping, scalpingHard);
+text = ensureNewsProximityNote(text, warningMinutes, instrument);
+
 
   // Ensure Full Breakdown has all required subsections and Final Table Summary exists
   text = await enforceFullBreakdownSkeleton(MODEL, instrument, text);
@@ -2721,12 +2763,20 @@ if (mode === "fast") {
   // === Order Option 1/2 to align with Final Fundamental Bias ===
   textFull = enforceOptionOrderByBias(textFull, fundamentalsSnapshotFull.final.sign);
 
-  // === Tournament & Trigger Enforcement ===
-  textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
-  textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
-  textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
-  textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
-  textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
+  // === HTF swing reconciliation + Tournament & Trigger Enforcement ===
+// 1) Clarify BOS wording and reconcile 4H X-ray with swing cues from your uploaded charts
+textFull = _clarifyBOSWording(textFull);
+textFull = _reconcileHTFTrendFromText(textFull);
+
+// 2) Tournament diversity + trigger specificity
+textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
+textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
+
+// 3) Scalp guardrails + news proximity
+textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
+textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
+textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
+
 
   // Ensure Full Breakdown skeleton + Final Table Summary
   textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
