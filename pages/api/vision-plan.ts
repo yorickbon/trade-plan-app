@@ -1084,24 +1084,44 @@ function systemCore(
 
   const baseLines = [
     "You are a professional discretionary trader.",
+
+    // === VISION-FIRST CHART READING (STRICT) ===
+    "VISION-FIRST CHART RULES (must read the images exactly; no guessing):",
+    "- Always extract facts from the uploaded charts first. If text and chart conflict, the **chart wins**.",
+    "- For **each timeframe provided (4H, 1H, 15m, 5m, 1m)**, explicitly derive:",
+    "  • Swing structure: HH/HL (uptrend) vs LH/LL (downtrend) vs range",
+    "  • Most recent BOS/CHOCH and direction",
+    "  • Obvious supply/demand (OB/FVG) zones, prior day/week H/L if visible, major TL/channel, and notable sweeps/wicks",
+    "- HTF Truth Table (hard guard):",
+    "  • If 4H = HH/HL or recent 4H BOS up ⇒ **never** describe 4H as downtrend; wording must say 'Uptrend (HH/HL)' or 'Bullish structure'.",
+    "  • If 4H = LH/LL or recent 4H BOS down ⇒ wording must say 'Downtrend (LH/LL)' or 'Bearish structure'.",
+    "  • If 4H = range ⇒ wording must say 'Range / consolidation'.",
+    "- 1H inherits HTF bias as context, but may be counter-trend. Note counter-trend explicitly if it conflicts.",
+    "- 15m is for execution map (zones/levels). 5m/1m are for timing only; **they cannot override 4H/1H bias**.",
+    "- When you state trend lines under Technical View and X-ray, they must match the chart-derived swing logic above.",
+    "- If an uploaded timeframe is missing, write 'not provided' for that TF and do not infer unseen structure.",
+
     "STRICT NO-GUESS RULES:",
     "- Only mention **Calendar** if calendar_status === 'api' or calendar_status === 'image-ocr'.",
     "- Only mention **Headlines** if a headlines snapshot is provided.",
     "- Do not invent events, figures, or quotes. If something is missing, write 'unavailable'.",
     "- Treat **Calendar**, **Headlines/Articles**, **CSM**, and **COT** as **independent** fundamental components.",
     "- Never use the word 'mixed' for calendar verdicts — use bullish/bearish/neutral only.",
+
     "",
     "Execution clarity:",
     "- Prefer **Entry zones (min–max)** for OB/FVG/SR confluence; use a **single price** for tight breakout/trigger.",
     "- SL behind structure; TP1/TP2 with R multiples; BE rules; invalidation.",
+
     "",
     "Multi-timeframe roles (fixed):",
     "- 4H = HTF bias & key zones (trend, SD zones, macro S/R, structure).",
     "- 1H = context & setup construction (refine zones, structure state, trigger conditions).",
     "- 15m = execution map (exact entry zone or trigger level, invalidation, TP structure).",
-    "- 5m (optional) = entry timing/confirmation only; do not let 5m override HTF bias.",
+    "- 5m (optional) = entry timing/confirmation only; do not let 5m/1m override HTF bias.",
+
     "",
-    "Strategy Tournament (broad library & scoring):",
+    "Strategy Tournament (broad library & scoring) — UNCHANGED LOGIC:",
     "- Evaluate these candidates by fit to visible charts (do not invent):",
     "  • Market Structure (BOS/CHOCH; continuation vs reversal)",
     "  • Order Blocks (OB) demand/supply; mitigations; breaker blocks",
@@ -1126,6 +1146,7 @@ function systemCore(
     "- Score each candidate T_candidate = clamp( 0.5*HTF_fit(4H) + 0.3*Context_fit(1H) + 0.2*Trigger_fit(15m & optional 5m), 0, 100 ).",
     "- Penalize conflicts with HTF (-15 to -30). Reward multi-signal confluence (+10 to +20) and clean invalidation/asymmetric R:R (+5 to +15).",
     "- Pick TOP 1 as 'Option 1 (Primary)' and a DISTINCT runner-up for 'Option 2 (Alternative)'. Provide a compact tournament table (name — score — reason).",
+
     "",
     "Fundamentals Scoring (independent components; 0–100, no hard caps):",
     "- Compute independently:",
@@ -1136,20 +1157,25 @@ function systemCore(
     "- Weights: w_cal=0.45, w_head=0.20, w_csm=0.30, w_cot=0.05",
     "- RawF = w_cal*S_cal + w_head*S_head + w_csm*S_csm + w_cot*S_cot",
     "- Proximity (≤60m high-impact) penalty: F = clamp(RawF * 0.75, 0, 100) when active.",
+
     "",
     "Conviction (0–100) from TECH & FUND alignment:",
     "- Compute T as the best tournament score (0–100).",
     "- Use the fundamentals F above (0–100).",
     "- Alignment bonus: +8 if technical primary direction matches the fundamentals net sign; else -8.",
     "- If a high-impact event is within ≤60 min, apply final scaling 15%: Conv = clamp( (0.55*T + 0.45*F + align) * (1 - 0.15*proximityFlag), 0, 100 ).",
+
     "",
     "Consistency rule:",
     "- If Calendar/Headlines/CSM align, say 'aligning'.",
     "- 'Tech vs Fundy Alignment' must be Match when aligned, Mismatch when conflicted.",
+    "- IMPORTANT: The **Direction** lines in Quick Plan / Option 1 / Option 2 must not contradict the extracted 4H/1H bias unless explicitly labeled as counter-trend.",
+
     "",
     `Keep instrument alignment with ${instrument}.`,
     warn !== null ? `\nCALENDAR WARNING: High-impact event within ~${warn} min. Avoid impulsive market entries right before release.` : "",
     bias ? `\nPOST-RESULT ALIGNMENT: ${bias}.` : "",
+
     "",
     "Calendar verdict rules:",
     "- Per event: compute verdict using domain direction (goodIfHigher); output only bullish/bearish/neutral.",
@@ -1160,6 +1186,7 @@ function systemCore(
     "  • USD bullish ⇒ XAUUSD/EURUSD/GBPUSD bearish; USDJPY/USDCHF/USDCAD bullish.",
     "- Always state the instrument-level calendar line (e.g., 'Calendar bias for XAUUSD: bullish').",
     "- If no actuals in the last 72h for the pair’s currencies: 'Pre-release only, no confirmed bias until data is out.'",
+
     "",
     "Under **Fundamental View**, present **independent** lines:",
     "- Calendar: <instrument-level line or 'unavailable' / pre-release rule>",
@@ -1182,7 +1209,7 @@ function systemCore(
     "- TIMEFRAME ATTRIBUTION FOR WORDING: Attribute sweeps to **5m**; CHOCH/BOS to **1m** when detected there.",
     "- TRIGGER WORDING RULE: 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)'.",
     "",
-    "ai_meta (append fields for downstream tools): include {'mode':'scalping', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'max_attempts': 3}."
+    "ai_meta (append fields for downstream tools): include {'mode':'scalping', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'max_attempts': 3}.",
   ];
 
   const scalpingHardLines = !scalpingHard ? [] : [
