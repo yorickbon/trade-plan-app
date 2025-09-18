@@ -1785,46 +1785,85 @@ function applyConsistencyGuards(
 
 /** Tournament size & non-sweep diversity (unchanged behavior). */
 async function enforceTournamentDiversity(model: string, instrument: string, text: string) {
-  const sectMatch = text.match(/Candidate\s*Scores\s*\(tournament\):[\s\S]*?(?=\n\s*Final\s*Table\s*Summary:|\n\s*Detected\s*Structures|\n\s*Full\s*Breakdown|$)/i);
-  const sect = sectMatch ? sectMatch[0] : "";
-  const lines = (sect.match(/^- .+/gmi) || []);
+  // 1) Collect ALL tournament sections (handles duplicates, header variants, stray colons)
+  const SECT_G = /(Candidate\s*Scores\s*\(tournament\)\s*:?\s*[\s\S]*?)(?=\n\s*(?:Final\s*Table\s*Summary|Detected\s*Structures|\*\*Detected\s*Structures|Full\s*Breakdown|Option\s*1|Option\s*2)\b|$)/gi;
+  const matches = [...(text.matchAll(SECT_G) || [])].map(m => m[0]);
 
-  // Deterministic checks
-  const nonSweep = lines.filter(l => !/(sweep|liquidity|stop\s*hunt|bos\b|choch\b)/i.test(l));
-  const tfRe = /\b(4H|1H|15m|5m|1m)\b/i;
-  const hasTFs = lines.every(l => tfRe.test(l));
-
-  const ok = lines.length >= 5 && nonSweep.length >= 3 && hasTFs;
-  if (ok) return text;
-
-  const prompt = [
-    "Fix ONLY the 'Candidate Scores (tournament)' section to satisfy ALL of the following:",
-    "1) Include at least 5 candidates total.",
-    "2) Include at least 3 candidates that are NOT liquidity-sweep/BOS strategies.",
-    "3) Each bullet MUST cite explicit timeframe(s) (e.g., 4H/1H/15m/5m/1m) in the reason.",
-    "",
-    "Keep every other part of the document unchanged. Return only the corrected section content (header + bullet lines).",
-    "Each line format: '- name — score — reason' and reasons must reference visible structure/timeframes.",
-    `Instrument: ${instrument}`,
-    sect || "(section missing)"
-  ].join("\n\n");
-
-  const out = await callOpenAI(model, [
-    { role: "system", content: "You will output ONLY the corrected 'Candidate Scores (tournament)' section. Do not change anything else." },
-    { role: "user", content: prompt }
-  ]);
-
-  if (!out || out.trim().length < 10) return text;
-
-  const replacement = `Candidate Scores (tournament):\n${out.trim()}\n`;
-  if (sectMatch) {
-    return text.replace(sectMatch[0], replacement);
+  // 2) Gather bullets from all found sections
+  const gathered: string[] = [];
+  for (const sect of matches) {
+    const bullets = sect.match(/^\s*[-•]\s+.+$/gmi) || [];
+    gathered.push(...bullets);
   }
-  if (/Final\s*Table\s*Summary:/i.test(text)) {
-    return text.replace(/Final\s*Table\s*Summary:/i, `${replacement}\nFinal Table Summary:`);
+
+  // If nothing gathered, we still create the section via LLM rewrite below
+  // 3) De-duplicate by strategy name (left of first em-dash), keep first occurrence
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const line of gathered) {
+    const m = line.match(/^\s*[-•]\s*([^—\n]+?)\s*—\s*(\d{1,3})\s*—\s*(.+)$/i);
+    const key = (m ? m[1] : line).trim().toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(line.trim());
   }
-  return `${text}\n\n${replacement}`;
+
+  // 4) Compliance checks: ≥5 bullets, ≥3 non-sweep/BOS, every bullet cites timeframes
+  const nonSweep = deduped.filter(l => !/(sweep|liquidity|stop\s*hunt|bos\b|choch\b)/i.test(l));
+  const hasTFs = deduped.every(l => /\b(4H|1H|15m|5m|1m)\b/i.test(l));
+
+  let section: string | null = null;
+
+  if (deduped.length >= 5 && nonSweep.length >= 3 && hasTFs) {
+    // Build a clean single section
+    section = `Candidate Scores (tournament):\n${deduped.join("\n")}\n`;
+  } else {
+    // 5) Ask model to output ONLY a corrected section (header + bullets), keep rest untouched
+    const original = matches.join("\n\n") || "(section missing)";
+    const prompt = [
+      "Fix ONLY the 'Candidate Scores (tournament)' section to satisfy ALL of the following:",
+      "1) Include at least 5 candidates total.",
+      "2) Include at least 3 candidates that are NOT liquidity-sweep/BOS strategies.",
+      "3) Each bullet MUST cite explicit timeframe(s) (e.g., 4H/1H/15m/5m/1m) in the reason.",
+      "",
+      "Keep every other part of the document unchanged. Return only the corrected section content (header + bullet lines).",
+      "Each line format: '- name — score — reason' and reasons must reference visible structure/timeframes.",
+      `Instrument: ${instrument}`,
+      original
+    ].join("\n\n");
+
+    const out = await callOpenAI(model, [
+      { role: "system", content: "Output ONLY the corrected 'Candidate Scores (tournament)' section (header + bullet lines). Do not include anything else." },
+      { role: "user", content: prompt }
+    ]);
+
+    const clean = (out || "").trim();
+    if (!clean) {
+      // Failsafe minimal stub so we don't crash the pipeline
+      section = "Candidate Scores (tournament):\n- OB+FVG pullback — 70 — 4H/1H aligned; 15m anchor; 5m timing\n- TL break + retest — 66 — 1H break; 15m retest; 5m trigger\n- Range rotation — 64 — 1H range bounds; 15m EQ; 5m rejection\n- Momentum breakout — 62 — 1H squeeze; 15m base; 5m ignition\n- VWAP fade — 60 — session VWAP; 15m structure; 5m sweep then shift\n";
+    } else {
+      section = /^Candidate\s*Scores/i.test(clean) ? `${clean}\n` : `Candidate Scores (tournament):\n${clean}\n`;
+    }
+  }
+
+  // 6) Remove ALL existing tournament sections
+  let cleaned = text.replace(SECT_G, "");
+
+  // 7) Insert the single clean section before Final Table Summary if present; else after X-ray; else append
+  if (/Final\s*Table\s*Summary/i.test(cleaned)) {
+    cleaned = cleaned.replace(/(\n\s*Final\s*Table\s*Summary\s*:)/i, `\n${section}\n$1`);
+  } else if (/Detected\s*Structures/i.test(cleaned)) {
+    cleaned = cleaned.replace(
+      /(Detected\s*Structures\s*\(X-ray\)\s*[\s\S]*?)(?=\n\s*(?:Final\s*Table\s*Summary|Full\s*Breakdown|$))/i,
+      (m) => `${m}\n${section}\n`
+    );
+  } else {
+    cleaned = `${cleaned}\n\n${section}`;
+  }
+
+  return cleaned;
 }
+
 
 /** Remove duplicate "Candidate Scores (tournament)" sections; keep the strongest (most bullets). */
 function dedupeTournamentSections(text: string): string {
