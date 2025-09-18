@@ -2168,36 +2168,110 @@ function _clarifyBOSWording(text: string): string {
 function _reconcileHTFTrendFromText(text: string): string {
   if (!text) return text;
 
-  // 1) Extract any 4H description inside "Technical View"
-  const tech4hMatch = text.match(/Technical\s*View[\s\S]{0,800}?4H\s*:\s*([^\n]+)/i);
-  const tech4hLine = tech4hMatch ? String(tech4hMatch[1]).toLowerCase() : "";
+  // ---- Parse Technical View snippets for 4H and 1H cues (image-first wording) ----
+  const techWin = /Technical\s*View[\s\S]{0,1000}?(\n\s*•|\n\s*-\s*|$)/i; // limit scope
+  const techBlockMatch = text.match(techWin);
+  const techBlock = techBlockMatch ? techBlockMatch[0] : "";
 
-  // Heuristics from image-read text (HH/HL → uptrend, LH/LL → downtrend, range/consolidation)
-  let desired: "up" | "down" | "range" | null = null;
-  if (/(uptrend|higher\s+high|higher\s+low|hh\s*\/?\s*hl|bullish\s+structure)/i.test(tech4hLine)) desired = "up";
-  else if (/(downtrend|lower\s+high|lower\s+low|lh\s*\/?\s*ll|bearish\s+structure)/i.test(tech4hLine)) desired = "down";
-  else if (/(range|ranging|consolidation|sideways)/i.test(tech4hLine)) desired = "range";
+  const tech4hMatch = techBlock.match(/4H\s*:\s*([^\n]+)/i);
+  const tech1hMatch = techBlock.match(/1H\s*:\s*([^\n]+)/i);
+  const t4 = (tech4hMatch ? String(tech4hMatch[1]) : "").toLowerCase();
+  const t1 = (tech1hMatch ? String(tech1hMatch[1]) : "").toLowerCase();
 
-  if (!desired) return text;
+  // 4H desired state
+  let d4: "up" | "down" | "range" | null = null;
+  if (/(uptrend|higher\s+high|higher\s+low|hh\s*\/?\s*hl|bullish\s+structure)/i.test(t4)) d4 = "up";
+  else if (/(downtrend|lower\s+high|lower\s+low|lh\s*\/?\s*ll|bearish\s+structure)/i.test(t4)) d4 = "down";
+  else if (/(range|ranging|consolidation|sideways)/i.test(t4)) d4 = "range";
 
-  // 2) Patch the 4H line under "Detected Structures (X-ray)" only (don’t rewrite your free-form notes)
+  // 1H desired trend & phase
+  let d1: "up" | "down" | "range" | null = null;
+  if (/(trend\s*up|uptrend|hh\s*\/?\s*hl|bullish)/i.test(t1)) d1 = "up";
+  else if (/(trend\s*down|downtrend|lh\s*\/?\s*ll|bearish)/i.test(t1)) d1 = "down";
+  else if (/(range|ranging|consolidation|sideways|equal\s*(highs|lows))/i.test(t1)) d1 = "range";
+
+  // Phase detection (pullback/impulse) from 1H wording; if unclear, infer vs 4H
+  let phase: "pullback" | "impulse" | "range-phase" | null = null;
+  if (/(pullback|retracement|counter|mean\s*revert)/i.test(t1)) phase = "pullback";
+  else if (/(impulse|expansion|continuation|momentum)/i.test(t1)) phase = "impulse";
+  else if (d1 === "range") phase = "range-phase";
+
+  if (!phase && d4 && d1 && d1 !== "range") {
+    // If 4H up & 1H down ⇒ 1H pullback; if same sign ⇒ impulse
+    if ((d4 === "up" && d1 === "down") || (d4 === "down" && d1 === "up")) phase = "pullback";
+    else phase = "impulse";
+  }
+
+  // ---- Determine 15m structure bucket from document cues ----
+  const doc = text.toLowerCase();
+  const hasOB   = /(order\s*block|\bob\b|breaker)/i.test(doc);
+  const hasFVG  = /(fair\s*value\s*gap|\bfvg\b|imbalance)/i.test(doc);
+  const hasTL   = /(trendline|channel|wedge|triangle)/i.test(doc);
+  const hasRng  = /\brange\b|rotation|eq\s*of\s*range/i.test(doc);
+
+  let m15Desc = "";
+  if (hasOB && hasFVG) m15Desc = "OB+FVG confluence";
+  else if (hasOB) m15Desc = "Order Block (OB) anchor";
+  else if (hasFVG) m15Desc = "FVG/imbalance anchor";
+  else if (hasTL) m15Desc = "Trendline/channel structure";
+  else if (hasRng) m15Desc = "Range bounds & EQ rotation";
+  else m15Desc = "Execution anchors from 1H (refined on 15m)";
+
+  // ---- Patch X-ray section lines (4H / 1H / 15m / 5m / 1m) ----
   const xraySectRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
   const xrayMatch = text.match(xraySectRe);
   if (!xrayMatch) return text;
+  let xray = xrayMatch[0];
 
-  const xray = xrayMatch[0];
-  const fourHLineRe = /(^\s*[-•]\s*4H:\s*)([^\n]*)/mi;
-  if (!fourHLineRe.test(xray)) return text; // nothing to normalize
+  const line4hRe = /(^\s*[-•]\s*4H:\s*)([^\n]*)/mi;
+  const line1hRe = /(^\s*[-•]\s*1H:\s*)([^\n]*)/mi;
+  const line15Re = /(^\s*[-•]\s*15m:\s*)([^\n]*)/mi;
+  const line5mRe = /(^\s*[-•]\s*5m\s*\(if\s*used\)\s*:\s*|^\s*[-•]\s*5m:\s*)([^\n]*)/mi;
+  const line1mRe = /(^\s*[-•]\s*1m\s*\(if\s*used\)\s*:\s*|^\s*[-•]\s*1m:\s*)([^\n]*)/mi;
 
-  const newDesc =
-    desired === "up"    ? "Uptrend (HH/HL), bullish structure"
-  : desired === "down"  ? "Downtrend (LH/LL), bearish structure"
-  :                       "Consolidation / range";
+  // 4H normalization
+  if (d4) {
+    const desc4 =
+      d4 === "up"   ? "Uptrend (HH/HL), bullish structure"
+    : d4 === "down" ? "Downtrend (LH/LL), bearish structure"
+    :                 "Larger range / consolidation";
+    if (line4hRe.test(xray)) xray = xray.replace(line4hRe, (_m, p1) => `${p1}${desc4}`);
+  }
 
-  const patchedXray = xray.replace(fourHLineRe, (_m, p1) => `${p1}${newDesc}`);
-  return text.replace(xray, patchedXray);
+  // 1H normalization w/ phase
+  if (d1) {
+    const ph = phase || (d1 === "range" ? "range-phase" : "impulse");
+    const desc1 =
+      d1 === "up"   ? `Trend Up (${ph})`
+    : d1 === "down" ? `Trend Down (${ph})`
+    :                 "Range (mark RH/RL & EQ)";
+    if (line1hRe.test(xray)) {
+      xray = xray.replace(line1hRe, (_m, p1) => `${p1}${desc1}`);
+    } else {
+      // If missing, insert a normalized 1H line after 4H
+      xray = xray.replace(/(^\s*[-•]\s*4H:[^\n]*\n)/mi, ($0) => $0 + `• 1H: ${desc1}\n`);
+    }
+  }
+
+  // 15m structure description
+  if (line15Re.test(xray)) {
+    xray = xray.replace(line15Re, (_m, p1) => `${p1}${m15Desc}`);
+  } else {
+    // Insert a 15m line after 1H if absent
+    if (line1hRe.test(xray)) {
+      xray = xray.replace(line1hRe, (m) => m + `\n• 15m: ${m15Desc}`);
+    }
+  }
+
+  // 5m/1m confirmation wording (timing only; explicit BOS/CHOCH)
+  const fiveDesc = "awaiting BOS (decisive break/close of latest 5m swing) for timing";
+  const oneDesc  = "awaiting CHOCH/BOS micro-shift for entry timing";
+  if (line5mRe.test(xray)) xray = xray.replace(line5mRe, (_m, p1) => `${p1}${fiveDesc}`);
+  if (line1mRe.test(xray)) xray = xray.replace(line1mRe, (_m, p1) => `${p1}${oneDesc}`);
+
+  // Apply patched X-ray back into text
+  return text.replace(xrayMatch[0], xray);
 }
-
 
 /** Ensure Option 1 aligns with fundamentals when possible; also prefers confirmation-based option when Option 1 uses Limit but trigger says BOS. */
 function enforceOptionOrderByBias(text: string, fundamentalsSign: number): string {
