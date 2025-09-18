@@ -2021,18 +2021,36 @@ ${newRow}\n`;
 }
 
 function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
+  // Merge existing ai_meta (if any) with the provided patch
   const meta = extractAiMeta(text) || {};
   const merged = { ...meta, ...patch };
   const json = JSON.stringify(merged, null, 2);
 
-  const reFence = /\nai_meta\s*```json[\s\S]*?```\s*$/i;
-  if (reFence.test(text)) return text.replace(reFence, `\nai_meta ${json}\n`);
+  // Always emit a fenced JSON block:
+  // ai_meta
+  // ```json
+  // { ... }
+  // ```
+  const fenced = `\nai_meta\n\`\`\`json\n${json}\n\`\`\`\n`;
 
-  const reBraces = /\nai_meta\s*{[\s\S]*?}\s*$/i;
-  if (reBraces.test(text)) return text.replace(reBraces, `\nai_meta ${json}\n`);
+  // Replace existing fenced ai_meta if present
+  const reFenced = /\nai_meta\s*```json[\s\S]*?```\s*/i;
+  if (reFenced.test(text)) {
+    return text.replace(reFenced, fenced);
+  }
 
-  return `${text}\n\nai_meta ${json}\n`;
+  // Replace legacy unfenced ai_meta { ... } if present
+  const reLegacy = /\nai_meta\s*{[\s\S]*?}\s*/i;
+  if (reLegacy.test(text)) {
+    return text.replace(reLegacy, fenced);
+  }
+
+  // Otherwise, append at the end
+  // Ensure there is a trailing newline separation to avoid gluing to previous content
+  const needsNL = !/\n$/.test(text);
+  return `${needsNL ? text + "\n" : text}${fenced}`;
 }
+
 
 /** Normalize Order Type (existing behavior kept) if ai_meta has price & zone. */
 function normalizeOrderTypeLines(text: string, aiMeta: any) {
