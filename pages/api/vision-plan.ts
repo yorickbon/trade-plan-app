@@ -1444,11 +1444,12 @@ function hasOption1(text: string): boolean {
   return re.test(text);
 }
 
-/** Deterministically build & insert "Option 1 (Primary)" if missing. */
+/** Deterministically build & insert "Option 1 (Primary)" if missing.
+ * Also avoids duplicate regex const names elsewhere by keeping all regexes local to this function. */
 async function enforceOption1(_model: string, instrument: string, text: string) {
   if (!text) return text;
 
-  // Dedupe
+  // Dedupe extra Option 1 blocks if any
   const RE_O1_BLOCK_G = /(Option\s*1(?!\d)[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/gi;
   let o1Count = 0;
   const deduped = text.replace(RE_O1_BLOCK_G, (m) => (++o1Count === 1 ? m : ""));
@@ -1456,12 +1457,13 @@ async function enforceOption1(_model: string, instrument: string, text: string) 
 
   if (hasOption1(text)) return text;
 
-  const RE_QP_BLOCK = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
-  const RE_O2_BLOCK = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
-  const RE_FULL     = /(\n\s*Full\s*Breakdown)/i;
+  // Local-only regex (do not collide with other helpers)
+  const RE_QP_BLOCK_LOCAL = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
+  const RE_O2_BLOCK_LOCAL = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
+  const RE_FULL_LOCAL     = /(\n\s*Full\s*Breakdown)/i;
 
-  const qpBlock = text.match(RE_QP_BLOCK)?.[0] || "";
-  const o2Block = text.match(RE_O2_BLOCK)?.[0] || "";
+  const qpBlock = text.match(RE_QP_BLOCK_LOCAL)?.[0] || "";
+  const o2Block = text.match(RE_O2_BLOCK_LOCAL)?.[0] || "";
 
   function detectBulletChar(block: string): string {
     if (/^\s*•\s/m.test(block)) return "• ";
@@ -1494,12 +1496,12 @@ async function enforceOption1(_model: string, instrument: string, text: string) 
 
   const qp = parseFields(qpBlock);
   const o2 = parseFields(o2Block);
-
   const choose = (a?: string | null, b?: string | null, ph = "...") =>
     (a && a.trim()) || (b && b.trim()) || ph;
 
   const bullet = detectBulletChar(qpBlock || o2Block || text);
   const bold = blockUsesBoldLabels(qpBlock || o2Block || "");
+  const L = (label: string) => (bold ? `**${label}:**` : `${label}:`);
 
   const fields = {
     direction: choose(qp.direction, o2.direction, "Long"),
@@ -1509,10 +1511,8 @@ async function enforceOption1(_model: string, instrument: string, text: string) 
     stop:      choose(qp.stop,      o2.stop,      "behind recent swing"),
     tps:       choose(qp.tps,       o2.tps,       "TP1 1.0R / TP2 2.0R"),
     conv:      choose(qp.conv,      o2.conv,      "60"),
-    why:       choose(qp.shortWhy, qp.setup, "Primary due to HTF alignment, clean invalidation, and superior R:R.")
+    why:       choose(qp.shortWhy,  qp.setup,     "Primary due to HTF alignment, clean invalidation, and superior R:R.")
   };
-
-  const L = (label: string) => (bold ? `**${label}:**` : `${label}:`);
 
   const option1Block =
 `Option 1 (Primary)
@@ -1528,25 +1528,22 @@ ${bullet}${L("Why this is primary")} ${fields.why}
 
   let out = text;
 
-  const RE_O2_BLOCK = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
-  const RE_QP_BLOCK2 = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
-  const RE_FULL     = /(\n\s*Full\s*Breakdown)/i;
-
-  if (RE_O2_BLOCK.test(out)) {
-    out = out.replace(RE_O2_BLOCK, `${option1Block}\n$&`);
+  if (RE_O2_BLOCK_LOCAL.test(out)) {
+    out = out.replace(RE_O2_BLOCK_LOCAL, `${option1Block}\n$&`);
     return out;
   }
-  if (RE_QP_BLOCK2.test(out)) {
-    out = out.replace(RE_QP_BLOCK2, (m) => `${m}\n${option1Block}\n`);
+  if (RE_QP_BLOCK_LOCAL.test(out)) {
+    out = out.replace(RE_QP_BLOCK_LOCAL, (m) => `${m}\n${option1Block}\n`);
     return out;
   }
-  if (RE_FULL.test(out)) {
-    out = out.replace(RE_FULL, `\n${option1Block}\n$1`);
+  if (RE_FULL_LOCAL.test(out)) {
+    out = out.replace(RE_FULL_LOCAL, `\n${option1Block}\n$1`);
   } else {
     out = `${out}\n\n${option1Block}\n`;
   }
   return out;
 }
+
 
 function hasQuickPlan(text: string): boolean { return /Quick\s*Plan\s*\(Actionable\)/i.test(text || ""); }
 
@@ -1713,38 +1710,43 @@ function stampM1Used(text: string, used: boolean) {
   return out;
 }
 
-/** NEW: Deterministic alignment wording using final fundamentals sign + actual plan direction. */
+/** Deterministic alignment wording using *final* fundamentals sign + actual plan direction.
+ * If fundamentals are neutral, force "Match (Fundamentals neutral — trade managed by technicals)". */
 function applyConsistencyGuards(
   text: string,
   args: { fundamentalsSign: -1 | 0 | 1 }
 ) {
   let out = text || "";
-  const { qp, o1, RE_QP, RE_O1 } = _pickBlocks(out);
+  const { qp, o1 } = _pickBlocks(out);
 
-  // pick tech sign from Option 1; fallback to Quick Plan
+  // Technical sign preference: Option 1 first, then Quick Plan
   let techSign: -1 | 0 | 1 = _dirSignFromBlock(o1);
   if (techSign === 0) techSign = _dirSignFromBlock(qp);
 
   const reTF = /(Tech\s*vs\s*Fundy\s*Alignment:\s*)(Match|Mismatch)([^\n]*)/i;
   const isNeutralFinal = args.fundamentalsSign === 0;
 
-  const desired = isNeutralFinal
-    ? "Match (Fundamentals neutral — trade managed by technicals)"
-    : (techSign !== 0 && techSign === args.fundamentalsSign)
-      ? "Match"
-      : (techSign !== 0 && args.fundamentalsSign !== 0)
-        ? "Mismatch"
-        : "Match";
+  const desired =
+    isNeutralFinal
+      ? "Match (Fundamentals neutral — trade managed by technicals)"
+      : (techSign !== 0 && techSign === args.fundamentalsSign)
+        ? "Match"
+        : (techSign !== 0 && args.fundamentalsSign !== 0)
+          ? "Mismatch"
+          : "Match";
 
   if (reTF.test(out)) {
     out = out.replace(reTF, (_m, p1) => `${p1}${desired}`);
   } else {
-    // inject under Full Breakdown if missing
-    out = out.replace(/(Full\s*Breakdown[\s\S]*?Fundamental\s*View:[\s\S]*?)(\n\s*•\s*Tech\s*vs\s*Fundy\s*Alignment:|$)/i,
-      (m, a) => `${a}\n• Tech vs Fundy Alignment: ${desired}\n`);
+    // Inject under Full Breakdown > Fundamental View if missing
+    out = out.replace(
+      /(Full\s*Breakdown[\s\S]*?Fundamental\s*View:[\s\S]*?)(\n\s*•\s*Tech\s*vs\s*Fundy\s*Alignment:|$)/i,
+      (m, a) => `${a}\n• Tech vs Fundy Alignment: ${desired}\n`
+    );
   }
   return out;
 }
+
 
 /** Tournament size & non-sweep diversity (unchanged behavior). */
 async function enforceTournamentDiversity(model: string, instrument: string, text: string) {
