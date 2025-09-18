@@ -1745,32 +1745,76 @@ function applyConsistencyGuards(
   args: { instrument: string; headlinesSign: number; csmSign: number; calendarSign: number; }
 ) {
   let out = text || "";
+
+  // --- 1) Keep our previous soft “aligning” replacement for generic prose ---
   const signs = [args.headlinesSign, args.csmSign, args.calendarSign].filter((s) => s !== 0);
   const hasPos = signs.some((s) => s > 0);
   const hasNeg = signs.some((s) => s < 0);
-  const aligned = signs.length > 0 && ((hasPos && !hasNeg) || (hasNeg && !hasPos));
-  const mismatch = hasPos && hasNeg;
+  const alignedComponents = signs.length > 0 && ((hasPos && !hasNeg) || (hasNeg && !hasPos));
+  if (alignedComponents) out = out.replace(/contradict(?:ion|ing|s)?/gi, "aligning");
 
-  // Prefer "aligning" wording when aligned.
-  if (aligned) out = out.replace(/contradict(?:ion|ing|s)?/gi, "aligning");
+  // --- 2) Parse Final Fundamental Bias → fundSign (-1/0/+1) ---
+  function parseFinalFundSign(s: string): -1|0|1 {
+    const m = s.match(/Final\s*Fundamental\s*Bias\s*:\s*(bullish|bearish|neutral)/i);
+    if (!m) return 0;
+    const w = m[1].toLowerCase();
+    return w === "bullish" ? 1 : w === "bearish" ? -1 : 0;
+  }
+  const fundSign = parseFinalFundSign(out);
 
-  const reTF = /(Tech\s*vs\s*Fundy\s*Alignment:\s*)(Match|Mismatch)([^\n]*)/i;
+  // --- 3) Parse technical direction from Quick Plan (or Option 1) → techSign ---
+  function parseTechSignFromBlocks(s: string): -1|0|1 {
+    const getDir = (re: RegExp) => {
+      const m = s.match(re);
+      const v = m ? m[1].toLowerCase() : "";
+      if (v.startsWith("long")) return 1;
+      if (v.startsWith("short")) return -1;
+      return 0;
+    };
+    const qpRe = /Quick\s*Plan[\s\S]*?Direction\s*:\s*(Long|Short|Stay\s*Flat)/i;
+    const o1Re = /Option\s*1[\s\S]*?Direction\s*:\s*(Long|Short|Stay\s*Flat)/i;
+    let dir = getDir(qpRe);
+    if (dir === 0) dir = getDir(o1Re);
+    return dir;
+  }
+  const techSign = parseTechSignFromBlocks(out);
 
-  // If Final Fundamental Bias is explicitly neutral → force Match with explanation.
-  const isNeutralFinal = /Final\s*Fundamental\s*Bias\s*:\s*neutral/i.test(out);
-  if (isNeutralFinal) {
-    if (reTF.test(out)) {
-      out = out.replace(reTF, (_m, p1) => `${p1}Match (Fundamentals neutral — trade managed by technicals)`);
+  // --- 4) Rewrite “Tech vs Fundy Alignment” line deterministically ---
+  const reTFLine = /(Tech\s*vs\s*Fundy\s*Alignment:\s*)(Match|Mismatch)([^\n]*)/i;
+  function desiredAlignmentLine(): string {
+    if (fundSign === 0) return "Match (Fundamentals neutral — trade managed by technicals)";
+    if (techSign === 0)  return "Match (Technical stance not explicit — defaulting to fundamentals)";
+    const match = Math.sign(techSign) === Math.sign(fundSign);
+    const labFund = fundSign > 0 ? "bullish" : "bearish";
+    const labTech = techSign > 0 ? "bullish" : "bearish";
+    return `${match ? "Match" : "Mismatch"} (${labFund} fundamentals vs. ${labTech} technicals)`;
+  }
+
+  if (reTFLine.test(out)) {
+    out = out.replace(reTFLine, (_m, p1) => `${p1}${desiredAlignmentLine()}`);
+  } else {
+    // If missing, inject under Fundamental View block
+    const reFundView = /(Fundamental\s*View:[\s\S]*?)(?=\n\s*Conditional\s*Scenarios|\n\s*Surprise\s*Risk|\n\s*Invalidation|\n\s*One-liner\s*Summary|$)/i;
+    if (reFundView.test(out)) {
+      out = out.replace(reFundView, (blk) =>
+        `${blk}\n- Tech vs Fundy Alignment: ${desiredAlignmentLine()}`
+      );
     }
-    return out;
   }
 
-  // Otherwise use aligned/mismatch logic.
-  if (reTF.test(out)) {
-    out = out.replace(reTF, (_m, p1) => `${p1}${aligned ? "Match" : mismatch ? "Mismatch" : "Match"}`);
+  // --- 5) Wording repair: “technical support/resistance” matches direction ---
+  // If direction is Short, prefer “technical resistance”; if Long, prefer “technical support”.
+  const isShort = techSign < 0;
+  const isLong  = techSign > 0;
+  if (isShort) {
+    out = out.replace(/technical\s+support/gi, "technical resistance");
+  } else if (isLong) {
+    out = out.replace(/technical\s+resistance/gi, "technical support");
   }
+
   return out;
 }
+
 
 
 /** Ensure ≥5 candidates and ≥3 non-sweep/BOS strategies in the tournament table. */
