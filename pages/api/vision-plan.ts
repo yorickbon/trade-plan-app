@@ -2786,13 +2786,16 @@ text = ensureNewsProximityNote(text, warningMinutes, instrument);
     parseInstrumentBiasFromNote(biasNote) === 0 ||
     (warningMinutes != null);
 
-   const aiPatchFast = {
+     const aiPatchFast = {
     version: "vp-AtoL-1",
+    instrument,
     mode,
     vwap_used: /vwap/i.test(text),
     time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
     max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
     currentPrice: livePrice ?? undefined,
+    scalping: !!scalping,
+    scalping_hard: !!scalpingHard,
     fundamentals: {
       calendar: { sign: fundamentalsSnapshot.components.calendar.sign, line: calendarText || null },
       headlines: { label: fundamentalsSnapshot.components.headlines.label, avg: hBias.avg ?? null },
@@ -2833,6 +2836,7 @@ text = ensureNewsProximityNote(text, warningMinutes, instrument);
     },
     vp_version: VP_VERSION
   };
+
 
   text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatchFast).filter(([,v]) => v !== undefined)));
 
