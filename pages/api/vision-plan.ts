@@ -2943,15 +2943,29 @@ textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
     parseInstrumentBiasFromNote(biasNote) === 0 ||
     (warningMinutes != null);
 
-  const aiPatchFull = {
+    const aiPatchFull = {
+    version: "vp-AtoL-1",
     mode,
     vwap_used: /vwap/i.test(textFull),
     time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
     max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
     currentPrice: livePrice ?? undefined,
-    fundamentals_reliability: lowFundReliabilityFull ? "low" : "normal",
+    fundamentals: {
+      calendar: { sign: fundamentalsSnapshotFull.components.calendar.sign, line: calendarText || null },
+      headlines: { label: fundamentalsSnapshotFull.components.headlines.label, avg: hBias.avg ?? null },
+      csm: { diff: fundamentalsSnapshotFull.components.csm.diff },
+      cot: { sign: fundamentalsSnapshotFull.components.cot.sign, detail: fundamentalsSnapshotFull.components.cot.detail },
+      final: {
+        score: Math.round(fundamentalsSnapshotFull.final.score),
+        label: fundamentalsSnapshotFull.final.label,
+        sign: fundamentalsSnapshotFull.final.sign
+      },
+      reliability: lowFundReliabilityFull ? "low" : "normal"
+    },
+    proximity: { highImpactMins: warningMinutes ?? null },
     vp_version: VP_VERSION
   };
+
   textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
 
     aiMetaFull = extractAiMeta(textFull) || aiMetaFull;
