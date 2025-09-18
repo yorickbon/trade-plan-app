@@ -2712,7 +2712,7 @@ if (mode === "fast") {
   const usedM1 = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(text);
   text = stampM1Used(text, usedM1);
 
-   // === Independent Fundamentals Snapshot (Calendar, Headlines, CSM, COT) ===
+  // === Independent Fundamentals Snapshot (Calendar, Headlines, CSM, COT) ===
   const calendarSignFast = parseInstrumentBiasFromNote(biasNote);
   const fundamentalsSnapshot = computeIndependentFundamentals({
     instrument,
@@ -2723,10 +2723,22 @@ if (mode === "fast") {
     warningMinutes
   });
 
-  // (moved: Fundamentals Snapshot + alignment guard run later, after textFull is initialized)
+  // Inject standardized Fundamentals block under Full Breakdown (fast mode too)
+  text = ensureFundamentalsSnapshot(text, {
+    instrument,
+    snapshot: fundamentalsSnapshot,
+    preReleaseOnly,
+    calendarLine: calendarText || null
+  });
+
+  // Consistency pass on alignment wording (neutral ⇒ "Match (Fundamentals neutral — trade managed by technicals)")
+  text = applyConsistencyGuards(text, {
+    fundamentalsSign: fundamentalsSnapshot.final.sign as -1 | 0 | 1
+  });
 
   // === Order Option 1/2 to align with Final Fundamental Bias ===
   text = enforceOptionOrderByBias(text, fundamentalsSnapshot.final.sign);
+
 
 // === HTF swing reconciliation + Tournament & Trigger Enforcement ===
 // 1) Clarify BOS wording and reconcile 4H X-ray with swing cues from your uploaded charts
