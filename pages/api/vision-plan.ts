@@ -1744,6 +1744,8 @@ function applyConsistencyGuards(
   text: string,
   args: { instrument: string; headlinesSign: number; csmSign: number; calendarSign: number; }
 ) {
+  type Sign = -1 | 0 | 1; // <<< exact union type so TS is happy
+
   let out = text || "";
 
   // --- 1) Keep our previous soft “aligning” replacement for generic prose ---
@@ -1754,30 +1756,30 @@ function applyConsistencyGuards(
   if (alignedComponents) out = out.replace(/contradict(?:ion|ing|s)?/gi, "aligning");
 
   // --- 2) Parse Final Fundamental Bias → fundSign (-1/0/+1) ---
-  function parseFinalFundSign(s: string): -1|0|1 {
+  function parseFinalFundSign(s: string): Sign {
     const m = s.match(/Final\s*Fundamental\s*Bias\s*:\s*(bullish|bearish|neutral)/i);
     if (!m) return 0;
     const w = m[1].toLowerCase();
-    return w === "bullish" ? 1 : w === "bearish" ? -1 : 0;
+    return (w === "bullish" ? 1 : w === "bearish" ? -1 : 0) as Sign;
   }
-  const fundSign = parseFinalFundSign(out);
+  const fundSign: Sign = parseFinalFundSign(out);
 
   // --- 3) Parse technical direction from Quick Plan (or Option 1) → techSign ---
-  function parseTechSignFromBlocks(s: string): -1|0|1 {
-    const getDir = (re: RegExp) => {
+  function parseTechSignFromBlocks(s: string): Sign {
+    const getDir = (re: RegExp): Sign => {
       const m = s.match(re);
       const v = m ? m[1].toLowerCase() : "";
-      if (v.startsWith("long")) return 1;
+      if (v.startsWith("long"))  return 1;
       if (v.startsWith("short")) return -1;
       return 0;
     };
     const qpRe = /Quick\s*Plan[\s\S]*?Direction\s*:\s*(Long|Short|Stay\s*Flat)/i;
     const o1Re = /Option\s*1[\s\S]*?Direction\s*:\s*(Long|Short|Stay\s*Flat)/i;
-    let dir = getDir(qpRe);
+    let dir: Sign = getDir(qpRe);
     if (dir === 0) dir = getDir(o1Re);
     return dir;
   }
-  const techSign = parseTechSignFromBlocks(out);
+  const techSign: Sign = parseTechSignFromBlocks(out);
 
   // --- 4) Rewrite “Tech vs Fundy Alignment” line deterministically ---
   const reTFLine = /(Tech\s*vs\s*Fundy\s*Alignment:\s*)(Match|Mismatch)([^\n]*)/i;
@@ -1814,6 +1816,7 @@ function applyConsistencyGuards(
 
   return out;
 }
+
 
 
 
