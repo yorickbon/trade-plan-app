@@ -2777,14 +2777,28 @@ text = ensureNewsProximityNote(text, warningMinutes, instrument);
     (warningMinutes != null);
 
   const aiPatchFast = {
+    version: "vp-AtoL-1",
     mode,
     vwap_used: /vwap/i.test(text),
     time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
     max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
     currentPrice: livePrice ?? undefined,
-    fundamentals_reliability: lowFundReliability ? "low" : "normal",
+    fundamentals: {
+      calendar: { sign: fundamentalsSnapshot.components.calendar.sign, line: calendarText || null },
+      headlines: { label: fundamentalsSnapshot.components.headlines.label, avg: hBias.avg ?? null },
+      csm: { diff: fundamentalsSnapshot.components.csm.diff },
+      cot: { sign: fundamentalsSnapshot.components.cot.sign, detail: fundamentalsSnapshot.components.cot.detail },
+      final: {
+        score: Math.round(fundamentalsSnapshot.final.score),
+        label: fundamentalsSnapshot.final.label,
+        sign: fundamentalsSnapshot.final.sign
+      },
+      reliability: lowFundReliability ? "low" : "normal"
+    },
+    proximity: { highImpactMins: warningMinutes ?? null },
     vp_version: VP_VERSION
   };
+
   text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatchFast).filter(([,v]) => v !== undefined)));
 
   aiMeta = extractAiMeta(text) || aiMeta;
