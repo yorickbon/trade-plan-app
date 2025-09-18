@@ -2892,10 +2892,44 @@ if (mode === "fast") {
 
   text = ensureCalendarVisibilityInQuickPlan(text, { instrument, preReleaseOnly, biasLine: calendarText });
 
-    const usedM5 = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
+  // Scalping guard + stamps (FAST)
+// - If NOT scalping, purge ALL 1m references from X-ray, triggers, and stamps
+{
+  const allow1m = !!scalping && !!m1;
+
+  if (!allow1m) {
+    // 1) Remove 1m line in X-ray (any bullet)
+    text = text.replace(/^\s*[-•]\s*1m(?:\s*\(if\s*used\))?\s*:\s*[^\n]*\n/gmi, "");
+
+    // 2) Scrub 1m from Trigger lines (keep the rest intact)
+    text = text.replace(/(^\s*•\s*Trigger:\s*)([^\n]+)$/gmi, (_m, p1, p2) => {
+      let s = String(p2)
+        .replace(/\b1m\s*BOS\b/gi, "")
+        .replace(/\b1m\s*CHOCH\b/gi, "")
+        .replace(/\b1m\b/gi, "")
+        .replace(/,\s*,/g, ",")
+        .replace(/\(\s*\)/g, "")
+        .replace(/\s{2,}/g, " ")
+        .trim();
+      // Tidy dangling punctuation
+      s = s.replace(/^[,;/\-]+/, "").replace(/[,;/\-]+\s*$/, "").trim();
+      if (!s) s = "15m/5m confirmation (no 1m in non-scalp mode)";
+      return `${p1}${s}`;
+    });
+
+    // 3) Remove any 1M stamp line
+    text = text.replace(/^\s*[-•]\s*Used\s*Chart:\s*1M[^\n]*\n/gmi, "");
+  }
+
+  // 4) Stamps: always reflect 5m; only stamp 1m if allowed
+  const usedM5 = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
   text = stampM5Used(text, usedM5);
-  const usedM1 = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(text);
-  text = stampM1Used(text, usedM1);
+  if (allow1m) {
+    const usedM1 = /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(text);
+    text = stampM1Used(text, usedM1);
+  }
+}
+
 
   // If no 1m chart is provided and we’re not scalping, scrub any 1m references.
   if (!m1 && !scalping && !scalpingHard) {
@@ -3126,10 +3160,42 @@ text = ensureNewsProximityNote(text, warningMinutes, instrument);
     textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
 
     // Stamp 5M/1M execution if used
-      const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
+   // Scalping guard + stamps (FULL)
+{
+  const allow1mFull = !!scalping && !!m1;
+
+  if (!allow1mFull) {
+    // 1) Remove 1m line in X-ray
+    textFull = textFull.replace(/^\s*[-•]\s*1m(?:\s*\(if\s*used\))?\s*:\s*[^\n]*\n/gmi, "");
+
+    // 2) Scrub 1m from Trigger lines
+    textFull = textFull.replace(/(^\s*•\s*Trigger:\s*)([^\n]+)$/gmi, (_m, p1, p2) => {
+      let s = String(p2)
+        .replace(/\b1m\s*BOS\b/gi, "")
+        .replace(/\b1m\s*CHOCH\b/gi, "")
+        .replace(/\b1m\b/gi, "")
+        .replace(/,\s*,/g, ",")
+        .replace(/\(\s*\)/g, "")
+        .replace(/\s{2,}/g, " ")
+        .trim();
+      s = s.replace(/^[,;/\-]+/, "").replace(/[,;/\-]+\s*$/, "").trim();
+      if (!s) s = "15m/5m confirmation (no 1m in non-scalp mode)";
+      return `${p1}${s}`;
+    });
+
+    // 3) Remove any 1M stamp line
+    textFull = textFull.replace(/^\s*[-•]\s*Used\s*Chart:\s*1M[^\n]*\n/gmi, "");
+  }
+
+  // 4) Stamps: always reflect 5m; only stamp 1m if allowed
+  const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
   textFull = stampM5Used(textFull, usedM5Full);
-  const usedM1Full = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(textFull);
-  textFull = stampM1Used(textFull, usedM1Full);
+  if (allow1mFull) {
+    const usedM1Full = /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(textFull);
+    textFull = stampM1Used(textFull, usedM1Full);
+  }
+}
+
 
   // If no 1m chart is provided and we’re not scalping, scrub any 1m references.
   if (!m1 && !scalping && !scalpingHard) {
