@@ -2377,52 +2377,71 @@ function _finalPolish(text: string): string {
 }
 
 
-/** Context Engine v2: force-consistency for 4H/1H across Technical View & X-ray.
- *  - If any 4H cue suggests HH/HL/bullish, never allow "downtrend" on 4H lines.
- *  - 1H phrasing: prefer "support test" vs "resistance rejection" based on document cues.
- *  - Also refresh X-ray entries for 15m/5m/1m exactly like before.
+/** Context Engine v3: strict chart-text override for 4H/1H + synced X-ray.
+ *  - If the uploaded chart text contains HH/HL cues anywhere, 4H MUST be Uptrend.
+ *  - If LH/LL cues exist BUT HH/HL also exists, prefer Uptrend (no downtrend allowed).
+ *  - Only mark Downtrend if LH/LL (or explicit downtrend words) appear AND no HH/HL/bull cues.
+ *  - Range only when neither up nor down dominates.
+ *  - Keep 1H phrasing based on support vs resistance cues in the whole doc.
+ *  - Apply the same resolved 4H/1H lines to BOTH:
+ *      • Full Breakdown → Technical View
+ *      • Detected Structures (X-ray)
  */
 function _reconcileHTFTrendFromText(text: string): string {
   if (!text) return text;
 
-  const doc = text.toLowerCase();
+  // Use raw (for regex extraction) and lowercased (for counting cues)
+  const raw = text;
+  const doc = raw.toLowerCase();
 
-  // Pull Technical View 4H/1H lines (if present)
-  const techBlock = (text.match(/Full\s*Breakdown[\s\S]{0,1200}?Fundamental\s*View/i)?.[0] || "")
-                 || (text.match(/Technical\s*View[\s\S]{0,800}/i)?.[0] || "");
-  const t4 = (techBlock.match(/4H\s*:\s*([^\n]+)/i)?.[1] || "").toLowerCase();
-  const t1 = (techBlock.match(/1H\s*:\s*([^\n]+)/i)?.[1] || "").toLowerCase();
+  // Pull existing Technical View block to read current lines (optional)
+  const techBlock = (raw.match(/Full\s*Breakdown[\s\S]{0,1200}?Fundamental\s*View/i)?.[0] || "")
+                 || (raw.match(/Technical\s*View[\s\S]{0,800}/i)?.[0] || "");
+  const t4Line = (techBlock.match(/4H\s*:\s*([^\n]+)/i)?.[1] || "").toLowerCase();
 
-  // Consensus detectors
-  const upCue4  = /(uptrend|higher\s+high|higher\s+low|\bhh\b\s*\/?\s*\bhl\b|bullish\s+structure)/i;
-  const downCue4= /(downtrend|lower\s+high|lower\s+low|\blh\b\s*\/?\s*\bll\b|bearish\s+structure)/i;
-  const range4  = /(range|consolidation|sideways)/i;
+  // --- Cue detectors (strict) ---
+  const HHHL_RX   = /\b(hh\s*\/\s*hl|hh\s*-\s*hl|hhhl|higher\s*highs?\b.*\bhigher\s*lows?\b|uptrend|bullish\s*structure)\b/i;
+  const LhLl_RX   = /\b(lh\s*\/\s*ll|lh\s*-\s*ll|lhll|lower\s*highs?\b.*\blower\s*lows?\b|downtrend|bearish\s*structure)\b/i;
+  const RANGE_RX  = /\b(range|consolidation|sideways)\b/i;
 
-  let d4: "up" | "down" | "range" | null = null;
-  if (upCue4.test(t4) || /hh\/hl/i.test(doc)) d4 = "up";
-  else if (downCue4.test(t4)) d4 = "down";
-  else if (range4.test(t4)) d4 = "range";
+  // Hard override: if ANY HH/HL cue appears anywhere in the doc or in the current 4H line, it's UP.
+  const hasHHHL_global = HHHL_RX.test(raw) || /hh\s*\/\s*hl/i.test(t4Line);
+  const hasLhLl_global = LhLl_RX.test(raw) || /lh\s*\/\s*ll/i.test(t4Line);
+  const hasRange_global= RANGE_RX.test(raw);
 
-  // 1H: prefer "support test" if support cues dominate in doc
+  let d4: "up" | "down" | "range";
+
+  if (hasHHHL_global) {
+    d4 = "up";
+  } else if (hasLhLl_global && !hasHHHL_global) {
+    d4 = "down";
+  } else if (hasRange_global) {
+    d4 = "range";
+  } else {
+    // Fallback: count soft cues if explicit tokens not found
+    const upSoft   = (doc.match(/\b(higher\s+high|higher\s+low|bullish|uptrend)\b/gi) || []).length;
+    const downSoft = (doc.match(/\b(lower\s+high|lower\s+low|bearish|downtrend)\b/gi) || []).length;
+    if (upSoft > downSoft) d4 = "up";
+    else if (downSoft > upSoft) d4 = "down";
+    else d4 = "range";
+  }
+
+  const desc4 =
+      d4 === "up"   ? "Uptrend (HH/HL), bullish structure"
+    : d4 === "down" ? "Downtrend (LH/LL), bearish structure"
+    :                 "Larger range / consolidation";
+
+  // 1H phrasing preference based on whole doc cues
   const supCount = (doc.match(/\bsupport\b/gi) || []).length;
   const resCount = (doc.match(/\bresistance\b/gi) || []).length;
-  const oneHSupportFirst = supCount > resCount + 0; // tie → leave as-is
-
-  // Build normalized phrases
-  const desc4 =
-    d4 === "up"   ? "Uptrend (HH/HL), bullish structure"
-  : d4 === "down" ? "Downtrend (LH/LL), bearish structure"
-  : d4 === "range"? "Larger range / consolidation"
-  :                 "";
-
   const desc1ByDoc =
-    oneHSupportFirst
+    supCount >= resCount
       ? "At support / demand test; watch for continuation vs pullback"
       : "At resistance / supply test; watch for rejection vs break";
 
-  // X-ray section patching
+  // === Patch X-ray section in lockstep ===
   const xraySectRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
-  const xrayMatch = text.match(xraySectRe);
+  const xrayMatch = raw.match(xraySectRe);
   if (xrayMatch) {
     let xray = xrayMatch[0];
     const line4hRe = /(^\s*[-•]\s*4H:\s*)([^\n]*)/mi;
@@ -2431,29 +2450,25 @@ function _reconcileHTFTrendFromText(text: string): string {
     const line5mRe = /(^\s*[-•]\s*5m\s*\(if\s*used\)\s*:\s*|^\s*[-•]\s*5m:\s*)([^\n]*)/mi;
     const line1mRe = /(^\s*[-•]\s*1m\s*\(if\s*used\)\s*:\s*|^\s*[-•]\s*1m:\s*)([^\n]*)/mi;
 
-    if (desc4) {
-      if (line4hRe.test(xray)) xray = xray.replace(line4hRe, (_m, p1) => `${p1}${desc4}`);
-    }
-    if (line1hRe.test(xray)) {
-      xray = xray.replace(line1hRe, (_m, p1) => `${p1}${desc1ByDoc}`);
-    }
-    // 15m execution anchor from document cues
+    if (line4hRe.test(xray)) xray = xray.replace(line4hRe, (_m, p1) => `${p1}${desc4}`);
+    if (line1hRe.test(xray)) xray = xray.replace(line1hRe, (_m, p1) => `${p1}${desc1ByDoc}`);
+
+    // 15m anchor wording from existing doc cues (unchanged)
     const m15Desc =
-      /(order\s*block|\bob\b|breaker)/i.test(doc) && /(fair\s*value\s*gap|\bfvg\b|imbalance)/i.test(doc)
+      /(order\s*block|\bob\b|breaker)/i.test(raw) && /(fair\s*value\s*gap|\bfvg\b|imbalance)/i.test(raw)
         ? "OB+FVG confluence"
-        : /(order\s*block|\bob\b|breaker)/i.test(doc)
+        : /(order\s*block|\bob\b|breaker)/i.test(raw)
         ? "Order Block (OB) anchor"
-        : /(fair\s*value\s*gap|\bfvg\b|imbalance)/i.test(doc)
+        : /(fair\s*value\s*gap|\bfvg\b|imbalance)/i.test(raw)
         ? "FVG/imbalance anchor"
-        : /(trendline|channel|wedge|triangle)/i.test(doc)
+        : /(trendline|channel|wedge|triangle)/i.test(raw)
         ? "Trendline/channel structure"
-        : /\brange\b|rotation|eq\s*of\s*range/i.test(doc)
+        : /\brange\b|rotation|eq\s*of\s*range/i.test(raw)
         ? "Range bounds & EQ rotation"
         : "Execution anchors from 1H (refined on 15m)";
 
     if (line15Re.test(xray)) xray = xray.replace(line15Re, (_m, p1) => `${p1}${m15Desc}`);
 
-    // BOS/CHOCH clarification lines (unchanged intent)
     const fiveDesc = "awaiting BOS (decisive break/close of latest 5m swing) for timing";
     const oneDesc  = "awaiting CHOCH/BOS micro-shift for entry timing";
     if (line5mRe.test(xray)) xray = xray.replace(line5mRe, (_m, p1) => `${p1}${fiveDesc}`);
@@ -2462,17 +2477,13 @@ function _reconcileHTFTrendFromText(text: string): string {
     text = text.replace(xrayMatch[0], xray);
   }
 
-  // Also hard-normalize the "Technical View" bullet lines if present
-  text = text.replace(/(Technical\s*View[\s\S]{0,600}?4H:\s*)([^\n]*)/i, (_m, p1) => {
-    return desc4 ? `${p1}${desc4}` : _m;
-  });
-  text = text.replace(/(Technical\s*View[\s\S]{0,600}?1H:\s*)([^\n]*)/i, (_m, p1) => {
-    return `${p1}${desc1ByDoc}`;
-  });
+  // === Normalize Technical View bullets (Full Breakdown) ===
+  text = text.replace(/(Technical\s*View[\s\S]{0,600}?4H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${desc4}`);
+  text = text.replace(/(Technical\s*View[\s\S]{0,600}?1H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${desc1ByDoc}`);
 
   return text;
 }
-
+// ---- END _reconcileHTFTrendFromText (v3) ----
 
 /** Ensure Option 1 aligns with fundamentals when possible; also prefers confirmation-based option when Option 1 uses Limit but trigger says BOS. */
 function enforceOptionOrderByBias(text: string, fundamentalsSign: number): string {
