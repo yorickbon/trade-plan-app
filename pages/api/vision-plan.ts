@@ -592,7 +592,6 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
 
   const lines: string[] = [];
   const postRows: OcrCalendarRow[] = [];
-  const preRows: OcrCalendarRow[] = [];
   let hasActualOnlyRecent = false;
 
   const rowsForDebug = (ocr.items || []).slice(0, 3).map(r => ({
@@ -627,75 +626,20 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     // Only consider rows within last 72h when time is known; if time missing, allow but don't score far history
     const ts = it.timeISO ? Date.parse(it.timeISO) : NaN;
     const isWithin72h = isFinite(ts) ? ts <= nowMs && nowMs - ts <= H72 : true;
-
     if (!isWithin72h) continue;
 
-    // Classify
+    // Classification for post-release evidence & scoring
     if (a != null && (f != null || p != null)) {
       postRows.push({ ...it, actual: a, forecast: f, previous: p });
     } else if (a != null && f == null && p == null) {
-      // Post-release present but insufficient refs to score — remember for acknowledgement
       hasActualOnlyRecent = true;
-    } else if (a == null && f != null && p != null) {
-      preRows.push({ ...it, actual: null, forecast: f, previous: p });
     }
   }
 
-  // If no post-result rows, handle expected/pre-release and actual-only acknowledgement
+  // If no post-result rows, STRICT pre-release behavior
   if (postRows.length === 0) {
-    if (preRows.length > 0) {
-      // Compute expected bias from forecast vs previous using goodIfHigher
-      const scoreByCur: Record<string, number> = {};
-      for (const it of preRows) {
-        const cur = (it.currency || "").toUpperCase();
-        const dir = goodIfHigher(String(it.title || "")); // true=higher good; false=lower good
-        if (dir == null) continue;
-        const f = Number(it.forecast);
-        const p = Number(it.previous);
-        if (!isFinite(f) || !isFinite(p)) continue;
-        const raw = (f - p) / Math.max(Math.abs(p), 1e-9);
-        const clamped = Math.max(-0.25, Math.min(0.25, raw));
-        const signed = (dir ? Math.sign(clamped) : -Math.sign(clamped)) * Math.round((Math.abs(clamped) / 0.25) * 10);
-        scoreByCur[cur] = (scoreByCur[cur] ?? 0) + signed;
-      }
-
-      const sumBase = Math.round(scoreByCur[base] ?? 0);
-      const sumQuote = Math.round(scoreByCur[quote] ?? 0);
-      const netInstr = sumBase - sumQuote;
-
-      let expected: "bullish" | "bearish" | "neutral";
-      if (sumBase === 0 && sumQuote === 0) expected = "neutral";
-      else expected = netInstr > 0 ? "bullish" : netInstr < 0 ? "bearish" : "neutral";
-
-      const biasLine = `Calendar expected bias for ${pair}: ${expected} (pre-release; awaiting actual).`;
-      const biasNote = `Expected (forecast vs previous) → ${base}:${sumBase >= 0 ? "+" : ""}${sumBase}, ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}; Net ${netInstr >= 0 ? "+" : ""}${netInstr}`;
-
-      return {
-        biasLine,
-        biasNote,
-        warningMinutes: warn,
-        evidenceLines: [], // evidence only after actuals print
-        preReleaseOnly: true,
-        rowsForDebug,
-      };
-    }
-
-    if (hasActualOnlyRecent) {
-      // Post-release present but cannot score — acknowledge without pre-release label
-      const note = `Calendar for ${pair}: post-release figures detected but insufficient refs to score (missing forecast/previous).`;
-      return {
-        biasLine: note,
-        biasNote: null,
-        warningMinutes: warn,
-        evidenceLines: [],
-        preReleaseOnly: false,
-        rowsForDebug,
-      };
-    }
-
-    const preLine = `Calendar: ${
-      warn != null ? `High-impact events scheduled (≤${warn} min). ` : ""
-    }Pre-release only, no confirmed bias until data is out.`;
+    // Waiting state, do not compute expectation from forecast/previous
+    const preLine = `Waiting for results (pre-release)${warn != null ? ` — high-impact event in ~${warn} min` : ""}.`;
     return {
       biasLine: preLine,
       biasNote: null,
@@ -715,35 +659,33 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
 
   for (const it of postRows) {
     const cur = (it.currency || "").toUpperCase();
-    const dir = goodIfHigher(String(it.title || "")); // true=higher good; false=lower good
-    if (dir == null) continue;
 
-    const ref = (it.forecast ?? it.previous) as number | null;
-    if (ref == null) continue;
-
+    // Strict sign: actual vs forecast only. If no forecast for this row, skip scoring (still produce evidence).
+    const fNum = it.forecast != null ? Number(it.forecast) : null;
     const aNum = Number(it.actual);
-    const raw = (aNum - ref) / Math.max(Math.abs(ref), 1e-9);
-    const clamped = Math.max(-0.25, Math.min(0.25, raw)); // limit ±25%
+    const pNum = it.previous != null ? Number(it.previous) : null;
 
-    // Score 0–10 scaled, impact-weighted
+    // Evidence line (transparent)
+    const ev = evidenceLine(it, cur);
+    if (ev) lines.push(ev);
+
+    if (fNum == null || !isFinite(aNum) || !isFinite(fNum)) continue;
+
+    // Magnitude from percent surprise (capped), weighted by impact; previous can add a tiny modulation but never flips sign.
+    const raw = (aNum - fNum) / Math.max(Math.abs(fNum), 1e-9);
+    const clamped = Math.max(-0.25, Math.min(0.25, raw)); // limit ±25%
     const unsigned0to10 = Math.round((Math.abs(clamped) / 0.25) * 10);
     const w = impactW[it.impact as keyof typeof impactW] ?? 1.0;
-    const lineScore = Math.round(unsigned0to10 * w);
 
-    // Signed score (goodIfHigher flips)
-    const signed = (dir ? Math.sign(clamped) : -Math.sign(clamped)) * lineScore;
+    // Optional tiny modulation from previous, purely as strength seasoning (never sign):
+    let mod = 1.0;
+    if (pNum != null && isFinite(pNum)) {
+      const cont = (aNum - pNum) / Math.max(Math.abs(pNum), 1e-9);
+      if (Math.sign(cont) === Math.sign(clamped)) mod += 0.1; // continuity bump
+    }
 
-    // Evidence line (never "mixed")
-    const fNum = it.forecast != null ? Number(it.forecast) : null;
-    const pNum = it.previous != null ? Number(it.previous) : null;
-    let comp: string[] = [];
-    if (fNum != null) comp.push(aNum < fNum ? "< forecast" : aNum > fNum ? "> forecast" : "= forecast");
-    if (pNum != null) comp.push(aNum < pNum ? "< previous" : aNum > pNum ? "> previous" : "= previous");
-    const comps = comp.join(" & ");
-
-    const impactTag = it.impact ? ` (${it.impact})` : "";
-    const signWord: "bullish" | "bearish" | "neutral" = signed > 0 ? "bullish" : signed < 0 ? "bearish" : "neutral";
-    lines.push(`${cur} — ${it.title}: ${aNum}${comps ? " " + comps : ""} → ${signWord} ${cur} (${signed >= 0 ? "+" : ""}${signed}/10${impactTag})`);
+    const lineScore = Math.round(unsigned0to10 * w * mod);
+    const signed = Math.sign(aNum - fNum) * lineScore; // sign ONLY from a-f
 
     add(cur, signed);
   }
@@ -769,7 +711,6 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     rowsForDebug,
   };
 }
-
 
 // Helpers to determine instrument-relevant currencies for OCR usability checks
 const CURRENCIES = new Set(G8);
@@ -1900,13 +1841,15 @@ function enforceFinalTableSummary(text: string, instrument: string) {
 }
 
 /** Compute Convictions (0–100) and inject separately into Quick Plan / Option 1 / Option 2.
- * Formula per option:
- *   Conv = clamp( (0.55*T + 0.45*F + align) * (1 - 0.15*proximityFlag), 0, 100 )
- * Where:
- *   - T = technical score from tournament (O1 = top; O2 = runner-up). If runner-up absent, T2 = max(T1-12, 0).
- *   - F = independent fundamentals final score (0–100).
- *   - align = +8 if fundamentals sign matches that option’s Direction, -8 if conflicts, else 0.
- * Also de-dupes any duplicate “Conviction:” lines by rewriting the block with a single line.
+ * New formula (transparent):
+ *   Tq = clamp(T * Q_tech, 0..100),  Q_tech ∈ [0.8, 1.1] from text quality cues
+ *   Fr = clamp(F * R_fund, 0..100),  R_fund ∈ [0.8, 1.05] from reliability cues
+ *   align = +8 (match) / -8 (conflict) / 0 (neutral)
+ *   risk = prox_pen (≤60m) + minor textual penalties (if any)  // subtractive
+ *   Conv = clamp( round(0.60*Tq + 0.40*Fr + align - risk), 0, 100 )
+ * Notes:
+ * - No fabricated data. All cues derived from the generated text + proximity flag.
+ * - Option 1 uses T1; Option 2 uses T2 (runner-up or fallback T1-12).
  */
 function computeAndInjectConviction(
   text: string,
@@ -1946,11 +1889,8 @@ function computeAndInjectConviction(
     if (v.startsWith("short")) return -1;
     return 0;
   }
-
-  function pickBlock(src: string, re: RegExp): string {
-    const m = src.match(re);
-    return m ? m[0] : "";
-  }
+  function hasText(s: string, re: RegExp) { return re.test((s || "").toLowerCase()); }
+  function pickBlock(src: string, re: RegExp): string { const m = src.match(re); return m ? m[0] : ""; }
 
   const qpBlock = pickBlock(text, RE_QP_BLOCK);
   const o1Block = pickBlock(text, RE_O1_BLOCK);
@@ -1967,17 +1907,44 @@ function computeAndInjectConviction(
   const alignO1 = (fSign !== 0 && dO1 !== 0) ? (fSign === dO1 ? 8 : -8) : 0;
   const alignO2 = (fSign !== 0 && dO2 !== 0) ? (fSign === dO2 ? 8 : -8) : 0;
 
+  // === Quality & reliability factors (derived from text cues only; no fabrication) ===
+  function qualityFactor(block: string): number {
+    let q = 1.0;
+    if (hasText(block, /(htf\s+alignment|clean\s+invalidation|confluence|ob\s*\+?\s*fvg|rr\s*[:x]?\s*2(\.?\d+)?|\bR\s*[:x]\s*2)/i)) q += 0.05;
+    if (hasText(block, /(clear\s+(bos|choch)|trendline\s+break|range\s+rotation|vwap)/i)) q += 0.05;
+    if (hasText(block, /(chop|unclear|messy|low\s+confidence)/i)) q -= 0.1;
+    return Math.max(0.8, Math.min(1.1, q));
+  }
+  function reliabilityFactor(textAll: string): number {
+    let r = 1.0;
+    // If the doc explicitly says pre-release or unavailable, reduce slightly (F reliability)
+    if (hasText(textAll, /pre-release\s+only|waiting\s+for\s+results|calendar:\s*unavailable/i)) r -= 0.1;
+    // If components conflict is mentioned heavily, reduce slightly
+    if (hasText(textAll, /\bMismatch\b/i)) r -= 0.05;
+    return Math.max(0.8, Math.min(1.05, r));
+  }
+  const Q_qp = qualityFactor(qpBlock || o1Block || "");
+  const Q_o1 = qualityFactor(o1Block);
+  const Q_o2 = qualityFactor(o2Block);
+  const R_f  = reliabilityFactor(text);
+
+  // Risk penalties (no invented data): proximity → 6pt haircut; add tiny penalty if block hints "illiquid/time" (rare)
+  const prox_pen = prox ? 6 : 0;
+  const liq_pen  = hasText(text, /\b(asia\s+session|illiquid|thin\s+liquidity)\b/i) ? 2 : 0;
+
+  // Compute Tq / Fr
+  const Tq_qp = Math.max(0, Math.min(100, Math.round((T1) * Q_qp)));
+  const Tq_o1 = Math.max(0, Math.min(100, Math.round((T1) * Q_o1)));
+  const Tq_o2 = Math.max(0, Math.min(100, Math.round((T2) * Q_o2)));
+  const Fr    = Math.max(0, Math.min(100, Math.round(F * R_f)));
+
   // Convictions
-  const convQP = Math.max(0, Math.min(100, Math.round((0.55 * T1 + 0.45 * F + alignQP) * (prox ? 0.85 : 1))));
-  const convO1 = Math.max(0, Math.min(100, Math.round((0.55 * T1 + 0.45 * F + alignO1) * (prox ? 0.85 : 1))));
-  const convO2 = Math.max(0, Math.min(100, Math.round((0.55 * T2 + 0.45 * F + alignO2) * (prox ? 0.85 : 1))));
+  const convQP = Math.max(0, Math.min(100, Math.round(0.60 * Tq_qp + 0.40 * Fr + alignQP - (prox_pen + liq_pen))));
+  const convO1 = Math.max(0, Math.min(100, Math.round(0.60 * Tq_o1 + 0.40 * Fr + alignO1 - (prox_pen + liq_pen))));
+  const convO2 = Math.max(0, Math.min(100, Math.round(0.60 * Tq_o2 + 0.40 * Fr + alignO2 - (prox_pen + liq_pen))));
 
   // === Rewriter: remove ALL existing Conviction lines in a block, then insert one clean line ===
-  function detectBullet(block: string): string {
-    if (/^\s*•\s/m.test(block)) return "• ";
-    if (/^\s*-\s/m.test(block)) return "- ";
-    return "• ";
-  }
+  function detectBullet(block: string): string { if (/^\s*•\s/m.test(block)) return "• "; if (/^\s*-\s/m.test(block)) return "- "; return "• "; }
   function usesBoldLabels(block: string): boolean {
     return /\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:\s*\*\*/i.test(block)
         || /(?:^|\n)\s*(?:[-•]\s*)?\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:/i.test(block);
@@ -2549,44 +2516,89 @@ if (mode === "fast") {
 
   // (moved: Fundamentals Snapshot + alignment guard run later, after textFull is initialized)
 
+  // === Order Option 1/2 to align with Final Fundamental Bias ===
+  text = enforceOptionOrderByBias(text, fundamentalsSnapshot.final.sign);
 
+  // === Tournament & Trigger Enforcement ===
+  // Ensure ≥5 candidates with ≥3 non-sweep/BOS; fix generic triggers with timeframe-specific wording
+  text = await enforceTournamentDiversity(MODEL, instrument, text);
+  text = await enforceTriggerSpecificity(MODEL, instrument, text);
+  text = enforceScalpHardStopLossLines(text, scalpingHard);
+  text = enforceScalpRiskLines(text, scalping, scalpingHard);
+  text = ensureNewsProximityNote(text, warningMinutes, instrument);
 
- // === Tournament & Trigger Enforcement ===
-// Ensure ≥5 candidates with ≥3 non-sweep/BOS; fix generic triggers with timeframe-specific wording
- text = await enforceTournamentDiversity(MODEL, instrument, text);
-text = await enforceTriggerSpecificity(MODEL, instrument, text);
-text = enforceScalpHardStopLossLines(text, scalpingHard);
-text = enforceScalpRiskLines(text, scalping, scalpingHard);
-text = ensureNewsProximityNote(text, warningMinutes, instrument);
+  // Ensure Full Breakdown has all required subsections and Final Table Summary exists
+  text = await enforceFullBreakdownSkeleton(MODEL, instrument, text);
+  text = enforceFinalTableSummary(text, instrument);
 
-// Ensure Full Breakdown has all required subsections and Final Table Summary exists
-text = await enforceFullBreakdownSkeleton(MODEL, instrument, text);
-text = enforceFinalTableSummary(text, instrument);
-
-// === Conviction (0–100) based on T & F, then fill table row ===
-text = computeAndInjectConviction(text, {
-  fundamentals: fundamentalsSnapshot,
-  proximityFlag: warningMinutes != null
-});
-text = fillFinalTableSummaryRow(text, instrument);
-
-
+  // === Conviction (0–100) based on T & F, then fill table row ===
+  text = computeAndInjectConviction(text, {
+    fundamentals: fundamentalsSnapshot,
+    proximityFlag: warningMinutes != null
+  });
+  text = fillFinalTableSummaryRow(text, instrument);
 
   // Ensure Full Breakdown has all required subsections and Final Table Summary exists
   text = await enforceFullBreakdownSkeleton(MODEL, instrument, text);
   text = enforceFinalTableSummary(text, instrument);
 
   // Ensure ai_meta exists and is enriched with runtime fields
+  const lowFundReliability =
+    preReleaseOnly ||
+    parseInstrumentBiasFromNote(biasNote) === 0 ||
+    (warningMinutes != null);
+
   const aiPatchFast = {
     mode,
     vwap_used: /vwap/i.test(text),
     time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
     max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
     currentPrice: livePrice ?? undefined,
+    fundamentals_reliability: lowFundReliability ? "low" : "normal",
     vp_version: VP_VERSION
   };
-     text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatchFast).filter(([,v]) => v !== undefined)));
+  text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatchFast).filter(([,v]) => v !== undefined)));
+
   aiMeta = extractAiMeta(text) || aiMeta;
+
+
+/** Ensure Option 1 aligns with Final Fundamental Bias when possible by swapping Option 1/2 blocks.
+ * No text fabrication; preserves content. If neither aligns, order unchanged. */
+function enforceOptionOrderByBias(text: string, fundamentalsSign: number): string {
+  if (!text || (fundamentalsSign !== -1 && fundamentalsSign !== 1)) return text;
+
+  const RE_O1_BLOCK = /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
+  const RE_O2_BLOCK = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
+
+  const m1 = text.match(RE_O1_BLOCK);
+  const m2 = text.match(RE_O2_BLOCK);
+  if (!m1 || !m2) return text;
+
+  const o1 = m1[0], o2 = m2[0];
+
+  function dirSign(block: string): number {
+    const m = block.match(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Direction\s*:\s*(Long|Short|Stay\s*Flat)/im);
+    if (!m) return 0;
+    const v = m[1].toLowerCase();
+    if (v.startsWith("long")) return 1;
+    if (v.startsWith("short")) return -1;
+    return 0;
+  }
+  const d1 = dirSign(o1);
+  const d2 = dirSign(o2);
+
+  const o1Aligned = d1 !== 0 && Math.sign(d1) === Math.sign(fundamentalsSign);
+  const o2Aligned = d2 !== 0 && Math.sign(d2) === Math.sign(fundamentalsSign);
+
+  if (!o1Aligned && o2Aligned) {
+    // swap blocks
+    let out = text.replace(RE_O2_BLOCK, "__O2_SWAP_MARKER__"); // placeholder
+    out = out.replace(RE_O1_BLOCK, o2);
+    out = out.replace("__O2_SWAP_MARKER__", o1);
+    return out;
+  }
+  return text;
+}
 
   // Normalize conflicting Order Type for primary plan if needed
   if (aiMeta && invalidOrderRelativeToPrice(aiMeta)) {
@@ -2675,7 +2687,7 @@ text = fillFinalTableSummaryRow(text, instrument);
     warningMinutes
   });
 
-   // Inject standardized Fundamentals block under Full Breakdown
+  // Inject standardized Fundamentals block under Full Breakdown
   textFull = ensureFundamentalsSnapshot(textFull, {
     instrument,
     snapshot: fundamentalsSnapshotFull,
@@ -2683,8 +2695,7 @@ text = fillFinalTableSummaryRow(text, instrument);
     calendarLine: calendarText || null
   });
 
-
-   // Consistency pass on alignment wording (run AFTER fundamentals snapshot so neutral forces Match)
+  // Consistency pass on alignment wording (run AFTER fundamentals snapshot so neutral forces Match)
   textFull = applyConsistencyGuards(textFull, {
     instrument,
     headlinesSign: computeHeadlinesSign(hBias),
@@ -2692,42 +2703,48 @@ text = fillFinalTableSummaryRow(text, instrument);
     calendarSign: parseInstrumentBiasFromNote(biasNote)
   });
 
+  // === Order Option 1/2 to align with Final Fundamental Bias ===
+  textFull = enforceOptionOrderByBias(textFull, fundamentalsSnapshotFull.final.sign);
 
+  // === Tournament & Trigger Enforcement ===
+  textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
+  textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
+  textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
+  textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
+  textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
 
-    // === Tournament & Trigger Enforcement ===
-textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
-textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
-textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
-textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
-textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
+  // Ensure Full Breakdown skeleton + Final Table Summary
+  textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
+  textFull = enforceFinalTableSummary(textFull, instrument);
 
-// Ensure Full Breakdown skeleton + Final Table Summary
-textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
-textFull = enforceFinalTableSummary(textFull, instrument);
+  // === Conviction (0–100) based on T & F, then fill table row ===
+  textFull = computeAndInjectConviction(textFull, {
+    fundamentals: fundamentalsSnapshotFull,
+    proximityFlag: warningMinutes != null
+  });
+  textFull = fillFinalTableSummaryRow(textFull, instrument);
 
-// === Conviction (0–100) based on T & F, then fill table row ===
-textFull = computeAndInjectConviction(textFull, {
-  fundamentals: fundamentalsSnapshotFull,
-  proximityFlag: warningMinutes != null
-});
-textFull = fillFinalTableSummaryRow(textFull, instrument);
+  // Ensure Full Breakdown skeleton + Final Table Summary
+  textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
+  textFull = enforceFinalTableSummary(textFull, instrument);
 
+  // Ensure ai_meta exists and is enriched with runtime fields
+  const lowFundReliabilityFull =
+    preReleaseOnly ||
+    parseInstrumentBiasFromNote(biasNote) === 0 ||
+    (warningMinutes != null);
 
+  const aiPatchFull = {
+    mode,
+    vwap_used: /vwap/i.test(textFull),
+    time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
+    max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
+    currentPrice: livePrice ?? undefined,
+    fundamentals_reliability: lowFundReliabilityFull ? "low" : "normal",
+    vp_version: VP_VERSION
+  };
+  textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
 
-    // Ensure Full Breakdown skeleton + Final Table Summary
-    textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
-    textFull = enforceFinalTableSummary(textFull, instrument);
-
-    // Ensure ai_meta exists and is enriched with runtime fields
-    const aiPatchFull = {
-      mode,
-      vwap_used: /vwap/i.test(textFull),
-      time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
-      max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
-      currentPrice: livePrice ?? undefined,
-      vp_version: VP_VERSION
-    };
-       textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
     aiMetaFull = extractAiMeta(textFull) || aiMetaFull;
 
     // Normalize conflicting Order Type for primary plan if needed
