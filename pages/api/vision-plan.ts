@@ -2499,7 +2499,7 @@ async function enforceDistinctAlternative(model: string, instrument: string, tex
 }
 
 /** HARD-GATE: Ensure Option 2 is DISTINCT post-generation (after ai_meta). */
-async function hardGateOption2Distinctness(model: string, instrument: string, text: string) {
+async function enforceOption2DistinctHard(model: string, instrument: string, text: string) {
   const MAX_TRIES = 3;
 
   function norm(s: string) { return String(s || "").toLowerCase().replace(/\s+/g, " ").trim(); }
@@ -2544,6 +2544,10 @@ async function hardGateOption2Distinctness(model: string, instrument: string, te
   return out;
 }
 
+/** Backward-compat alias (so older call sites still work). */
+async function hardGateOption2Distinctness(model: string, instrument: string, text: string) {
+  return enforceOption2DistinctHard(model, instrument, text);
+}
 
 // ---------- Live price ----------
 
