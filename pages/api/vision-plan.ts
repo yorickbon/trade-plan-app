@@ -293,17 +293,43 @@ function extractAiMeta(text: string) {
   return null;
 }
 function invalidOrderRelativeToPrice(aiMeta: any): string | null {
-  const o = String(aiMeta?.entryOrder || "").toLowerCase();
+  // Backward-compatible: read order type from either 'orderType' or legacy 'entryOrder'
+  const oRaw = String(aiMeta?.orderType || aiMeta?.entryOrder || "").toLowerCase();
   const dir = String(aiMeta?.direction || "").toLowerCase();
   const z = aiMeta?.zone || {};
   const p = Number(aiMeta?.currentPrice);
   const zmin = Number(z?.min);
   const zmax = Number(z?.max);
-  if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return null;
-  if (o === "sell limit" && dir === "short") { if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price"; }
-  if (o === "buy limit" && dir === "long") { if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price"; }
+
+  if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax) || !oRaw) return null;
+
+  // Normalize zone bounds
+  const lo = Math.min(zmin, zmax);
+  const hi = Math.max(zmin, zmax);
+
+  // Limit order sanity:
+  // - Long + Buy Limit should be BELOW price (tap/retest). If zone entirely ABOVE price → invalid.
+  // - Short + Sell Limit should be ABOVE price. If zone entirely BELOW price → invalid.
+  if (oRaw === "buy limit" && dir === "long") {
+    if (lo >= p) return "buy-limit-above-price";
+  }
+  if (oRaw === "sell limit" && dir === "short") {
+    if (hi <= p) return "sell-limit-below-price";
+  }
+
+  // Stop order sanity (breakout/BOS semantics):
+  // - Long + Buy Stop should be ABOVE price. If zone entirely BELOW price → invalid.
+  // - Short + Sell Stop should be BELOW price. If zone entirely ABOVE price → invalid.
+  if (oRaw === "buy stop" && dir === "long") {
+    if (hi <= p) return "buy-stop-below-price";
+  }
+  if (oRaw === "sell stop" && dir === "short") {
+    if (lo >= p) return "sell-stop-above-price";
+  }
+
   return null;
 }
+
 
 // ---------- CSM (intraday) ----------
 const G8 = ["USD", "EUR", "JPY", "GBP", "CHF", "CAD", "AUD", "NZD"];
