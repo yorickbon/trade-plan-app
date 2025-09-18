@@ -2316,7 +2316,82 @@ function _finalPolish(text: string): string {
  *  - 1H phrasing: prefer "support test" vs "resistance rejection" based on document cues.
  *  - Also refresh X-ray entries for 15m/5m/1m exactly like before.
  */
+/** HTF classifier + reconciliation (image-first, hard override) */
+async function classifyHTFFromImages(model: string, args: { h4: string; h1: string }) {
+  const sys = [
+    "You are a strict market structure classifier.",
+    "Look ONLY at the images to label:",
+    "- 4H trend: 'up' | 'down' | 'range'",
+    "- 1H context: 'support' | 'resistance' | 'range'",
+    "Return JSON ONLY as: { h4Trend: 'up'|'down'|'range', h1Context: 'support'|'resistance'|'range', notes?: string }",
+  ].join("\n");
+
+  const user = [
+    { type: "text", text: "Classify strictly from charts. JSON only." },
+    { type: "image_url", image_url: { url: args.h4 } },
+    { type: "image_url", image_url: { url: args.h1 } },
+  ];
+
+  const out = await callOpenAI(model, [{ role: "system", content: sys }, { role: "user", content: user }]);
+  try { return JSON.parse((out.match(/```json\s*([\s\S]*?)\s*```/i)?.[1] || out).trim()); }
+  catch { return { h4Trend: "range", h1Context: "range", notes: "parse-failed" }; }
+}
+
+/** Enforce HTF classification onto Technical View + X-ray (hard override) */
+function enforceHTFFromClassifier(text: string, cls: { h4Trend?: string; h1Context?: string }) {
+  if (!text) return text;
+  const up4 = "Uptrend (HH/HL), bullish structure";
+  const dn4 = "Downtrend (LH/LL), bearish structure";
+  const rn4 = "Larger range / consolidation";
+  const h4Desc = cls.h4Trend === "up" ? up4 : cls.h4Trend === "down" ? dn4 : rn4;
+
+  const h1Desc =
+    cls.h1Context === "support" ? "At/near support test (reaction focus)" :
+    cls.h1Context === "resistance" ? "At/near resistance test (reaction focus)" :
+    "Range (mark RH/RL & EQ)";
+
+  // --- Technical View block rewrites
+  let out = text;
+  const techRe = /(Full\s*Breakdown[\s\S]*?Technical\s*View\s*\(HTF\s*\+\s*Intraday\)\s*:\s*)([\s\S]*?)(?=\n\s*•\s*Fundamental\s*View:|\n\s*Fundamental\s*View:|\n\s*•\s*Tech\s*vs\s*Fundy|\n\s*Tech\s*vs\s*Fundy|$)/i;
+  const tMatch = out.match(techRe);
+  if (tMatch) {
+    let block = tMatch[0];
+    // 4H line
+    block = block.replace(/(^\s*-\s*\*\*4H\*\*:\s*)([^\n]*)/mi, `$1${h4Desc}`);
+    block = block.replace(/(^\s*•\s*\*\*4H\*\*:\s*)([^\n]*)/mi, `$1${h4Desc}`);
+    // 1H line
+    block = block.replace(/(^\s*-\s*\*\*1H\*\*:\s*)([^\n]*)/mi, `$1${h1Desc}`);
+    block = block.replace(/(^\s*•\s*\*\*1H\*\*:\s*)([^\n]*)/mi, `$1${h1Desc}`);
+    out = out.replace(tMatch[0], block);
+  }
+
+  // --- X-ray section rewrites
+  const xrRe = /(Detected\s*Structures\s*\(X-ray\)\s*[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
+  const xMatch = out.match(xrRe);
+  if (xMatch) {
+    let block = xMatch[0];
+    block = block.replace(/(^\s*-\s*\*\*4H\*\*:\s*)([^\n]*)/mi, `$1${h4Desc}`);
+    block = block.replace(/(^\s*•\s*\*\*4H\*\*:\s*)([^\n]*)/mi, `$1${h4Desc}`);
+
+    block = block.replace(/(^\s*-\s*\*\*1H\*\*:\s*)([^\n]*)/mi, `$1${h1Desc}`);
+    block = block.replace(/(^\s*•\s*\*\*1H\*\*:\s*)([^\n]*)/mi, `$1${h1Desc}`);
+
+    out = out.replace(xMatch[0], block);
+  }
+
+  // Also sanitize any contradictory phrases in free text
+  out = out
+    .replace(/\b4H:\s*Downtrend[^\n]*/gi, `4H: ${h4Desc}`)
+    .replace(/\b1H:\s*Bearish\s*structure[^\n]*/gi, `1H: ${h1Desc}`);
+
+  return out;
+}
+
+/** Legacy shim: keep name but just pass-through; classifier is now authoritative. */
 function _reconcileHTFTrendFromText(text: string): string {
+  return text;
+}
+
   if (!text) return text;
 
   const doc = text.toLowerCase();
