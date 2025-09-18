@@ -2394,6 +2394,23 @@ function _reconcileHTFTrendFromText(text: string): string {
   const raw = text;
   const doc = raw.toLowerCase();
 
+  // Prefer hard locks from ai_meta.charts if available (image-grounded or upstream)
+  let d4Lock: "up" | "down" | "range" | null = null;
+  let d1Lock: "up" | "down" | "range" | null = null;
+  try {
+    const meta = extractAiMeta(raw) || {};
+    const charts = (meta && (meta as any).charts) || {};
+    const norm = (v: any): "up" | "down" | "range" | null => {
+      const s = String(v || "").toLowerCase().trim();
+      if (s === "up" || s === "bullish" || s === "hh/hl") return "up";
+      if (s === "down" || s === "bearish" || s === "lh/ll") return "down";
+      if (s === "range" || s === "sideways" || s === "consolidation") return "range";
+      return null;
+    };
+    d4Lock = norm(charts.h4_trend ?? charts.h4?.trend);
+    d1Lock = norm(charts.h1_trend ?? charts.h1?.trend);
+  } catch {}
+
   // Pull existing Technical View block to read current lines (optional)
   const techBlock = (raw.match(/Full\s*Breakdown[\s\S]{0,1200}?Fundamental\s*View/i)?.[0] || "")
                  || (raw.match(/Technical\s*View[\s\S]{0,800}/i)?.[0] || "");
@@ -2413,26 +2430,24 @@ function _reconcileHTFTrendFromText(text: string): string {
   const hasHHHL = (s: string) => HHHL_RX.test(s) || HHHL_COUPLET.test(s);
   const hasLHLL = (s: string) => LHLL_RX.test(s) || LHLL_COUPLET.test(s);
 
-  // Hard override: if ANY HH/HL cue appears anywhere (doc, TV line, or X-ray 4H), it MUST be UP.
-  const upAny   = hasHHHL(raw) || hasHHHL(t4Line) || hasHHHL(xr4Line);
-  const downAny = hasLHLL(raw) || hasLHLL(t4Line) || hasLHLL(xr4Line);
-  const rngAny  = RANGE_RX.test(raw) || RANGE_RX.test(xr4Line);
-
+  // If ai_meta provided hard locks from the image, use them. Otherwise, infer from text cues.
   let d4: "up" | "down" | "range";
-
-  if (upAny) {
-    d4 = "up";
-  } else if (downAny) {
-    d4 = "down";
-  } else if (rngAny) {
-    d4 = "range";
+  if (d4Lock) {
+    d4 = d4Lock;
   } else {
-    // Fallback: count soft cues if explicit tokens not found
-    const upSoft   = (doc.match(/\b(higher\s+high|higher\s+low|bullish|uptrend)\b/gi) || []).length;
-    const downSoft = (doc.match(/\b(lower\s+high|lower\s+low|bearish|downtrend)\b/gi) || []).length;
-    if (upSoft > downSoft) d4 = "up";
-    else if (downSoft > upSoft) d4 = "down";
-    else d4 = "range";
+    const upAny   = hasHHHL(raw) || hasHHHL(t4Line) || hasHHHL(xr4Line);
+    const downAny = hasLHLL(raw) || hasLHLL(t4Line) || hasLHLL(xr4Line);
+    const rngAny  = RANGE_RX.test(raw) || RANGE_RX.test(xr4Line);
+    if (upAny) d4 = "up";
+    else if (downAny) d4 = "down";
+    else if (rngAny) d4 = "range";
+    else {
+      const upSoft   = (doc.match(/\b(higher\s+high|higher\s+low|bullish|uptrend)\b/gi) || []).length;
+      const downSoft = (doc.match(/\b(lower\s+high|lower\s+low|bearish|downtrend)\b/gi) || []).length;
+      if (upSoft > downSoft) d4 = "up";
+      else if (downSoft > upSoft) d4 = "down";
+      else d4 = "range";
+    }
   }
 
   const desc4 =
@@ -2440,13 +2455,23 @@ function _reconcileHTFTrendFromText(text: string): string {
     : d4 === "down" ? "Downtrend (LH/LL), bearish structure"
     :                 "Larger range / consolidation";
 
-  // 1H phrasing preference based on whole doc cues
-  const supCount = (doc.match(/\bsupport\b/gi) || []).length;
-  const resCount = (doc.match(/\bresistance\b/gi) || []).length;
-  const desc1ByDoc =
-    supCount >= resCount
+  // 1H phrasing preference:
+  // - If ai_meta lock exists, use it.
+  // - Else prefer support vs resistance wording from whole-doc cues (unchanged).
+  let desc1ByDoc: string;
+  if (d1Lock === "up") {
+    desc1ByDoc = "At support / demand test; watch for continuation vs pullback";
+  } else if (d1Lock === "down") {
+    desc1ByDoc = "At resistance / supply test; watch for rejection vs break";
+  } else if (d1Lock === "range") {
+    desc1ByDoc = "Within intraday range; watch EQ rotations / range extremes";
+  } else {
+    const supCount = (doc.match(/\bsupport\b/gi) || []).length;
+    const resCount = (doc.match(/\bresistance\b/gi) || []).length;
+    desc1ByDoc = supCount >= resCount
       ? "At support / demand test; watch for continuation vs pullback"
       : "At resistance / supply test; watch for rejection vs break";
+  }
 
   // === Patch X-ray section in lockstep ===
   const xraySectRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
@@ -2492,7 +2517,7 @@ function _reconcileHTFTrendFromText(text: string): string {
 
   return text;
 }
-// ---- END _reconcileHTFTrendFromText (v4) ----
+// ---- END _reconcileHTFTrendFromText (v4 — honors ai_meta.charts locks) ----
 
 /** Ensure Option 1 aligns with fundamentals when possible; also prefers confirmation-based option when Option 1 uses Limit but trigger says BOS. */
 function enforceOptionOrderByBias(text: string, fundamentalsSign: number): string {
