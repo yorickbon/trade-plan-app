@@ -2939,19 +2939,22 @@ if (mode === "fast") {
   text = applyConsistencyGuards(text, { fundamentalsSign: fundamentalsSnapshot.final.sign as -1 | 0 | 1 });
 
 // === HTF swing reconciliation + Tournament & Trigger Enforcement ===
-// 1) Clarify BOS wording and reconcile 4H X-ray with swing cues from your uploaded charts
+// 1) Clarify BOS wording and reconcile 4H/1H across Technical View & X-ray (strict)
 text = _clarifyBOSWording(text);
 text = _reconcileHTFTrendFromText(text);
 
-// 2) Ensure ≥5 candidates with ≥3 non-sweep/BOS; fix generic triggers with timeframe-specific wording
+// 2) Ensure ≥5 candidates with ≥3 non-sweep/BOS; fix generic triggers; then dedupe any duplicate sections
 text = await enforceTournamentDiversity(MODEL, instrument, text);
 text = await enforceTriggerSpecificity(MODEL, instrument, text);
+text = dedupeTournamentSections(text);
 
-// 3) Scalp guardrails + news proximity note
+// 3) Enforce ENTRY ZONE (QP + Options) so the table later uses a zone
+text = enforceEntryZoneUsage(text, instrument);
+
+// 4) Scalp guardrails + news proximity note
 text = enforceScalpHardStopLossLines(text, scalpingHard);
 text = enforceScalpRiskLines(text, scalping, scalpingHard);
 text = ensureNewsProximityNote(text, warningMinutes, instrument);
-
 
   // Ensure Full Breakdown has all required subsections and Final Table Summary exists
   text = await enforceFullBreakdownSkeleton(MODEL, instrument, text);
@@ -3037,18 +3040,23 @@ text = ensureNewsProximityNote(text, warningMinutes, instrument);
   };
 
 
+  // ai_meta patch (first pass)
   text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatchFast).filter(([,v]) => v !== undefined)));
 
-  aiMeta = extractAiMeta(text) || aiMeta;
-
-  // Normalize conflicting Order Type for primary plan if needed
-  if (aiMeta && invalidOrderRelativeToPrice(aiMeta)) {
-    text = normalizeOrderTypeLines(text, aiMeta);
+  // Normalize conflicting Order Type for primary plan if needed (uses ai_meta)
+  let aiMetaNow = extractAiMeta(text) || {};
+  if (aiMetaNow && invalidOrderRelativeToPrice(aiMetaNow)) {
+    text = normalizeOrderTypeLines(text, aiMetaNow);
   }
 
- // HARD-GATE: Ensure Option 2 is truly distinct (post-ai_meta)
-text = await hardGateOption2Distinctness(MODEL, instrument, text);
+  // Hard-enforce Option 2 distinctness (post-pass)
+  text = await enforceOption2DistinctHard(MODEL, instrument, text);
 
+  // Re-apply zone enforcement after any rewrites
+  text = enforceEntryZoneUsage(text, instrument);
+
+  // Rebuild ai_meta in case distinctness rewrite changed anything
+  text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatchFast).filter(([,v]) => v !== undefined)));
 
   // Cache & provenance footer
   const cacheKey = setCache({ instrument, m5: m5 || null, m15, h1, h4, calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
@@ -3061,6 +3069,7 @@ text = await hardGateOption2Distinctness(MODEL, instrument, text);
     extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard },
   });
   text = `${text}\n${footer}`;
+
 
 
   res.setHeader("Cache-Control", "no-store");
@@ -3161,20 +3170,23 @@ text = await hardGateOption2Distinctness(MODEL, instrument, text);
   // === Order Option 1/2 to align with Final Fundamental Bias ===
   textFull = enforceOptionOrderByBias(textFull, fundamentalsSnapshotFull.final.sign);
 
-  // === HTF swing reconciliation + Tournament & Trigger Enforcement ===
-// 1) Clarify BOS wording and reconcile 4H X-ray with swing cues from your uploaded charts
+// === HTF swing reconciliation + Tournament & Trigger Enforcement ===
+// 1) Clarify BOS wording and reconcile 4H/1H across Technical View & X-ray (strict)
 textFull = _clarifyBOSWording(textFull);
 textFull = _reconcileHTFTrendFromText(textFull);
 
-// 2) Tournament diversity + trigger specificity
+// 2) Tournament diversity + trigger specificity; then dedupe any duplicate sections
 textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
 textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
+textFull = dedupeTournamentSections(textFull);
 
-// 3) Scalp guardrails + news proximity
+// 3) Enforce ENTRY ZONE (QP + Options)
+textFull = enforceEntryZoneUsage(textFull, instrument);
+
+// 4) Scalp guardrails + news proximity
 textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
 textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
 textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
-
 
   // Ensure Full Breakdown skeleton + Final Table Summary
   textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
