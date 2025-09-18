@@ -2738,9 +2738,10 @@ if (mode === "fast") {
     fundamentalsSign: fundamentalsSnapshot.final.sign as -1 | 0 | 1
   });
 
-  // === Order Option 1/2 to align with Final Fundamental Bias ===
+    // === Order Option 1/2 to align with Final Fundamental Bias + Alignment wording ===
   text = enforceOptionOrderByBias(text, fundamentalsSnapshot.final.sign);
-
+  // Deterministic alignment wording pass (Match/Mismatch per final fundamentals sign)
+  text = applyConsistencyGuards(text, { fundamentalsSign: fundamentalsSnapshot.final.sign as -1 | 0 | 1 });
 
 // === HTF swing reconciliation + Tournament & Trigger Enforcement ===
 // 1) Clarify BOS wording and reconcile 4H X-ray with swing cues from your uploaded charts
