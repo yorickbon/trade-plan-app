@@ -2167,6 +2167,30 @@ function _clarifyBOSWording(text: string): string {
     .replace(/BOS\s*needed\s*for\s*confirmation/gi, "BOS needed for confirmation (break/close of recent swing)");
 }
 
+/** FINAL POLISH: vocabulary guard & cleanup (post-generation, pre-ai_meta).
+ *  - Never allow 'mixed' on calendar lines; convert to 'neutral'.
+ *  - Keep scope tight: only touch lines that explicitly start with 'Calendar:' or 'Calendar bias for ...'.
+ */
+function _finalPolish(text: string): string {
+  if (!text) return text;
+  let out = text;
+
+  // Calendar: ... mixed  ->  Calendar: ... neutral
+  out = out.replace(/(^|\n)(\s*•\s*)?Calendar\s*:\s*([^\n]*?)\bmixed\b([^\n]*)/gi, (_m, pfx, bullet, before, after) => {
+    const replaced = (before + after).replace(/\bmixed\b/gi, "neutral");
+    return `${pfx || "\n"}${bullet || ""}Calendar: ${replaced}`;
+  });
+
+  // Calendar bias for <INSTRUMENT>: ... mixed -> ... neutral
+  out = out.replace(/(^|\n)(\s*•\s*)?Calendar\s*bias\s*for\s+[A-Z0-9:_\-]+?\s*:\s*([^\n]*?)\bmixed\b([^\n]*)/gi, (_m, pfx, bullet, before, after) => {
+    const replaced = (before + after).replace(/\bmixed\b/gi, "neutral");
+    return `${pfx || "\n"}${bullet || ""}Calendar bias for ${replaced}`;
+  });
+
+  return out;
+}
+
+
 /** NEW: Reconcile 4H trend in X-ray with swing cues read from your uploaded charts (Technical View text). */
 function _reconcileHTFTrendFromText(text: string): string {
   if (!text) return text;
