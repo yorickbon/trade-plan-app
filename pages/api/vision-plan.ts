@@ -2429,7 +2429,6 @@ function enforceOptionOrderByBias(text: string, fundamentalsSign: number): strin
 
   return out;
 }
-
 /** Ensure Option 2 is a distinct strategy. */
 async function enforceDistinctAlternative(model: string, instrument: string, text: string) {
   const m1 = text.match(/(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
@@ -2470,6 +2469,53 @@ async function enforceDistinctAlternative(model: string, instrument: string, tex
   if (!out || out.length < 30) return text;
   return text.replace(m2[0], out.trim());
 }
+
+/** HARD-GATE: Ensure Option 2 is DISTINCT post-generation (after ai_meta). */
+async function hardGateOption2Distinctness(model: string, instrument: string, text: string) {
+  const MAX_TRIES = 3;
+
+  function norm(s: string) { return String(s || "").toLowerCase().replace(/\s+/g, " ").trim(); }
+  const buckets: Record<string, RegExp> = {
+    sweep: /(sweep|liquidity|raid|stop\s*hunt|bos\b|choch\b)/i,
+    ob_fvg: /(order\s*block|\bob\b|fvg|fair\s*value|breaker)/i,
+    tl_break: /(trendline|channel|wedge|triangle)/i,
+    range: /(range\s*rotation|range\b|mean\s*reversion|eq\s*of\s*range)/i,
+    vwap: /\bvwap\b/i,
+    momentum: /(ignition|breakout|squeeze|bollinger|macd|divergence)/i,
+  };
+  const bucketOf = (s: string) => {
+    for (const [k, re] of Object.entries(buckets)) if (re.test(s)) return k;
+    return "other";
+  };
+
+  function isDistinct(doc: string): { ok: boolean; b1: string; b2: string; t1: string; t2: string } {
+    const { o1, o2 } = _pickBlocks(doc);
+    const t1 = norm(o1?.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "");
+    const t2 = norm(o2?.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "");
+    const b1 = bucketOf(t1), b2 = bucketOf(t2);
+    const ok = !!t1 && !!t2 && (b1 !== b2 || t1 !== t2);
+    return { ok, b1, b2, t1, t2 };
+  }
+
+  let out = text;
+  for (let i = 0; i < MAX_TRIES; i++) {
+    const check = isDistinct(out);
+    if (check.ok) {
+      out = ensureAiMetaBlock(out, {
+        compliance: { ...(extractAiMeta(out)?.compliance || {}), option2Distinct: true }
+      });
+      return out;
+    }
+    out = await enforceDistinctAlternative(model, instrument, out);
+  }
+
+  const final = isDistinct(out);
+  out = ensureAiMetaBlock(out, {
+    compliance: { ...(extractAiMeta(out)?.compliance || {}), option2Distinct: !!final.ok }
+  });
+  return out;
+}
+
 
 // ---------- Live price ----------
 
@@ -2972,8 +3018,9 @@ text = ensureNewsProximityNote(text, warningMinutes, instrument);
     text = normalizeOrderTypeLines(text, aiMeta);
   }
 
-  // Ensure Option 2 is a truly distinct strategy
-  text = await enforceDistinctAlternative(MODEL, instrument, text);
+ // HARD-GATE: Ensure Option 2 is truly distinct (post-ai_meta)
+text = await hardGateOption2Distinctness(MODEL, instrument, text);
+
 
   // Cache & provenance footer
   const cacheKey = setCache({ instrument, m5: m5 || null, m15, h1, h4, calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
@@ -3183,9 +3230,8 @@ textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
       textFull = normalizeOrderTypeLines(textFull, aiMetaFull);
     }
 
-    // Ensure Option 2 is a truly distinct strategy
-    textFull = await enforceDistinctAlternative(MODEL, instrument, textFull);
-
+    // HARD-GATE: Ensure Option 2 is truly distinct (post-ai_meta)
+textFull = await hardGateOption2Distinctness(MODEL, instrument, textFull);
 
     // Provenance footer
     const footer = buildServerProvenanceFooter({
