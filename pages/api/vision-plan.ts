@@ -2069,24 +2069,16 @@ function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
   // ```
   const fenced = `\nai_meta\n\`\`\`json\n${json}\n\`\`\`\n`;
 
-  // Replace existing fenced ai_meta if present
-  const reFenced = /\nai_meta\s*```json[\s\S]*?```\s*/i;
-  if (reFenced.test(text)) {
-    return text.replace(reFenced, fenced);
-  }
+  // Hard-deduplicate: remove ANY existing ai_meta blocks (fenced or legacy) before appending one clean block.
+  let out = text.replace(/\nai_meta\s*```json[\s\S]*?```\s*/gi, "");
+  out = out.replace(/\nai_meta\s*{[\s\S]*?}\s*/gi, "");
 
-  // Replace legacy unfenced ai_meta { ... } if present
-  const reLegacy = /\nai_meta\s*{[\s\S]*?}\s*/i;
-  if (reLegacy.test(text)) {
-    return text.replace(reLegacy, fenced);
-  }
-
-  // Otherwise, append at the end
   // Ensure there is a trailing newline separation to avoid gluing to previous content
-  const needsNL = !/\n$/.test(text);
-  return `${needsNL ? text + "\n" : text}${fenced}`;
-}
+  const needsNL = !/\n$/.test(out);
+  if (needsNL) out += "\n";
 
+  return `${out}${fenced}`;
+}
 
 /** Normalize Order Type (existing behavior kept) if ai_meta has price & zone. */
 function normalizeOrderTypeLines(text: string, aiMeta: any) {
