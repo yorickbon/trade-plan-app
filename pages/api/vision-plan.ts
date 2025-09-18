@@ -2706,11 +2706,9 @@ if (mode === "fast") {
 
   // Consistency pass on alignment wording (run AFTER fundamentals snapshot so neutral forces Match)
   textFull = applyConsistencyGuards(textFull, {
-    instrument,
-    headlinesSign: computeHeadlinesSign(hBias),
-    csmSign: computeCSMInstrumentSign(csm, instrument).sign,
-    calendarSign: parseInstrumentBiasFromNote(biasNote)
+    fundamentalsSign: fundamentalsSnapshotFull.final.sign as -1 | 0 | 1
   });
+
 
   // === Order Option 1/2 to align with Final Fundamental Bias ===
   textFull = enforceOptionOrderByBias(textFull, fundamentalsSnapshotFull.final.sign);
