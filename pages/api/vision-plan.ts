@@ -2978,13 +2978,16 @@ textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
     parseInstrumentBiasFromNote(biasNote) === 0 ||
     (warningMinutes != null);
 
-    const aiPatchFull = {
+     const aiPatchFull = {
     version: "vp-AtoL-1",
+    instrument,
     mode,
     vwap_used: /vwap/i.test(textFull),
     time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
     max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
     currentPrice: livePrice ?? undefined,
+    scalping: !!scalping,
+    scalping_hard: !!scalpingHard,
     fundamentals: {
       calendar: { sign: fundamentalsSnapshotFull.components.calendar.sign, line: calendarText || null },
       headlines: { label: fundamentalsSnapshotFull.components.headlines.label, avg: hBias.avg ?? null },
@@ -2998,8 +3001,34 @@ textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
       reliability: lowFundReliabilityFull ? "low" : "normal"
     },
     proximity: { highImpactMins: warningMinutes ?? null },
+    compliance: {
+      option2Distinct: (() => {
+        try {
+          const { o1, o2 } = _pickBlocks(textFull);
+          const t1 = (o1.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase();
+          const t2 = (o2.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase();
+          if (!t1 || !t2) return false;
+          const buckets: Record<string, RegExp> = {
+            sweep: /(sweep|liquidity|raid|stop\s*hunt|bos\b|choch\b)/i,
+            ob_fvg: /(order\s*block|\bob\b|fvg|fair\s*value|breaker)/i,
+            tl_break: /(trendline|channel|wedge|triangle)/i,
+            range: /(range\s*rotation|range\b|mean\s*reversion|eq\s*of\s*range)/i,
+            vwap: /\bvwap\b/i,
+            momentum: /(ignition|breakout|squeeze|bollinger|macd|divergence)/i,
+          };
+          const bucketOf = (s: string) => {
+            for (const [k, re] of Object.entries(buckets)) if (re.test(s)) return k;
+            return "other";
+          };
+          return bucketOf(t1) !== bucketOf(t2) || t1.replace(/\s+/g,"") !== t2.replace(/\s+/g,"");
+        } catch { return false; }
+      })(),
+      tournamentMin: 5,
+      nonSweepMin: 3
+    },
     vp_version: VP_VERSION
   };
+
 
   textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
 
