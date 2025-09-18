@@ -2033,6 +2033,7 @@ function computeAndInjectConviction(
 function fillFinalTableSummaryRow(text: string, instrument: string) {
   if (!text) return text;
 
+  const ai = extractAiMeta(text) || {};
   const stripMd = (s: string) =>
     String(s || "")
       .replace(/[*_`~]/g, "")
@@ -2044,16 +2045,42 @@ function fillFinalTableSummaryRow(text: string, instrument: string) {
     return m ? stripMd(m[1]) : null;
   }
 
+  // Bias & Conviction from Quick Plan
   const bias = grab(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(?:\*\*)?\s*(Long|Short|Stay\s*Flat)/i) || "...";
-  const entry = grab(/Quick\s*Plan[\s\S]*?Entry\s*\(zone\s*or\s*single\)\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
-             || grab(/Quick\s*Plan[\s\S]*?Entry\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
-             || "...";
-  const sl    = grab(/Quick\s*Plan[\s\S]*?Stop\s*Loss\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "...";
-  const tps   = grab(/Quick\s*Plan[\s\S]*?Take\s*Profit\(s\)\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
-             || grab(/Quick\s*Plan[\s\S]*?TPs?\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
-             || "";
-  const conv  = grab(/Quick\s*Plan[\s\S]*?Conviction\s*:\s*(?:\*\*)?\s*(\d{1,3})\s*%/i) || "...";
+  const sl   = grab(/Quick\s*Plan[\s\S]*?Stop\s*Loss\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "...";
+  const tps  = grab(/Quick\s*Plan[\s\S]*?Take\s*Profit\(s\)\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
+            || grab(/Quick\s*Plan[\s\S]*?TPs?\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
+            || "";
+  const conv = grab(/Quick\s*Plan[\s\S]*?Conviction\s*:\s*(?:\*\*)?\s*(\d{1,3})\s*%/i) || "...";
 
+  // Entry zone: prefer ai_meta.zone {min,max}; else derive from QP line
+  function fmtZone(min: number, max: number): string {
+    const lo = Math.min(min, max);
+    const hi = Math.max(min, max);
+    const dec = Math.max(
+      (String(lo).split(".")[1] || "").length,
+      (String(hi).split(".")[1] || "").length,
+      2
+    );
+    return `${lo.toFixed(dec)} – ${hi.toFixed(dec)}`;
+  }
+  let entryZone = "...";
+  if (ai?.zone && Number.isFinite(+ai.zone.min) && Number.isFinite(+ai.zone.max)) {
+    entryZone = fmtZone(Number(ai.zone.min), Number(ai.zone.max));
+  } else {
+    const raw = grab(/Quick\s*Plan[\s\S]*?Entry\s*(?:\(zone\s*or\s*single\))?\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "";
+    const nums = (raw.match(/[0-9]+(?:\.[0-9]+)?/g) || []).map(Number).filter(Number.isFinite);
+    if (nums.length >= 2) entryZone = fmtZone(nums[0], nums[1]);
+    else if (nums.length === 1) {
+      const entry = nums[0];
+      const decs = (String(entry).split(".")[1] || "").length;
+      const pip = Math.pow(10, -(decs || 4));
+      const w = 10 * pip;
+      entryZone = fmtZone(entry - w, entry + w);
+    }
+  }
+
+  // TP parsing (unchanged)
   let tp1 = "...", tp2 = "...";
   if (tps) {
     const mm1 = tps.match(/TP1[:\s]*([0-9.]+)/i);
@@ -2068,8 +2095,8 @@ function fillFinalTableSummaryRow(text: string, instrument: string) {
   }
 
   const headerRe = /Final\s*Table\s*Summary:\s*\n\|\s*Instrument\s*\|\s*Bias\s*\|\s*Entry Zone\s*\|\s*SL\s*\|\s*TP1\s*\|\s*TP2\s*\|\s*Conviction %\s*\|\n/i;
-  const rowRe = new RegExp(`^\\|\\s*${instrument.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\|[^\\n]*$`, "im");
-  const newRow = `| ${instrument} | ${bias} | ${entry} | ${sl} | ${tp1} | ${tp2} | ${conv} |`;
+  const rowRe = new RegExp(`^\\|\\s*${instrument.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\s*\\|[^\\n]*$`, "im");
+  const newRow = `| ${instrument} | ${bias} | ${entryZone} | ${sl} | ${tp1} | ${tp2} | ${conv} |`;
 
   if (!headerRe.test(text)) {
     const block =
@@ -2082,6 +2109,7 @@ ${newRow}\n`;
   if (rowRe.test(text)) return text.replace(rowRe, newRow);
   return text.replace(headerRe, (m) => m + newRow + "\n");
 }
+
 
 function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
   // Merge existing ai_meta (if any) with the provided patch
