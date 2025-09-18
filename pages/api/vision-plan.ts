@@ -1826,6 +1826,32 @@ async function enforceTournamentDiversity(model: string, instrument: string, tex
   return `${text}\n\n${replacement}`;
 }
 
+/** Remove duplicate "Candidate Scores (tournament)" sections; keep the strongest (most bullets). */
+function dedupeTournamentSections(text: string): string {
+  if (!text) return text;
+  const re = /Candidate\s*Scores\s*\(tournament\):[\s\S]*?(?=\n\s*Final\s*Table\s*Summary:|\n\s*Detected\s*Structures|\n\s*Full\s*Breakdown|$)/gi;
+  const matches = [...text.matchAll(re)];
+  if (matches.length <= 1) return text;
+
+  // keep the block with most bullet lines
+  let best = matches[0];
+  let bestScore = (matches[0][0].match(/^- .+/gmi) || []).length;
+  for (const m of matches.slice(1)) {
+    const s = (m[0].match(/^- .+/gmi) || []).length;
+    if (s > bestScore) { best = m; bestScore = s; }
+  }
+
+  // remove all and insert best before Final Table
+  let out = text.replace(re, "");
+  if (/Final\s*Table\s*Summary:/i.test(out)) {
+    out = out.replace(/(\n\s*Final\s*Table\s*Summary:)/i, `\n${best[0].trim()}\n$1`);
+  } else if (/Full\s*Breakdown/i.test(out)) {
+    out = out.replace(/(\n\s*Full\s*Breakdown)/i, `\n${best[0].trim()}\n$1`);
+  } else {
+    out = `${out}\n${best[0].trim()}\n`;
+  }
+  return out;
+}
 
 /** Trigger specificity (unchanged behavior). */
 async function enforceTriggerSpecificity(model: string, instrument: string, text: string) {
@@ -2159,6 +2185,72 @@ function _normalizeOrderTypeByTrigger(text: string): string {
   if (o2) out = fixInBlock(out, o2);
   return out;
 }
+
+/** Enforce "Entry (zone or single)" to be a zone (min–max).
+ *  - Prefer ai_meta.zone {min,max} if present.
+ *  - Fallback: derive symmetric ±10 pips (or ±10 * 10^-d) around single price.
+ */
+function enforceEntryZoneUsage(text: string, instrument: string): string {
+  if (!text) return text;
+  const ai = extractAiMeta(text) || {};
+  const z = ai?.zone;
+
+  function fmtZone(min: number, max: number): string {
+    const lo = Math.min(min, max);
+    const hi = Math.max(min, max);
+    const dec = Math.max(
+      (String(lo).split(".")[1] || "").length,
+      (String(hi).split(".")[1] || "").length,
+      2
+    );
+    return `${lo.toFixed(dec)} – ${hi.toFixed(dec)}`;
+  }
+
+  function deriveZoneFromLine(line: string): string | null {
+    const nums = (line.match(/[0-9]+(?:\.[0-9]+)?/g) || []).map(Number).filter(Number.isFinite);
+    if (nums.length >= 2) return fmtZone(nums[0], nums[1]);
+    if (nums.length === 1) {
+      const entry = nums[0];
+      const decs = (String(entry).split(".")[1] || "").length;
+      const pip = Math.pow(10, -(decs || 4));
+      const w = 10 * pip;
+      return fmtZone(entry - w, entry + w);
+    }
+    return null;
+  }
+
+  function rewriteBlock(src: string, reBlock: RegExp) {
+    const m = src.match(reBlock);
+    if (!m) return src;
+    let block = m[0];
+
+    const reEntry = /(^\s*•\s*Entry\s*\(zone\s*or\s*single\)\s*:\s*)([^\n]+)$/mi;
+    const reEntryAlt = /(^\s*•\s*Entry\s*:\s*)([^\n]+)$/mi;
+
+    const zoneText = (() => {
+      if (z && Number.isFinite(+z.min) && Number.isFinite(+z.max)) {
+        return fmtZone(Number(z.min), Number(z.max));
+      }
+      const raw = (block.match(reEntry)?.[2] || block.match(reEntryAlt)?.[2] || "").trim();
+      return deriveZoneFromLine(raw);
+    })();
+
+    if (!zoneText) return src;
+
+    if (reEntry.test(block)) block = block.replace(reEntry, (_f, p1) => `${p1}${zoneText}`);
+    else if (reEntryAlt.test(block)) block = block.replace(reEntryAlt, (_f, p1) => `${p1}${zoneText}`);
+    else block = `${block}\n• Entry (zone or single): ${zoneText}`;
+
+    return src.replace(m[0], block);
+  }
+
+  let out = text;
+  out = rewriteBlock(out, /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
+  out = rewriteBlock(out, /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
+  out = rewriteBlock(out, /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i);
+  return out;
+}
+
 
 /** NEW: Clarify BOS wording (no numbers needed). */
 function _clarifyBOSWording(text: string): string {
