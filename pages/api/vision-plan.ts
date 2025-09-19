@@ -2404,8 +2404,7 @@ function _finalPolish(text: string): string {
 
   return out;
 }
-/** Context Engine v5: image-first reconciliation for 4H/1H/15m/5m/1m + synced X-ray. */
-
+/** Context Engine v5: image-first reconciliation for 4H/1H/15m/5m/1m + synced X-ray.
  *  - Does NOT rely on HH/HL labels in the image.
  *  - Prefers the model's X-ray outputs (produced from the uploaded images) to decide trend.
  *  - Falls back to plan direction if the X-ray/TV lines are ambiguous.
@@ -2414,6 +2413,7 @@ function _finalPolish(text: string): string {
  *  - No extra model calls → no added latency.
  */
 function _reconcileHTFTrendFromText(text: string): string {
+
   if (!text) return text;
 
   const raw = text;
