@@ -456,31 +456,63 @@ async function fetchSeries15(pair: string): Promise<Series | null> {
 function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnapshot | null {
   const weights = { r60: 0.6, r240: 0.4 };
   const curScore: Record<string, number> = Object.fromEntries(G8.map((c) => [c, 0]));
+
   for (const pair of USD_PAIRS) {
     const S = seriesMap[pair];
     if (!S || !Array.isArray(S.c) || S.c.length < 17) continue;
+
+    // 60m ≈ 4 bars of 15m, 240m ≈ 16 bars
     const r60 = kbarReturn(S.c, 4) ?? 0;
     const r240 = kbarReturn(S.c, 16) ?? 0;
     const r = r60 * weights.r60 + r240 * weights.r240;
+
     const base = pair.slice(0, 3);
     const quote = pair.slice(3);
     curScore[base] += r;
     curScore[quote] -= r;
   }
+
   const vals = G8.map((c) => curScore[c]);
+  if (!vals.every((v) => Number.isFinite(v))) return null;
+
   const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
   const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length) || 1;
+
   const z: Record<string, number> = {};
   for (const c of G8) z[c] = (curScore[c] - mean) / sd;
+
   const ranks = [...G8].sort((a, b) => z[b] - z[a]);
-  return { tsISO: new Date().toISOString(), ranks, scores: z, ttl: Date.now() + 15 * 60 * 1000 };
+
+  return {
+    tsISO: new Date().toISOString(),
+    ranks,
+    scores: z,
+    ttl: Date.now() + 15 * 60 * 1000,
+  };
 }
+
 async function getCSM(): Promise<CsmSnapshot> {
-  if (CSM_CACHE && Date.now() < CSM_CACHE.ttl) return CSM_CACHE;
-  const seriesMap: Record<string, Series | null> = {};
-  await Promise.all(USD_PAIRS.map(async (p) => { seriesMap[p] = await fetchSeries15(p); }));
+  // Use cache only if snapshot is still fresh
+  if (CSM_CACHE && Date.now() < CSM_CACHE.ttl) {
+    return CSM_CACHE;
+  }
+
+  // Fetch all pairs in parallel for speed
+  const entries = await Promise.all(
+    USD_PAIRS.map(async (p) => [p, await fetchSeries15(p)] as [string, Series | null])
+  );
+  const seriesMap: Record<string, Series | null> = Object.fromEntries(entries);
+
   const snap = computeCSMFromPairs(seriesMap);
-  if (!snap) { if (CSM_CACHE) return CSM_CACHE; throw new Error("CSM unavailable (fetch failed and no cache)."); }
+
+  if (!snap) {
+    // Fallback to last cached snapshot if available
+    if (CSM_CACHE && Date.now() < CSM_CACHE.ttl) {
+      return CSM_CACHE;
+    }
+    throw new Error("CSM unavailable (fetch failed and no valid cache).");
+  }
+
   CSM_CACHE = snap;
   return snap;
 }
