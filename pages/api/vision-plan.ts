@@ -370,7 +370,7 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
 }
 
 
-// ---------- CSM (intraday) ----------
+// ---------- CSM (intraday, patched for speed + correctness) ----------
 const G8 = ["USD", "EUR", "JPY", "GBP", "CHF", "CAD", "AUD", "NZD"];
 const USD_PAIRS = ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDJPY", "USDCHF", "USDCAD"];
 type Series = { t: number[]; c: number[] };
@@ -382,6 +382,8 @@ function kbarReturn(closes: number[], k: number): number | null {
   if (!(a > 0) || !(b > 0)) return null;
   return Math.log(a / b);
 }
+
+// ------------------ Providers ------------------
 async function tdSeries15(pair: string): Promise<Series | null> {
   if (!TD_KEY) return null;
   try {
@@ -398,6 +400,7 @@ async function tdSeries15(pair: string): Promise<Series | null> {
     return { t, c };
   } catch { return null; }
 }
+
 async function fhSeries15(pair: string): Promise<Series | null> {
   if (!FH_KEY) return null;
   try {
@@ -415,6 +418,7 @@ async function fhSeries15(pair: string): Promise<Series | null> {
     return { t, c };
   } catch { return null; }
 }
+
 async function polySeries15(pair: string): Promise<Series | null> {
   if (!POLY_KEY) return null;
   try {
@@ -433,12 +437,22 @@ async function polySeries15(pair: string): Promise<Series | null> {
     return { t, c };
   } catch { return null; }
 }
+
+// ------------------ Parallel Fetch ------------------
 async function fetchSeries15(pair: string): Promise<Series | null> {
-  const td = await tdSeries15(pair); if (td) return td;
-  const fh = await fhSeries15(pair); if (fh) return fh;
-  const pg = await polySeries15(pair); if (pg) return pg;
-  return null;
+  const [td, fh, pg] = await Promise.allSettled([
+    tdSeries15(pair),
+    fhSeries15(pair),
+    polySeries15(pair)
+  ]);
+
+  const results = [td, fh, pg]
+    .map(r => (r.status === "fulfilled" ? r.value : null))
+    .filter(Boolean) as Series[];
+
+  return results.length > 0 ? results[0] : null;
 }
+
 function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnapshot | null {
   const weights = { r60: 0.6, r240: 0.4 };
   const curScore: Record<string, number> = Object.fromEntries(G8.map((c) => [c, 0]));
