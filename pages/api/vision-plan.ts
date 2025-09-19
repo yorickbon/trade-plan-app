@@ -3267,8 +3267,10 @@ text = ensureNewsProximityNote(text, warningMinutes, instrument);
   };
 
 
-  // ai_meta patch (first pass)
+   // final polish then ai_meta patch (first pass)
+  text = _finalPolish(text);
   text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatchFast).filter(([,v]) => v !== undefined)));
+
 
   // Normalize conflicting Order Type for primary plan if needed (uses ai_meta)
   let aiMetaNow = extractAiMeta(text) || {};
