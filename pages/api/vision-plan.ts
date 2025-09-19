@@ -975,26 +975,47 @@ function computeCompositeBias(args: {
   instrument: string;
   calendarBiasNote: string | null;
   headlinesBias: HeadlineBias;
-  csm: CsmSnapshot;
+  csm: CsmSnapshot | null;
   warningMinutes: number | null;
 }) {
   const calSign = parseInstrumentBiasFromNote(args.calendarBiasNote);
   const hSign = computeHeadlinesSign(args.headlinesBias);
-  const { sign: csmSign, zdiff } = computeCSMInstrumentSign(args.csm, args.instrument);
 
+  // Guard against null or expired CSM
+  const { sign: csmSign, zdiff } =
+    args.csm && Date.now() < args.csm.ttl
+      ? computeCSMInstrumentSign(args.csm, args.instrument)
+      : { sign: 0, zdiff: null };
+
+  // Build composite parts
   const parts = [calSign !== 0 ? (calSign > 0 ? 1 : -1) : 0, hSign, csmSign];
-  const pos = parts.some(s => s > 0);
-  const neg = parts.some(s => s < 0);
-  const align = (pos && !neg) || (neg && !pos);
-  const conflict = pos && neg;
+  const pos = parts.filter((s) => s > 0).length;
+  const neg = parts.filter((s) => s < 0).length;
 
-  // Retained only for provenance/debug (no conviction caps applied anymore)
+  const align = (pos > 0 && neg === 0) || (neg > 0 && pos === 0);
+  const conflict = pos > 0 && neg > 0;
+
+  // Enforced sign if clear alignment
+  let enforcedSign = 0;
+  if (align) enforcedSign = pos > 0 ? 1 : -1;
+
+  // Conviction cap for conflict / proximity to events
   let cap = 70;
   if (conflict) cap = 35;
   if (args.warningMinutes != null) cap = Math.min(cap, 35);
 
-  return { calendarSign: calSign, headlinesSign: hSign, csmSign, csmZDiff: zdiff, align, conflict, cap };
+  return {
+    calendarSign: calSign,
+    headlinesSign: hSign,
+    csmSign,
+    csmZDiff: zdiff,
+    align,
+    conflict,
+    enforcedSign,
+    cap,
+  };
 }
+
 
 /** Derive COT instrument sign from headline cues (independent component).
  * Uses cotCue.net per-currency signals: +1 net long, -1 net short. Maps to pair via baseMinusQuote. */
