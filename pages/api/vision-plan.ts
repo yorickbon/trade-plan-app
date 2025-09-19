@@ -1997,7 +1997,7 @@ function enforceFinalTableSummary(text: string, instrument: string) {
   return `${text}\n${stub}`;
 }
 
-/** Conviction calculation & injection (independent per-plan + hard-gated Option2 distinct). */
+/** Conviction calculation & injection (independent per-plan + hard-gated Option2 distinct + scaffold enforcement). */
 function computeAndInjectConviction(
   text: string,
   args: { fundamentals: { final: { score: number; sign: number } }, proximityFlag?: boolean }
@@ -2036,9 +2036,20 @@ function computeAndInjectConviction(
   function hasText(s: string, re: RegExp) { return re.test((s || "").toLowerCase()); }
   function pickBlock(src: string, re: RegExp): string { const m = src.match(re); return m ? m[0] : ""; }
 
-  const qpBlock = pickBlock(text, RE_QP_BLOCK);
-  const o1Block = pickBlock(text, RE_O1_BLOCK);
-  const o2Block = pickBlock(text, RE_O2_BLOCK);
+  let qpBlock = pickBlock(text, RE_QP_BLOCK);
+  let o1Block = pickBlock(text, RE_O1_BLOCK);
+  let o2Block = pickBlock(text, RE_O2_BLOCK);
+
+  // ---- Scaffold enforcement (ensure all three exist) ----
+  function ensureScaffold(block: string, label: string): string {
+    if (!block || block.trim() === "") {
+      return `${label}\n• Direction: ...\n• Order Type: ...\n• Trigger: ...\n• Entry (zone or single): ...\n• Stop Loss: ...\n• Take Profit(s): ...\n• Conviction: ...\n`;
+    }
+    return block;
+  }
+  qpBlock = ensureScaffold(qpBlock, "Quick Plan (Actionable)");
+  o1Block = ensureScaffold(o1Block, "Option 1 (Primary)");
+  o2Block = ensureScaffold(o2Block, "Option 2 (Alternative)");
 
   let dQP = dirSign(qpBlock);
   const dO1 = dirSign(o1Block);
@@ -2151,7 +2162,7 @@ function enforceOption2DistinctHardSync(instrument: string, text: string): strin
   return text;
 }
 
-/** Final table row filler (unchanged). */
+/** Final table row filler (with entry zone enforcement). */
 function fillFinalTableSummaryRow(text: string, instrument: string) {
   if (!text) return text;
 
