@@ -2880,7 +2880,7 @@ if (scalpingHard && (!m5 || !m1)) {
     }
     const hBias = computeHeadlinesBias(headlineItems);
 
-    // Calendar (OCR-first STRICT pre-release handling, fallback to API)
+     // Calendar (OCR-first STRICT pre-release handling, fallback to API) — v2 full-table scan + past-72h filter
     let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
     let calendarProvider: string | null = null;
     let calendarText: string | null = null;
@@ -2893,25 +2893,65 @@ if (scalpingHard && (!m5 || !m1)) {
 
     let calDataUrlForPrompt: string | null = calUrlOrig;
 
+    // Helper: normalize OCR rows → relevant to instrument, “past” rows, last 72h window
+    function _normalizeCalendarItemsFor72h(items: any[], instr: string) {
+      const rel = new Set(relevantCurrenciesFromInstrument(instr)); // e.g., EUR & USD for EURUSD
+      const now = Date.now();
+      const CUT = now - 72 * 3600 * 1000;
+
+      function tsOf(r: any): number {
+        if (Number.isFinite(+r?.timestamp)) return +r.timestamp;
+        const d = String(r?.date || r?.day || r?.datetime || "").trim();
+        const t = String(r?.time || r?.localTime || "").trim();
+        const s = d && t ? `${d} ${t}` : (d || t);
+        const v = s ? Date.parse(s) : NaN;
+        return Number.isFinite(v) ? v : NaN;
+      }
+
+      const rows = (Array.isArray(items) ? items : [])
+        .filter(r => rel.has(String(r?.currency || "").toUpperCase()) && hasUsableFields(r))
+        .map(r => ({ ...r, _ts: tsOf(r), _hasActual: r?.actual != null && String(r.actual).trim() !== "" }));
+
+      // “Past” rows = have ACTUAL or timestamp <= now
+      const past = rows.filter(r => r._hasActual || (Number.isFinite(r._ts) && r._ts <= now));
+
+      // Restrict to last 72h if timestamps exist, else keep latest 40 rows to be safe
+      const past72 = past.filter(r => Number.isFinite(r._ts) ? r._ts >= CUT : true);
+      const selected = (past72.length ? past72 : past).sort((a, b) => {
+        const aa = Number.isFinite(a._ts) ? a._ts : 0;
+        const bb = Number.isFinite(b._ts) ? b._ts : 0;
+        return aa - bb;
+      });
+
+      // Trim to keep prompts lean (speed); we still cover a full 72h narrative
+      const trimmed = selected.slice(-40);
+      return trimmed.map(({ _ts, _hasActual, ...rest }) => rest);
+    }
+
     if (calUrlOrig) {
       const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch(() => null);
       if (ocr && Array.isArray(ocr.items)) {
+        const normalizedItems = _normalizeCalendarItemsFor72h(ocr.items, instrument);
         const relCurs = new Set(relevantCurrenciesFromInstrument(instrument));
-        const usableForInstr = (ocr.items || []).some((r) => relCurs.has(String(r?.currency || "")) && hasUsableFields(r));
+        const usableForInstr = normalizedItems.some((r) => relCurs.has(String(r?.currency || "")) && hasUsableFields(r));
+
         calendarStatus = "image-ocr";
         calendarProvider = "image-ocr";
+
         if (usableForInstr) {
-          const analyzed = analyzeCalendarOCR(ocr, instrument);
-          calendarText = analyzed.biasLine;                    // pre-release line or bias line
-          calendarEvidence = analyzed.evidenceLines;           // only post-result rows (≤72h)
+          // Re-run analysis on the filtered/ordered rows only (no top-rows bias)
+          const ocr72 = { ...ocr, items: normalizedItems };
+          const analyzed = analyzeCalendarOCR(ocr72, instrument);
+
+          calendarText = analyzed.biasLine;                         // bias line or pre-release line
+          calendarEvidence = (analyzed.evidenceLines || []).slice(-20); // cap evidence lines for speed
           warningMinutes = analyzed.warningMinutes;
-          biasNote = analyzed.preReleaseOnly ? null : analyzed.biasNote; // no biasNote if pre-release
+          biasNote = analyzed.preReleaseOnly ? null : analyzed.biasNote;
           preReleaseOnly = analyzed.preReleaseOnly;
           debugRows = analyzed.rowsForDebug || null;
-          calDataUrlForPrompt = calUrlOrig; // keep image in prompt
-          if (preReleaseOnly) {
-            advisoryText = calendarText; // surface pre-release line in prompt too
-          }
+
+          calDataUrlForPrompt = calUrlOrig; // keep image reference in prompt
+          if (preReleaseOnly) advisoryText = calendarText;
         } else {
           calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
           calDataUrlForPrompt = null;
@@ -2937,8 +2977,8 @@ if (scalpingHard && (!m5 || !m1)) {
       biasNote = calAdv.biasNote;
       calDataUrlForPrompt = null;
     }
-
     // Sentiment + price
+
     let csm: CsmSnapshot;
     try { csm = await getCSM(); }
     catch (e: any) { return res.status(503).json({ ok: false, reason: `CSM unavailable: ${e?.message || "fetch failed"}.` }); }
