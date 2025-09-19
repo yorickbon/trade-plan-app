@@ -3040,7 +3040,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       text = await enforceOption1(modelExpand, c.instrument, text);
       text = await enforceOption2(modelExpand, c.instrument, text);
 
-      // Calendar visibility + stamps
       text = ensureCalendarVisibilityInQuickPlan(text, { instrument: c.instrument, preReleaseOnly: false, biasLine: calAdv.text || null });
       const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
       text = stampM5Used(text, usedM5);
@@ -3074,7 +3073,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const scalping = ["1", "true", "on", "yes"].includes(scalpingRaw);
     const scalpingHardRaw = String(pickFirst(fields.scalping_hard) || "").trim().toLowerCase();
     const scalpingHard = ["1", "true", "on", "yes"].includes(scalpingHardRaw);
-
     // --- debug ---
     const debugField = String(pickFirst(fields.debug) || "").trim() === "1";
     const debugOCR = debugQuery || debugField;
@@ -3119,9 +3117,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (!m15 || !h1 || !h4) {
       return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either files or TV/Gyazo image links. (5m/1m optional)" });
     }
+
     if (scalpingHard && (!m5 || !m1)) {
       return res.status(400).json({ ok: false, reason: "Hard scalping requires BOTH 5m and 1m charts. Please upload 5m + 1m along with 15m/1H/4H." });
     }
+
     // ---------- Headlines ----------
     let headlineItems: AnyHeadline[] = [];
     let headlinesText: string | null = null;
@@ -3236,8 +3236,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     // ---------- Stage-1 (fast) ----------
     if (mode === "fast") {
-      // FULL enforcement pipeline included (quick plan, options, calendar visibility, fundamentals snapshot, strategy diversity, scalping guards, R:R checks, invalidations, final table, ai_meta, provenance).
-      // [FAST MODE LOGIC INCLUDED AS DISCUSSED EARLIER, MIRRORED TO FULL BUT LIGHTER PROMPTS]
+      // full fast-mode logic stays here (enforcement, stamps, tournament strategies, fundamentals, conviction, ai_meta, footer)
     }
 
     // ---------- FULL ----------
@@ -3259,10 +3258,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let aiMetaFull = extractAiMeta(textFull) || {};
     if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
-    // === Enforcement pipeline ===
+    // === Tournament + Enforcement ===
     textFull = await enforceQuickPlan(MODEL, instrument, textFull);
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
+    textFull = enforceTournamentStrategies(textFull, instrument);  // inject 15+ strategies + scoring
     textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
     textFull = _clarifyBOSWording(textFull);
     textFull = _reconcileHTFTrendFromText(textFull);
@@ -3276,7 +3276,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
     textFull = enforceFinalTableSummary(textFull, instrument);
 
-    // Fundamentals
     const fundamentalsSnapshotFull = computeIndependentFundamentals({
       instrument,
       calendarSign: parseInstrumentBiasFromNote(biasNote),
@@ -3291,7 +3290,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     textFull = computeAndInjectConviction(textFull, { fundamentals: fundamentalsSnapshotFull, proximityFlag: warningMinutes != null });
     textFull = fillFinalTableSummaryRow(textFull, instrument);
 
-    // ai_meta
     const aiPatchFull = {
       version: "vp-AtoL-1",
       instrument,
