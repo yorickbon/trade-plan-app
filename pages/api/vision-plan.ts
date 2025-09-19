@@ -1624,6 +1624,40 @@ function hasOption1(text: string): boolean {
   return re.test(text);
 }
 
+// Inject tournament strategies + scoring
+function enforceTournamentStrategies(text: string, instrument: string): string {
+  const strategies = [
+    "Trend-Following",
+    "Liquidity-Sweep A",
+    "Liquidity-Sweep B",
+    "Breakout",
+    "Break and Retest",
+    "Range Rotation / Mean Reversion",
+    "Order Block",
+    "Fair Value Gap (FVG)",
+    "VWAP Reversion",
+    "Momentum Ignition",
+    "Stop Hunt / Raid",
+    "Channel / Wedge Break",
+    "Triangle / Consolidation Break",
+    "Scalp BOS/CHOCH",
+    "High-Timeframe Continuation",
+    "Countertrend Reversal",
+    "News Event Play",
+  ];
+
+  const header = `### Candidate Scores (tournament)\n\n`;
+  const lines = strategies.map((s) => `- ${s} — ?? — placeholder score; ensure AI fills`).join("\n");
+
+  // If section already exists, replace it
+  if (/### Candidate Scores/.test(text)) {
+    return text.replace(/### Candidate Scores[\s\S]*?(?=\n###|$)/, header + lines + "\n");
+  }
+
+  // Otherwise, inject before Final Table Summary
+  return text.replace(/### Final Table Summary/, `${header}${lines}\n\n### Final Table Summary`);
+}
+
 /** Deterministically build & insert "Option 1 (Primary)" if missing.
  * Also avoids duplicate regex const names elsewhere by keeping all regexes local to this function. */
 async function enforceOption1(_model: string, instrument: string, text: string) {
