@@ -262,25 +262,64 @@ function headlinesToPromptLines(items: AnyHeadline[], limit = 6): string | null 
   return lines.join("\n");
 }
 
+// Cache for headline parsing to avoid reprocessing identical text
+const HEADLINE_CACHE = new Map<string, HeadlineBias>();
+
 function computeHeadlinesBias(items: AnyHeadline[]): HeadlineBias {
-  if (!Array.isArray(items) || items.length === 0) return { label: "unavailable", avg: null, count: 0 };
-  const scores = items.map(h => typeof h?.sentiment?.score === "number" ? Number(h.sentiment!.score) : null).filter(v => Number.isFinite(v)) as number[];
-  if (scores.length === 0) return { label: "unavailable", avg: null, count: 0 };
-  const avg = scores.reduce((a, b) => a + b, 0) / (scores.length || 1);
-  const label = avg > 0.05 ? "bullish" : avg < -0.05 ? "bearish" : "neutral";
-  return { label, avg, count: scores.length };
+  if (!Array.isArray(items) || items.length === 0) {
+    return { label: "unavailable", avg: null, count: 0 };
+  }
+
+  // Use concatenated text as cache key
+  const rawKey = items.map(h => h?.title || "").join("|");
+  if (HEADLINE_CACHE.has(rawKey)) {
+    return HEADLINE_CACHE.get(rawKey)!;
+  }
+
+  const scores = items
+    .map(h => (typeof h?.sentiment?.score === "number" ? Number(h.sentiment!.score) : null))
+    .filter(v => Number.isFinite(v)) as number[];
+
+  if (scores.length === 0) {
+    const out: HeadlineBias = { label: "unavailable", avg: null, count: 0 };
+    HEADLINE_CACHE.set(rawKey, out);
+    return out;
+  }
+
+  const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
+  let label: "bullish" | "bearish" | "neutral";
+  // Slightly widened thresholds to reduce flip-flop
+  if (avg > 0.1) label = "bullish";
+  else if (avg < -0.1) label = "bearish";
+  else label = "neutral";
+
+  const out: HeadlineBias = { label, avg, count: scores.length };
+  HEADLINE_CACHE.set(rawKey, out);
+  return out;
 }
 
-async function fetchedHeadlinesViaServer(req: NextApiRequest, instrument: string): Promise<{ items: AnyHeadline[]; promptText: string | null; provider: string }> {
+async function fetchedHeadlinesViaServer(
+  req: NextApiRequest,
+  instrument: string
+): Promise<{ items: AnyHeadline[]; promptText: string | null; provider: string }> {
   try {
     const base = originFromReq(req);
     const url = `${base}/api/news?instrument=${encodeURIComponent(instrument)}&hours=48&max=12&_t=${Date.now()}`;
-    const r = await fetch(url, { cache: "no-store" });
-    const j = await r.json().catch(() => ({}));
+
+    // Parallelize fetch + json parse
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(2500) });
+    if (!r.ok) throw new Error(`Headlines fetch failed: ${r.status}`);
+    const j: any = await r.json().catch(() => ({}));
+
     const items: AnyHeadline[] = Array.isArray(j?.items) ? j.items : [];
     const provider = String(j?.provider || "unknown");
-    return { items, promptText: headlinesToPromptLines(items, 6), provider };
-  } catch {
+
+    // Deduplicate & sanitize items
+    const deduped = Array.from(new Map(items.map(i => [i.title, i])).values());
+
+    return { items: deduped, promptText: headlinesToPromptLines(deduped, 6), provider };
+  } catch (err) {
+    console.error("fetchedHeadlinesViaServer error", err);
     return { items: [], promptText: null, provider: "unknown" };
   }
 }
