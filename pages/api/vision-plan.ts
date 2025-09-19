@@ -3012,7 +3012,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (req.method !== "POST") return res.status(405).json({ ok: false, reason: "Method not allowed" });
     if (!OPENAI_API_KEY) return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
 
-    // --- Perf helpers ---
+    // --- Perf helpers inlined here ---
     const withTimeout = <T>(p: Promise<T>, ms: number, label: string): Promise<T> =>
       new Promise((resolve, reject) => {
         const id = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
@@ -3074,6 +3074,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       text = await enforceOption1(modelExpand, c.instrument, text);
       text = await enforceOption2(modelExpand, c.instrument, text);
 
+      // Calendar visibility + stamps
       text = ensureCalendarVisibilityInQuickPlan(text, { instrument: c.instrument, preReleaseOnly: false, biasLine: calAdv.text || null });
       const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
       text = stampM5Used(text, usedM5);
@@ -3107,6 +3108,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const scalping = ["1", "true", "on", "yes"].includes(scalpingRaw);
     const scalpingHardRaw = String(pickFirst(fields.scalping_hard) || "").trim().toLowerCase();
     const scalpingHard = ["1", "true", "on", "yes"].includes(scalpingHardRaw);
+
     // --- debug ---
     const debugField = String(pickFirst(fields.debug) || "").trim() === "1";
     const debugOCR = debugQuery || debugField;
@@ -3190,7 +3192,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let debugRows: any[] | null = null;
     let preReleaseOnly = false;
     let calDataUrlForPrompt: string | null = calUrlOrig;
-
     if (calUrlOrig) {
       const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch(() => null);
       if (ocr && Array.isArray(ocr.items)) {
@@ -3268,11 +3269,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       scalping_hard_mode: !!scalpingHard
     };
 
-    // ---------- Stage-1 (fast) ----------
-    if (mode === "fast") {
-      // full fast-mode logic stays here (enforcement, stamps, tournament strategies, fundamentals, conviction, ai_meta, footer)
-    }
-
     // ---------- FULL ----------
     const messages = messagesFull({
       instrument, dateStr, m15, h1, h4, m5, m1,
@@ -3292,15 +3288,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let aiMetaFull = extractAiMeta(textFull) || {};
     if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
-    // === Tournament + Enforcement ===
+    // === Post-processing enforcement ===
     textFull = await enforceQuickPlan(MODEL, instrument, textFull);
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
-    textFull = enforceTournamentStrategies(textFull, instrument);  // inject 15+ strategies + scoring
+
+    // Inject tournament strategy set (15+ playbooks, no minimums)
+    textFull = enforceTournamentStrategies(textFull, instrument);
+
     textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
     textFull = _clarifyBOSWording(textFull);
     textFull = _reconcileHTFTrendFromText(textFull);
-    textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
     textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
     textFull = dedupeTournamentSections(textFull);
     textFull = enforceEntryZoneUsage(textFull, instrument);
