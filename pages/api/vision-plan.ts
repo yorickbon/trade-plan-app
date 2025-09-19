@@ -2197,8 +2197,11 @@ ${newRow}\n`;
 
 
 function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
+  // Final polish pass BEFORE emitting ai_meta (normalizes 'mixed' → 'neutral' on calendar lines, etc.)
+  const polished = _finalPolish(text || "");
+
   // Merge existing ai_meta (if any) with the provided patch
-  const meta = extractAiMeta(text) || {};
+  const meta = extractAiMeta(polished) || {};
   const merged = { ...meta, ...patch };
   const json = JSON.stringify(merged, null, 2);
 
@@ -2210,7 +2213,7 @@ function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
   const fenced = `\nai_meta\n\`\`\`json\n${json}\n\`\`\`\n`;
 
   // Hard-deduplicate: remove ANY existing ai_meta blocks (fenced or legacy) before appending one clean block.
-  let out = text.replace(/\nai_meta\s*```json[\s\S]*?```\s*/gi, "");
+  let out = polished.replace(/\nai_meta\s*```json[\s\S]*?```\s*/gi, "");
   out = out.replace(/\nai_meta\s*{[\s\S]*?}\s*/gi, "");
 
   // Ensure there is a trailing newline separation to avoid gluing to previous content
@@ -2219,8 +2222,8 @@ function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
 
   return `${out}${fenced}`;
 }
-
 /** Normalize Order Type (existing behavior kept) if ai_meta has price & zone. */
+
 function normalizeOrderTypeLines(text: string, aiMeta: any) {
   const dir = String(aiMeta?.direction || "").toLowerCase();
   const p = Number(aiMeta?.currentPrice);
