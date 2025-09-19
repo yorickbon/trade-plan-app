@@ -2977,36 +2977,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (req.method !== "POST") return res.status(405).json({ ok: false, reason: "Method not allowed" });
     if (!OPENAI_API_KEY) return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
 
-    // --- Perf helpers inlined here ---
-    const withTimeout = <T>(p: Promise<T>, ms: number, label: string): Promise<T> =>
-      new Promise((resolve, reject) => {
-        const id = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
-        p.then((v) => { clearTimeout(id); resolve(v); })
-         .catch((err) => { clearTimeout(id); reject(err); });
-      });
-
-    async function retry<T>(fn: () => Promise<T>, retries = 2, label = "task"): Promise<T> {
-      let lastErr: any;
-      for (let i = 0; i <= retries; i++) {
-        try { return await fn(); } catch (e) { lastErr = e; }
-      }
-      throw new Error(`${label} failed after ${retries + 1} attempts: ${lastErr?.message || lastErr}`);
-    }
-
-    async function parallelFetch<T>(tasks: { label: string; fn: () => Promise<T> }[]): Promise<Record<string, T | null>> {
-      const results: Record<string, T | null> = {};
-      await Promise.all(tasks.map(async (t) => {
-        try { results[t.label] = await retry(() => withTimeout(t.fn(), 5000, t.label), 1, t.label); }
-        catch { results[t.label] = null; }
-      }));
-      return results;
-    }
-
-    const latency: Record<string, number> = {};
-    const markStart = (k: string) => (latency[k] = Date.now());
-    const markEnd = (k: string) => { latency[k] = Date.now() - latency[k]; };
-
-    // --- Mode selection ---
     const urlMode = String((req.query.mode as string) || "").toLowerCase();
     let mode: "full" | "fast" | "expand" = urlMode === "fast" ? "fast" : urlMode === "expand" ? "expand" : "full";
     const debugQuery = String(req.query.debug || "").trim() === "1";
@@ -3039,7 +3009,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       text = await enforceOption1(modelExpand, c.instrument, text);
       text = await enforceOption2(modelExpand, c.instrument, text);
 
-      // Calendar visibility + stamps
+      // Visibility and stamping
       text = ensureCalendarVisibilityInQuickPlan(text, { instrument: c.instrument, preReleaseOnly: false, biasLine: calAdv.text || null });
       const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
       text = stampM5Used(text, usedM5);
@@ -3063,22 +3033,26 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
 
     const { fields, files } = await parseMultipart(req);
+
     const MODEL = pickModelFromFields(req, fields);
     const instrument = String(fields.instrument || fields.code || "EURUSD").toUpperCase().replace(/\s+/g, "");
     const requestedMode = String(fields.mode || "").toLowerCase();
     if (requestedMode === "fast") mode = "fast";
 
-    // --- scalping toggles ---
+    // NEW: scalping toggles (default off). Safe: when off, behavior is unchanged.
     const scalpingRaw = String(pickFirst(fields.scalping) || "").trim().toLowerCase();
-    const scalping = ["1", "true", "on", "yes"].includes(scalpingRaw);
-    const scalpingHardRaw = String(pickFirst(fields.scalping_hard) || "").trim().toLowerCase();
-    const scalpingHard = ["1", "true", "on", "yes"].includes(scalpingHardRaw);
+    const scalping =
+      scalpingRaw === "1" || scalpingRaw === "true" || scalpingRaw === "on" || scalpingRaw === "yes";
 
-    // --- debug ---
+    const scalpingHardRaw = String(pickFirst(fields.scalping_hard) || "").trim().toLowerCase();
+    const scalpingHard =
+      scalpingHardRaw === "1" || scalpingHardRaw === "true" || scalpingHardRaw === "on" || scalpingHardRaw === "yes";
+
+    // debug toggle
     const debugField = String(pickFirst(fields.debug) || "").trim() === "1";
     const debugOCR = debugQuery || debugField;
 
-    // --- Files + URLs ---
+    // files + urls
     const m1f = pickFirst(files.m1);
     const m5f = pickFirst(files.m5);
     const m15f = pickFirst(files.m15);
@@ -3119,10 +3093,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either files or TV/Gyazo image links. (5m/1m optional)" });
     }
 
+    // Hard scalping requires both 5m and 1m charts.
     if (scalpingHard && (!m5 || !m1)) {
       return res.status(400).json({ ok: false, reason: "Hard scalping requires BOTH 5m and 1m charts. Please upload 5m + 1m along with 15m/1H/4H." });
     }
-    // ---------- Headlines ----------
+
+    // Headlines
     let headlineItems: AnyHeadline[] = [];
     let headlinesText: string | null = null;
     let headlinesProvider: string = "unknown";
@@ -3144,8 +3120,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       headlinesProvider = viaServer.provider || "unknown";
     }
     const hBias = computeHeadlinesBias(headlineItems);
-
-    // ---------- Calendar ----------
+    // Calendar (OCR-first STRICT pre-release handling, fallback to API)
     let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
     let calendarProvider: string | null = null;
     let calendarText: string | null = null;
@@ -3155,6 +3130,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let advisoryText: string | null = null;
     let debugRows: any[] | null = null;
     let preReleaseOnly = false;
+
     let calDataUrlForPrompt: string | null = calUrlOrig;
 
     if (calUrlOrig) {
@@ -3173,7 +3149,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           preReleaseOnly = analyzed.preReleaseOnly;
           debugRows = analyzed.rowsForDebug || null;
           calDataUrlForPrompt = calUrlOrig;
-          if (preReleaseOnly) advisoryText = calendarText;
+          if (preReleaseOnly) {
+            advisoryText = calendarText;
+          }
         } else {
           calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
           calDataUrlForPrompt = null;
@@ -3200,17 +3178,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       calDataUrlForPrompt = null;
     }
 
-    // ---------- Sentiment + Price ----------
+    // Sentiment + price
     let csm: CsmSnapshot;
     try { csm = await getCSM(); }
     catch (e: any) { return res.status(503).json({ ok: false, reason: `CSM unavailable: ${e?.message || "fetch failed"}.` }); }
-
     const cotCue = detectCotCueFromHeadlines(headlineItems);
     const { text: sentimentText } = sentimentSummary(csm, cotCue, hBias);
     const livePrice = await fetchLivePrice(instrument);
     const dateStr = new Date().toISOString().slice(0, 10);
 
-    // Composite bias
+    // Composite bias (provenance only)
     const composite = computeCompositeBias({
       instrument,
       calendarBiasNote: biasNote,
@@ -3234,121 +3211,39 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       scalping_hard_mode: !!scalpingHard
     };
 
-    // ---------- Stage-1 (fast) ----------
-    if (mode === "fast") {
-      // ... (fast mode logic unchanged — full enforcement, stamps, fundamentals, conviction, ai_meta, footer)
-      // [KEEP ALL THE LOGIC FROM PREVIOUS PATCH — it is still intact here]
-    }
-
-    // ---------- FULL ----------
-    const messages = messagesFull({
-      instrument, dateStr, m15, h1, h4, m5, m1,
-      calendarDataUrl: calDataUrlForPrompt || undefined,
-      calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
-      headlinesText: headlinesText || undefined,
-      sentimentText,
-      calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
-      provenance: provForModel,
-      scalping,
-      scalpingHard
-    });
-
-    if (livePrice) { (messages[0] as any).content += `\n\nNote: Current price hint ~ ${livePrice};`; }
-
-    let textFull = await callOpenAI(MODEL, messages);
-    let aiMetaFull = extractAiMeta(textFull) || {};
-    if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
-
-    // === Post-processing enforcement ===
-    textFull = await enforceQuickPlan(MODEL, instrument, textFull);
-    textFull = await enforceOption1(MODEL, instrument, textFull);
-    textFull = await enforceOption2(MODEL, instrument, textFull);
-    textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
-    textFull = _clarifyBOSWording(textFull);
-    textFull = _reconcileHTFTrendFromText(textFull);
-    textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
-    textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
-    textFull = dedupeTournamentSections(textFull);
-    textFull = enforceEntryZoneUsage(textFull, instrument);
-    textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
-    textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
-    textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
-    textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
-    textFull = enforceFinalTableSummary(textFull, instrument);
-
-    const fundamentalsSnapshotFull = computeIndependentFundamentals({
-      instrument,
-      calendarSign: parseInstrumentBiasFromNote(biasNote),
-      headlinesBias: hBias,
-      csm,
-      cotCue,
-      warningMinutes
-    });
-    textFull = ensureFundamentalsSnapshot(textFull, { instrument, snapshot: fundamentalsSnapshotFull, preReleaseOnly, calendarLine: calendarText || null });
-    textFull = applyConsistencyGuards(textFull, { fundamentalsSign: fundamentalsSnapshotFull.final.sign as -1 | 0 | 1 });
-    textFull = enforceOptionOrderByBias(textFull, fundamentalsSnapshotFull.final.sign);
-    textFull = computeAndInjectConviction(textFull, { fundamentals: fundamentalsSnapshotFull, proximityFlag: warningMinutes != null });
-    textFull = fillFinalTableSummaryRow(textFull, instrument);
-
-    const aiPatchFull = {
-      version: "vp-AtoL-1",
-      instrument,
+    // === Run fast/full depending on mode ===
+    let output = await runFastOrFull({
       mode,
-      vwap_used: /vwap/i.test(textFull),
-      time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
-      max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
-      currentPrice: livePrice ?? undefined,
-      scalping: !!scalping,
-      scalping_hard: !!scalpingHard,
-      fundamentals: {
-        calendar: { sign: fundamentalsSnapshotFull.components.calendar.sign, line: calendarText || null },
-        headlines: { label: fundamentalsSnapshotFull.components.headlines.label, avg: hBias.avg ?? null },
-        csm: { diff: fundamentalsSnapshotFull.components.csm.diff },
-        cot: { sign: fundamentalsSnapshotFull.components.cot.sign, detail: fundamentalsSnapshotFull.components.cot.detail },
-        final: { score: Math.round(fundamentalsSnapshotFull.final.score), label: fundamentalsSnapshotFull.final.label, sign: fundamentalsSnapshotFull.final.sign },
-        reliability: preReleaseOnly ? "low" : "normal"
-      },
-      proximity: { highImpactMins: warningMinutes ?? null },
-      vp_version: VP_VERSION
-    };
-    textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
-    let aiMetaFullNow = extractAiMeta(textFull) || {};
-    if (aiMetaFullNow && invalidOrderRelativeToPrice(aiMetaFullNow)) {
-      textFull = normalizeOrderTypeLines(textFull, aiMetaFullNow);
-    }
-    textFull = await enforceOption2DistinctHard(MODEL, instrument, textFull);
-    textFull = enforceEntryZoneUsage(textFull, instrument);
-    textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
-
-    // Provenance footer
-    const footer = buildServerProvenanceFooter({
-      headlines_provider: headlinesProvider || "unknown",
-      calendar_status: calendarStatus,
-      calendar_provider: calendarProvider,
-      csm_time: csm.tsISO,
-      extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard, latency },
+      MODEL,
+      instrument,
+      dateStr,
+      m1,
+      m5,
+      m15,
+      h1,
+      h4,
+      calDataUrlForPrompt,
+      calendarText,
+      headlinesText,
+      sentimentText,
+      warningMinutes,
+      biasNote,
+      advisoryText,
+      calendarEvidence,
+      debugOCR,
+      debugRows,
+      preReleaseOnly,
+      provForModel,
+      scalping,
+      scalpingHard,
+      livePrice,
+      hBias,
+      csm,
+      cotCue
     });
-    textFull = `${textFull}\n${footer}`;
 
     res.setHeader("Cache-Control", "no-store");
-    return res.status(200).json({
-      ok: true,
-      text: textFull,
-      meta: {
-        instrument, mode, vp_version: VP_VERSION, model: MODEL,
-        sources: {
-          headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
-          headlines_instrument: instrument,
-          headlines_provider: headlinesProvider || "unknown",
-          calendar_used: calendarStatus !== "unavailable",
-          calendar_status: calendarStatus,
-          calendar_provider: calendarProvider,
-          csm_used: true,
-          csm_time: csm.tsISO,
-        },
-        aiMeta: aiMetaFull,
-      },
-    });
+    return res.status(200).json(output);
 
   } catch (err: any) {
     return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
