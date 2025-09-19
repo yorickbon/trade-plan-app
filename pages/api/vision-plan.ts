@@ -1985,30 +1985,37 @@ function enforceFinalTableSummary(text: string, instrument: string) {
   return `${text}\n${stub}`;
 }
 
-/** Conviction calculation & injection (unchanged math, refactored for clarity). */
+/** Conviction calculation & injection (independent per-plan; minor speed-safe tweak). */
 function computeAndInjectConviction(
   text: string,
   args: { fundamentals: { final: { score: number; sign: number } }, proximityFlag?: boolean }
 ) {
   if (!text) return text;
 
+  // ---- Tournament scores (now map Top1→QP, Top2→O1, Top3→O2 for independence) ----
   const tSect = text.match(
     /Candidate\s*Scores\s*\(tournament\):[\s\S]*?(?=\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i
   )?.[0] || "";
+
   const tMatches = [...tSect.matchAll(/—\s*(\d{1,3})\s*—/g)];
-  const uniqSorted = [...new Set(tMatches
-    .map((m) => Number(m[1]))
-    .filter((n) => Number.isFinite(n))
-    .map((n) => Math.max(0, Math.min(100, n)))
+  const uniqSorted = [...new Set(
+    tMatches
+      .map((m) => Number(m[1]))
+      .filter((n) => Number.isFinite(n))
+      .map((n) => Math.max(0, Math.min(100, n)))
   )].sort((a, b) => b - a);
 
   const T1 = uniqSorted[0] ?? 0;
-  const T2 = uniqSorted[1] ?? Math.max(0, T1 - 12);
+  const T2 = uniqSorted[1] ?? Math.max(0, T1 - 8);
+  const T3 = uniqSorted[2] ?? Math.max(0, T2 - 8);
 
-  const F = Math.max(0, Math.min(100, Number(args.fundamentals?.final?.score) || 0));
+  // ---- Fundamentals snapshot ----
+  const Fraw = Number(args.fundamentals?.final?.score) || 0;
+  const F = Math.max(0, Math.min(100, Fraw));
   const fSign = (Number(args.fundamentals?.final?.sign) || 0) as -1 | 0 | 1;
   const prox = !!args.proximityFlag;
 
+  // ---- Plan blocks ----
   const RE_QP_BLOCK = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
   const RE_O1_BLOCK = /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
   const RE_O2_BLOCK = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
@@ -2026,10 +2033,12 @@ function computeAndInjectConviction(
   const dO2 = dirSign(o2Block);
   if (dQP === 0) dQP = dO1;
 
+  // Independent alignment bonuses/penalties
   const alignQP = (fSign !== 0 && dQP !== 0) ? (fSign === dQP ? 8 : -8) : 0;
   const alignO1 = (fSign !== 0 && dO1 !== 0) ? (fSign === dO1 ? 8 : -8) : 0;
   const alignO2 = (fSign !== 0 && dO2 !== 0) ? (fSign === dO2 ? 8 : -8) : 0;
 
+  // Quality factors (lightweight text heuristics)
   function qualityFactor(block: string): number {
     let q = 1.0;
     if (hasText(block, /(htf\s+alignment|clean\s+invalidation|confluence|ob\s*\+?\s*fvg|rr\s*[:x]?\s*2(\.?\d+)?|\bR\s*[:x]\s*2)/i)) q += 0.05;
@@ -2043,24 +2052,33 @@ function computeAndInjectConviction(
     if (hasText(textAll, /\bMismatch\b/i)) r -= 0.05;
     return Math.max(0.8, Math.min(1.05, r));
   }
+
   const Q_qp = qualityFactor(qpBlock || o1Block || "");
   const Q_o1 = qualityFactor(o1Block);
   const Q_o2 = qualityFactor(o2Block);
   const R_f  = reliabilityFactor(text);
 
+  // News proximity / liquidity penalties
   const prox_pen = prox ? 6 : 0;
   const liq_pen  = hasText(text, /\b(asia\s+session|illiquid|thin\s+liquidity)\b/i) ? 2 : 0;
 
-  const Tq_qp = Math.max(0, Math.min(100, Math.round((T1) * Q_qp)));
-  const Tq_o1 = Math.max(0, Math.min(100, Math.round((T1) * Q_o1)));
-  const Tq_o2 = Math.max(0, Math.min(100, Math.round((T2) * Q_o2)));
+  // ---- Independent technical baselines per plan ----
+  const Tq_qp = Math.max(0, Math.min(100, Math.round(T1 * Q_qp)));
+  const Tq_o1 = Math.max(0, Math.min(100, Math.round(T2 * Q_o1)));
+  const Tq_o2 = Math.max(0, Math.min(100, Math.round(T3 * Q_o2)));
   const Fr    = Math.max(0, Math.min(100, Math.round(F * R_f)));
 
+  // Final convictions (0–100), per plan
   const convQP = Math.max(0, Math.min(100, Math.round(0.60 * Tq_qp + 0.40 * Fr + alignQP - (prox_pen + liq_pen))));
   const convO1 = Math.max(0, Math.min(100, Math.round(0.60 * Tq_o1 + 0.40 * Fr + alignO1 - (prox_pen + liq_pen))));
   const convO2 = Math.max(0, Math.min(100, Math.round(0.60 * Tq_o2 + 0.40 * Fr + alignO2 - (prox_pen + liq_pen))));
 
-  function detectBullet(block: string): string { if (/^\s*•\s/m.test(block)) return "• "; if (/^\s*-\s/m.test(block)) return "- "; return "• "; }
+  // ---- Write back into each block right after TP/SL lines ----
+  function detectBullet(block: string): string {
+    if (/^\s*•\s/m.test(block)) return "• ";
+    if (/^\s*-\s/m.test(block)) return "- ";
+    return "• ";
+  }
   function usesBoldLabels(block: string): boolean {
     return /\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:\s*\*\*/i.test(block)
         || /(?:^|\n)\s*(?:[-•]\s*)?\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:/i.test(block);
@@ -2094,6 +2112,7 @@ function computeAndInjectConviction(
 
   return out;
 }
+
 
 /** Final table row filler (unchanged). */
 function fillFinalTableSummaryRow(text: string, instrument: string) {
