@@ -2504,7 +2504,7 @@ function _reconcileHTFTrendFromText(text: string): string {
 
   // Build a clean, synchronized X-ray section.
   const newXray =
-`Detected Structures (X-ray)
+`Detected Structures (X-ray):
 • 4H: ${desc4}
 • 1H: ${desc1}
 • 15m: ${synth15()}
@@ -2513,6 +2513,7 @@ function _reconcileHTFTrendFromText(text: string): string {
 `;
 
   // Replace or insert X-ray.
+
   const xraySectRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
   let out = raw;
   const hasXray = xraySectRe.test(out);
