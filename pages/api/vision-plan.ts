@@ -2405,21 +2405,20 @@ function _finalPolish(text: string): string {
   return out;
 }
 /** Context Engine v5: image-first reconciliation for 4H/1H/15m/5m/1m + synced X-ray.
- *  - Does NOT rely on HH/HL labels in the image.
- *  - Prefers the model's X-ray outputs (produced from the uploaded images) to decide trend.
- *  - Falls back to plan direction if the X-ray/TV lines are ambiguous.
- *  - Syncs Technical View and X-ray so they always match.
- *  - 1m line is included when mentioned/used; otherwise marked "not used".
- *  - No extra model calls → no added latency.
+ *  - Enforces explicit Trend: Uptrend/Downtrend/Range tokens on every TF line (X-ray + Technical View).
+ *  - Image-first: no need for HH/HL text on the chart; derive from wording and plan where needed.
+ *  - 4H is the truth source for HTF; 1H can be counter-trend only if explicitly stated.
+ *  - 15m must state Trend and is marked (counter-trend) when it fights 4H/1H.
+ *  - 5m/1m are "timing only" and cannot override HTF bias; still get micro trend label.
+ *  - No extra model calls → zero latency impact.
  */
 function _reconcileHTFTrendFromText(text: string): string {
-
   if (!text) return text;
 
   const raw = text;
   const lower = raw.toLowerCase();
 
-  // Read an existing descriptor for a timeframe from X-ray (preferred) or Technical View.
+  // Helpers to read prior lines from X-ray / Technical View
   function readTF(tf: '4H'|'1H'|'15m'|'5m'|'1m'): string {
     const tfEsc = tf.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
     const reX = new RegExp(`^\\s*[-•]\\s*${tfEsc}\\s*(?:\\(if\\s*used\\))?\\s*:\\s*([^\\n]*)`, 'mi');
@@ -2431,8 +2430,9 @@ function _reconcileHTFTrendFromText(text: string): string {
     return '';
   }
 
-  // Classify a descriptor into up / down / range.
-  function classify(desc: string): 'up'|'down'|'range'|'' {
+  // Classifier
+  type Dir = 'up'|'down'|'range'|'';
+  function classify(desc: string): Dir {
     const s = (desc || '').toLowerCase();
     if (!s) return '';
     if (/\b(uptrend|bullish)\b/.test(s)) return 'up';
@@ -2441,24 +2441,24 @@ function _reconcileHTFTrendFromText(text: string): string {
     return '';
   }
 
-  // Use plan direction if HTF descriptors are missing/ambiguous.
+  // Plan direction fallback
   function planDirSign(): -1|0|1 {
     const mQP = raw.match(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(Long|Short)/i);
     const mO1 = raw.match(/Option\s*1[\s\S]*?Direction\s*:\s*(Long|Short)/i);
     const d = (mQP?.[1] || mO1?.[1] || '').toLowerCase();
     return d === 'long' ? 1 : d === 'short' ? -1 : 0;
-    }
+  }
 
-  // Pull existing lines (from earlier image-driven pass).
-  const line4 = readTF('4H');
-  const line1 = readTF('1H');
-  const line15 = readTF('15m');
-  const line5 = readTF('5m');
-  const line1m = readTF('1m');
+  // Pull prior lines
+  const prior4 = readTF('4H');
+  const prior1 = readTF('1H');
+  const prior15 = readTF('15m');
+  const prior5 = readTF('5m');
+  const prior1m = readTF('1m');
 
-  // Decide 4H/1H regime.
-  let d4 = classify(line4);
-  let d1 = classify(line1);
+  // Decide HTF regimes
+  let d4: Dir = classify(prior4);
+  let d1: Dir = classify(prior1);
 
   if (!d4) {
     const sign = planDirSign();
@@ -2466,58 +2466,65 @@ function _reconcileHTFTrendFromText(text: string): string {
   }
   if (!d1) d1 = d4;
 
-  const desc4 =
-      d4 === 'up'   ? 'Uptrend (HH/HL implied), bullish structure'
-    : d4 === 'down' ? 'Downtrend (LH/LL implied), bearish structure'
-    :                 'Larger range / consolidation';
+  // Friendly words
+  const word = (d: Dir) => d === 'up' ? 'Uptrend' : d === 'down' ? 'Downtrend' : 'Range';
+  const microWord = (d: Dir) => d === 'up' ? 'Micro up' : d === 'down' ? 'Micro down' : 'Micro range';
 
-  // 1H context wording based on doc cues.
+  // 4H canonical line
+  const tail4 =
+    d4 === 'up' ? '— bullish structure (HH/HL implied)'
+  : d4 === 'down' ? '— bearish structure (LH/LL implied)'
+                  : '— larger consolidation';
+  const line4 = `Trend: ${word(d4)} ${tail4}`;
+
+  // 1H canonical line (context wording from presence of supply/resistance vs demand/support)
   const supCount = (lower.match(/\b(support|demand)\b/gi) || []).length;
   const resCount = (lower.match(/\b(resistance|supply)\b/gi) || []).length;
-  const desc1 =
-    resCount > supCount
-      ? 'At resistance / supply test; watch for rejection vs break'
-      : 'At support / demand test; watch for continuation vs pullback';
+  const ctx1 = resCount > supCount
+    ? '— at resistance/supply; monitor rejection vs break'
+    : '— at support/demand; monitor continuation vs pullback';
+  const line1 = `Trend: ${word(d1)} ${ctx1}`;
 
-  // 15m/5m/1m anchors: keep existing if present; otherwise synthesize safe defaults.
-  function synth15(): string {
-    const s = (line15 || '').trim();
+  // 15m trend: try classify; else inherit 1H
+  let d15: Dir = classify(prior15) || d1;
+  // 15m anchors pulled from doc cues
+  function anchor15(): string {
+    const s = (prior15 || '').trim();
     if (s) return s;
     if (/\bob\b/i.test(lower) && /(fvg|fair\s*value\s*gap|imbalance)/i.test(lower)) return 'OB+FVG confluence';
     if (/\b(order\s*block|ob|breaker)\b/i.test(lower)) return 'Order Block (OB) anchor';
     if (/(fvg|fair\s*value\s*gap|imbalance)/i.test(lower)) return 'FVG/imbalance anchor';
     if (/\b(trendline|channel|wedge|triangle)\b/i.test(lower)) return 'Trendline/channel structure';
     if (/\brange\b|rotation|eq\s*of\s*range/i.test(lower)) return 'Range bounds & EQ rotation';
-    return 'Execution anchors from 1H (refined on 15m)';
+    return 'Execution anchors refined from 1H';
   }
-  function synth5(): string {
-    const s = (line5 || '').trim();
-    if (s) return s;
-    return 'awaiting BOS (decisive break/close of latest 5m swing) for timing';
-  }
-  function synth1m(): string {
-    const s = (line1m || '').trim();
-    if (s) return s;
-    const mentions1m = /\b1m\b/i.test(raw) || /Used\s*Chart:\s*1M/i.test(raw);
-    return mentions1m ? 'awaiting CHOCH/BOS micro-shift for entry timing' : 'not used';
-  }
+  const ctNote = (d4 && d15 && d15 !== d4 && d15 !== d1) ? ' (counter-trend)' : '';
+  const line15 = `Trend: ${word(d15)} — ${anchor15()}${ctNote}`;
 
-  // Build a clean, synchronized X-ray section.
+  // 5m/1m micro
+  let d5: Dir = classify(prior5) || 'range';
+  const line5 = `Trend: ${microWord(d5)} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`;
+
+  const mentions1m = /\b1m\b/i.test(raw) || /Used\s*Chart:\s*1M/i.test(raw);
+  let d1m: Dir = classify(prior1m) || 'range';
+  const line1m = mentions1m
+    ? `Trend: ${microWord(d1m)} — timing only; CHOCH/BOS micro-shift for entry`
+    : 'not used';
+
+  // Build deterministic X-ray block (always emits explicit Trend:)
   const newXray =
-`Detected Structures (X-ray):
-• 4H: ${desc4}
-• 1H: ${desc1}
-• 15m: ${synth15()}
-• 5m: ${synth5()}
-• 1m: ${synth1m()}
+`Detected Structures (X-ray)
+• 4H: ${line4}
+• 1H: ${line1}
+• 15m: ${line15}
+• 5m: ${line5}
+• 1m: ${line1m}
 `;
 
-  // Replace or insert X-ray.
-
+  // Replace/insert X-ray
   const xraySectRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
   let out = raw;
-  const hasXray = xraySectRe.test(out);
-  if (hasXray) {
+  if (xraySectRe.test(out)) {
     out = out.replace(xraySectRe, (_m) => newXray);
   } else if (/Final\s*Table\s*Summary:/i.test(out)) {
     out = out.replace(/(\n\s*Final\s*Table\s*Summary:)/i, `\n${newXray}\n$1`);
@@ -2527,13 +2534,17 @@ function _reconcileHTFTrendFromText(text: string): string {
     out = `${out}\n\n${newXray}`;
   }
 
-  // Sync Technical View bullets.
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${desc4}`);
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${desc1}`);
+  // Sync Technical View 4H/1H lines to explicit Trend:
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line4}`);
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line1}`);
+
+  // Ensure 15m bullet under Technical View carries Trend: token too, if present
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m, p1, _old) => `${p1}${line15}`);
 
   return out;
 }
 // ---- END _reconcileHTFTrendFromText (v5) ----
+
 
 
 /** Ensure Option 1 aligns with fundamentals when possible; also prefers confirmation-based option when Option 1 uses Limit but trigger says BOS. */
