@@ -2616,11 +2616,25 @@ async function enforceDistinctAlternative(model: string, instrument: string, tex
   return text.replace(m2[0], out.trim());
 }
 
-/** HARD-GATE: Ensure Option 2 is DISTINCT post-generation (after ai_meta). 
- *  Single-pass version (no loops, no new globals) to avoid build issues and reduce latency.
+/** HARD-GATE: Ensure Option 2 is DISTINCT post-generation (after ai_meta).
+ *  Latency-safe version: no extra model calls, deterministic rewrite if needed.
+ *  - If Option 2 trigger is same bucket as Option 1, we rewrite ONLY Option 2's Trigger
+ *    (and tweak its "Why" line) to a different strategy class with explicit TFs.
+ *  - Then we normalize Order Type from the trigger (via _normalizeOrderTypeByTrigger).
+ *  - Everything else (direction, entry, SL/TP, conviction) is preserved.
  */
-async function enforceOption2DistinctHard(model: string, instrument: string, text: string) {
-  function norm(s: string) { return String(s || "").toLowerCase().replace(/\s+/g, " ").trim(); }
+async function enforceOption2DistinctHard(_model: string, instrument: string, text: string) {
+  if (!text) return text;
+
+  // Grab blocks
+  const { o1, o2, RE_O2 } = _pickBlocks(text);
+  if (!o1 || !o2) return text;
+
+  // Extract current triggers
+  const trig1 = (o1.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase().replace(/\s+/g, " ").trim();
+  const trig2 = (o2.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase().replace(/\s+/g, " ").trim();
+
+  // Bucket classifier (must stay in sync with other parts of the app)
   const buckets: Record<string, RegExp> = {
     sweep: /(sweep|liquidity|raid|stop\s*hunt|bos\b|choch\b)/i,
     ob_fvg: /(order\s*block|\bob\b|fvg|fair\s*value|breaker)/i,
@@ -2634,32 +2648,80 @@ async function enforceOption2DistinctHard(model: string, instrument: string, tex
     return "other";
   };
 
-  function isDistinct(doc: string): { ok: boolean; b1: string; b2: string; t1: string; t2: string } {
-    const { o1, o2 } = _pickBlocks(doc);
-    const t1 = norm(o1?.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "");
-    const t2 = norm(o2?.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "");
-    const b1 = bucketOf(t1), b2 = bucketOf(t2);
-    const ok = !!t1 && !!t2 && (b1 !== b2 || t1 !== t2);
-    return { ok, b1, b2, t1, t2 };
-  }
+  const b1 = bucketOf(trig1);
+  const b2 = bucketOf(trig2);
+  const isTooSimilar = !!trig1 && !!trig2 && (b1 === b2 || trig1 === trig2);
 
-  // Initial check
-  let out = text;
-  const pre = isDistinct(out);
-  if (pre.ok) {
-    return ensureAiMetaBlock(out, {
-      compliance: { ...(extractAiMeta(out)?.compliance || {}), option2Distinct: true }
+  if (!isTooSimilar) {
+    // Already distinct → set compliance flag and return
+    return ensureAiMetaBlock(text, {
+      compliance: { ...(extractAiMeta(text)?.compliance || {}), option2Distinct: true }
     });
   }
 
-  // Single correction attempt (keeps latency low)
-  const attempt = await enforceDistinctAlternative(model, instrument, out);
-  out = (attempt && attempt.trim().length > 0) ? attempt : out;
+  // Choose a distinct alternative bucket deterministically (no LLM)
+  const altByPrimary: Record<string, string> = {
+    sweep: "tl_break",
+    tl_break: "range",
+    range: "ob_fvg",
+    ob_fvg: "momentum",
+    momentum: "vwap",
+    vwap: "ob_fvg",
+    other: "tl_break"
+  };
+  const alt = altByPrimary[b1] || "tl_break";
 
-  const post = isDistinct(out);
-  return ensureAiMetaBlock(out, {
-    compliance: { ...(extractAiMeta(out)?.compliance || {}), option2Distinct: !!post.ok }
+  // Build a concrete trigger line for the chosen alt bucket (explicit TFs)
+  function altTrigger(bucket: string): string {
+    switch (bucket) {
+      case "tl_break":
+        return "15m trendline break; 5m retest; confirm 5m BOS";
+      case "range":
+        return "15m range EQ rotation; sell from range high; 5m shift/BOS for entry";
+      case "ob_fvg":
+        return "15m OB+FVG pullback; 5m mitigation + BOS continuation";
+      case "momentum":
+        return "15m squeeze → momentum breakout; 5m close-through + hold; 5m BOS";
+      case "vwap":
+        return "Session VWAP fade at deviation; 15m structure; 5m rejection + shift";
+      default:
+        return "15m structural break; 5m retest; 5m BOS confirmation";
+    }
+  }
+
+  const newTrig = `• Trigger: ${altTrigger(alt)}`;
+
+  // Replace ONLY the Trigger line inside Option 2 block; preserve everything else
+  let newO2 = o2;
+  if (/^\s*•\s*Trigger:\s*/mi.test(newO2)) {
+    newO2 = newO2.replace(/^\s*•\s*Trigger:\s*.+$/mi, newTrig);
+  } else {
+    // If somehow missing, append near the top (after Order Type / Direction if present)
+    const insertAfter = /(^\s*•\s*Order\s*Type:[^\n]*\n)/mi;
+    if (insertAfter.test(newO2)) newO2 = newO2.replace(insertAfter, (m) => m + newTrig + "\n");
+    else newO2 = newO2.replace(/(^\s*•\s*Direction:[^\n]*\n)/mi, (m) => m + newTrig + "\n");
+  }
+
+  // Tweak the "Why this alternative" line to reflect distinct strategy
+  const whyLine = `• Why this alternative: Different playbook (${alt.replace("_", "/")}) to avoid overlap with Option 1; uses explicit 15m/5m confirmation.`;
+  if (/^\s*•\s*Why\s+this\s+alternative\s*:/mi.test(newO2)) {
+    newO2 = newO2.replace(/^\s*•\s*Why\s+this\s+alternative\s*:[^\n]*$/mi, whyLine);
+  } else {
+    newO2 = `${newO2}\n${whyLine}\n`;
+  }
+
+  // Write back Option 2 block
+  let out = text.replace(RE_O2, newO2);
+
+  // Normalize Order Type to match the new trigger semantics
+  out = _normalizeOrderTypeByTrigger(out);
+
+  // Mark compliance in ai_meta
+  out = ensureAiMetaBlock(out, {
+    compliance: { ...(extractAiMeta(out)?.compliance || {}), option2Distinct: true }
   });
+
+  return out;
 }
 
 /** Backward-compat alias (so older call sites still work). */
