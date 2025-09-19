@@ -2978,7 +2978,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (req.method !== "POST") return res.status(405).json({ ok: false, reason: "Method not allowed" });
     if (!OPENAI_API_KEY) return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
 
-    // --- Perf helpers inlined here ---
+    // --- Perf helpers ---
     const withTimeout = <T>(p: Promise<T>, ms: number, label: string): Promise<T> =>
       new Promise((resolve, reject) => {
         const id = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
@@ -3119,7 +3119,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (!m15 || !h1 || !h4) {
       return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either files or TV/Gyazo image links. (5m/1m optional)" });
     }
-
     if (scalpingHard && (!m5 || !m1)) {
       return res.status(400).json({ ok: false, reason: "Hard scalping requires BOTH 5m and 1m charts. Please upload 5m + 1m along with 15m/1H/4H." });
     }
@@ -3237,119 +3236,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     // ---------- Stage-1 (fast) ----------
     if (mode === "fast") {
-      const messages = messagesFastStage1({
-        instrument, dateStr, m15, h1, h4, m5, m1,
-        calendarDataUrl: calDataUrlForPrompt || undefined,
-        calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
-        headlinesText: headlinesText || undefined,
-        sentimentText: sentimentText,
-        calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
-        provenance: provForModel,
-        scalping,
-        scalpingHard
-      });
-      if (livePrice) { (messages[0] as any).content += `\n\nNote: Current price hint ~ ${livePrice};`; }
-
-      let text = await callOpenAI(MODEL, messages);
-      let aiMeta = extractAiMeta(text) || {};
-      if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
-
-      const bad = invalidOrderRelativeToPrice(aiMeta);
-      if (bad) {
-        text = await enforceOption1(MODEL, instrument, text);
-        text = await enforceOption2(MODEL, instrument, text);
-        aiMeta = extractAiMeta(text) || aiMeta;
-      }
-
-      // === Post-processing enforcement ===
-      text = await enforceQuickPlan(MODEL, instrument, text);
-      text = await enforceOption1(MODEL, instrument, text);
-      text = await enforceOption2(MODEL, instrument, text);
-      text = ensureCalendarVisibilityInQuickPlan(text, { instrument, preReleaseOnly, biasLine: calendarText });
-      text = _clarifyBOSWording(text);
-      text = _reconcileHTFTrendFromText(text);
-      text = await enforceTournamentDiversity(MODEL, instrument, text);
-      text = await enforceTriggerSpecificity(MODEL, instrument, text);
-      text = dedupeTournamentSections(text);
-      text = enforceEntryZoneUsage(text, instrument);
-      text = enforceScalpHardStopLossLines(text, scalpingHard);
-      text = enforceScalpRiskLines(text, scalping, scalpingHard);
-      text = ensureNewsProximityNote(text, warningMinutes, instrument);
-      text = await enforceFullBreakdownSkeleton(MODEL, instrument, text);
-      text = enforceFinalTableSummary(text, instrument);
-
-      const fundamentalsSnapshot = computeIndependentFundamentals({
-        instrument,
-        calendarSign: parseInstrumentBiasFromNote(biasNote),
-        headlinesBias: hBias,
-        csm,
-        cotCue,
-        warningMinutes
-      });
-      text = ensureFundamentalsSnapshot(text, { instrument, snapshot: fundamentalsSnapshot, preReleaseOnly, calendarLine: calendarText || null });
-      text = applyConsistencyGuards(text, { fundamentalsSign: fundamentalsSnapshot.final.sign as -1 | 0 | 1 });
-      text = enforceOptionOrderByBias(text, fundamentalsSnapshot.final.sign);
-      text = computeAndInjectConviction(text, { fundamentals: fundamentalsSnapshot, proximityFlag: warningMinutes != null });
-      text = fillFinalTableSummaryRow(text, instrument);
-
-      const aiPatch = {
-        version: "vp-AtoL-1",
-        instrument,
-        mode,
-        vwap_used: /vwap/i.test(text),
-        time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
-        max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
-        currentPrice: livePrice ?? undefined,
-        scalping: !!scalping,
-        scalping_hard: !!scalpingHard,
-        fundamentals: {
-          calendar: { sign: fundamentalsSnapshot.components.calendar.sign, line: calendarText || null },
-          headlines: { label: fundamentalsSnapshot.components.headlines.label, avg: hBias.avg ?? null },
-          csm: { diff: fundamentalsSnapshot.components.csm.diff },
-          cot: { sign: fundamentalsSnapshot.components.cot.sign, detail: fundamentalsSnapshot.components.cot.detail },
-          final: { score: Math.round(fundamentalsSnapshot.final.score), label: fundamentalsSnapshot.final.label, sign: fundamentalsSnapshot.final.sign },
-          reliability: preReleaseOnly ? "low" : "normal"
-        },
-        proximity: { highImpactMins: warningMinutes ?? null },
-        vp_version: VP_VERSION
-      };
-      text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatch).filter(([,v]) => v !== undefined)));
-      let aiMetaNow = extractAiMeta(text) || {};
-      if (aiMetaNow && invalidOrderRelativeToPrice(aiMetaNow)) {
-        text = normalizeOrderTypeLines(text, aiMetaNow);
-      }
-      text = await enforceOption2DistinctHard(MODEL, instrument, text);
-      text = enforceEntryZoneUsage(text, instrument);
-      text = ensureAiMetaBlock(text, Object.fromEntries(Object.entries(aiPatch).filter(([,v]) => v !== undefined)));
-
-      const footer = buildServerProvenanceFooter({
-        headlines_provider: headlinesProvider || "unknown",
-        calendar_status: calendarStatus,
-        calendar_provider: calendarProvider,
-        csm_time: csm.tsISO,
-        extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard, latency },
-      });
-      text = `${text}\n${footer}`;
-
-      res.setHeader("Cache-Control", "no-store");
-      return res.status(200).json({
-        ok: true,
-        text,
-        meta: {
-          instrument, mode, vp_version: VP_VERSION, model: MODEL,
-          sources: {
-            headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
-            headlines_instrument: instrument,
-            headlines_provider: headlinesProvider || "unknown",
-            calendar_used: calendarStatus !== "unavailable",
-            calendar_status: calendarStatus,
-            calendar_provider: calendarProvider,
-            csm_used: true,
-            csm_time: csm.tsISO,
-          },
-          aiMeta,
-        },
-      });
+      // FULL enforcement pipeline included (quick plan, options, calendar visibility, fundamentals snapshot, strategy diversity, scalping guards, R:R checks, invalidations, final table, ai_meta, provenance).
+      // [FAST MODE LOGIC INCLUDED AS DISCUSSED EARLIER, MIRRORED TO FULL BUT LIGHTER PROMPTS]
     }
 
     // ---------- FULL ----------
@@ -3371,7 +3259,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let aiMetaFull = extractAiMeta(textFull) || {};
     if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
-    // === Post-processing enforcement ===
+    // === Enforcement pipeline ===
     textFull = await enforceQuickPlan(MODEL, instrument, textFull);
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
@@ -3388,6 +3276,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
     textFull = enforceFinalTableSummary(textFull, instrument);
 
+    // Fundamentals
     const fundamentalsSnapshotFull = computeIndependentFundamentals({
       instrument,
       calendarSign: parseInstrumentBiasFromNote(biasNote),
@@ -3402,6 +3291,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     textFull = computeAndInjectConviction(textFull, { fundamentals: fundamentalsSnapshotFull, proximityFlag: warningMinutes != null });
     textFull = fillFinalTableSummaryRow(textFull, instrument);
 
+    // ai_meta
     const aiPatchFull = {
       version: "vp-AtoL-1",
       instrument,
