@@ -1997,14 +1997,14 @@ function enforceFinalTableSummary(text: string, instrument: string) {
   return `${text}\n${stub}`;
 }
 
-/** Conviction calculation & injection (independent per-plan; minor speed-safe tweak). */
+/** Conviction calculation & injection (independent per-plan + hard-gated Option2 distinct). */
 function computeAndInjectConviction(
   text: string,
   args: { fundamentals: { final: { score: number; sign: number } }, proximityFlag?: boolean }
 ) {
   if (!text) return text;
 
-  // ---- Tournament scores (now map Top1→QP, Top2→O1, Top3→O2 for independence) ----
+  // ---- Tournament scores (map Top1→QP, Top2→O1, Top3→O2) ----
   const tSect = text.match(
     /Candidate\s*Scores\s*\(tournament\):[\s\S]*?(?=\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i
   )?.[0] || "";
@@ -2050,7 +2050,7 @@ function computeAndInjectConviction(
   const alignO1 = (fSign !== 0 && dO1 !== 0) ? (fSign === dO1 ? 8 : -8) : 0;
   const alignO2 = (fSign !== 0 && dO2 !== 0) ? (fSign === dO2 ? 8 : -8) : 0;
 
-  // Quality factors (lightweight text heuristics)
+  // Quality & reliability heuristics
   function qualityFactor(block: string): number {
     let q = 1.0;
     if (hasText(block, /(htf\s+alignment|clean\s+invalidation|confluence|ob\s*\+?\s*fvg|rr\s*[:x]?\s*2(\.?\d+)?|\bR\s*[:x]\s*2)/i)) q += 0.05;
@@ -2070,7 +2070,6 @@ function computeAndInjectConviction(
   const Q_o2 = qualityFactor(o2Block);
   const R_f  = reliabilityFactor(text);
 
-  // News proximity / liquidity penalties
   const prox_pen = prox ? 6 : 0;
   const liq_pen  = hasText(text, /\b(asia\s+session|illiquid|thin\s+liquidity)\b/i) ? 2 : 0;
 
@@ -2085,7 +2084,7 @@ function computeAndInjectConviction(
   const convO1 = Math.max(0, Math.min(100, Math.round(0.60 * Tq_o1 + 0.40 * Fr + alignO1 - (prox_pen + liq_pen))));
   const convO2 = Math.max(0, Math.min(100, Math.round(0.60 * Tq_o2 + 0.40 * Fr + alignO2 - (prox_pen + liq_pen))));
 
-  // ---- Write back into each block right after TP/SL lines ----
+  // ---- Write back into each block ----
   function detectBullet(block: string): string {
     if (/^\s*•\s/m.test(block)) return "• ";
     if (/^\s*-\s/m.test(block)) return "- ";
@@ -2122,8 +2121,12 @@ function computeAndInjectConviction(
   out = writeConv(out, RE_O1_BLOCK, convO1);
   out = writeConv(out, RE_O2_BLOCK, convO2);
 
+  // ---- Hard-gate Option2 distinctness ----
+  out = enforceOption2DistinctHard("gpt-4o", "EURUSD", out);
+
   return out;
 }
+
 
 
 /** Final table row filler (unchanged). */
