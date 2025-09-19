@@ -2378,28 +2378,34 @@ function _clarifyBOSWording(text: string): string {
 /** FINAL POLISH: vocabulary guard & cleanup (post-generation, pre-ai_meta).
  *  - Never allow 'mixed' on calendar lines; convert to 'neutral'.
  *  - Keep scope tight: only touch lines that explicitly start with 'Calendar:' or 'Calendar bias for ...'.
+ *  - BUGFIX: preserve instrument name in "Calendar bias for <INSTRUMENT>:" lines.
  */
 function _finalPolish(text: string): string {
   if (!text) return text;
   let out = text;
 
   // Calendar: ... mixed  ->  Calendar: ... neutral
-  out = out.replace(/(^|\n)(\s*•\s*)?Calendar\s*:\s*([^\n]*?)\bmixed\b([^\n]*)/gi, (_m, pfx, bullet, before, after) => {
-    const replaced = (before + after).replace(/\bmixed\b/gi, "neutral");
-    return `${pfx || "\n"}${bullet || ""}Calendar: ${replaced}`;
-  });
+  out = out.replace(
+    /(^|\n)(\s*•\s*)?Calendar\s*:\s*([^\n]*?)\bmixed\b([^\n]*)/gi,
+    (_m, pfx, bullet, before, after) => {
+      const replaced = (before + after).replace(/\bmixed\b/gi, "neutral");
+      return `${pfx || "\n"}${bullet || ""}Calendar: ${replaced}`;
+    }
+  );
 
-  // Calendar bias for <INSTRUMENT>: ... mixed -> ... neutral
-  out = out.replace(/(^|\n)(\s*•\s*)?Calendar\s*bias\s*for\s+[A-Z0-9:_\-]+?\s*:\s*([^\n]*?)\bmixed\b([^\n]*)/gi, (_m, pfx, bullet, before, after) => {
-    const replaced = (before + after).replace(/\bmixed\b/gi, "neutral");
-    return `${pfx || "\n"}${bullet || ""}Calendar bias for ${replaced}`;
-  });
+  // Calendar bias for <INSTRUMENT>: ... mixed -> ... neutral (preserve instrument token)
+  out = out.replace(
+    /(^|\n)(\s*•\s*)?Calendar\s*bias\s*for\s+([A-Z0-9:_\-]+?)\s*:\s*([^\n]*?)\bmixed\b([^\n]*)/gi,
+    (_m, pfx, bullet, instr, before, after) => {
+      const replaced = (before + after).replace(/\bmixed\b/gi, "neutral");
+      return `${pfx || "\n"}${bullet || ""}Calendar bias for ${instr}: ${replaced}`;
+    }
+  );
 
   return out;
 }
+/** Context Engine v5: image-first reconciliation for 4H/1H/15m/5m/1m + synced X-ray. */
 
-
-/** Context Engine v5: image-first reconciliation for 4H/1H/15m/5m/1m + synced X-ray.
  *  - Does NOT rely on HH/HL labels in the image.
  *  - Prefers the model's X-ray outputs (produced from the uploaded images) to decide trend.
  *  - Falls back to plan direction if the X-ray/TV lines are ambiguous.
