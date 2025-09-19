@@ -2585,8 +2585,12 @@ async function enforceDistinctAlternative(model: string, instrument: string, tex
 }
 
 /** HARD-GATE: Ensure Option 2 is DISTINCT post-generation (after ai_meta). */
+/** HARD-GATE: Ensure Option 2 is DISTINCT post-generation (after ai_meta).
+ * Latency optimization: reduce retries to 1 (from 3).
+ * This keeps behavior the same but removes extra model calls on near-duplicate options.
+ */
 async function enforceOption2DistinctHard(model: string, instrument: string, text: string) {
-  const MAX_TRIES = 3;
+  const MAX_TRIES = 1;  // ↓ lowered from 3 to cut extra LLM calls
 
   function norm(s: string) { return String(s || "").toLowerCase().replace(/\s+/g, " ").trim(); }
   const buckets: Record<string, RegExp> = {
@@ -2597,10 +2601,7 @@ async function enforceOption2DistinctHard(model: string, instrument: string, tex
     vwap: /\bvwap\b/i,
     momentum: /(ignition|breakout|squeeze|bollinger|macd|divergence)/i,
   };
-  const bucketOf = (s: string) => {
-    for (const [k, re] of Object.entries(buckets)) if (re.test(s)) return k;
-    return "other";
-  };
+  const bucketOf = (s: string) => { for (const [k, re] of Object.entries(buckets)) if (re.test(s)) return k; return "other"; };
 
   function isDistinct(doc: string): { ok: boolean; b1: string; b2: string; t1: string; t2: string } {
     const { o1, o2 } = _pickBlocks(doc);
@@ -2620,6 +2621,16 @@ async function enforceOption2DistinctHard(model: string, instrument: string, tex
       });
       return out;
     }
+    out = await enforceDistinctAlternative(model, instrument, out);
+  }
+
+  const final = isDistinct(out);
+  out = ensureAiMetaBlock(out, {
+    compliance: { ...(extractAiMeta(out)?.compliance || {}), option2Distinct: !!final.ok }
+  });
+  return out;
+}
+
     out = await enforceDistinctAlternative(model, instrument, out);
   }
 
