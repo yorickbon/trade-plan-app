@@ -3557,6 +3557,13 @@ async function buildRawSwingForTF(dataUrl: string | null, timeLabel: string): Pr
  * Accepts an object with keys: h4,h1,m15,m5,m1 (data URLs or null).
  * Returns { rawSwingMap, confidence, details } where rawSwingMap is the full markdown block or null.
  */
+// === local type needed by pixel extractor ===
+type SwingResult = {
+  rawSwingMap: string | null;
+  confidence: number; // 0..1
+  details?: any;
+};
+
 export async function generateRawSwingMapFromImages(images: {
   h4?: string | null;
   h1?: string | null;
