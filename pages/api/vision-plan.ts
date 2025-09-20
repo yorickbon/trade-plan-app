@@ -3220,10 +3220,109 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const markStart = (k: string) => (latency[k] = Date.now());
     const markEnd = (k: string) => { latency[k] = Date.now() - latency[k]; };
 
-    // --- Mode selection ---
+       // --- Mode selection ---
     const urlMode = String((req.query.mode as string) || "").toLowerCase();
     let mode: "full" | "fast" | "expand" = urlMode === "fast" ? "fast" : urlMode === "expand" ? "expand" : "full";
     const debugQuery = String(req.query.debug || "").trim() === "1";
+
+    // --- QA harness (golden self-tests) ---
+    // Enabled only when explicitly requested via ?qa=1 OR ?mode=selftest
+    const qaMode = String(req.query.qa || "").trim() === "1" || urlMode === "selftest";
+
+    if (qaMode) {
+      type QaResult = { name: string; pass: boolean; detail?: string };
+      const results: QaResult[] = [];
+
+      // Utility: add a test result
+      const T = (name: string, cond: boolean, detail = "") =>
+        results.push({ name, pass: !!cond, detail: cond ? undefined : detail });
+
+      try {
+        // 1) RAW SWING MAP → X-ray/TV sync
+        const sampleDoc1 =
+`RAW SWING MAP (first)
+4H: swings=LH, LL, LH, LL; last_BOS=down; verdict=Downtrend
+1H: swings=LH, LL, LH, LL; last_BOS=down; verdict=Downtrend
+15m: swings=LH, LL; last_BOS=down; verdict=Downtrend
+
+Quick Plan (Actionable)
+• Direction: Short
+• Order Type: Sell Limit
+• Trigger:Alternative wording that needs spacing fix
+• Entry (zone or single): 115950 - 116000
+• Stop Loss: 116200
+• Take Profit(s): TP1: 115500 / TP2: 115000
+• Conviction: 18%
+
+Full Breakdown
+• Technical View (HTF + Intraday): 4H: ... 1H: ... 15m: ...
+`;
+
+        const afterMap = _applyRawSwingMap(sampleDoc1);
+        T("RAW SWING MAP → X-ray includes 4H Downtrend",
+          /Detected Structures \(X-ray\)[\s\S]*4H: Trend:\s*Downtrend/i.test(afterMap),
+          "Expected 4H Downtrend line in X-ray.");
+
+        // 2) Trigger spacing normalization
+        const afterTrigSpacing = normalizeTriggerSpacing(afterMap);
+        T("Normalize '• Trigger:' spacing",
+          /• Trigger: Alternative wording that needs spacing fix/i.test(afterTrigSpacing),
+          "Expected exactly one space after colon in Trigger line.");
+
+        // 3) Entry zone enforcement (thousands-aware)
+        const afterZone = enforceEntryZoneUsage(afterTrigSpacing, "BTCUSD");
+        T("Entry rendered as zone with thousands separators",
+          /Entry \(zone or single\):\s*115,950\s*–\s*116,000/i.test(afterZone),
+          "Expected '115,950 – 116,000' as enforced zone.");
+
+        // 4) Final polish converts 'mixed' → 'neutral' only on Calendar lines
+        const sampleDoc2 =
+`Full Breakdown
+• Fundamental View:
+   - Calendar: mixed ahead of release
+   - Headlines bias (48h): neutral
+   - CSM: z(base)-z(quote) diff and interpretation
+   - COT: unavailable
+   - Final Fundamental Bias: neutral (score ~50)
+`;
+        const afterPolish = _finalPolish(sampleDoc2);
+        T("Final polish maps Calendar 'mixed' → 'neutral'",
+          /Calendar:\s*neutral ahead of release/i.test(afterPolish),
+          "Expected Calendar line to replace 'mixed' with 'neutral'.");
+
+        // 5) ai_meta block always present & deduped
+        const withMeta = ensureAiMetaBlock(afterZone, {
+          version: "vp-AtoL-1",
+          instrument: "BTCUSD",
+          mode: "full",
+          vwap_used: false,
+          fundamentals: {
+            final: { score: 50, label: "neutral", sign: 0 }
+          },
+          proximity: { highImpactMins: null },
+          vp_version: "2025-09-18-vp-AtoL-rc1"
+        });
+        T("ai_meta fenced block appended",
+          /\nai_meta\s*```json[\s\S]*?```/i.test(withMeta),
+          "Expected fenced JSON ai_meta at the end.");
+
+        // Summary + counts
+        const passed = results.filter(r => r.pass).length;
+        const failed = results.length - passed;
+
+        return res.status(failed ? 500 : 200).json({
+          ok: failed === 0,
+          qa_summary: { total: results.length, passed, failed },
+          results
+        });
+      } catch (e: any) {
+        return res.status(500).json({
+          ok: false,
+          qa_error: e?.message || String(e)
+        });
+      }
+    }
+
 
  // ---------- expand ----------
 if (mode === "expand") {
