@@ -3248,7 +3248,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     const cotCue = detectCotCueFromHeadlines(headlineItems);
     const { text: sentimentText } = sentimentSummary(csm, cotCue, hBias);
-    const livePrice = await fetchLivePrice(instrument);
+    const livePrice = null; // IMAGE-ONLY: never fetch or use live price
     const dateStr = new Date().toISOString().slice(0, 10);
 
     // Composite bias
@@ -3288,11 +3288,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       scalpingHard
     });
 
-    if (livePrice) { (messages[0] as any).content += `\n\nNote: Current price hint ~ ${livePrice};`; }
-
-    let textFull = await callOpenAI(MODEL, messages);
-    let aiMetaFull = extractAiMeta(textFull) || {};
-    if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
+    // IMAGE-ONLY: do not inject current price hints
+let textFull = await callOpenAI(MODEL, messages);
+let aiMetaFull = extractAiMeta(textFull) || {};
 
        // === Post-processing enforcement ===
     textFull = await enforceQuickPlan(MODEL, instrument, textFull);
@@ -3330,35 +3328,42 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     textFull = computeAndInjectConviction(textFull, { fundamentals: fundamentalsSnapshotFull, proximityFlag: warningMinutes != null });
     textFull = fillFinalTableSummaryRow(textFull, instrument);
 
-    const aiPatchFull = {
-      version: "vp-AtoL-1",
-      instrument,
-      mode,
-      vwap_used: /vwap/i.test(textFull),
-      time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
-      max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
-      currentPrice: livePrice ?? undefined,
-      scalping: !!scalping,
-      scalping_hard: !!scalpingHard,
-      fundamentals: {
-        calendar: { sign: fundamentalsSnapshotFull.components.calendar.sign, line: calendarText || null },
-        headlines: { label: fundamentalsSnapshotFull.components.headlines.label, avg: hBias.avg ?? null },
-        csm: { diff: fundamentalsSnapshotFull.components.csm.diff },
-        cot: { sign: fundamentalsSnapshotFull.components.cot.sign, detail: fundamentalsSnapshotFull.components.cot.detail },
-        final: { score: Math.round(fundamentalsSnapshotFull.final.score), label: fundamentalsSnapshotFull.final.label, sign: fundamentalsSnapshotFull.final.sign },
-        reliability: preReleaseOnly ? "low" : "normal"
-      },
-      proximity: { highImpactMins: warningMinutes ?? null },
-      vp_version: VP_VERSION
-    };
-    textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
-    let aiMetaFullNow = extractAiMeta(textFull) || {};
-    if (aiMetaFullNow && invalidOrderRelativeToPrice(aiMetaFullNow)) {
-      textFull = normalizeOrderTypeLines(textFull, aiMetaFullNow);
-    }
-    textFull = await enforceOption2DistinctHard(MODEL, instrument, textFull);
-    textFull = enforceEntryZoneUsage(textFull, instrument);
-    textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
+  // Determine if VWAP is truly used (ignore candidate list; look only at actionable parts)
+const _txtNoCand = textFull.replace(/Candidate\s*Scores[\s\S]*?Final\s*Table\s*Summary/i, "Final Table Summary");
+const vwap_used_flag =
+  /\bVWAP\b/i.test(_txtNoCand) &&
+  /\b(Setup|Trigger|Order\s*Type|Option\s*1|Option\s*2|Quick\s*Plan)\b/i.test(_txtNoCand);
+
+const aiPatchFull = {
+  version: "vp-AtoL-1",
+  instrument,
+  mode,
+  vwap_used: vwap_used_flag,
+  time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
+  max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
+  currentPrice: undefined, // IMAGE-ONLY: never embed price
+  scalping: !!scalping,
+  scalping_hard: !!scalpingHard,
+  fundamentals: {
+    calendar: { sign: fundamentalsSnapshotFull.components.calendar.sign, line: calendarText || null },
+    headlines: { label: fundamentalsSnapshotFull.components.headlines.label, avg: hBias.avg ?? null },
+    csm: { diff: fundamentalsSnapshotFull.components.csm.diff },
+    cot: { sign: fundamentalsSnapshotFull.components.cot.sign, detail: fundamentalsSnapshotFull.components.cot.detail },
+    final: { score: Math.round(fundamentalsSnapshotFull.final.score), label: fundamentalsSnapshotFull.final.label, sign: fundamentalsSnapshotFull.final.sign },
+    reliability: preReleaseOnly ? "low" : "normal"
+  },
+  proximity: { highImpactMins: warningMinutes ?? null },
+  vp_version: VP_VERSION
+};
+textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
+
+let aiMetaFullNow = extractAiMeta(textFull) || {};
+if (aiMetaFullNow && invalidOrderRelativeToPrice(aiMetaFullNow)) {
+  textFull = normalizeOrderTypeLines(textFull, aiMetaFullNow);
+}
+textFull = await enforceOption2DistinctHard(MODEL, instrument, textFull);
+textFull = enforceEntryZoneUsage(textFull, instrument);
+textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
 
     // Provenance footer
     const footer = buildServerProvenanceFooter({
