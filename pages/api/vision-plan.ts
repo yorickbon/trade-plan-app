@@ -3343,35 +3343,6 @@ function brightnessAtPixel(img: any, x: number, y: number): number {
 }
 
 
-type SwingResult = {
-  rawSwingMap: string | null;
-  confidence: number; // 0..1
-  details?: any;
-};
-
-/** Convert a data-url (image) to Jimp image. */
-async function loadJimpFromDataUrl(dataUrl: string): Promise<Jimp | null> {
-  if (!dataUrl) return null;
-  try {
-    const comma = dataUrl.indexOf(",");
-    const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
-    const buf = Buffer.from(b64, "base64");
-    const img = await Jimp.read(buf);
-    return img;
-  } catch (e) {
-    return null;
-  }
-}
-
-/** Basic grayscale / brightness helper. */
-function brightnessAtPixel(img: Jimp, x: number, y: number): number {
-  const idx = img.getPixelColor(x, y);
-  // Jimp's color integer -> extract RGB
-  const { r, g, b } = Jimp.intToRGBA(idx);
-  // luminance
-  return 0.299 * r + 0.587 * g + 0.114 * b;
-}
-
 /**
  * Estimate OHLC per column by scanning vertical pixels for dark clusters.
  * Returns an array of { o,h,l,c } sampled across width.
