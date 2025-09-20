@@ -3347,8 +3347,8 @@ function brightnessAtPixel(img: any, x: number, y: number): number {
  * Estimate OHLC per column by scanning vertical pixels for dark clusters.
  * Returns an array of { o,h,l,c } sampled across width.
  * columnsToSample - how many columns to sample (defaults to ~200 for large images).
- */
-function estimateOHLCFromImage(img: Jimp, columnsToSample = 200) {
+ */function estimateOHLCFromImage(img: any, columnsToSample = 200) {
+
   const w = img.bitmap.width;
   const h = img.bitmap.height;
   const step = Math.max(1, Math.floor(w / columnsToSample));
