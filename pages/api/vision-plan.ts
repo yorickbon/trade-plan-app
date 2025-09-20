@@ -2641,24 +2641,84 @@ function _clarifyBOSWording(text: string): string {
     .replace(/BOS\s*needed\s*for\s*confirmation/gi, "BOS needed for confirmation (break/close of recent swing)");
 }
 
-/** Normalize '• Trigger:' spacing to exactly one space after colon. */
-function normalizeTriggerSpacing(text: string): string {
-  if (!text) return text;
-  // Start-of-line bullets only; collapse any/none spaces after colon → one space
-  return text.replace(/^\s*•\s*Trigger\s*:\s*/gmi, '• Trigger: ');
+/* =========================
+   MEGA PATCH 1 (AtoL-Ω)
+   - Drop-in monolithic post-processing layer
+   - Replaces/extends earlier helpers with stricter, deterministic logic
+   ========================= */
+
+/* -------------------------
+   0) Safe object utils
+   ------------------------- */
+function _clamp(n: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, n));
+}
+function _defined<T>(v: T | null | undefined): v is T {
+  return v !== null && v !== undefined;
+}
+function _toNum(s: string | number | null | undefined): number | null {
+  if (s == null) return null;
+  const n = Number(String(s).replace(/,/g, ""));
+  return Number.isFinite(n) ? n : null;
 }
 
-/** FINAL POLISH: vocabulary guard & cleanup (post-generation, pre-ai_meta).
- *  - Never allow 'mixed' on calendar lines; convert to 'neutral'.
- *  - Keep scope tight: only touch lines that explicitly start with 'Calendar:' or 'Calendar bias for ...'.
- *  - BUGFIX: preserve instrument name in "Calendar bias for <INSTRUMENT>:" lines.
- */
+/* -------------------------
+   1) Trigger → Order-Type (REPLACE)
+   - Stop for BOS/breakout/ignition/close-through
+   - Limit for retest/tap/mitigation/OB/FVG/range rotation
+   ------------------------- */
+function desiredOrder(
+  type: "long" | "short",
+  triggerLine: string
+): "Market" | "Buy Stop" | "Sell Stop" | "Buy Limit" | "Sell Limit" {
+  const s = (triggerLine || "").toLowerCase();
 
- function _finalPolish(text: string): string {
+  const impliesBreak =
+    /(bos|break\s*of\s*structure|close\s*(above|below)|break\s*out|breakout|breach|ignite|ignition|momentum|impulse|squeeze|close\-through)/i.test(
+      s
+    );
+  // NOTE: if both appear (“break → retest”), treat as STOP (confirmation first).
+  const impliesRetest =
+    /(tap|retest|pullback|mitigation|mitigate|rebalance|fill|fvg|fair\s*value|order\s*block|\bob\b|supply|demand|breaker|range\s*(high|low)|eq\s*of\s*range|rotation)/i.test(
+      s
+    );
+
+  if (impliesBreak) return type === "long" ? "Buy Stop" : "Sell Stop";
+  if (impliesRetest) return type === "long" ? "Buy Limit" : "Sell Limit";
+  return "Market";
+}
+
+/* -------------------------
+   2) Normalize Trigger spacing (REPLACE)
+   ------------------------- */
+function normalizeTriggerSpacing(text: string): string {
+  if (!text) return text;
+  // fix "Trigger:Alternative" or multiple spaces
+  let out = text.replace(/^\s*•\s*Trigger\s*:?(\s*)/gmi, "• Trigger: ");
+  // collapse multiple spaces after "•" bullet labels generally
+  out = out.replace(/(^\s*•\s*[A-Za-z][A-Za-z ()/]*:)\s+/gmi, (_m, p1) => `${p1} `);
+  return out;
+}
+
+/* -------------------------
+   3) Clarify BOS wording (KEEP, stricter)
+   ------------------------- */
+function _clarifyBOSWording(text: string): string {
+  return text
+    .replace(/5m:\s*Awaiting\s*BOS\s*for\s*confirmation/gi, "5m: Awaiting 5m BOS (decisive break/close below latest 5m swing low) for confirmation")
+    .replace(/BOS\s*needed\s*for\s*confirmation/gi, "BOS needed for confirmation (break/close of recent swing)")
+    .replace(/(awaiting|need[s]?|requires?)\s*bos\b/gi, "awaiting BOS (decisive close through the swing)");
+}
+
+/* -------------------------
+   4) Final vocabulary guard (REPLACE)
+   - “mixed” → “neutral” on Calendar lines ONLY (including “Calendar bias for <INSTRUMENT>”)
+   ------------------------- */
+function _finalPolish(text: string): string {
   if (!text) return text;
   let out = text;
 
-  // Calendar: ... mixed  ->  Calendar: ... neutral
+  // Calendar: ... mixed -> neutral
   out = out.replace(
     /(^|\n)(\s*•\s*)?Calendar\s*:\s*([^\n]*?)\bmixed\b([^\n]*)/gi,
     (_m, pfx, bullet, before, after) => {
@@ -2667,7 +2727,7 @@ function normalizeTriggerSpacing(text: string): string {
     }
   );
 
-  // Calendar bias for <INSTRUMENT>: ... mixed -> ... neutral (preserve instrument token)
+  // Calendar bias for <INSTRUMENT>: ... mixed -> neutral (preserve instrument)
   out = out.replace(
     /(^|\n)(\s*•\s*)?Calendar\s*bias\s*for\s+([A-Z0-9:_\-]+?)\s*:\s*([^\n]*?)\bmixed\b([^\n]*)/gi,
     (_m, pfx, bullet, instr, before, after) => {
@@ -2676,33 +2736,207 @@ function normalizeTriggerSpacing(text: string): string {
     }
   );
 
+  // repair stray “Trigger:Alternative …” bugs
+  out = out.replace(/(^\s*•\s*Trigger:\s*)Alternative\s*/gmi, "$1");
+
   return out;
 }
-/** Context Engine v5: image-first reconciliation for 4H/1H/15m/5m/1m + synced X-ray.
- *  - Enforces explicit Trend: Uptrend/Downtrend/Range tokens on every TF line (X-ray + Technical View).
- *  - Image-first: no need for HH/HL text on the chart; derive from wording and plan where needed.
- *  - 4H is the truth source for HTF; 1H can be counter-trend only if explicitly stated.
- *  - 15m must state Trend and is marked (counter-trend) when it fights 4H/1H.
- *  - 5m/1m are "timing only" and cannot override HTF bias; still get micro trend label.
- *  - No extra model calls → zero latency impact.
- */
-/**
- * Reconciler with RAW SWING MAP priority.
- * If a RAW SWING MAP block exists, we do NOTHING here (map is the single source of truth).
- * If no map is present, fall back to heuristic reconciliation (previous behavior).
- */
+
+/* -------------------------
+   5) Entry zone enforcement (REPLACE, trigger-aware)
+   - Produces min–max zone
+   - BOS ⇢ synth tight zone around level
+   - Retest/tap ⇢ preserve two-number zone or synth around single
+   ------------------------- */
+function enforceEntryZoneUsage(text: string, instrument: string): string {
+  if (!text) return text;
+  const ai = extractAiMeta(text) || {};
+  const NUM_RE = /(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?/g;
+  const toNum = (s: string) => Number(String(s).replace(/,/g, ""));
+
+  function fmtZone(min: number, max: number): string {
+    const lo = Math.min(min, max);
+    const hi = Math.max(min, max);
+    const dec = Math.max((String(lo).split(".")[1] || "").length, (String(hi).split(".")[1] || "").length, 2);
+    return `${lo.toFixed(dec)} – ${hi.toFixed(dec)}`;
+  }
+  function widthAround(px: number) {
+    // Use ~0.18% span, floor by a “tick-like” epsilon
+    const span = Math.max(Math.abs(px) * 0.0018, Math.max(0.5, Math.abs(px) * 1e-5));
+    return { lo: px - span / 2, hi: px + span / 2 };
+  }
+  function deriveZone(triggerLine: string, entryLine: string, stopLine: string): string | null {
+    const trig = (triggerLine || "").toLowerCase();
+    const entryNums = (entryLine.match(NUM_RE) || []).map(toNum).filter(Number.isFinite);
+    const stopNums = (stopLine.match(NUM_RE) || []).map(toNum).filter(Number.isFinite);
+
+    const isBreak = /(bos|break\s*of\s*structure|close\s*(above|below)|breakout|breach|ignite|ignition|momentum|impulse|squeeze|close\-through)/i.test(trig);
+    const isRetest = /(tap|retest|pullback|mitigation|mitigate|rebalance|fill|fvg|fair\s*value|order\s*block|\bob\b|supply|demand|breaker|range\s*(high|low)|eq\s*of\s*range|rotation)/i.test(trig);
+
+    // BOS-anchor: use the first numeric from entry or trigger, widen slightly
+    if (isBreak) {
+      const px = entryNums[0] ?? ((triggerLine.match(NUM_RE) || []).map(toNum)[0]);
+      if (Number.isFinite(px)) {
+        const { lo, hi } = widthAround(px!);
+        return fmtZone(lo, hi);
+      }
+    }
+
+    // Retest anchor: if entry has two numbers already, respect them
+    if (isRetest && entryNums.length >= 2) return fmtZone(entryNums[0], entryNums[1]);
+
+    // If single number only, synth zone
+    const single = entryNums[0] ?? ((triggerLine.match(NUM_RE) || []).map(toNum)[0]);
+    if (Number.isFinite(single)) {
+      const { lo, hi } = widthAround(single!);
+      return fmtZone(lo, hi);
+    }
+
+    // Hail-mary: if nothing, synth near SL
+    if (stopNums.length) {
+      const px = stopNums[0]!;
+      const { lo, hi } = widthAround(px);
+      return fmtZone(lo, hi);
+    }
+    return null;
+  }
+
+  function rewriteBlock(src: string, reBlock: RegExp) {
+    const m = src.match(reBlock);
+    if (!m) return src;
+    let block = m[0];
+
+    const reTrig  = /(^\s*•\s*Trigger\s*:\s*)([^\n]+)$/mi;
+    const reEntry = /(^\s*•\s*Entry\s*\(zone\s*or\s*single\)\s*:\s*)([^\n]+)$/mi;
+    const reEntryAlt = /(^\s*•\s*Entry\s*:\s*)([^\n]+)$/mi;
+    const reStop  = /(^\s*•\s*Stop\s*Loss\s*:\s*)([^\n]+)$/mi;
+
+    const trigLine  = (block.match(reTrig)?.[2] || "").trim();
+    const entryLine = (block.match(reEntry)?.[2] || block.match(reEntryAlt)?.[2] || "").trim();
+    const stopLine  = (block.match(reStop)?.[2] || "").trim();
+
+    // Priority 1: ai_meta zone (when present)
+    let zoneText: string | null = null;
+    if (ai?.zone && Number.isFinite(+ai.zone.min) && Number.isFinite(+ai.zone.max)) {
+      const lo = Number(ai.zone.min), hi = Number(ai.zone.max);
+      zoneText = fmtZone(lo, hi);
+    } else {
+      zoneText = deriveZone(trigLine, entryLine, stopLine);
+    }
+
+    if (!zoneText) return src;
+
+    if (reEntry.test(block)) block = block.replace(reEntry, (_f, p1) => `${p1}${zoneText}`);
+    else if (reEntryAlt.test(block)) block = block.replace(reEntryAlt, (_f, p1) => `${p1}${zoneText}`);
+    else block = `${block}\n• Entry (zone or single): ${zoneText}`;
+
+    return src.replace(m[0], block);
+  }
+
+  let out = text;
+  out = rewriteBlock(out, /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
+  out = rewriteBlock(out, /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
+  out = rewriteBlock(out, /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i);
+  return out;
+}
+
+/* -------------------------
+   6) RAW SWING MAP enforcer (REPLACE)
+   - Accepts bullets or plain lines
+   - Syncs X-ray + Technical View
+   - 1H/15m can be counter-trend but may not override 4H wording
+   - Bullet normalization in X-ray
+   ------------------------- */
+function _applyRawSwingMap(text: string): string {
+  if (!text) return text;
+
+  const mapRe = /(RAW\s*SWING\s*MAP(?:\s*\(first\))?[\s\S]*?)(?=\n\s*Quick\s*Plan\s*\(Actionable\)|\n\s*Option\s*1|\n\s*Full\s*Breakdown|$)/i;
+  const m = text.match(mapRe);
+  if (!m) return text;
+
+  const block = m[1];
+  type Verdict = 'Uptrend'|'Downtrend'|'Range';
+  type TF = '4H'|'1H'|'15m'|'5m'|'1m';
+  const lines: Partial<Record<TF, { swings:string; bos:string; verdict:Verdict }>> = {};
+
+  function take(tf: TF) {
+    const tfEsc = tf.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
+    const re = new RegExp(
+      `^\\s*(?:[-•]\\s*)?(?:\\*\\*)?${tfEsc}(?:\\*\\*)?\\s*:\\s*` +
+      `(?:Swings|swings)?\\s*=?\\s*([^;\\n]+)?;?\\s*` +
+      `(?:last_?BOS|last\\s*BOS)?\\s*=\\s*([^;\\n]+)?;?\\s*` +
+      `verdict\\s*=\\s*(Uptrend|Downtrend|Range)\\s*$`,
+      'im'
+    );
+    const mm = block.match(re);
+    if (!mm) return;
+    lines[tf] = {
+      swings: (mm[1] || '').trim(),
+      bos: (mm[2] || '').trim().toLowerCase(),
+      verdict: (mm[3] as Verdict)
+    };
+  }
+  (['4H','1H','15m','5m','1m'] as TF[]).forEach(take);
+
+  if (!lines['4H'] || !lines['1H'] || !lines['15m']) return text;
+
+  const v4 = lines['4H']!.verdict;
+  const v1 = lines['1H']!.verdict;
+  const v15 = lines['15m']!.verdict;
+
+  const ct15 = (v4 !== 'Range' && v15 !== 'Range' && v15 !== v4);
+
+  const tail4 =
+    v4 === 'Uptrend'   ? '— bullish structure (HH/HL confirmed)'
+  : v4 === 'Downtrend' ? '— bearish structure (LH/LL confirmed)'
+                       : '— consolidation / range';
+
+  const ctx1 = '— at support/demand; monitor continuation vs pullback';
+
+  const line4 = `Trend: ${v4} ${tail4}`;
+  const line1 = `Trend: ${v1} ${ctx1}`;
+  const line15 = `Trend: ${v15} — Execution anchors refined from 1H${ct15 ? ' (counter-trend)' : ''}`;
+
+  // Micro TFs
+  const micro = (v?: Verdict) => v === 'Uptrend' ? 'Micro up' : v === 'Downtrend' ? 'Micro down' : 'Micro range';
+  const line5  = `Trend: ${micro(lines['5m']?.verdict)} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`;
+  const line1m = lines['1m'] ? `Trend: ${micro(lines['1m']!.verdict)} — timing only; CHOCH/BOS micro-shift for entry` : 'not used';
+
+  const newX =
+`Detected Structures (X-ray)
+• 4H: ${line4}
+• 1H: ${line1}
+• 15m: ${line15}
+• 5m: ${line5}
+• 1m: ${line1m}
+`;
+
+  const xrayRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
+  let out = text;
+  if (xrayRe.test(out)) out = out.replace(xrayRe, (_m)=>newX);
+  else out = out.replace(/(\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown)/i, `\n${newX}\n$1`);
+
+  // Sync Technical View lines
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line4}`);
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line1}`);
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line15}`);
+
+  return out;
+}
+
+/* -------------------------
+   7) Heuristic reconciliation when RAW SWING MAP missing (REPLACE)
+   - Keep old behavior but normalize output to match the new X-ray bullets
+   ------------------------- */
 function _reconcileHTFTrendFromText(text: string): string {
   if (!text) return text;
 
-  // If a RAW SWING MAP exists anywhere before Quick Plan / Options / Full Breakdown,
-  // short-circuit — the dedicated _applyRawSwingMap() will enforce parity later.
-  const hasRawMap = /(RAW\s*SWING\s*MAP[\s\S]*?)(?=\n\s*Quick\s*Plan\s*\(Actionable\)|\n\s*Option\s*1|\n\s*Full\s*Breakdown|$)/i.test(text);
+  // If a RAW SWING MAP exists, skip (truth source)
+  const hasRawMap = /(RAW\s*SWING\s*MAP[\s\S]*?)(?=\n\s*Quick\s*Plan|\n\s*Option\s*1|\n\s*Full\s*Breakdown|$)/i.test(text);
   if (hasRawMap) return text;
 
-  // ---- Heuristic fallback (unchanged semantics) ----
   const raw = text;
   const lower = raw.toLowerCase();
-
   function readTF(tf: '4H'|'1H'|'15m'|'5m'|'1m'): string {
     const tfEsc = tf.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
     const reX  = new RegExp(`^\\s*[-•]\\s*${tfEsc}\\s*(?:\\(if\\s*used\\))?\\s*:\\s*([^\\n]*)`, 'mi');
@@ -2713,14 +2947,12 @@ function _reconcileHTFTrendFromText(text: string): string {
     if (mT) return (mT[2] || '').trim();
     return '';
   }
-
   type Dir = 'up'|'down'|'range'|'';
-
   function classify(desc: string): Dir {
     const s = (desc || '').toLowerCase();
     if (!s) return '';
-    const hasHHHL = /\b(hh\/hl|higher\s*highs?\s*\/\s*higher\s*lows?|higher\s*highs?\b.*\bhigher\s*lows?\b)/i.test(s);
-    const hasLHLL = /\b(lh\/ll|lower\s*highs?\s*\/\s*lower\s*lows?|lower\s*highs?\b.*\blower\s*lows?\b)/i.test(s);
+    const hasHHHL = /\bhh\/hl|higher\s*highs?\b.*\bhigher\s*lows?\b/i.test(s);
+    const hasLHLL = /\blh\/ll|lower\s*highs?\b.*\blower\s*lows?\b/i.test(s);
     const saysUp  = /\b(uptrend|bullish)\b/.test(s);
     const saysDn  = /\b(downtrend|bearish)\b/.test(s);
     const saysRg  = /\b(range|sideways|consolidation|chop)\b/.test(s);
@@ -2732,13 +2964,12 @@ function _reconcileHTFTrendFromText(text: string): string {
     if (saysDn)  return 'down';
     return '';
   }
-
   function planDirSign(): -1|0|1 {
     const mQP = raw.match(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(Long|Short)/i);
     const mO1 = raw.match(/Option\s*1[\s\S]*?Direction\s*:\s*(Long|Short)/i);
     const d = (mQP?.[1] || mO1?.[1] || '').toLowerCase();
     return d === 'long' ? 1 : d === 'short' ? -1 : 0;
-    }
+  }
 
   const prior4  = readTF('4H');
   const prior1  = readTF('1H');
@@ -2783,126 +3014,6 @@ function _reconcileHTFTrendFromText(text: string): string {
   const mentions1m = /\b1m\b/i.test(raw) || /Used\s*Chart:\s*1M/i.test(raw);
   const line1m = mentions1m ? `Trend: ${microWord(d1m)} — timing only; CHOCH/BOS micro-shift for entry` : 'not used';
 
-  const newXray =
-`Detected Structures (X-ray)
-- 4H: ${line4}
-- 1H: ${line1}
-- 15m: ${line15}
-- 5m: ${line5}
-- 1m: ${line1m}
-`;
-
-  const xraySectRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
-  let out = raw;
-  if (xraySectRe.test(out)) out = out.replace(xraySectRe, (_m) => newXray);
-  else if (/Final\s*Table\s*Summary:/i.test(out)) out = out.replace(/(\n\s*Final\s*Table\s*Summary:)/i, `\n${newXray}\n$1`);
-  else if (/Full\s*Breakdown/i.test(out)) out = out.replace(/(\n\s*Full\s*Breakdown)/i, `\n${newXray}\n$1`);
-  else out = `${out}\n\n${newXray}`;
-
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line4}`);
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line1}`);
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line15}`);
-
-  return out;
-}
-
- // ---- END _reconcileHTFTrendFromText (v6) ----
-
-/**
- * Enforce HTF/LTF structure strictly from a mandatory RAW SWING MAP block.
- *  The RAW SWING MAP must appear at the top, before Quick Plan. Example lines:
- *    4H: swings=HH,HL,HH,HL; last_BOS=up; verdict=Uptrend
- *    1H: swings=LH,LL,LH,LL; last_BOS=down; verdict=Downtrend
- *  This parser is tolerant to extra spaces/case and missing 5m/1m lines.
- *  It updates:
- *    - Detected Structures (X-ray)
- *    - Technical View lines for 4H/1H/15m
- *  and applies the 4H truth table (1H/15m cannot override 4H; they may be counter-trend only).
- */
-/**
- * RAW SWING MAP — authoritative image-parity enforcer.
- * - Parses the RAW SWING MAP block and treats it as the single source of truth.
- * - Propagates verdicts to X-ray + Technical View with counter-trend labeling.
- * - Never invents missing TFs; absent TFs become "not used".
- * - Normalizes wording (Uptrend/Downtrend/Range) and prevents drift elsewhere.
- */
-function _applyRawSwingMap(text: string): string {
-  if (!text) return text;
-
-  // 1) Grab the RAW SWING MAP block (top section, before Quick Plan)
-  //    - Accept BOTH "RAW SWING MAP (first)" and plain "RAW SWING MAP"
-  //    - Robust to extra newlines/markdown
-  const mapRe = /(RAW\s*SWING\s*MAP(?:\s*\(first\))?[\s\S]*?)(?=\n\s*Quick\s*Plan\s*\(Actionable\)|\n\s*Option\s*1|\n\s*Full\s*Breakdown|$)/i;
-  const m = text.match(mapRe);
-  if (!m) return text; // nothing to enforce
-
-  const block = m[1];
-
-  type Verdict = 'Uptrend'|'Downtrend'|'Range';
-  type TF = '4H'|'1H'|'15m'|'5m'|'1m';
-
-  const lines: Partial<Record<TF, { swings:string; bos:string; verdict:Verdict }>> = {};
-
-  // Accept formats like:
-  // "- **4H:** swings=..., last_BOS=..., verdict=Downtrend"
-  // "- 4H: swings=..., ..."
-  // "4H: swings=..., ..."
-  function take(tf: TF) {
-    const tfEsc = tf.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
-    const re = new RegExp(
-      `^\\s*(?:[-•]\\s*)?(?:\\*\\*)?${tfEsc}(?:\\*\\*)?\\s*:\\s*` + // tolerant TF label (bullets + bold)
-      `swings\\s*=\\s*([^;\\n]+);\\s*` +                            // swings
-      `last_BOS\\s*=\\s*([^;\\n]+);\\s*` +                          // last_BOS
-      `verdict\\s*=\\s*(Uptrend|Downtrend|Range)\\s*$`,             // verdict
-      'im'
-    );
-    const mm = block.match(re);
-    if (!mm) return;
-    lines[tf] = {
-      swings: (mm[1] || '').trim(),
-      bos: (mm[2] || '').trim().toLowerCase(),
-      verdict: mm[3] as Verdict
-    };
-  }
-
-  (['4H','1H','15m','5m','1m'] as TF[]).forEach(take);
-
-  // Must have at least 4H,1H,15m verdicts to be useful
-  if (!lines['4H'] || !lines['1H'] || !lines['15m']) return text;
-
-  // 2) Truth table: 4H verdict anchors; 1H/15m can be counter-trend but cannot flip HTF wording.
-  const v4 = lines['4H']!.verdict;
-  const v1 = lines['1H']!.verdict;
-  const v15 = lines['15m']!.verdict;
-
-  const ct15 = (v4 !== 'Range' && v15 !== 'Range' && v15 !== v4);
-
-  // 3) Build normalized wording for X-ray + Technical View
-  const tail4 =
-    v4 === 'Uptrend'   ? '— bullish structure (HH/HL confirmed)'
-  : v4 === 'Downtrend' ? '— bearish structure (LH/LL confirmed)'
-                       : '— consolidation / range';
-
-  // Heuristic context line for 1H kept deterministic & stable
-  const ctx1 = '— at support/demand; monitor continuation vs pullback';
-
-  const line4 = `Trend: ${v4} ${tail4}`;
-  const line1 = `Trend: ${v1} ${ctx1}`;
-  const anchor15 = 'Execution anchors refined from 1H';
-  const line15 = `Trend: ${v15} — ${anchor15}${ct15 ? ' (counter-trend)' : ''}`;
-
-  // Micro TFs (5m/1m) are timing-only
-  const line5 =
-    lines['5m']
-      ? `Trend: ${lines['5m']!.verdict === 'Uptrend' ? 'Micro up' : lines['5m']!.verdict === 'Downtrend' ? 'Micro down' : 'Micro range'} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`
-      : 'Trend: Micro range — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)';
-
-  const line1m =
-    lines['1m']
-      ? `Trend: ${lines['1m']!.verdict === 'Uptrend' ? 'Micro up' : lines['1m']!.verdict === 'Downtrend' ? 'Micro down' : 'Micro range'} — timing only; CHOCH/BOS micro-shift for entry`
-      : 'not used';
-
-  // 4) Replace X-ray section deterministically (no nested template literals)
   const newX =
 `Detected Structures (X-ray)
 • 4H: ${line4}
@@ -2912,156 +3023,110 @@ function _applyRawSwingMap(text: string): string {
 • 1m: ${line1m}
 `;
 
-  const xrayRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
-  let out = text;
-  if (xrayRe.test(out)) out = out.replace(xrayRe, (_m)=>newX);
-  else out = out.replace(/(\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown)/i, `\n${newX}\n$1`);
+  const xraySectRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
+  let out = raw;
+  if (xraySectRe.test(out)) out = out.replace(xraySectRe, (_m) => newX);
+  else if (/Final\s*Table\s*Summary:/i.test(out)) out = out.replace(/(\n\s*Final\s*Table\s*Summary:)/i, `\n${newX}\n$1`);
+  else if (/Full\s*Breakdown/i.test(out)) out = out.replace(/(\n\s*Full\s*Breakdown)/i, `\n${newX}\n$1`);
+  else out = `${out}\n\n${newX}`;
 
-  // 5) Sync Technical View lines with RAW SWING MAP truth
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line4}`);
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line1}`);
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line15}`);
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line4}`);
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line1}`);
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line15}`);
 
   return out;
 }
 
-
-
-
-/** Ensure Option 1 aligns with fundamentals when possible; also prefers confirmation-based option when Option 1 uses Limit but trigger says BOS. */
+/* -------------------------
+   8) Option order alignment & swapping by fundamentals (REPLACE)
+   - Fix order types first
+   - If O1 misaligned and O2 aligned, swap
+   - Prefer confirmation-based option when O1 uses Limit but needs BOS
+   ------------------------- */
 function enforceOptionOrderByBias(text: string, fundamentalsSign: number): string {
   if (!text) return text;
 
   const { qp, o1, o2, RE_O1, RE_O2 } = _pickBlocks(text);
-  if (!o1 || !o2) return _normalizeOrderTypeByTrigger(text); // still fix order types
+  if (!o1 || !o2) return _normalizeOrderTypeByTrigger(text);
 
-  const d1 = _dirSignFromBlock(o1);
-  const d2 = _dirSignFromBlock(o2);
+  const trigImpliesBOS = (s: string) => /(bos|break\s+of\s+structure|close\s+(below|above)|breakout|breach|ignite|ignition|momentum|impulse|squeeze)/i.test(s);
 
-  const o1Trig = (o1.match(/^\s*•\s*Trigger:\s*([^\n]+)/mi)?.[1] || "").toLowerCase();
-  const o2Trig = (o2.match(/^\s*•\s*Trigger:\s*([^\n]+)/mi)?.[1] || "").toLowerCase();
-  const o1Ord  = (o1.match(/^\s*•\s*Order\s*Type:\s*([^\n]+)/mi)?.[1] || "").toLowerCase();
-  const o2Ord  = (o2.match(/^\s*•\s*Order\s*Type:\s*([^\n]+)/mi)?.[1] || "").toLowerCase();
-
-  const trigImpliesBOS = (s: string) => /(bos|break\s+of\s+structure|close\s+(below|above)|breakout|breach)/i.test(s);
-
-  // Fix Order Type mismatches to match triggers first
+  // Normalize first
   let out = _normalizeOrderTypeByTrigger(text);
 
-  // Re-pick post-normalization blocks for swap logic
-  const b = _pickBlocks(out);
-  const O1 = b.o1, O2 = b.o2;
-  if (!O1 || !O2) return out;
+  // Re-pick post-normalization
+  const B = _pickBlocks(out);
+  const O1 = B.o1!, O2 = B.o2!;
 
   const O1_trig = (O1.match(/^\s*•\s*Trigger:\s*([^\n]+)/mi)?.[1] || "").toLowerCase();
   const O2_trig = (O2.match(/^\s*•\s*Trigger:\s*([^\n]+)/mi)?.[1] || "").toLowerCase();
+
   const O1_dir  = _dirSignFromBlock(O1);
   const O2_dir  = _dirSignFromBlock(O2);
 
   const o1Aligned = fundamentalsSign !== 0 && O1_dir !== 0 && Math.sign(fundamentalsSign) === Math.sign(O1_dir);
   const o2Aligned = fundamentalsSign !== 0 && O2_dir !== 0 && Math.sign(fundamentalsSign) === Math.sign(O2_dir);
 
-  // If Option 1 requires BOS but is a pullback/limit-style (or simply less robust than O2 breakout), prefer O2
   const o1NeedsBOS = trigImpliesBOS(O1_trig);
   const o2NeedsBOS = trigImpliesBOS(O2_trig);
 
-  const preferO2BecauseConfirmation = (o1NeedsBOS && /limit/i.test(O1)) || (o2NeedsBOS && !o1NeedsBOS);
+  const preferO2BecauseConfirmation =
+    (o1NeedsBOS && /limit/i.test(O1)) ||
+    (o2NeedsBOS && !o1NeedsBOS);
 
   if ((!o1Aligned && o2Aligned) || preferO2BecauseConfirmation) {
-    // swap blocks
     let swapped = out.replace(RE_O2, "__O2_SWAP_MARKER__");
     swapped = swapped.replace(RE_O1, O2);
     swapped = swapped.replace("__O2_SWAP_MARKER__", O1);
     return swapped;
   }
-
   return out;
 }
-/** Ensure Option 2 is a distinct strategy. */
-async function enforceDistinctAlternative(model: string, instrument: string, text: string) {
-  const m1 = text.match(/(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
-  const m2 = text.match(/(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i);
-  if (!m1 || !m2) return text;
 
-  const o1 = m1[0], o2 = m2[0];
-  const t1 = (o1.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase();
-  const t2 = (o2.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase();
-  if (!t1 || !t2) return text;
-
-  const buckets: Record<string, RegExp> = {
-    sweep: /(sweep|liquidity|raid|stop\s*hunt|bos|choch)/i,
-    ob_fvg: /(order\s*block|\bob\b|fvg|fair\s*value|breaker)/i,
-    tl_break: /(trendline|channel|wedge|triangle)/i,
-    range: /(range|rotation|mean\s*reversion|eq\s*of\s*range)/i,
-    vwap: /\bvwap\b/i,
-    momentum: /(ignition|breakout|squeeze|bollinger|macd|divergence)/i,
-  };
-  function bucketOf(s: string): string | null { for (const [k, re] of Object.entries(buckets)) if (re.test(s)) return k; return null; }
-  const b1 = bucketOf(t1);
-  const b2 = bucketOf(t2);
-
-  const tooSimilar = (b1 && b2 && b1 === b2) || t1.replace(/\s+/g,"") === t2.replace(/\s+/g,"");
-  if (!tooSimilar) return text;
-
-  const sys = "Rewrite ONLY the 'Option 2 (Alternative)' block so it is a DISTINCT strategy from Option 1, with a different trigger type and explicit timeframes.";
-  const rules = [
-    "Choose a different play from the library (e.g., if Option 1 is sweep/BOS, make Option 2 a TL break+retest, range rotation, OB/FVG pullback, VWAP, or momentum breakout).",
-    "Keep direction if justified by HTF, but change the strategy & Trigger wording.",
-    "Include Direction, Order Type, Trigger (with timeframes), Entry (zone/single), Stop Loss, TP1/TP2, Conviction, Why this alternative."
-  ].join("\n- ");
-  const out = await callOpenAI(model, [
-    { role: "system", content: "Return ONLY a full, corrected 'Option 2 (Alternative)' block. Do not alter other sections." },
-    { role: "user", content: `Instrument: ${instrument}\n\nOPTION 1:\n${o1}\n\nOPTION 2 (to be rewritten):\n${o2}\n\nRules:\n- ${rules}` }
-  ]);
-
-  if (!out || out.length < 30) return text;
-  return text.replace(m2[0], out.trim());
-}
-
-/** HARD-GATE: Ensure Option 2 is DISTINCT post-generation (after ai_meta).
- *  Latency-safe version: no extra model calls, deterministic rewrite if needed.
- *  - If Option 2 trigger is same bucket as Option 1, we rewrite ONLY Option 2's Trigger
- *    (and tweak its "Why" line) to a different strategy class with explicit TFs.
- *  - Then we normalize Order Type from the trigger (via _normalizeOrderTypeByTrigger).
- *  - Everything else (direction, entry, SL/TP, conviction) is preserved.
- */
+/* -------------------------
+   9) Hard distinct Option 2 (REPLACE)
+   - Distinct strategy bucket
+   - If still overlapping and 1H shows counter-trend context, flip O2 direction
+   - Normalize order type afterwards
+   ------------------------- */
 async function enforceOption2DistinctHard(_model: string, instrument: string, text: string) {
   if (!text) return text;
 
-  // Grab blocks
   const { o1, o2, RE_O2 } = _pickBlocks(text);
   if (!o1 || !o2) return text;
 
-  // Extract current triggers
-  const trig1 = (o1.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase().replace(/\s+/g, " ").trim();
-  const trig2 = (o2.match(/^\s*•\s*Trigger:\s*(.+)$/mi)?.[1] || "").toLowerCase().replace(/\s+/g, " ").trim();
+  const dirOf = (s: string) => (s.match(/^\s*•\s*Direction\s*:\s*(Long|Short)/mi)?.[1] || "").toLowerCase();
+  const dir1 = dirOf(o1), dir2 = dirOf(o2);
 
-  // Bucket classifier (must stay in sync with other parts of the app)
+  const trigOf = (s: string) => (s.match(/^\s*•\s*Trigger\s*:\s*(.+)$/mi)?.[1] || "").toLowerCase().replace(/\s+/g, " ").trim();
+  const t1 = trigOf(o1), t2 = trigOf(o2);
+
   const buckets: Record<string, RegExp> = {
     sweep: /(sweep|liquidity|raid|stop\s*hunt|bos\b|choch\b)/i,
     ob_fvg: /(order\s*block|\bob\b|fvg|fair\s*value|breaker)/i,
     tl_break: /(trendline|channel|wedge|triangle)/i,
     range: /(range\s*rotation|range\b|mean\s*reversion|eq\s*of\s*range)/i,
     vwap: /\bvwap\b/i,
-    momentum: /(ignition|breakout|squeeze|bollinger|macd|divergence)/i,
+    momentum: /(ignition|breakout|squeeze|bollinger|macd|divergence|momentum|impulse)/i,
   };
   const bucketOf = (s: string) => {
     for (const [k, re] of Object.entries(buckets)) if (re.test(s)) return k;
     return "other";
   };
 
-  const b1 = bucketOf(trig1);
-  const b2 = bucketOf(trig2);
-  const isTooSimilar = !!trig1 && !!trig2 && (b1 === b2 || trig1 === trig2);
+  const b1 = bucketOf(t1);
+  const b2 = bucketOf(t2);
+  const sameBucket = !!t1 && !!t2 && (b1 === b2 || t1 === t2);
+  const sameDir = dir1 && dir2 && dir1 === dir2;
 
-  if (!isTooSimilar) {
-    // Already distinct → set compliance flag and return
+  let needRewrite = sameBucket || sameDir;
+
+  if (!needRewrite) {
     return ensureAiMetaBlock(text, {
       compliance: { ...(extractAiMeta(text)?.compliance || {}), option2Distinct: true }
     });
   }
 
-  // Choose a distinct alternative bucket deterministically (no LLM)
   const altByPrimary: Record<string, string> = {
     sweep: "tl_break",
     tl_break: "range",
@@ -3073,52 +3138,50 @@ async function enforceOption2DistinctHard(_model: string, instrument: string, te
   };
   const alt = altByPrimary[b1] || "tl_break";
 
-  // Build a concrete trigger line for the chosen alt bucket (explicit TFs)
   function altTrigger(bucket: string): string {
     switch (bucket) {
-      case "tl_break":
-        return "15m trendline break; 5m retest; confirm 5m BOS";
-      case "range":
-        return "15m range EQ rotation; sell from range high; 5m shift/BOS for entry";
-      case "ob_fvg":
-        return "15m OB+FVG pullback; 5m mitigation + BOS continuation";
-      case "momentum":
-        return "15m squeeze → momentum breakout; 5m close-through + hold; 5m BOS";
-      case "vwap":
-        return "Session VWAP fade at deviation; 15m structure; 5m rejection + shift";
-      default:
-        return "15m structural break; 5m retest; 5m BOS confirmation";
+      case "tl_break": return "15m trendline break → 15m/5m retest; confirm 5m BOS";
+      case "range":    return "15m range EQ rotation; act at range high/low; 5m shift/BOS confirmation";
+      case "ob_fvg":   return "15m OB + FVG pullback; 5m mitigation + BOS continuation";
+      case "momentum": return "15m momentum breakout; 5m close-through + hold, then 5m BOS";
+      case "vwap":     return "Session VWAP dev fade; 5m rejection + micro shift/BOS";
+      default:         return "15m structural break; 5m retest; 5m BOS";
     }
   }
 
-  const newTrig = `• Trigger: ${altTrigger(alt)}`;
-
-  // Replace ONLY the Trigger line inside Option 2 block; preserve everything else
   let newO2 = o2;
-  if (/^\s*•\s*Trigger:\s*/mi.test(newO2)) {
-    newO2 = newO2.replace(/^\s*•\s*Trigger:\s*.+$/mi, newTrig);
-  } else {
-    // If somehow missing, append near the top (after Order Type / Direction if present)
-    const insertAfter = /(^\s*•\s*Order\s*Type:[^\n]*\n)/mi;
-    if (insertAfter.test(newO2)) newO2 = newO2.replace(insertAfter, (m) => m + newTrig + "\n");
-    else newO2 = newO2.replace(/(^\s*•\s*Direction:[^\n]*\n)/mi, (m) => m + newTrig + "\n");
+
+  // If same direction and the 1H text indicates a counter-trend context, flip O2’s direction
+  const tv1H = (text.match(/Technical\s*View[\s\S]{0,800}?1H:\s*([^\n]+)/i)?.[1] || "").toLowerCase();
+  const hintCT = /\bcounter\-trend\b/.test(tv1H);
+  if (sameDir && hintCT) {
+    const flipped = dir1 === "long" ? "Short" : "Long";
+    if (/^\s*•\s*Direction\s*:/mi.test(newO2)) {
+      newO2 = newO2.replace(/(^\s*•\s*Direction\s*:\s*)(Long|Short)/mi, `$1${flipped}`);
+    } else {
+      newO2 = newO2.replace(/^(Option\s*2[^\n]*\n)/i, `$1• Direction: ${flipped}\n`);
+    }
   }
 
-  // Tweak the "Why this alternative" line to reflect distinct strategy
-  const whyLine = `• Why this alternative: Different playbook (${alt.replace("_", "/")}) to avoid overlap with Option 1; uses explicit 15m/5m confirmation.`;
+  // Replace or inject Trigger
+  const newTrig = `• Trigger: ${altTrigger(alt)}`;
+  if (/^\s*•\s*Trigger\s*:/mi.test(newO2)) newO2 = newO2.replace(/^\s*•\s*Trigger\s*:.+$/mi, newTrig);
+  else newO2 = newO2.replace(/^(Option\s*2[^\n]*\n)/i, `$1${newTrig}\n`);
+
+  // Why line tweak
+  const whyLine = `• Why this alternative: Different playbook (${alt.replace("_", "/")}) to avoid overlap with Option 1; explicit 15m/5m confirmation.`;
   if (/^\s*•\s*Why\s+this\s+alternative\s*:/mi.test(newO2)) {
     newO2 = newO2.replace(/^\s*•\s*Why\s+this\s+alternative\s*:[^\n]*$/mi, whyLine);
   } else {
-    newO2 = `${newO2}\n${whyLine}\n`;
+    newO2 += `\n${whyLine}\n`;
   }
 
-  // Write back Option 2 block
   let out = text.replace(RE_O2, newO2);
 
-  // Normalize Order Type to match the new trigger semantics
+  // Normalize order type to match new trigger
   out = _normalizeOrderTypeByTrigger(out);
 
-  // Mark compliance in ai_meta
+  // Mark compliance flag
   out = ensureAiMetaBlock(out, {
     compliance: { ...(extractAiMeta(out)?.compliance || {}), option2Distinct: true }
   });
@@ -3126,7 +3189,138 @@ async function enforceOption2DistinctHard(_model: string, instrument: string, te
   return out;
 }
 
-/** Backward-compat alias (so older call sites still work). */
+/* -------------------------
+   10) Calendar line normalization (ADD)
+   - Guarantee Full Breakdown snapshot emits a "Calendar:" line and never “mixed”
+   ------------------------- */
+function _normalizeCalendarSnapshotLines(text: string): string {
+  if (!text) return text;
+  let out = text;
+
+  // ensure there is a Calendar: line inside "Fundamental Bias Snapshot"
+  const hasSnapshot = /Fundamental\s*Bias\s*Snapshot/i.test(out);
+  if (hasSnapshot && !/Fundamental\s*Bias\s*Snapshot[\s\S]*?\n•\s*Calendar\s*:/i.test(out)) {
+    out = out.replace(/(Fundamental\s*Bias\s*Snapshot:\s*\n)/i, `$1• Calendar: unavailable.\n`);
+  }
+
+  // never “mixed”
+  out = _finalPolish(out);
+  return out;
+}
+
+/* -------------------------
+   11) Final Table Summary: show both options (ADD)
+   - Builds two rows when Option 2 exists
+   - Uses found numbers; if missing, leaves “—”
+   ------------------------- */
+function _expandFinalTableToTwoRows(text: string, instrument: string): string {
+  if (!text) return text;
+
+  const pick = (block: string, label: string) =>
+    (block.match(new RegExp(`^\\s*•\\s*${label}\\s*:\\s*([^\\n]+)`, "mi"))?.[1] || "").trim();
+
+  const { o1, o2 } = _pickBlocks(text);
+  if (!o1) return text;
+
+  const rowFrom = (name: string, blk: string) => {
+    const dir = pick(blk, "Direction") || "—";
+    const entry = pick(blk, "Entry\\s*\\(zone\\s*or\\s*single\\)") || pick(blk, "Entry") || "—";
+    const sl = pick(blk, "Stop\\s*Loss") || "—";
+    const tps = pick(blk, "Take\\s*Profit\\(s\\)|TPs?") || "—";
+    const tp1 = (tps.match(/TP1:\s*([^\s/]+)/i)?.[1] || "—");
+    const tp2 = (tps.match(/TP2:\s*([^\s/]+)/i)?.[1] || "—");
+    const conv = (pick(blk, "Conviction").match(/\d{1,3}/)?.[0] || "—");
+    return `| ${instrument} | ${dir} | ${entry} | ${sl} | ${tp1} | ${tp2} | ${conv} |`;
+  };
+
+  const row1 = rowFrom("Option 1", o1);
+  const row2 = o2 ? `\n${rowFrom("Option 2", o2)}` : "";
+
+  if (/Final\s*Table\s*Summary\s*:/i.test(text)) {
+    return text.replace(
+      /(Final\s*Table\s*Summary\s*:\s*\n\|[^\n]+\n\|[^\n]+\n)([\s\S]*?)(?:\n{0,2}(?:ai_meta|$))/i,
+      (_m, head) => `${head}${row1}${row2}\n`
+    );
+  }
+
+  // Inject a new table if missing
+  const header =
+`Final Table Summary:
+| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |
+|---|---|---|---|---|---|---|
+${row1}${row2}
+`;
+  return `${text}\n\n${header}`;
+}
+
+/* -------------------------
+   12) Repair stray “Trigger:Alternative …” in all blocks (ADD)
+   ------------------------- */
+function _repairAltTriggerTypos(text: string): string {
+  if (!text) return text;
+  return text.replace(/(^\s*•\s*Trigger:\s*)Alternative(?:\s+setup)?\s*/gmi, "$1");
+}
+
+/* -------------------------
+   13) Price/order sanity: if ai_meta shows invalid, fix order-type only (ADD)
+   ------------------------- */
+function _fixOrderAgainstPriceIfNeeded(text: string): string {
+  const ai = extractAiMeta(text);
+  if (!ai) return text;
+  const bad = invalidOrderRelativeToPrice(ai);
+  if (!bad) return text;
+  return normalizeOrderTypeLines(text, ai); // function exists in your file
+}
+
+/* -------------------------
+   14) Orchestrator: apply full chain in one call (ADD)
+   - Use this in both “expand” and “full” flows right before provenance
+   ------------------------- */
+async function _applyMegaPostGenChain(args: {
+  text: string;
+  instrument: string;
+  fundamentalsSign: number;
+  scalping?: boolean;
+  scalpingHard?: boolean;
+}): Promise<string> {
+  let out = args.text;
+
+  // 1) BOS wording + trigger spacing + typo repairs
+  out = _clarifyBOSWording(out);
+  out = normalizeTriggerSpacing(out);
+  out = _repairAltTriggerTypos(out);
+
+  // 2) Structure reconciliation (first heuristic, then RAW MAP truth in case it appears)
+  out = _reconcileHTFTrendFromText(out);
+  out = _applyRawSwingMap(out);
+
+  // 3) Trigger specificity is already elsewhere; ensure order type parity + option ordering
+  out = _normalizeOrderTypeByTrigger(out);
+  out = enforceOptionOrderByBias(out, args.fundamentalsSign);
+
+  // 4) Option 2 distinctness (post-normalization)
+  out = await enforceOption2DistinctHard("n/a", args.instrument, out);
+  out = _normalizeOrderTypeByTrigger(out);
+
+  // 5) Entry zone normalization (trigger-aware) + price sanity
+  out = enforceEntryZoneUsage(out, args.instrument);
+  out = _fixOrderAgainstPriceIfNeeded(out);
+
+  // 6) Calendar wording guard + BOS again (idempotent) + final polish
+  out = _normalizeCalendarSnapshotLines(out);
+  out = _clarifyBOSWording(out);
+  out = _finalPolish(out);
+
+  // 7) Final table: ensure both options row coverage
+  out = _expandFinalTableToTwoRows(out, args.instrument);
+
+  return out;
+}
+
+/* =========================
+   END MEGA PATCH 1
+   ========================= */
+
 async function hardGateOption2Distinctness(model: string, instrument: string, text: string) {
   return enforceOption2DistinctHard(model, instrument, text);
 }
