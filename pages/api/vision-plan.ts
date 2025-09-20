@@ -3280,14 +3280,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       calDataUrlForPrompt = null;
     }
 
-    // ---------- Sentiment + Price ----------
+   // ---------- Sentiment + Price ----------
     let csm: CsmSnapshot;
     try { csm = await getCSM(); }
     catch (e: any) { return res.status(503).json({ ok: false, reason: `CSM unavailable: ${e?.message || "fetch failed"}.` }); }
 
     const cotCue = detectCotCueFromHeadlines(headlineItems);
     const { text: sentimentText } = sentimentSummary(csm, cotCue, hBias);
-    const livePrice = null; // IMAGE-ONLY: never fetch or use live price
+
+    // Live price hint (guarded): used ONLY for order-type sanity (normalizeOrderTypeLines + invalidOrderRelativeToPrice).
+    // Not used to rewrite Entry/SL/TP or to influence structure/bias.
+    const livePrice = await fetchLivePrice(instrument).catch(() => null);
+
     const dateStr = new Date().toISOString().slice(0, 10);
 
     // Composite bias
@@ -3327,32 +3331,36 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       scalpingHard
     });
 
-    // IMAGE-ONLY: do not inject current price hints
-let textFull = await callOpenAI(MODEL, messages);
-let aiMetaFull = extractAiMeta(textFull) || {};
+    let textFull = await callOpenAI(MODEL, messages);
+    let aiMetaFull = extractAiMeta(textFull) || {};
 
-       // === Post-processing enforcement ===
+    // === Post-processing enforcement ===
     textFull = await enforceQuickPlan(MODEL, instrument, textFull);
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
 
-    // Inject tournament strategy set (15+ playbooks, no minimums)
-    textFull = enforceTournamentStrategies(textFull, instrument);
+    // Replace placeholder tournament injection with deterministic diversity/scoring
+    textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
+    textFull = dedupeTournamentSections(textFull); // keep only the best tournament block before Final Table
 
+    // Polish & structure guards
     textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
     textFull = _clarifyBOSWording(textFull);
-    textFull = normalizeTriggerSpacing(textFull);            // NEW: prevents "Trigger:Alternative" (forces "Trigger: Alternative")
+    textFull = normalizeTriggerSpacing(textFull); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
     textFull = _reconcileHTFTrendFromText(textFull);
     textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
-    textFull = dedupeTournamentSections(textFull);
+
+    // Execution & risk guards
     textFull = enforceEntryZoneUsage(textFull, instrument);
     textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
     textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
     textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
+
+    // Ensure full breakdown scaffold + final table heading placement
     textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
     textFull = enforceFinalTableSummary(textFull, instrument);
 
-
+    // Fundamentals snapshot + alignment copy
     const fundamentalsSnapshotFull = computeIndependentFundamentals({
       instrument,
       calendarSign: parseInstrumentBiasFromNote(biasNote),
@@ -3364,45 +3372,53 @@ let aiMetaFull = extractAiMeta(textFull) || {};
     textFull = ensureFundamentalsSnapshot(textFull, { instrument, snapshot: fundamentalsSnapshotFull, preReleaseOnly, calendarLine: calendarText || null });
     textFull = applyConsistencyGuards(textFull, { fundamentalsSign: fundamentalsSnapshotFull.final.sign as -1 | 0 | 1 });
     textFull = enforceOptionOrderByBias(textFull, fundamentalsSnapshotFull.final.sign);
+
+    // Conviction + final table values (fill → enforce order to keep parity and avoid truncation)
     textFull = computeAndInjectConviction(textFull, { fundamentals: fundamentalsSnapshotFull, proximityFlag: warningMinutes != null });
     textFull = fillFinalTableSummaryRow(textFull, instrument);
+    textFull = enforceEntryZoneUsage(textFull, instrument);
 
-  // Determine if VWAP is truly used (ignore candidate list; look only at actionable parts)
-const _txtNoCand = textFull.replace(/Candidate\s*Scores[\s\S]*?Final\s*Table\s*Summary/i, "Final Table Summary");
-const vwap_used_flag =
-  /\bVWAP\b/i.test(_txtNoCand) &&
-  /\b(Setup|Trigger|Order\s*Type|Option\s*1|Option\s*2|Quick\s*Plan)\b/i.test(_txtNoCand);
+    // Determine if VWAP is truly used (ignore candidate list; look only at actionable parts)
+    const _txtNoCand = textFull.replace(/Candidate\s*Scores[\s\S]*?Final\s*Table\s*Summary/i, "Final Table Summary");
+    const vwap_used_flag =
+      /\bVWAP\b/i.test(_txtNoCand) &&
+      /\b(Setup|Trigger|Order\s*Type|Option\s*1|Option\s*2|Quick\s*Plan)\b/i.test(_txtNoCand);
 
-const aiPatchFull = {
-  version: "vp-AtoL-1",
-  instrument,
-  mode,
-  vwap_used: vwap_used_flag,
-  time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
-  max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
-  currentPrice: undefined, // IMAGE-ONLY: never embed price
-  scalping: !!scalping,
-  scalping_hard: !!scalpingHard,
-  fundamentals: {
-    calendar: { sign: fundamentalsSnapshotFull.components.calendar.sign, line: calendarText || null },
-    headlines: { label: fundamentalsSnapshotFull.components.headlines.label, avg: hBias.avg ?? null },
-    csm: { diff: fundamentalsSnapshotFull.components.csm.diff },
-    cot: { sign: fundamentalsSnapshotFull.components.cot.sign, detail: fundamentalsSnapshotFull.components.cot.detail },
-    final: { score: Math.round(fundamentalsSnapshotFull.final.score), label: fundamentalsSnapshotFull.final.label, sign: fundamentalsSnapshotFull.final.sign },
-    reliability: preReleaseOnly ? "low" : "normal"
-  },
-  proximity: { highImpactMins: warningMinutes ?? null },
-  vp_version: VP_VERSION
-};
-textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
+    // ai_meta patch — keep live price hint, but never modify user numbers with it
+    const aiPatchFull = {
+      version: "vp-AtoL-1",
+      instrument,
+      mode,
+      vwap_used: vwap_used_flag,
+      time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
+      max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
+      currentPrice: livePrice ?? null, // HINT ONLY
+      scalping: !!scalping,
+      scalping_hard: !!scalpingHard,
+      fundamentals: {
+        calendar: { sign: fundamentalsSnapshotFull.components.calendar.sign, line: calendarText || null },
+        headlines: { label: fundamentalsSnapshotFull.components.headlines.label, avg: hBias.avg ?? null },
+        csm: { diff: fundamentalsSnapshotFull.components.csm.diff },
+        cot: { sign: fundamentalsSnapshotFull.components.cot.sign, detail: fundamentalsSnapshotFull.components.cot.detail },
+        final: { score: Math.round(fundamentalsSnapshotFull.final.score), label: fundamentalsSnapshotFull.final.label, sign: fundamentalsSnapshotFull.final.sign },
+        reliability: preReleaseOnly ? "low" : "normal"
+      },
+      proximity: { highImpactMins: warningMinutes ?? null },
+      vp_version: VP_VERSION
+    };
+    textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
 
-let aiMetaFullNow = extractAiMeta(textFull) || {};
-if (aiMetaFullNow && invalidOrderRelativeToPrice(aiMetaFullNow)) {
-  textFull = normalizeOrderTypeLines(textFull, aiMetaFullNow);
-}
-textFull = await enforceOption2DistinctHard(MODEL, instrument, textFull);
-textFull = enforceEntryZoneUsage(textFull, instrument);
-textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
+    // If the ai_meta + trigger semantics produced an order-type/price mismatch, fix order type ONLY.
+    let aiMetaFullNow = extractAiMeta(textFull) || {};
+    if (aiMetaFullNow && invalidOrderRelativeToPrice(aiMetaFullNow)) {
+      textFull = normalizeOrderTypeLines(textFull, aiMetaFullNow);
+    }
+
+    // Hard-gate: Option 2 must be a distinct playbook, then re-normalize entry zone & ai_meta footer once more
+    textFull = await enforceOption2DistinctHard(MODEL, instrument, textFull);
+    textFull = enforceEntryZoneUsage(textFull, instrument);
+    textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
+
 
     // Provenance footer
     const footer = buildServerProvenanceFooter({
