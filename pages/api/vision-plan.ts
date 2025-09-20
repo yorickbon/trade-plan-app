@@ -2567,10 +2567,6 @@ function _normalizeOrderTypeByTrigger(text: string): string {
   return out;
 }
 
-
-
-}
-
 /* =========================
    MEGA PATCH 1 (AtoL-Ω)
    - Drop-in monolithic post-processing layer
