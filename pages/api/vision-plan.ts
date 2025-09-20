@@ -2618,22 +2618,18 @@ function _reconcileHTFTrendFromText(text: string): string {
     return '';
   }
 
-  // Classifier — now prioritizes explicit HH/HL vs LH/LL cues
+  // Classifier
   type Dir = 'up'|'down'|'range'|'';
   function classify(desc: string): Dir {
     const s = (desc || '').toLowerCase();
     if (!s) return '';
-    // Strong structural cues first
-    if (/(hh\\s*\\/\\s*hl|higher\\s*highs?.*higher\\s*lows?)/i.test(s)) return 'up';
-    if (/(lh\\s*\\/\\s*ll|lower\\s*highs?.*lower\\s*lows?)/i.test(s)) return 'down';
-    // Then common words
     if (/\b(uptrend|bullish)\b/.test(s)) return 'up';
     if (/\b(downtrend|bearish)\b/.test(s)) return 'down';
     if (/\b(range|sideways|consolidation|chop)\b/.test(s)) return 'range';
     return '';
   }
 
-  // Plan direction fallback (unchanged)
+  // Plan direction fallback
   function planDirSign(): -1|0|1 {
     const mQP = raw.match(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(Long|Short)/i);
     const mO1 = raw.match(/Option\s*1[\s\S]*?Direction\s*:\s*(Long|Short)/i);
@@ -2648,7 +2644,7 @@ function _reconcileHTFTrendFromText(text: string): string {
   const prior5 = readTF('5m');
   const prior1m = readTF('1m');
 
-  // Decide HTF regimes with inheritance (same as before)
+  // Decide HTF regimes
   let d4: Dir = classify(prior4);
   let d1: Dir = classify(prior1);
 
@@ -2658,18 +2654,18 @@ function _reconcileHTFTrendFromText(text: string): string {
   }
   if (!d1) d1 = d4;
 
-  // Friendly words (unchanged)
+  // Friendly words
   const word = (d: Dir) => d === 'up' ? 'Uptrend' : d === 'down' ? 'Downtrend' : 'Range';
   const microWord = (d: Dir) => d === 'up' ? 'Micro up' : d === 'down' ? 'Micro down' : 'Micro range';
 
-  // 4H canonical line (unchanged tail text)
+  // 4H canonical line
   const tail4 =
     d4 === 'up' ? '— bullish structure (HH/HL implied)'
   : d4 === 'down' ? '— bearish structure (LH/LL implied)'
                   : '— larger consolidation';
   const line4 = `Trend: ${word(d4)} ${tail4}`;
 
-  // 1H canonical line (keep your context wording)
+  // 1H canonical line (context wording from presence of supply/resistance vs demand/support)
   const supCount = (lower.match(/\b(support|demand)\b/gi) || []).length;
   const resCount = (lower.match(/\b(resistance|supply)\b/gi) || []).length;
   const ctx1 = resCount > supCount
@@ -2677,9 +2673,9 @@ function _reconcileHTFTrendFromText(text: string): string {
     : '— at support/demand; monitor continuation vs pullback';
   const line1 = `Trend: ${word(d1)} ${ctx1}`;
 
-  // 15m trend: try classify; else inherit 1H (same), but add firm counter-trend note
+  // 15m trend: try classify; else inherit 1H
   let d15: Dir = classify(prior15) || d1;
-
+  // 15m anchors pulled from doc cues
   function anchor15(): string {
     const s = (prior15 || '').trim();
     if (s) return s;
@@ -2693,7 +2689,7 @@ function _reconcileHTFTrendFromText(text: string): string {
   const ctNote = (d4 && d15 && d15 !== d4 && d15 !== d1) ? ' (counter-trend)' : '';
   const line15 = `Trend: ${word(d15)} — ${anchor15()}${ctNote}`;
 
-  // 5m/1m micro (unchanged)
+  // 5m/1m micro
   let d5: Dir = classify(prior5) || 'range';
   const line5 = `Trend: ${microWord(d5)} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`;
 
@@ -2703,7 +2699,7 @@ function _reconcileHTFTrendFromText(text: string): string {
     ? `Trend: ${microWord(d1m)} — timing only; CHOCH/BOS micro-shift for entry`
     : 'not used';
 
-  // Build deterministic X-ray block (same section anchors)
+  // Build deterministic X-ray block (always emits explicit Trend:)
   const newXray =
 `Detected Structures (X-ray)
 • 4H: ${line4}
@@ -2713,7 +2709,7 @@ function _reconcileHTFTrendFromText(text: string): string {
 • 1m: ${line1m}
 `;
 
-  // Replace/insert X-ray (regex unchanged)
+  // Replace/insert X-ray
   const xraySectRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
   let out = raw;
   if (xraySectRe.test(out)) {
@@ -2726,14 +2722,18 @@ function _reconcileHTFTrendFromText(text: string): string {
     out = `${out}\n\n${newXray}`;
   }
 
-  // Sync Technical View 4H/1H/15m bullets (unchanged patterns)
+  // Sync Technical View 4H/1H lines to explicit Trend:
   out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line4}`);
   out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line1}`);
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line15}`);
+
+  // Ensure 15m bullet under Technical View carries Trend: token too, if present
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m, p1, _old) => `${p1}${line15}`);
 
   return out;
 }
-// ---- END _reconcileHTFTrendFromText (v6) ----
+// ---- END _reconcileHTFTrendFromText (v5) ----
+
+
 
 /** Ensure Option 1 aligns with fundamentals when possible; also prefers confirmation-based option when Option 1 uses Limit but trigger says BOS. */
 function enforceOptionOrderByBias(text: string, fundamentalsSign: number): string {
