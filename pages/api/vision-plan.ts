@@ -2307,66 +2307,78 @@ function fillFinalTableSummaryRow(text: string, instrument: string) {
   if (!text) return text;
 
   const ai = extractAiMeta(text) || {};
+
+  // thousands-aware tokenization (preserve formatting from QP lines)
+  const TOKEN_RE = /(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?/g;
   const stripMd = (s: string) =>
     String(s || "")
       .replace(/[*_`~]/g, "")
       .replace(/\s+/g, " ")
       .trim();
+  const fmtThousands = (s: string) => {
+    if (!s) return s;
+    if (/,/.test(s)) return s;
+    const [i, d] = s.split(".");
+    const ii = i.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    return d ? `${ii}.${d}` : ii;
+  };
+  const numFromToken = (tok: string) => Number(tok.replace(/,/g, ""));
 
-  function grab(re: RegExp): string | null {
+  const grab = (re: RegExp): string | null => {
     const m = text.match(re);
     return m ? stripMd(m[1]) : null;
-  }
+  };
 
-  const NUM_RE = /(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?/g;
-  const toNum = (s: string) => Number(String(s).replace(/,/g, ""));
-
-  // Bias & Conviction
+  // Bias & Conviction from Quick Plan
   const bias = grab(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(?:\*\*)?\s*(Long|Short|Stay\s*Flat)/i) || "...";
-  const sl   = grab(/Quick\s*Plan[\s\S]*?Stop\s*Loss\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "...";
-  const tps  = grab(/Quick\s*Plan[\s\S]*?Take\s*Profit\(s\)\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
-            || grab(/Quick\s*Plan[\s\S]*?TPs?\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
-            || "";
+  const slLine = grab(/Quick\s*Plan[\s\S]*?Stop\s*Loss\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "...";
+  const tpsLine =
+    grab(/Quick\s*Plan[\s\S]*?Take\s*Profit\(s\)\s*:\s*(?:\*\*)?\s*([^\n]+)/i) ||
+    grab(/Quick\s*Plan[\s\S]*?TPs?\s*:\s*(?:\*\*)?\s*([^\n]+)/i) ||
+    "";
   const conv = grab(/Quick\s*Plan[\s\S]*?Conviction\s*:\s*(?:\*\*)?\s*(\d{1,3})\s*%/i) || "...";
 
-  function fmtZone(min: number, max: number): string {
-    const lo = Math.min(min, max);
-    const hi = Math.max(min, max);
-    const dec = Math.max(
-      (String(lo).split(".")[1] || "").length,
-      (String(hi).split(".")[1] || "").length,
-      2
-    );
-    return `${lo.toFixed(dec)} – ${hi.toFixed(dec)}`;
-  }
-
+  // Entry zone: prefer ai_meta.zone; else reuse QP tokens (preserving commas)
   let entryZone = "...";
   if (ai?.zone && Number.isFinite(+ai.zone.min) && Number.isFinite(+ai.zone.max)) {
-    entryZone = fmtZone(Number(ai.zone.min), Number(ai.zone.max));
+    const lo = Math.min(Number(ai.zone.min), Number(ai.zone.max));
+    const hi = Math.max(Number(ai.zone.min), Number(ai.zone.max));
+    const sLo = fmtThousands(String(lo));
+    const sHi = fmtThousands(String(hi));
+    entryZone = `${sLo} – ${sHi}`;
   } else {
-    const raw = grab(/Quick\s*Plan[\s\S]*?Entry\s*(?:\(zone\s*or\s*single\))?\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "";
-    const nums = (raw.match(NUM_RE) || []).map(toNum).filter(Number.isFinite);
-    if (nums.length >= 2) entryZone = fmtZone(nums[0], nums[1]);
-    else if (nums.length === 1) {
-      const entry = nums[0];
-      const decs = (String(entry).split(".")[1] || "").length;
-      const pip = Math.pow(10, -(decs || 4));
+    const rawEntry = grab(/Quick\s*Plan[\s\S]*?Entry\s*(?:\(zone\s*or\s*single\))?\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "";
+    const toks = (rawEntry.match(TOKEN_RE) || []).map(String);
+    if (toks.length >= 2) {
+      entryZone = `${fmtThousands(toks[0])} – ${fmtThousands(toks[1])}`;
+    } else if (toks.length === 1) {
+      const t = toks[0];
+      const decs = (t.split(".")[1] || "").length || 4;
+      const entry = numFromToken(t);
+      const pip = Math.pow(10, -decs);
       const w = 10 * pip;
-      entryZone = fmtZone(entry - w, entry + w);
+      const lo = (entry - w).toFixed(decs);
+      const hi = (entry + w).toFixed(decs);
+      entryZone = `${fmtThousands(lo)} – ${fmtThousands(hi)}`;
     }
   }
 
-  // TP parsing (support thousands)
+  // SL from QP tokens (preserve commas)
+  let sl = slLine;
+  const slTok = (slLine.match(TOKEN_RE) || [])[0];
+  if (slTok) sl = slLine.replace(TOKEN_RE, fmtThousands(slTok));
+
+  // TP1/TP2 from QP tokens (preserve commas)
   let tp1 = "...", tp2 = "...";
-  if (tps) {
-    const mm1 = tps.match(/TP1[:\s]*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)/i);
-    const mm2 = tps.match(/TP2[:\s]*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)/i);
-    if (mm1) tp1 = stripMd(mm1[1]);
-    if (mm2) tp2 = stripMd(mm2[1]);
+  if (tpsLine) {
+    const mm1 = tpsLine.match(/TP1[:\s]*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)/i);
+    const mm2 = tpsLine.match(/TP2[:\s]*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)/i);
+    if (mm1) tp1 = fmtThousands(mm1[1]);
+    if (mm2) tp2 = fmtThousands(mm2[1]);
     if (tp1 === "..." || tp2 === "...") {
-      const nums = (tps.match(NUM_RE) || []).map((s) => stripMd(s));
-      if (tp1 === "..." && nums[0]) tp1 = nums[0];
-      if (tp2 === "..." && nums[1]) tp2 = nums[1];
+      const toks = (tpsLine.match(TOKEN_RE) || []).map(fmtThousands);
+      if (tp1 === "..." && toks[0]) tp1 = toks[0];
+      if (tp2 === "..." && toks[1]) tp2 = toks[1];
     }
   }
 
@@ -2381,12 +2393,9 @@ function fillFinalTableSummaryRow(text: string, instrument: string) {
 ${newRow}\n`;
     return `${text}\n${block}`;
   }
-
   if (rowRe.test(text)) return text.replace(rowRe, newRow);
   return text.replace(headerRe, (m) => m + newRow + "\n");
 }
-
-
 
 function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
   // Final polish pass BEFORE emitting ai_meta (normalizes 'mixed' → 'neutral' on calendar lines, etc.)
