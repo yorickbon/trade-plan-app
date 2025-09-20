@@ -3884,7 +3884,9 @@ if (mode === "expand") {
     textFull = enforceEntryZoneUsage(textFull, instrument);
     textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
 
-
+// >>> enforce HTF truth-table & sync Technical View to RAW SWING MAP
+    textFull = _fixChartVerdictsBlock(textFull);
+    
     // Provenance footer
     const footer = buildServerProvenanceFooter({
       headlines_provider: headlinesProvider || "unknown",
@@ -3914,6 +3916,93 @@ if (mode === "expand") {
         aiMeta: aiMetaFull,
       },
     });
+// --- CHART VERDICT GUARD (HTF truth-table; sync RAW SWING MAP ↔ Technical View) ---
+function _fixChartVerdictsBlock(src: string): string {
+  if (!src) return src;
+
+  // find RAW SWING MAP block
+  const mapRe = /(##\s*RAW\s*SWING\s*MAP[\s\S]*?)(?:\n-{3,}|\n##|\nFull\s*Breakdown|\n$)/i;
+  const m = src.match(mapRe);
+  if (!m) return src;
+  let block = m[1];
+
+  const tfs = ["4H", "1H", "15m", "5m"] as const;
+  type Row = { swings: string; bos: string; verdict: string };
+  const rows: Record<(typeof tfs)[number], Row> = {
+    "4H": { swings: "", bos: "", verdict: "" },
+    "1H": { swings: "", bos: "", verdict: "" },
+    "15m": { swings: "", bos: "", verdict: "" },
+    "5m": { swings: "", bos: "", verdict: "" },
+  };
+
+  // helpers
+  function swingVerdictFrom(swings: string, lastBOS: string): string {
+    const s = String(swings || "").toUpperCase();
+    const bos = String(lastBOS || "").toLowerCase();
+    const hasHHHL = /\bHH\b.*\bHL\b|\bHL\b.*\bHH\b/.test(s);
+    const hasLHLL = /\bLH\b.*\bLL\b|\bLL\b.*\bLH\b/.test(s);
+    if (hasHHHL && !hasLHLL) return "Uptrend (HH/HL)";
+    if (hasLHLL && !hasHHHL) return "Downtrend (LH/LL)";
+    if (/up/.test(bos)) return "Uptrend (HH/HL)";
+    if (/down/.test(bos)) return "Downtrend (LH/LL)";
+    return "Range / consolidation";
+  }
+
+  function grab(tf: (typeof tfs)[number]) {
+    const sectRe = new RegExp(`\\*\\*${tf}\\*\\*:\\s*[\\r\\n]+([\\s\\S]*?)(?:\\n\\*\\*|\\n-{3,}|\\n##|\\n$)`, "i");
+    const s = block.match(sectRe)?.[1] || "";
+    const swings = s.match(/Swings:\s*([^\n]+)/i)?.[1]?.trim() || "";
+    const bos    = s.match(/Last\s*BOS:\s*([^\n]+)/i)?.[1]?.trim() || "";
+    const verdict= s.match(/Verdict:\s*([^\n]+)/i)?.[1]?.trim() || "";
+    rows[tf] = { swings, bos, verdict };
+  }
+  tfs.forEach(grab);
+
+  const v4  = swingVerdictFrom(rows["4H"].swings, rows["4H"].bos);
+  const v1  = swingVerdictFrom(rows["1H"].swings, rows["1H"].bos);
+  const v15 = swingVerdictFrom(rows["15m"].swings, rows["15m"].bos);
+  const v5  = swingVerdictFrom(rows["5m"].swings, rows["5m"].bos);
+
+  const counter1H =
+    (v4.startsWith("Uptrend") && v1.startsWith("Downtrend")) ||
+    (v4.startsWith("Downtrend") && v1.startsWith("Uptrend"));
+
+  const vFix: Record<string, string> = { "4H": v4, "1H": v1, "15m": v15, "5m": v5 };
+
+  // rewrite RAW SWING MAP verdict lines
+  function setVerdict(tf: (typeof tfs)[number], verdictText: string) {
+    const sectRe = new RegExp(`(\\*\\*${tf}\\*\\*:[\\s\\S]*?\\n)(-\\s*Verdict:\\s*)([^\\n]+)`, "i");
+    block = block.replace(sectRe, (_m, head, vlabel) => `${head}${vlabel}${verdictText}`);
+  }
+  tfs.forEach(tf => setVerdict(tf, vFix[tf as string]));
+
+  if (counter1H) {
+    const oneHRe = /(\*\*1H\*\*:[\s\S]*?)(\n-\s*Verdict:\s*[^\n]+)/i;
+    block = block.replace(oneHRe, (_m, head, verdictLine) => `${head}${verdictLine} — counter-trend vs 4H`);
+  }
+
+  // put RAW SWING MAP back
+  let out = src.replace(m[1], block);
+
+  // sync Technical View lines
+  const tvRe = /(\*\*Technical\s*View[^\n]*\*\*:[\s\S]*?)(?:\n\*\*Fundamental|\nFundamental\s*Bias\s*Snapshot|\n##|\n$)/i;
+  const tvBlock = out.match(tvRe)?.[1];
+  if (!tvBlock) return out;
+  let tv = tvBlock;
+
+  function replaceTV(tf: string, verdictText: string) {
+    const lineRe = new RegExp(`(-\\s*\\*\\*${tf}\\*\\*:\\s*)([^\\n]+)`, "i");
+    tv = tv.replace(lineRe, (_m, pre) => `${pre}${verdictText}`);
+  }
+  replaceTV("4H",  vFix["4H"]);
+  replaceTV("1H",  vFix["1H"] + (counter1H ? " — counter-trend vs 4H" : ""));
+  replaceTV("15m", vFix["15m"]);
+  replaceTV("5m",  vFix["5m"]);
+
+  out = out.replace(tvBlock, tv);
+  return out;
+}
+// --- END CHART VERDICT GUARD ---
 
   } catch (err: any) {
     return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
