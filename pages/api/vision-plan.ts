@@ -2813,8 +2813,12 @@ function _applyRawSwingMap(text: string): string {
 
   // 1) Locate RAW SWING MAP block (must be before Quick Plan / Option / Full Breakdown)
   // Accept RAW SWING MAP with or without "(first)", tolerate markdown/bullets/spaces
-  const mapRe =
-    /(?:^|\n)\s*(?:[-•]?\s*)?[*_]*RAW\s*SWING\s*MAP[*_]*\s*(?:\(\s*first\s*\))?\s*[\r\n]+([\s\S]*?)(?=\n\s*Quick\s*Plan\s*\(Actionable\)|\n\s*Option\s*1|\n\s*Full\s*Breakdown|$)/i;
+    // Accept bold, bullets, and optional “(first)” after the header; capture only the map body
+  const mapRe = new RegExp(
+    String.raw`^\s*(?:#+\s*)?(?:[-•]\s*)?(?:\*\*)?\s*RAW\s*SWING\s*MAP(?:\s*\(first\))?(?:\*\*)?\s*\r?\n([\s\S]*?)(?=\n\s*(?:Quick\s*Plan\s*\(Actionable\)|Option\s*1|Full\s*Breakdown|$))`,
+    'i'
+  );
+
   const m = text.match(mapRe);
   if (!m) return text;
 
