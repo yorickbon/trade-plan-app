@@ -3542,8 +3542,7 @@ if (mode === "expand") {
   text = enforceFinalTableSummary(text, c.instrument);
   text = enforceEntryZoneUsage(text, c.instrument);
 
-/
-  
+
   // Provenance footer
   const footer = buildServerProvenanceFooter({
     headlines_provider: "expand-uses-stage1",
