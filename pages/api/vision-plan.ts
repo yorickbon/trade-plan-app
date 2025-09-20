@@ -1394,7 +1394,7 @@ function messagesFull(args: {
     args.scalping,
     args.scalpingHard
   ),
-  "",
+    "",
     "OUTPUT format (in this exact order):",
   "RAW SWING MAP (first)",
   "4H: swings=<comma-separated HH/HL/LH/LL sequence>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
@@ -1403,18 +1403,7 @@ function messagesFull(args: {
   "5m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
   "1m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
   "",
-  "Quick Plan (Actionable)",
 
-  "• Direction: Long | Short | Stay Flat",
-  "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-  "• Trigger: (state timeframes explicitly, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)')",
-  "• Entry (zone or single):",
-  "• Stop Loss:",
-  "• Take Profit(s): TP1 / TP2 (approx R multiples)",
-  "• Conviction: <0–100>%",
-  "• Setup:",
-  "• Short Reasoning:",
-  "",
   "Option 1 (Primary)",
   "• Direction: ...",
   "• Order Type: ...",
@@ -1422,19 +1411,23 @@ function messagesFull(args: {
   "• Entry (zone or single):",
   "• Stop Loss:",
   "• Take Profit(s): TP1 / TP2",
+  "• Setup: ...",
   "• Conviction: <0–100>%",
   "• Why this is primary:",
   "",
-  "Option 2 (Alternative)",
+   
+   "Option 2 (Alternative)",
   "• Direction: ...",
   "• Order Type: ...",
   "• Trigger:",
   "• Entry (zone or single):",
   "• Stop Loss:",
   "• Take Profit(s): TP1 / TP2",
+  "• Setup: ...",
   "• Conviction: <0–100>%",
   "• Why this alternative:",
   "",
+   
     "Full Breakdown",
   "• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m/1m if used)",
   "• Fundamental View:",
@@ -1507,7 +1500,7 @@ function messagesFastStage1(args: {
     args.scalping,
     args.scalpingHard
   ),
-  "",
+    "",
    "OUTPUT ONLY:",
   "RAW SWING MAP (first)",
   "4H: swings=<comma-separated HH/HL/LH/LL sequence>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
@@ -1516,38 +1509,23 @@ function messagesFastStage1(args: {
   "5m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
   "1m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
   "",
-  "Quick Plan (Actionable)",
 
-  "• Direction: Long | Short | Stay Flat",
-  "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-  "• Trigger: (state timeframes explicitly, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)')",
-  "• Entry (zone or single):",
-  "• Stop Loss:",
+   "Option 1 (Primary)",
+  ...
   "• Take Profit(s): TP1 / TP2",
-  "• Conviction: <0–100>%",
-  "• Setup:",
-  "• Short Reasoning:",
-  "",
-  "Option 1 (Primary)",
-  "• Direction: ...",
-  "• Order Type: ...",
-  "• Trigger:",
-  "• Entry (zone or single):",
-  "• Stop Loss:",
-  "• Take Profit(s): TP1 / TP2",
+  "• Setup: ...",
   "• Conviction: <0–100>%",
   "• Why this is primary:",
   "",
-  "Option 2 (Alternative)",
-  "• Direction: ...",
-  "• Order Type: ...",
-  "• Trigger:",
-  "• Entry (zone or single):",
-  "• Stop Loss:",
+   
+   "Option 2 (Alternative)",
+  ...
   "• Take Profit(s): TP1 / TP2",
+  "• Setup: ...",
   "• Conviction: <0–100>%",
   "• Why this alternative:",
    "",
+   
   "Management: Partials at ~1R; move to BE at 1R; time-stop 20m (scalping) / 15m (scalping-hard) / 15–20m default; max attempts 3 (scalping) / 2 (hard).",
   "",
   "Under Full Breakdown, include 'Fundamental Bias Snapshot' with Calendar, Headlines, CSM, COT, and the Final Fundamental Bias (score + label).",
@@ -1807,24 +1785,20 @@ ${bullet}${L("Why this is primary")} ${fields.why}
 
 function hasQuickPlan(text: string): boolean { return /Quick\s*Plan\s*\(Actionable\)/i.test(text || ""); }
 
-async function enforceQuickPlan(model: string, instrument: string, text: string) {
-  if (hasQuickPlan(text)) return text;
-  const messages = [
-    { role: "system", content: "Add a 'Quick Plan (Actionable)' section at the very top, copying primary trade details. Keep all other sections unchanged and in order." },
-    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd the Quick Plan section at the top.` },
-  ];
-  return callOpenAI(model, messages);
+// Quick Plan is deprecated — no-op to avoid callers changing.
+async function enforceQuickPlan(_model: string, _instrument: string, text: string) {
+  return text;
 }
 
 /** SCALPING guards (unchanged logic, wording improved where needed) */
 function enforceScalpHardStopLossLines(text: string, scalpingHard: boolean) {
   if (!scalpingHard || !text) return text;
 
-  const blocks = [
-    { name: "Quick Plan (Actionable)", re: /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
+   const blocks = [
     { name: "Option 1", re: /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
     { name: "Option 2", re: /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i },
   ];
+
 
   const lineRe = /(^\s*•\s*Stop\s*Loss:\s*)(.*)$/mi;
   const needsRewrite = (s: string) => {
@@ -1909,31 +1883,58 @@ function ensureNewsProximityNote(text: string, warnMins: number | null, instrume
   return text.replace(m[0], block);
 }
 
-function ensureCalendarVisibilityInQuickPlan(text: string, args: { instrument: string; preReleaseOnly: boolean; biasLine: string | null }) {
+// Inject calendar visibility under Option 1 (Quick Plan deprecated)
+function ensureCalendarVisibilityInQuickPlan(
+  text: string,
+  args: { instrument: string; preReleaseOnly: boolean; biasLine: string | null }
+) {
   if (!text) return text;
-  const hasQP = /Quick\s*Plan\s*\(Actionable\)/i.test(text);
-  if (!hasQP) return text;
 
-  const qpBlock = text.match(/Quick\s*Plan\s*\(Actionable\)[\s\S]*?(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i)?.[0] || "";
-  const hasCalendarMention = /Calendar\s*:/i.test(qpBlock) || /Calendar\s*bias\s*for\s*/i.test(qpBlock);
-  if (hasCalendarMention) return text;
+  // Find Option 1 block
+  const o1Match = text.match(/(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
+  if (!o1Match) return text;
 
+  let o1 = o1Match[0];
+
+  // If a calendar line already exists in Option 1, do nothing
+  if (/^\s*•\s*(Calendar|Note|Calendar\s*bias\s*for)\s*:/mi.test(o1)) return text;
+
+  // Build the injection line
   let inject = "";
   if (args.preReleaseOnly) {
-    inject = `\n• Note: Pre-release only, no confirmed bias until data is out.`;
-   } else if (args.biasLine) {
+    inject = "• Note: Pre-release only, no confirmed bias until data is out.";
+  } else if (args.biasLine) {
     if (/unavailable/i.test(args.biasLine)) {
-      inject = `\n• Calendar: unavailable.`;
+      inject = "• Calendar: unavailable.";
     } else {
       const trimmed = args.biasLine.replace(/^Calendar\s*:\s*/i, "").replace(/\.$/, "");
-      const normalized = /^Calendar\s*bias\s*for/i.test(trimmed) ? trimmed : `Calendar bias for ${args.instrument}: ${trimmed}`;
-      const finalLine = normalized.replace(new RegExp(`^Calendar\\s*bias\\s*for\\s*${args.instrument}\\s*:\\s*`, "i"), `Calendar bias for ${args.instrument}: `);
-      inject = `\n• ${finalLine}`;
+      const normalized = /^Calendar\s*bias\s*for/i.test(trimmed)
+        ? trimmed
+        : `Calendar bias for ${args.instrument}: ${trimmed}`;
+      inject = `• ${normalized}`;
     }
+  } else {
+    inject = "• Calendar: unavailable.";
   }
 
-  if (!inject) return text;
-  return text.replace(/(Quick\s*Plan\s*\(Actionable\)[^\n]*\n)/i, `$1${inject}\n`);
+  // Place the calendar line just under the title or after Direction line if present
+  const placeAfter =
+    o1.match(/(^\s*•\s*Direction\s*:[^\n]*\n)/mi)?.[0] ||
+    o1.match(/(^\s*Option\s*1[^\n]*\n)/i)?.[0] ||
+    "";
+
+  if (placeAfter) {
+    const patched = o1.replace(placeAfter, `${placeAfter}${inject}\n`);
+    return text.replace(o1Match[0], patched);
+  } else {
+    // Fallback: append near the top
+    const firstLineBreak = o1.indexOf("\n");
+    const patched =
+      firstLineBreak >= 0
+        ? o1.slice(0, firstLineBreak + 1) + inject + "\n" + o1.slice(firstLineBreak + 1)
+        : o1 + "\n" + inject + "\n";
+    return text.replace(o1Match[0], patched);
+  }
 }
 
 function stampM5Used(text: string, used: boolean) {
@@ -2119,8 +2120,7 @@ function dedupeTournamentSections(text: string): string {
 
 /** Trigger specificity (unchanged behavior). */
 async function enforceTriggerSpecificity(model: string, instrument: string, text: string) {
-  const blockSpecs = [
-    { name: "Quick Plan (Actionable)", re: /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
+    const blockSpecs = [
     { name: "Option 1", re: /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
     { name: "Option 2", re: /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i },
   ];
@@ -2190,7 +2190,7 @@ function computeAndInjectConviction(
 ) {
   if (!text) return text;
 
-  // ---- Tournament scores (map Top1→QP, Top2→O1, Top3→O2) ----
+  // ---- Tournament scores (map Top1→Option1, Top2→Option2) ----
   const tSect = text.match(
     /Candidate\s*Scores\s*\(tournament\):[\s\S]*?(?=\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i
   )?.[0] || "";
@@ -2203,9 +2203,8 @@ function computeAndInjectConviction(
       .map((n) => Math.max(0, Math.min(100, n)))
   )].sort((a, b) => b - a);
 
-  const T1 = uniqSorted[0] ?? 0;
-  const T2 = uniqSorted[1] ?? Math.max(0, T1 - 8);
-  const T3 = uniqSorted[2] ?? Math.max(0, T2 - 8);
+  const T1 = uniqSorted[0] ?? 0;                         // Option 1 baseline
+  const T2 = uniqSorted[1] ?? Math.max(0, T1 - 8);       // Option 2 baseline
 
   // ---- Fundamentals snapshot ----
   const Fraw = Number(args.fundamentals?.final?.score) || 0;
@@ -2213,41 +2212,22 @@ function computeAndInjectConviction(
   const fSign = (Number(args.fundamentals?.final?.sign) || 0) as -1 | 0 | 1;
   const prox = !!args.proximityFlag;
 
-  // ---- Plan blocks ----
-  const RE_QP_BLOCK = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
+  // ---- Plan blocks (ONLY O1/O2) ----
   const RE_O1_BLOCK = /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
   const RE_O2_BLOCK = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
 
-  function dirSign(block: string): -1 | 0 | 1 { return _dirSignFromBlock(block); }
   function hasText(s: string, re: RegExp) { return re.test((s || "").toLowerCase()); }
-  function pickBlock(src: string, re: RegExp): string { const m = src.match(re); return m ? m[0] : ""; }
+  const o1Block = text.match(RE_O1_BLOCK)?.[0] || "";
+  const o2Block = text.match(RE_O2_BLOCK)?.[0] || "";
 
-  let qpBlock = pickBlock(text, RE_QP_BLOCK);
-  let o1Block = pickBlock(text, RE_O1_BLOCK);
-  let o2Block = pickBlock(text, RE_O2_BLOCK);
+  const dO1 = _dirSignFromBlock(o1Block);
+  const dO2 = _dirSignFromBlock(o2Block);
 
-  // ---- Scaffold enforcement (ensure all three exist) ----
-  function ensureScaffold(block: string, label: string): string {
-    if (!block || block.trim() === "") {
-      return `${label}\n• Direction: ...\n• Order Type: ...\n• Trigger: ...\n• Entry (zone or single): ...\n• Stop Loss: ...\n• Take Profit(s): ...\n• Conviction: ...\n`;
-    }
-    return block;
-  }
-  qpBlock = ensureScaffold(qpBlock, "Quick Plan (Actionable)");
-  o1Block = ensureScaffold(o1Block, "Option 1 (Primary)");
-  o2Block = ensureScaffold(o2Block, "Option 2 (Alternative)");
-
-  let dQP = dirSign(qpBlock);
-  const dO1 = dirSign(o1Block);
-  const dO2 = dirSign(o2Block);
-  if (dQP === 0) dQP = dO1;
-
-  // Independent alignment bonuses/penalties
-  const alignQP = (fSign !== 0 && dQP !== 0) ? (fSign === dQP ? 8 : -8) : 0;
+  // Alignment bonuses/penalties
   const alignO1 = (fSign !== 0 && dO1 !== 0) ? (fSign === dO1 ? 8 : -8) : 0;
   const alignO2 = (fSign !== 0 && dO2 !== 0) ? (fSign === dO2 ? 8 : -8) : 0;
 
-  // Quality & reliability heuristics
+  // Quality & reliability heuristics (reuse original logic)
   function qualityFactor(block: string): number {
     let q = 1.0;
     if (hasText(block, /(htf\s+alignment|clean\s+invalidation|confluence|ob\s*\+?\s*fvg|rr\s*[:x]?\s*2(\.?\d+)?|\bR\s*[:x]\s*2)/i)) q += 0.05;
@@ -2257,12 +2237,10 @@ function computeAndInjectConviction(
   }
   function reliabilityFactor(textAll: string): number {
     let r = 1.0;
-    if (hasText(textAll, /pre-release\s+only|waiting\s+for\s+results|calendar:\s*unavailable/i)) r -= 0.1;
     if (hasText(textAll, /\bMismatch\b/i)) r -= 0.05;
     return Math.max(0.8, Math.min(1.05, r));
   }
 
-  const Q_qp = qualityFactor(qpBlock || o1Block || "");
   const Q_o1 = qualityFactor(o1Block);
   const Q_o2 = qualityFactor(o2Block);
   const R_f  = reliabilityFactor(text);
@@ -2270,18 +2248,14 @@ function computeAndInjectConviction(
   const prox_pen = prox ? 6 : 0;
   const liq_pen  = hasText(text, /\b(asia\s+session|illiquid|thin\s+liquidity)\b/i) ? 2 : 0;
 
-  // ---- Independent technical baselines per plan ----
-  const Tq_qp = Math.max(0, Math.min(100, Math.round(T1 * Q_qp)));
-  const Tq_o1 = Math.max(0, Math.min(100, Math.round(T2 * Q_o1)));
-  const Tq_o2 = Math.max(0, Math.min(100, Math.round(T3 * Q_o2)));
+  const Tq_o1 = Math.max(0, Math.min(100, Math.round(T1 * Q_o1)));
+  const Tq_o2 = Math.max(0, Math.min(100, Math.round(T2 * Q_o2)));
   const Fr    = Math.max(0, Math.min(100, Math.round(F * R_f)));
 
-  // Final convictions (0–100), per plan
-  const convQP = Math.max(0, Math.min(100, Math.round(0.60 * Tq_qp + 0.40 * Fr + alignQP - (prox_pen + liq_pen))));
   const convO1 = Math.max(0, Math.min(100, Math.round(0.60 * Tq_o1 + 0.40 * Fr + alignO1 - (prox_pen + liq_pen))));
   const convO2 = Math.max(0, Math.min(100, Math.round(0.60 * Tq_o2 + 0.40 * Fr + alignO2 - (prox_pen + liq_pen))));
 
-  // ---- Write back into each block ----
+  // ---- Write into Option blocks only ----
   function detectBullet(block: string): string {
     if (/^\s*•\s/m.test(block)) return "• ";
     if (/^\s*-\s/m.test(block)) return "- ";
@@ -2314,11 +2288,10 @@ function computeAndInjectConviction(
   }
 
   let out = text;
-  out = writeConv(out, RE_QP_BLOCK, convQP);
   out = writeConv(out, RE_O1_BLOCK, convO1);
   out = writeConv(out, RE_O2_BLOCK, convO2);
 
-  // ---- Hard-gate Option2 distinctness (sync) ----
+  // Keep distinctness guard (same as before)
   out = enforceOption2DistinctHardSync("EURUSD", out);
 
   return out;
@@ -2352,9 +2325,9 @@ function enforceOption2DistinctHardSync(instrument: string, text: string): strin
 function fillFinalTableSummaryRow(text: string, instrument: string) {
   if (!text) return text;
 
+  // --- Helpers ---
   const ai = extractAiMeta(text) || {};
 
-  // thousands-aware tokenization (preserve formatting from QP lines)
   const TOKEN_RE = /(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?/g;
   const stripMd = (s: string) =>
     String(s || "")
@@ -2364,59 +2337,71 @@ function fillFinalTableSummaryRow(text: string, instrument: string) {
   const fmtThousands = (s: string) => {
     if (!s) return s;
     if (/,/.test(s)) return s;
-    const [i, d] = s.split(".");
+    const [i, d] = String(s).split(".");
     const ii = i.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
     return d ? `${ii}.${d}` : ii;
   };
-  const numFromToken = (tok: string) => Number(tok.replace(/,/g, ""));
+  const toNum = (s: string) => Number(String(s).replace(/,/g, ""));
 
-  const grab = (re: RegExp): string | null => {
-    const m = text.match(re);
+  const getBlock = () =>
+    text.match(/(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i)?.[0] ||
+    text.match(/(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i)?.[0] ||
+    "";
+
+  const grabFromBlock = (re: RegExp): string | null => {
+    const blk = getBlock();
+    if (!blk) return null;
+    const m = blk.match(re);
     return m ? stripMd(m[1]) : null;
   };
 
-  // Bias & Conviction from Quick Plan
-  const bias = grab(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(?:\*\*)?\s*(Long|Short|Stay\s*Flat)/i) || "...";
-  const slLine = grab(/Quick\s*Plan[\s\S]*?Stop\s*Loss\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "...";
-  const tpsLine =
-    grab(/Quick\s*Plan[\s\S]*?Take\s*Profit\(s\)\s*:\s*(?:\*\*)?\s*([^\n]+)/i) ||
-    grab(/Quick\s*Plan[\s\S]*?TPs?\s*:\s*(?:\*\*)?\s*([^\n]+)/i) ||
-    "";
-  const conv = grab(/Quick\s*Plan[\s\S]*?Conviction\s*:\s*(?:\*\*)?\s*(\d{1,3})\s*%/i) || "...";
+  // --- Read fields from Option 1 (fallback to Option 2) ---
+  const bias =
+    grabFromBlock(/^\s*•\s*Direction\s*:\s*(Long|Short|Stay\s*Flat)/mi) || "...";
 
-  // Entry zone: prefer ai_meta.zone; else reuse QP tokens (preserving commas)
-  let entryZone = "...";
-  if (ai?.zone && Number.isFinite(+ai.zone.min) && Number.isFinite(+ai.zone.max)) {
-    const lo = Math.min(Number(ai.zone.min), Number(ai.zone.max));
-    const hi = Math.max(Number(ai.zone.min), Number(ai.zone.max));
-    const sLo = fmtThousands(String(lo));
-    const sHi = fmtThousands(String(hi));
-    entryZone = `${sLo} – ${sHi}`;
-  } else {
-    const rawEntry = grab(/Quick\s*Plan[\s\S]*?Entry\s*(?:\(zone\s*or\s*single\))?\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "";
+  // Entry zone: prefer ai_meta.zone; else parse from Entry line numbers
+  function buildEntryZone(): string {
+    const z = ai?.zone;
+    if (z && Number.isFinite(+z.min) && Number.isFinite(+z.max)) {
+      const lo = Math.min(Number(z.min), Number(z.max));
+      const hi = Math.max(Number(z.min), Number(z.max));
+      return `${fmtThousands(String(lo))} – ${fmtThousands(String(hi))}`;
+    }
+    const rawEntry =
+      grabFromBlock(/^\s*•\s*Entry\s*\(zone\s*or\s*single\)\s*:\s*([^\n]+)/mi) ||
+      grabFromBlock(/^\s*•\s*Entry\s*:\s*([^\n]+)/mi) ||
+      "";
     const toks = (rawEntry.match(TOKEN_RE) || []).map(String);
     if (toks.length >= 2) {
-      entryZone = `${fmtThousands(toks[0])} – ${fmtThousands(toks[1])}`;
-    } else if (toks.length === 1) {
-      const t = toks[0];
-      const decs = (t.split(".")[1] || "").length || 4;
-      const entry = numFromToken(t);
+      return `${fmtThousands(toks[0])} – ${fmtThousands(toks[1])}`;
+    }
+    if (toks.length === 1) {
+      const entry = toNum(toks[0]);
+      const decs = (String(toks[0]).split(".")[1] || "").length || 4;
       const pip = Math.pow(10, -decs);
       const w = 10 * pip;
       const lo = (entry - w).toFixed(decs);
       const hi = (entry + w).toFixed(decs);
-      entryZone = `${fmtThousands(lo)} – ${fmtThousands(hi)}`;
+      return `${fmtThousands(lo)} – ${fmtThousands(hi)}`;
     }
+    return "...";
   }
 
-  // SL from QP tokens (preserve commas)
-  let sl = slLine;
-  const slTok = (slLine.match(TOKEN_RE) || [])[0];
-  if (slTok) sl = slLine.replace(TOKEN_RE, fmtThousands(slTok));
+  // SL: keep the line, but format the first numeric token with thousands
+  function buildSL(): string {
+    const slLine =
+      grabFromBlock(/^\s*•\s*Stop\s*Loss\s*:\s*([^\n]+)/mi) || "...";
+    const tok = (slLine.match(TOKEN_RE) || [])[0];
+    if (!tok) return slLine;
+    return slLine.replace(TOKEN_RE, fmtThousands(tok));
+  }
 
-  // TP1/TP2 from QP tokens (preserve commas)
-  let tp1 = "...", tp2 = "...";
-  if (tpsLine) {
+  // TP1/TP2: try labeled capture first, else first two numbers on the TP line
+  function buildTPs(): { tp1: string; tp2: string } {
+    const tpsLine =
+      grabFromBlock(/^\s*•\s*(?:Take\s*Profit\(s\)|TPs?)\s*:\s*([^\n]+)/mi) || "";
+    if (!tpsLine) return { tp1: "...", tp2: "..." };
+    let tp1 = "...", tp2 = "...";
     const mm1 = tpsLine.match(/TP1[:\s]*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)/i);
     const mm2 = tpsLine.match(/TP2[:\s]*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)/i);
     if (mm1) tp1 = fmtThousands(mm1[1]);
@@ -2426,22 +2411,35 @@ function fillFinalTableSummaryRow(text: string, instrument: string) {
       if (tp1 === "..." && toks[0]) tp1 = toks[0];
       if (tp2 === "..." && toks[1]) tp2 = toks[1];
     }
+    return { tp1, tp2 };
   }
 
+  const entryZone = buildEntryZone();
+  const sl = buildSL();
+  const { tp1, tp2 } = buildTPs();
+  const conv =
+    grabFromBlock(/^\s*•\s*Conviction\s*:\s*(\d{1,3})\s*%/mi) || "...";
+
+  // --- Write/Update the Final Table Summary ---
   const headerRe = /Final\s*Table\s*Summary:\s*\n\|\s*Instrument\s*\|\s*Bias\s*\|\s*Entry Zone\s*\|\s*SL\s*\|\s*TP1\s*\|\s*TP2\s*\|\s*Conviction %\s*\|\n/i;
-  const rowRe = new RegExp(`^\\|\\s*${instrument.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\s*\\|[^\\n]*$`, "im");
+  const rowRe = new RegExp(
+    `^\\|\\s*${instrument.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\s*\\|[^\\n]*$`,
+    "im"
+  );
+
   const newRow = `| ${instrument} | ${bias} | ${entryZone} | ${sl} | ${tp1} | ${tp2} | ${conv} |`;
 
   if (!headerRe.test(text)) {
     const block =
-`\nFinal Table Summary:
-| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |
-${newRow}\n`;
+      `\nFinal Table Summary:\n` +
+      `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |\n` +
+      `${newRow}\n`;
     return `${text}\n${block}`;
   }
   if (rowRe.test(text)) return text.replace(rowRe, newRow);
   return text.replace(headerRe, (m) => m + newRow + "\n");
 }
+
 
 function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
   // Final polish pass BEFORE emitting ai_meta (normalizes 'mixed' → 'neutral' on calendar lines, etc.)
