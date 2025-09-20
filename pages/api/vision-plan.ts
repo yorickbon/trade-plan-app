@@ -3542,18 +3542,29 @@ if (mode === "expand") {
   text = enforceFinalTableSummary(text, c.instrument);
   text = enforceEntryZoneUsage(text, c.instrument);
 
-  // Provenance footer
+  // >>> NEW: Apply mega post-gen chain before footer (order/trigger, BOS wording, entry zone, vocab guards)
+  textFull = _applyMegaPostGenChain(
+    textFull,
+    {
+      instrument,
+      fundamentalsSign: fundamentalsSnapshotFull.final.sign || 0,
+      preReleaseOnly
+    }
+  );
+
+  // Provenance footer (unchanged)
   const footer = buildServerProvenanceFooter({
-    headlines_provider: "expand-uses-stage1",
-    calendar_status: c.calendar ? "image-ocr" : (calAdv?.status || "unavailable"),
-    calendar_provider: c.calendar ? "image-ocr" : calAdv?.provider || null,
-    csm_time: null,
-    extras: { vp_version: VP_VERSION, model: modelExpand, mode: "expand" }
+    headlines_provider: headlinesProvider || "unknown",
+    calendar_status: calendarStatus,
+    calendar_provider: calendarProvider,
+    csm_time: csm.tsISO,
+    extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard, latency },
   });
-  text = `${text}\n${footer}`;
+  textFull = `${textFull}\n${footer}`;
 
   res.setHeader("Cache-Control", "no-store");
   return res.status(200).json({
+
     ok: true,
     text,
     meta: { instrument: c.instrument, cacheKey, model: modelExpand, vp_version: VP_VERSION }
