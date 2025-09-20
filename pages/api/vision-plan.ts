@@ -15,7 +15,14 @@ import sharp from "sharp";
 // ---------- config ----------
 export const config = { api: { bodyParser: false, sizeLimit: "25mb" } };
 
-type Ok = { ok: true; text: string; meta?: any };
+type Ok = {
+  ok: true;
+  text: string;
+  meta?: any;
+  // Optional diagnostics used by QA / dry-run paths
+  qa_summary?: { total: number; passed: number; failed: number };
+  results?: any;
+};
 type Err = { ok: false; reason: string };
 
 const VP_VERSION = "2025-09-18-vp-AtoL-rc1";
