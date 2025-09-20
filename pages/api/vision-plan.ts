@@ -2812,11 +2812,13 @@ function _applyRawSwingMap(text: string): string {
   if (!text) return text;
 
   // 1) Locate RAW SWING MAP block (must be before Quick Plan / Option / Full Breakdown)
-  const mapRe = /(RAW\s*SWING\s*MAP[\s\S]*?)(?=\n\s*Quick\s*Plan\s*\(Actionable\)|\n\s*Option\s*1|\n\s*Full\s*Breakdown|$)/i;
+  // Accept RAW SWING MAP with or without "(first)", tolerate markdown/bullets/spaces
+  const mapRe =
+    /(?:^|\n)\s*(?:[-•]?\s*)?[*_]*RAW\s*SWING\s*MAP[*_]*\s*(?:\(\s*first\s*\))?\s*[\r\n]+([\s\S]*?)(?=\n\s*Quick\s*Plan\s*\(Actionable\)|\n\s*Option\s*1|\n\s*Full\s*Breakdown|$)/i;
   const m = text.match(mapRe);
   if (!m) return text;
 
-  const block = m[1];
+    const block = m[1]; // (unchanged variable name; now uses the capture group content)
 
   type Verdict = 'Uptrend' | 'Downtrend' | 'Range';
   type TF = '4H' | '1H' | '15m' | '5m' | '1m';
