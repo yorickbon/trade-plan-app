@@ -2797,7 +2797,8 @@ function _reconcileHTFTrendFromText(text: string): string {
 }
  // ---- END _reconcileHTFTrendFromText (v6) ----
 
-/** Enforce HTF/LTF structure strictly from a mandatory RAW SWING MAP block.
+/**
+ * Enforce HTF/LTF structure strictly from a mandatory RAW SWING MAP block.
  *  The RAW SWING MAP must appear at the top, before Quick Plan. Example lines:
  *    4H: swings=HH,HL,HH,HL; last_BOS=up; verdict=Uptrend
  *    1H: swings=LH,LL,LH,LL; last_BOS=down; verdict=Downtrend
@@ -2853,14 +2854,25 @@ function _applyRawSwingMap(text: string): string {
   const anchor15 = 'Execution anchors refined from 1H';
   const line15 = `Trend: ${v15} — ${anchor15}${ct15 ? ' (counter-trend)' : ''}`;
 
-  // 4) Replace X-ray section deterministically
+  // Precompute micro lines to avoid nested template literals
+  const line5 =
+    lines['5m']
+      ? `Trend: ${lines['5m']!.verdict === 'Uptrend' ? 'Micro up' : lines['5m']!.verdict === 'Downtrend' ? 'Micro down' : 'Micro range'} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`
+      : 'Trend: Micro range — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)';
+
+  const line1m =
+    lines['1m']
+      ? `Trend: ${lines['1m']!.verdict === 'Uptrend' ? 'Micro up' : lines['1m']!.verdict === 'Downtrend' ? 'Micro down' : 'Micro range'} — timing only; CHOCH/BOS micro-shift for entry`
+      : 'not used';
+
+  // 4) Replace X-ray section deterministically (no nested backticks)
   const newX =
 `Detected Structures (X-ray)
 • 4H: ${line4}
 • 1H: ${line1}
 • 15m: ${line15}
-• 5m: ${lines['5m'] ? `Trend: ${lines['5m']!.verdict === 'Uptrend' ? 'Micro up' : lines['5m']!.verdict === 'Downtrend' ? 'Micro down' : 'Micro range'} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)` : 'Trend: Micro range — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)'}
-• 1m: ${lines['1m'] ? `Trend: ${lines['1m']!.verdict === 'Uptrend' ? 'Micro up' : lines['1m']!.verdict === 'Downtrend' ? 'Micro down' : 'Micro range'} — timing only; CHOCH/BOS micro-shift for entry` : 'not used'}
+• 5m: ${line5}
+• 1m: ${line1m}
 `;
 
   const xrayRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
