@@ -3541,15 +3541,17 @@ if (mode === "expand") {
   text = await enforceFullBreakdownSkeleton(modelExpand, c.instrument, text);
   text = enforceFinalTableSummary(text, c.instrument);
   text = enforceEntryZoneUsage(text, c.instrument);
+  
   // >>> NEW: Apply mega post-gen chain before footer (order/trigger, BOS wording, entry zone, vocab guards)
-  textFull = await _applyMegaPostGenChain(
-    textFull,
+  text = await _applyMegaPostGenChain(
+    text,
     {
-      instrument,
-      fundamentalsSign: (fundamentalsSnapshotFull?.final?.sign ?? 0),
-      preReleaseOnly
+      instrument: c.instrument,
+      fundamentalsSign: 0,
+      preReleaseOnly: false
     }
   );
+
 
   // Provenance footer (unchanged)
 
