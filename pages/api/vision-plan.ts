@@ -3335,35 +3335,6 @@ async function loadJimpFromDataUrl(dataUrl: string): Promise<any | null> {
   }
 }
 
-/* =========================================================================
-   PIXEL-BASED CHART SWING EXTRACTOR (drop-in, no hard dep)
-   - Reads candles from pixels (black/white charts), builds RAW SWING MAP.
-   - Safe on Vercel: soft-requires 'jimp'; if missing, it auto-skips.
-   ========================================================================= */
-
-/* soft-import jimp so builds don't fail if it isn't installed */
-let Jimp: any = null;
-try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  Jimp = require("jimp");
-} catch {
-  Jimp = null; // pixel extractor will auto-skip if null
-}
-
-/** Convert a data-url (image) to Jimp image. */
-async function loadJimpFromDataUrl(dataUrl: string): Promise<any | null> {
-  if (!dataUrl || !Jimp) return null;
-  try {
-    const comma = dataUrl.indexOf(",");
-    const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
-    const buf = Buffer.from(b64, "base64");
-    const img = await Jimp.read(buf);
-    return img;
-  } catch {
-    return null;
-  }
-}
-
 /** Basic grayscale / brightness helper. */
 function brightnessAtPixel(img: any, x: number, y: number): number {
   const idx = img.getPixelColor(x, y);
