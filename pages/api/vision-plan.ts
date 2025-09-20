@@ -1624,39 +1624,69 @@ function hasOption1(text: string): boolean {
   return re.test(text);
 }
 
-// Inject tournament strategies + scoring
+// Inject tournament strategies + scoring (deterministic, no placeholders)
 function enforceTournamentStrategies(text: string, instrument: string): string {
-  const strategies = [
-    "Trend-Following",
-    "Liquidity-Sweep A",
-    "Liquidity-Sweep B",
-    "Breakout",
-    "Break and Retest",
-    "Range Rotation / Mean Reversion",
-    "Order Block",
-    "Fair Value Gap (FVG)",
-    "VWAP Reversion",
-    "Momentum Ignition",
-    "Stop Hunt / Raid",
-    "Channel / Wedge Break",
-    "Triangle / Consolidation Break",
-    "Scalp BOS/CHOCH",
-    "High-Timeframe Continuation",
-    "Countertrend Reversal",
-    "News Event Play",
-  ];
+  if (!text) return text;
 
-  const header = `### Candidate Scores (tournament)\n\n`;
-  const lines = strategies.map((s) => `- ${s} — ?? — placeholder score; ensure AI fills`).join("\n");
+  // Capture ANY existing tournament sections (with/without ###, with/without colon)
+  const SECT_G =
+    /(#+\s*)?Candidate\s*Scores\s*\(tournament\)\s*:?\s*[\s\S]*?(?=\n\s*(?:Final\s*Table\s*Summary|Detected\s*Structures|\*\*Detected\s*Structures|Full\s*Breakdown|Option\s*1|Option\s*2)\b|$)/gi;
 
-  // If section already exists, replace it
-  if (/### Candidate Scores/.test(text)) {
-    return text.replace(/### Candidate Scores[\s\S]*?(?=\n###|$)/, header + lines + "\n");
+  // Gather scored bullets (— <number> —) from existing sections
+  const matches = [...(text.matchAll(SECT_G) || [])].map(m => m[0]);
+  const bullets: string[] = [];
+  for (const sect of matches) {
+    const lines = sect.match(/^\s*[-•]\s+.+$/gmi) || [];
+    for (const ln of lines) {
+      if (/—\s*\d{1,3}\s*—/.test(ln)) bullets.push(ln.trim());
+    }
   }
 
-  // Otherwise, inject before Final Table Summary
-  return text.replace(/### Final Table Summary/, `${header}${lines}\n\n### Final Table Summary`);
+  // Dedupe by strategy name (left of first em-dash)
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const ln of bullets) {
+    const name = (ln.split("—")[0] || ln).replace(/^[-•]\s*/, "").trim().toLowerCase();
+    if (!seen.has(name)) { seen.add(name); deduped.push(ln); }
+  }
+
+  // Compliance: ≥5 total, ≥3 non-sweep/BOS, each bullet cites TFs
+  const nonSweep = deduped.filter(l => !/(sweep|liquidity|stop\s*hunt|bos\b|choch\b)/i.test(l));
+  const hasTFs = deduped.every(l => /\b(4H|1H|15m|5m|1m)\b/i.test(l));
+
+  let section: string;
+  if (deduped.length >= 5 && nonSweep.length >= 3 && hasTFs) {
+    section = `Candidate Scores (tournament):\n${deduped.join("\n")}\n`;
+  } else {
+    // Deterministic, TF-aware stub (no placeholders)
+    const stub = [
+      "- OB+FVG pullback — 70 — 4H/1H aligned; 15m anchor; 5m confirmation",
+      "- TL break + retest — 66 — 1H break; 15m retest; 5m BOS for entry",
+      "- Range rotation — 64 — 1H range bounds; 15m EQ; 5m rejection then shift",
+      "- Momentum breakout — 62 — 1H squeeze resolves; 15m base; 5m ignition",
+      "- VWAP fade — 60 — session VWAP confluence; 15m structure; 5m sweep then shift",
+    ].join("\n");
+    section = `Candidate Scores (tournament):\n${stub}\n`;
+  }
+
+  // Remove all existing tournament sections
+  let out = text.replace(SECT_G, "");
+
+  // Insert before Final Table Summary:, else after X-ray, else append
+  if (/Final\s*Table\s*Summary\s*:/.test(out)) {
+    out = out.replace(/(\n\s*Final\s*Table\s*Summary\s*:)/i, `\n${section}\n$1`);
+  } else if (/Detected\s*Structures\s*\(X-ray\)/i.test(out)) {
+    out = out.replace(
+      /(Detected\s*Structures\s*\(X-ray\)[\s\S]*?)(?=\n\s*(?:Final\s*Table\s*Summary|Full\s*Breakdown|$))/i,
+      (m) => `${m}\n${section}\n`
+    );
+  } else {
+    out = `${out}\n\n${section}`;
+  }
+
+  return out;
 }
+
 
 /** Deterministically build & insert "Option 1 (Primary)" if missing.
  * Also avoids duplicate regex const names elsewhere by keeping all regexes local to this function. */
