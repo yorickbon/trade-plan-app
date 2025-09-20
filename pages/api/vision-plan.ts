@@ -3467,7 +3467,42 @@ if (mode === "expand") {
 
     // === Post-processing enforcement ===
     textFull = await enforceQuickPlan(MODEL, instrument, textFull);
-    textFull = await enforceOption1(MODEL, instrument, textFull);
+        textFull = await enforceOption1(MODEL, instrument, textFull);
+
+    // Deterministic fallback: if Option 1 is still missing, copy from Quick Plan
+    if (!/Option\s*1\s*\(?(Primary)?\)?/i.test(textFull)) {
+      const qpMatch = textFull.match(/(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
+      const qpBlock = qpMatch ? qpMatch[0] : "";
+
+      const pick = (labelRe: string) => {
+        const m = qpBlock.match(new RegExp(`^\\s*•\\s*${labelRe}\\s*:\\s*([^\\n]+)`, "mi"));
+        return m ? m[1].trim() : "...";
+      };
+
+      const dir = pick("(?:\\*\\*)?Direction(?:\\*\\*)?");
+      const ord = pick("(?:\\*\\*)?Order\\s*Type(?:\\*\\*)?");
+      const trg = pick("(?:\\*\\*)?Trigger(?:\\*\\*)?");
+      const ent = pick("(?:\\*\\*)?Entry(?:\\s*\\(zone\\s*or\\s*single\\))?(?:\\*\\*)?");
+      const sl  = pick("(?:\\*\\*)?Stop\\s*Loss(?:\\*\\*)?");
+      const tps = pick("(?:\\*\\*)?(?:Take\\s*Profit\\(s\\)|TPs?)(?:\\*\\*)?");
+      const cv  = pick("(?:\\*\\*)?Conviction(?:\\*\\*)?");
+
+      const option1Synth =
+`Option 1 (Primary)
+• Direction: ${dir}
+• Order Type: ${ord}
+• Trigger: ${trg}
+• Entry (zone or single): ${ent}
+• Stop Loss: ${sl}
+• Take Profit(s): ${tps}
+• Conviction: ${/^\d{1,3}\s*%$/.test(cv) ? cv : (cv ? `${cv}` : "...")}
+• Why this is primary: Primary derived from Quick Plan details (HTF guardrails, clean invalidation).`;
+
+      if (qpBlock) {
+        textFull = textFull.replace(qpBlock, `${qpBlock}\n${option1Synth}\n`);
+      }
+    }
+
     textFull = await enforceOption2(MODEL, instrument, textFull);
 
         // Enforce structure directly from RAW SWING MAP (truth source)
