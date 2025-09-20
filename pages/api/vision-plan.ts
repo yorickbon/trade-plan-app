@@ -2859,8 +2859,8 @@ function _applyRawSwingMap(text: string): string {
 • 4H: ${line4}
 • 1H: ${line1}
 • 15m: ${line15}
-• 5m: ${lines['5m'] ? \`Trend: \${lines['5m']!.verdict === 'Uptrend' ? 'Micro up' : lines['5m']!.verdict === 'Downtrend' ? 'Micro down' : 'Micro range'} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)\` : 'Trend: Micro range — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)'}
-• 1m: ${lines['1m'] ? \`Trend: \${lines['1m']!.verdict === 'Uptrend' ? 'Micro up' : lines['1m']!.verdict === 'Downtrend' ? 'Micro down' : 'Micro range'} — timing only; CHOCH/BOS micro-shift for entry\` : 'not used'}
+• 5m: ${lines['5m'] ? `Trend: ${lines['5m']!.verdict === 'Uptrend' ? 'Micro up' : lines['5m']!.verdict === 'Downtrend' ? 'Micro down' : 'Micro range'} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)` : 'Trend: Micro range — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)'}
+• 1m: ${lines['1m'] ? `Trend: ${lines['1m']!.verdict === 'Uptrend' ? 'Micro up' : lines['1m']!.verdict === 'Downtrend' ? 'Micro down' : 'Micro range'} — timing only; CHOCH/BOS micro-shift for entry` : 'not used'}
 `;
 
   const xrayRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
