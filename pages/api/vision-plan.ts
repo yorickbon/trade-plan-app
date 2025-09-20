@@ -2183,14 +2183,14 @@ function enforceFinalTableSummary(text: string, instrument: string) {
   return `${text}\n${stub}`;
 }
 
-/** Conviction calculation & injection (independent per-plan + hard-gated Option2 distinct + scaffold enforcement). */
+/** Conviction calculation & injection (Option 1 ← T1, Option 2 ← T2; no Quick Plan). */
 function computeAndInjectConviction(
   text: string,
   args: { fundamentals: { final: { score: number; sign: number } }, proximityFlag?: boolean }
 ) {
   if (!text) return text;
 
-  // ---- Tournament scores (map Top1→Option1, Top2→Option2) ----
+  // ---- Tournament scores (map Top1→O1, Top2→O2) ----
   const tSect = text.match(
     /Candidate\s*Scores\s*\(tournament\):[\s\S]*?(?=\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i
   )?.[0] || "";
@@ -2203,8 +2203,8 @@ function computeAndInjectConviction(
       .map((n) => Math.max(0, Math.min(100, n)))
   )].sort((a, b) => b - a);
 
-  const T1 = uniqSorted[0] ?? 0;                         // Option 1 baseline
-  const T2 = uniqSorted[1] ?? Math.max(0, T1 - 8);       // Option 2 baseline
+  const T1 = uniqSorted[0] ?? 0;                    // → Option 1
+  const T2 = uniqSorted[1] ?? Math.max(0, T1 - 8);  // → Option 2
 
   // ---- Fundamentals snapshot ----
   const Fraw = Number(args.fundamentals?.final?.score) || 0;
@@ -2212,22 +2212,23 @@ function computeAndInjectConviction(
   const fSign = (Number(args.fundamentals?.final?.sign) || 0) as -1 | 0 | 1;
   const prox = !!args.proximityFlag;
 
-  // ---- Plan blocks (ONLY O1/O2) ----
+  // ---- Plan blocks ----
   const RE_O1_BLOCK = /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
   const RE_O2_BLOCK = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
 
-  function hasText(s: string, re: RegExp) { return re.test((s || "").toLowerCase()); }
   const o1Block = text.match(RE_O1_BLOCK)?.[0] || "";
   const o2Block = text.match(RE_O2_BLOCK)?.[0] || "";
+  if (!o1Block && !o2Block) return text;
 
   const dO1 = _dirSignFromBlock(o1Block);
   const dO2 = _dirSignFromBlock(o2Block);
 
-  // Alignment bonuses/penalties
+  // Alignment bonus/penalty
   const alignO1 = (fSign !== 0 && dO1 !== 0) ? (fSign === dO1 ? 8 : -8) : 0;
   const alignO2 = (fSign !== 0 && dO2 !== 0) ? (fSign === dO2 ? 8 : -8) : 0;
 
-  // Quality & reliability heuristics (reuse original logic)
+  // Quality & reliability heuristics (same rules)
+  function hasText(s: string, re: RegExp) { return re.test((s || "").toLowerCase()); }
   function qualityFactor(block: string): number {
     let q = 1.0;
     if (hasText(block, /(htf\s+alignment|clean\s+invalidation|confluence|ob\s*\+?\s*fvg|rr\s*[:x]?\s*2(\.?\d+)?|\bR\s*[:x]\s*2)/i)) q += 0.05;
@@ -2237,6 +2238,7 @@ function computeAndInjectConviction(
   }
   function reliabilityFactor(textAll: string): number {
     let r = 1.0;
+    if (hasText(textAll, /pre-release\s+only|waiting\s+for\s+results|calendar:\s*unavailable/i)) r -= 0.1;
     if (hasText(textAll, /\bMismatch\b/i)) r -= 0.05;
     return Math.max(0.8, Math.min(1.05, r));
   }
@@ -2248,14 +2250,16 @@ function computeAndInjectConviction(
   const prox_pen = prox ? 6 : 0;
   const liq_pen  = hasText(text, /\b(asia\s+session|illiquid|thin\s+liquidity)\b/i) ? 2 : 0;
 
+  // ---- Technical baselines per plan ----
   const Tq_o1 = Math.max(0, Math.min(100, Math.round(T1 * Q_o1)));
   const Tq_o2 = Math.max(0, Math.min(100, Math.round(T2 * Q_o2)));
   const Fr    = Math.max(0, Math.min(100, Math.round(F * R_f)));
 
+  // Final convictions (0–100)
   const convO1 = Math.max(0, Math.min(100, Math.round(0.60 * Tq_o1 + 0.40 * Fr + alignO1 - (prox_pen + liq_pen))));
   const convO2 = Math.max(0, Math.min(100, Math.round(0.60 * Tq_o2 + 0.40 * Fr + alignO2 - (prox_pen + liq_pen))));
 
-  // ---- Write into Option blocks only ----
+  // ---- Write back into each Option block ----
   function detectBullet(block: string): string {
     if (/^\s*•\s/m.test(block)) return "• ";
     if (/^\s*-\s/m.test(block)) return "- ";
@@ -2291,11 +2295,12 @@ function computeAndInjectConviction(
   out = writeConv(out, RE_O1_BLOCK, convO1);
   out = writeConv(out, RE_O2_BLOCK, convO2);
 
-  // Keep distinctness guard (same as before)
+  // Keep the original sync distinctness guard
   out = enforceOption2DistinctHardSync("EURUSD", out);
 
   return out;
 }
+
 
 /** Ensures Option 2 is distinct from Option 1 without async */
 function enforceOption2DistinctHardSync(instrument: string, text: string): string {
@@ -2325,9 +2330,9 @@ function enforceOption2DistinctHardSync(instrument: string, text: string): strin
 function fillFinalTableSummaryRow(text: string, instrument: string) {
   if (!text) return text;
 
-  // --- Helpers ---
   const ai = extractAiMeta(text) || {};
 
+  // thousands-aware tokenization (preserve formatting from QP lines)
   const TOKEN_RE = /(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?/g;
   const stripMd = (s: string) =>
     String(s || "")
@@ -2337,71 +2342,59 @@ function fillFinalTableSummaryRow(text: string, instrument: string) {
   const fmtThousands = (s: string) => {
     if (!s) return s;
     if (/,/.test(s)) return s;
-    const [i, d] = String(s).split(".");
+    const [i, d] = s.split(".");
     const ii = i.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
     return d ? `${ii}.${d}` : ii;
   };
-  const toNum = (s: string) => Number(String(s).replace(/,/g, ""));
+  const numFromToken = (tok: string) => Number(tok.replace(/,/g, ""));
 
-  const getBlock = () =>
-    text.match(/(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i)?.[0] ||
-    text.match(/(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i)?.[0] ||
-    "";
-
-  const grabFromBlock = (re: RegExp): string | null => {
-    const blk = getBlock();
-    if (!blk) return null;
-    const m = blk.match(re);
+  const grab = (re: RegExp): string | null => {
+    const m = text.match(re);
     return m ? stripMd(m[1]) : null;
   };
 
-  // --- Read fields from Option 1 (fallback to Option 2) ---
-  const bias =
-    grabFromBlock(/^\s*•\s*Direction\s*:\s*(Long|Short|Stay\s*Flat)/mi) || "...";
+  // Bias & Conviction from Quick Plan
+  const bias = grab(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(?:\*\*)?\s*(Long|Short|Stay\s*Flat)/i) || "...";
+  const slLine = grab(/Quick\s*Plan[\s\S]*?Stop\s*Loss\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "...";
+  const tpsLine =
+    grab(/Quick\s*Plan[\s\S]*?Take\s*Profit\(s\)\s*:\s*(?:\*\*)?\s*([^\n]+)/i) ||
+    grab(/Quick\s*Plan[\s\S]*?TPs?\s*:\s*(?:\*\*)?\s*([^\n]+)/i) ||
+    "";
+  const conv = grab(/Quick\s*Plan[\s\S]*?Conviction\s*:\s*(?:\*\*)?\s*(\d{1,3})\s*%/i) || "...";
 
-  // Entry zone: prefer ai_meta.zone; else parse from Entry line numbers
-  function buildEntryZone(): string {
-    const z = ai?.zone;
-    if (z && Number.isFinite(+z.min) && Number.isFinite(+z.max)) {
-      const lo = Math.min(Number(z.min), Number(z.max));
-      const hi = Math.max(Number(z.min), Number(z.max));
-      return `${fmtThousands(String(lo))} – ${fmtThousands(String(hi))}`;
-    }
-    const rawEntry =
-      grabFromBlock(/^\s*•\s*Entry\s*\(zone\s*or\s*single\)\s*:\s*([^\n]+)/mi) ||
-      grabFromBlock(/^\s*•\s*Entry\s*:\s*([^\n]+)/mi) ||
-      "";
+  // Entry zone: prefer ai_meta.zone; else reuse QP tokens (preserving commas)
+  let entryZone = "...";
+  if (ai?.zone && Number.isFinite(+ai.zone.min) && Number.isFinite(+ai.zone.max)) {
+    const lo = Math.min(Number(ai.zone.min), Number(ai.zone.max));
+    const hi = Math.max(Number(ai.zone.min), Number(ai.zone.max));
+    const sLo = fmtThousands(String(lo));
+    const sHi = fmtThousands(String(hi));
+    entryZone = `${sLo} – ${sHi}`;
+  } else {
+    const rawEntry = grab(/Quick\s*Plan[\s\S]*?Entry\s*(?:\(zone\s*or\s*single\))?\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "";
     const toks = (rawEntry.match(TOKEN_RE) || []).map(String);
     if (toks.length >= 2) {
-      return `${fmtThousands(toks[0])} – ${fmtThousands(toks[1])}`;
-    }
-    if (toks.length === 1) {
-      const entry = toNum(toks[0]);
-      const decs = (String(toks[0]).split(".")[1] || "").length || 4;
+      entryZone = `${fmtThousands(toks[0])} – ${fmtThousands(toks[1])}`;
+    } else if (toks.length === 1) {
+      const t = toks[0];
+      const decs = (t.split(".")[1] || "").length || 4;
+      const entry = numFromToken(t);
       const pip = Math.pow(10, -decs);
       const w = 10 * pip;
       const lo = (entry - w).toFixed(decs);
       const hi = (entry + w).toFixed(decs);
-      return `${fmtThousands(lo)} – ${fmtThousands(hi)}`;
+      entryZone = `${fmtThousands(lo)} – ${fmtThousands(hi)}`;
     }
-    return "...";
   }
 
-  // SL: keep the line, but format the first numeric token with thousands
-  function buildSL(): string {
-    const slLine =
-      grabFromBlock(/^\s*•\s*Stop\s*Loss\s*:\s*([^\n]+)/mi) || "...";
-    const tok = (slLine.match(TOKEN_RE) || [])[0];
-    if (!tok) return slLine;
-    return slLine.replace(TOKEN_RE, fmtThousands(tok));
-  }
+  // SL from QP tokens (preserve commas)
+  let sl = slLine;
+  const slTok = (slLine.match(TOKEN_RE) || [])[0];
+  if (slTok) sl = slLine.replace(TOKEN_RE, fmtThousands(slTok));
 
-  // TP1/TP2: try labeled capture first, else first two numbers on the TP line
-  function buildTPs(): { tp1: string; tp2: string } {
-    const tpsLine =
-      grabFromBlock(/^\s*•\s*(?:Take\s*Profit\(s\)|TPs?)\s*:\s*([^\n]+)/mi) || "";
-    if (!tpsLine) return { tp1: "...", tp2: "..." };
-    let tp1 = "...", tp2 = "...";
+  // TP1/TP2 from QP tokens (preserve commas)
+  let tp1 = "...", tp2 = "...";
+  if (tpsLine) {
     const mm1 = tpsLine.match(/TP1[:\s]*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)/i);
     const mm2 = tpsLine.match(/TP2[:\s]*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)/i);
     if (mm1) tp1 = fmtThousands(mm1[1]);
@@ -2411,35 +2404,22 @@ function fillFinalTableSummaryRow(text: string, instrument: string) {
       if (tp1 === "..." && toks[0]) tp1 = toks[0];
       if (tp2 === "..." && toks[1]) tp2 = toks[1];
     }
-    return { tp1, tp2 };
   }
 
-  const entryZone = buildEntryZone();
-  const sl = buildSL();
-  const { tp1, tp2 } = buildTPs();
-  const conv =
-    grabFromBlock(/^\s*•\s*Conviction\s*:\s*(\d{1,3})\s*%/mi) || "...";
-
-  // --- Write/Update the Final Table Summary ---
   const headerRe = /Final\s*Table\s*Summary:\s*\n\|\s*Instrument\s*\|\s*Bias\s*\|\s*Entry Zone\s*\|\s*SL\s*\|\s*TP1\s*\|\s*TP2\s*\|\s*Conviction %\s*\|\n/i;
-  const rowRe = new RegExp(
-    `^\\|\\s*${instrument.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\s*\\|[^\\n]*$`,
-    "im"
-  );
-
+  const rowRe = new RegExp(`^\\|\\s*${instrument.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\s*\\|[^\\n]*$`, "im");
   const newRow = `| ${instrument} | ${bias} | ${entryZone} | ${sl} | ${tp1} | ${tp2} | ${conv} |`;
 
   if (!headerRe.test(text)) {
     const block =
-      `\nFinal Table Summary:\n` +
-      `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |\n` +
-      `${newRow}\n`;
+`\nFinal Table Summary:
+| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |
+${newRow}\n`;
     return `${text}\n${block}`;
   }
   if (rowRe.test(text)) return text.replace(rowRe, newRow);
   return text.replace(headerRe, (m) => m + newRow + "\n");
 }
-
 
 function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
   // Final polish pass BEFORE emitting ai_meta (normalizes 'mixed' → 'neutral' on calendar lines, etc.)
