@@ -1468,22 +1468,23 @@ function messagesFull(args: {
   "• One-liner Summary:",
 
   "",
-  "Detected Structures (X-ray):",
-"• 4H: Classify as Uptrend only if clear HH/HL are present. Classify as Downtrend only if LH/LL are confirmed. Do not mark Downtrend when higher highs are visible.",
-"• 1H: Apply same HH/HL vs LH/LL rules as 4H. If mixed signals are present, label as Range/Neutral.",
-"• 15m: Confirm BOS/CHOCH strictly. Use HH/HL vs LH/LL for classification. If unclear, default to Neutral instead of forcing a bias.",
-"• 5m (if used): Use only for execution timing. Must still follow HH/HL vs LH/LL rules to avoid false bias calls.",
-"• 1m (if used): Execution timing only — never overrides higher timeframe structure.",
-"",
-"Candidate Scores (tournament):",
-"- All strategy scores must be consistent with the detected structures above.",
-"- Trend-Following: Score higher only if two or more HTFs (4H, 1H, 15m) show HH/HL (uptrend) or LH/LL (downtrend).",
-"- BOS Strategy: Score only when BOS/CHOCH confirmed across at least two timeframes.",
-"- Liquidity-Sweep: Score only if explicit sweep wicks are detected (esp. on 5m/15m).",
-"- Breakout Strategy: Score only on clean breakout beyond HTF key levels, aligned with structure.",
-"- Mean Reversion: Score only if repeated rejection at OB/FVG with opposite HTF bias, not randomly.",
-"",
-"Final Table Summary:",
+    "Detected Structures (X-ray):",
+  "• 4H: Classify as Uptrend only if clear HH/HL are present. Classify as Downtrend only if LH/LL are confirmed. Do not mark Downtrend when higher highs are visible.",
+  "• 1H: Apply same HH/HL vs LH/LL rules as 4H. If mixed signals are present, label as Range/Neutral.",
+  "• 15m: Confirm BOS/CHOCH strictly. Use HH/HL vs LH/LL for classification. If unclear, default to Neutral instead of forcing a bias.",
+  "• 5m (if used): Use only for execution timing. Must still follow HH/HL vs LH/LL rules to avoid false bias calls.",
+  "• 1m (if used): Execution timing only — never overrides higher timeframe structure.",
+  "",
+  "Candidate Scores (tournament):",
+  "- All strategy scores must be consistent with the detected structures above.",
+  "- Trend-Following: Score higher only if two or more HTFs (4H, 1H, 15m) show HH/HL (uptrend) or LH/LL (downtrend).",
+  "- BOS Strategy: Score only when BOS/CHOCH confirmed across at least two timeframes.",
+  "- Liquidity-Sweep: Score only if explicit sweep wicks are detected (esp. on 5m/15m).",
+  "- Breakout Strategy: Score only on clean breakout beyond HTF key levels, aligned with structure.",
+  "- Mean Reversion: Score only if repeated rejection at OB/FVG with opposite HTF bias, not randomly.",
+  "",
+  "Final Table Summary:",
+
 
   `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |`,
   `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
@@ -3304,7 +3305,102 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
      - Extract candlestick OHLC approximation directly from chart images
        (black/white TradingView-like charts), detect swings and produce a
        RAW SWING MAP block that the rest of the pipeline consumes.
-     - Insert BEFORE: the line "// ---------- Provenance footer ----------"
+     - Insert BEFORE: the line "
+     
+     // --- CHART VERDICT GUARD (HTF truth-table; sync RAW SWING MAP ↔ Technical View) ---
+function _fixChartVerdictsBlock(src: string): string {
+  if (!src) return src;
+
+  // 1) Find RAW SWING MAP block
+  const mapRe = /(##\s*RAW\s*SWING\s*MAP[\s\S]*?)(?:\n-{3,}|\n##|\nFull\s*Breakdown|\n$)/i;
+  const m = src.match(mapRe);
+  if (!m) return src;
+  let block = m[1];
+
+  const tfs = ["4H", "1H", "15m", "5m"] as const;
+  const rows: Record<string, { swings: string; bos: string; verdict: string }> = {
+    "4H": { swings: "", bos: "", verdict: "" },
+    "1H": { swings: "", bos: "", verdict: "" },
+    "15m": { swings: "", bos: "", verdict: "" },
+    "5m": { swings: "", bos: "", verdict: "" },
+  };
+
+  // helpers
+  function swingVerdictFrom(swings: string, lastBOS: string): string {
+    const s = String(swings || "").toUpperCase();
+    const bos = String(lastBOS || "").toLowerCase();
+    const hasHHHL = /\bHH\b.*\bHL\b|\bHL\b.*\bHH\b/.test(s);
+    const hasLHLL = /\bLH\b.*\bLL\b|\bLL\b.*\bLH\b/.test(s);
+    if (hasHHHL && !hasLHLL) return "Uptrend (HH/HL)";
+    if (hasLHLL && !hasHHHL) return "Downtrend (LH/LL)";
+    if (/up/.test(bos)) return "Uptrend (HH/HL)";
+    if (/down/.test(bos)) return "Downtrend (LH/LL)";
+    return "Range / consolidation";
+  }
+
+  function grab(tf: string) {
+    const sectRe = new RegExp(`\\*\\*${tf}\\*\\*:\\s*[\\r\\n]+([\\s\\S]*?)(?:\\n\\*\\*|\\n-{3,}|\\n##|\\n$)`, "i");
+    const s = block.match(sectRe)?.[1] || "";
+    const swings = s.match(/Swings:\s*([^\n]+)/i)?.[1]?.trim() || "";
+    const bos    = s.match(/Last\s*BOS:\s*([^\n]+)/i)?.[1]?.trim() || "";
+    const verdict= s.match(/Verdict:\s*([^\n]+)/i)?.[1]?.trim() || "";
+    rows[tf] = { swings, bos, verdict };
+  }
+  tfs.forEach(grab);
+
+  const v4  = swingVerdictFrom(rows["4H"].swings, rows["4H"].bos);
+  const v1  = swingVerdictFrom(rows["1H"].swings, rows["1H"].bos);
+  const v15 = swingVerdictFrom(rows["15m"].swings, rows["15m"].bos);
+  const v5  = swingVerdictFrom(rows["5m"].swings, rows["5m"].bos);
+
+  const counter1H =
+    (v4.startsWith("Uptrend") && v1.startsWith("Downtrend")) ||
+    (v4.startsWith("Downtrend") && v1.startsWith("Uptrend"));
+
+  const vFix: Record<string, string> = { "4H": v4, "1H": v1, "15m": v15, "5m": v5 };
+
+  // 2) Rewrite RAW SWING MAP verdict lines to normalized wording
+  function setVerdict(tf: string, verdictText: string) {
+    const sectRe = new RegExp(`(\\*\\*${tf}\\*\\*:[\\s\\S]*?\\n)(-\\s*Verdict:\\s*)([^\\n]+)`, "i");
+    block = block.replace(sectRe, (_m, head, vlabel) => `${head}${vlabel}${verdictText}`);
+  }
+  tfs.forEach(tf => setVerdict(tf, vFix[tf]));
+
+  if (counter1H) {
+    const oneHRe = /(\*\*1H\*\*:[\s\S]*?)(\n-\s*Verdict:\s*[^\n]+)/i;
+    block = block.replace(oneHRe, (_m, head, verdictLine) => `${head}${verdictLine} — counter-trend vs 4H`);
+  }
+
+  // put RAW SWING MAP back
+  let out = src.replace(m[1], block);
+
+  // 3) Sync **Technical View** lines to match the normalized verdicts
+  const tvRe = /(\*\*Technical\s*View[^\n]*\*\*:[\s\S]*?)(?:\n\*\*Fundamental|\nFundamental\s*Bias\s*Snapshot|\n##|\n$)/i;
+  const tvBlock = out.match(tvRe)?.[1];
+  if (!tvBlock) return out;
+  let tv = tvBlock;
+
+  function replaceTV(tf: string, verdictText: string) {
+    const lineRe = new RegExp(`(-\\s*\\*\\*${tf}\\*\\*:\\s*)([^\\n]+)`, "i");
+    if (lineRe.test(tv)) {
+      tv = tv.replace(lineRe, (_m, pre) => `${pre}${verdictText}`);
+    } else {
+      // add missing line in canonical order at the end of the block
+      tv = tv.trimEnd() + `\n- **${tf}:** ${verdictText}`;
+    }
+  }
+  replaceTV("4H",  vFix["4H"]);
+  replaceTV("1H",  vFix["1H"] + (counter1H ? " — counter-trend vs 4H" : ""));
+  replaceTV("15m", vFix["15m"]);
+  replaceTV("5m",  vFix["5m"]);
+
+  out = out.replace(tvBlock, tv);
+  return out;
+}
+// --- END CHART VERDICT GUARD ---
+
+     
+     // ---------- Provenance footer ----------"
    Notes:
      - Requires `jimp` (npm install jimp).
      - Heuristics only: works best with simple black-on-white candlesticks.
