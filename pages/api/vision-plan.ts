@@ -3574,9 +3574,24 @@ type SwingResult = {
 };
 
 /** Build RAW SWING MAP block for a TF from its image data URL */
-async function buildRawSwingForTF(dataUrl: string | null, timeLabel: string): Promise<{ block: string | null; confidence: number }> {
-  if (!dataUrl) return { block: null, confidence: 0 };
-  const img = await loadJimpFromDataUrl(dataUrl);
+// Self-contained (no external helper): loads Jimp image from data URL inline
+async function buildRawSwingForTF(
+  dataUrl: string | null,
+  timeLabel: string
+): Promise<{ block: string | null; confidence: number }> {
+  // Guard: need dataUrl and Jimp available
+  if (!dataUrl || !Jimp) return { block: null, confidence: 0 };
+
+  // Inline loader (replaces loadJimpFromDataUrl)
+  let img: any = null;
+  try {
+    const comma = dataUrl.indexOf(",");
+    const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+    const buf = Buffer.from(b64, "base64");
+    img = await Jimp.read(buf);
+  } catch {
+    return { block: null, confidence: 0 };
+  }
   if (!img) return { block: null, confidence: 0 };
 
   const MAX_W = 1200;
@@ -3598,6 +3613,7 @@ async function buildRawSwingForTF(dataUrl: string | null, timeLabel: string): Pr
 
   return { block, confidence: detectConfidence };
 }
+
 
 /** Images (4H/1H/15m/5m/1m) → RAW SWING MAP */
 export async function generateRawSwingMapFromImages(images: {
