@@ -3543,14 +3543,8 @@ if (mode === "expand") {
   text = enforceEntryZoneUsage(text, c.instrument);
   
   // >>> NEW: Apply mega post-gen chain before footer (order/trigger, BOS wording, entry zone, vocab guards)
-  text = await _applyMegaPostGenChain(
-    text,
-    {
-      instrument: c.instrument,
-      fundamentalsSign: 0,
-      preReleaseOnly: false
-    }
-  );
+  text = await _applyMegaPostGenChain(text);
+
 
 
   // Provenance footer (unchanged)
