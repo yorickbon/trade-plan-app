@@ -2567,78 +2567,8 @@ function _normalizeOrderTypeByTrigger(text: string): string {
   return out;
 }
 
-/** Enforce "Entry (zone or single)" to be a zone (min–max), thousands-aware. */
-function enforceEntryZoneUsage(text: string, instrument: string): string {
-  if (!text) return text;
-  const ai = extractAiMeta(text) || {};
-  const z = ai?.zone;
-
-  const NUM_RE = /(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?/g;
-  const toNum = (s: string) => Number(String(s).replace(/,/g, ""));
-
-  function fmtZone(min: number, max: number): string {
-    const lo = Math.min(min, max);
-    const hi = Math.max(min, max);
-    const dec = Math.max(
-      (String(lo).split(".")[1] || "").length,
-      (String(hi).split(".")[1] || "").length,
-      2
-    );
-    return `${lo.toFixed(dec)} – ${hi.toFixed(dec)}`;
-  }
-
-  function deriveZoneFromLine(line: string): string | null {
-    const nums = (line.match(NUM_RE) || []).map(toNum).filter(Number.isFinite);
-    if (nums.length >= 2) return fmtZone(nums[0], nums[1]);
-    if (nums.length === 1) {
-      const entry = nums[0];
-      const decs = (String(entry).split(".")[1] || "").length;
-      const pip = Math.pow(10, -(decs || 4));
-      const w = 10 * pip;
-      return fmtZone(entry - w, entry + w);
-    }
-    return null;
-  }
-
-  function rewriteBlock(src: string, reBlock: RegExp) {
-    const m = src.match(reBlock);
-    if (!m) return src;
-    let block = m[0];
-
-    const reEntry = /(^\s*•\s*Entry\s*\(zone\s*or\s*single\)\s*:\s*)([^\n]+)$/mi;
-    const reEntryAlt = /(^\s*•\s*Entry\s*:\s*)([^\n]+)$/mi;
-
-    const zoneText = (() => {
-      if (z && Number.isFinite(+z.min) && Number.isFinite(+z.max)) {
-        return fmtZone(Number(z.min), Number(z.max));
-      }
-      const raw = (block.match(reEntry)?.[2] || block.match(reEntryAlt)?.[2] || "").trim();
-      return deriveZoneFromLine(raw);
-    })();
-
-    if (!zoneText) return src;
-
-    if (reEntry.test(block)) block = block.replace(reEntry, (_f, p1) => `${p1}${zoneText}`);
-    else if (reEntryAlt.test(block)) block = block.replace(reEntryAlt, (_f, p1) => `${p1}${zoneText}`);
-    else block = `${block}\n• Entry (zone or single): ${zoneText}`;
-
-    return src.replace(m[0], block);
-  }
-
-  let out = text;
-  out = rewriteBlock(out, /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
-  out = rewriteBlock(out, /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
-  out = rewriteBlock(out, /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i);
-  return out;
-}
 
 
-
-/** NEW: Clarify BOS wording (no numbers needed). */
-function _clarifyBOSWording(text: string): string {
-  return text
-    .replace(/5m:\s*Awaiting\s*BOS\s*for\s*confirmation/gi, "5m: Awaiting 5m BOS (decisive break/close below latest 5m swing low) for confirmation")
-    .replace(/BOS\s*needed\s*for\s*confirmation/gi, "BOS needed for confirmation (break/close of recent swing)");
 }
 
 /* =========================
