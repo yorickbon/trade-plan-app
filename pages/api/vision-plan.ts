@@ -3250,11 +3250,14 @@ if (mode === "expand") {
   const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
   text = stampM5Used(text, usedM5);
 
-  // Polish & structure guards (spacing + BOS wording + HTF reconciliation + trigger specificity)
+    // Polish & structure guards (spacing + BOS wording + HTF reconciliation + trigger specificity)
   text = _clarifyBOSWording(text);
   text = normalizeTriggerSpacing(text); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
   text = _reconcileHTFTrendFromText(text);
+  // NEW: enforce HTF/LTF structure from RAW SWING MAP (map has final authority over X-ray/TV lines)
+  text = _applyRawSwingMap(text);
   text = await enforceTriggerSpecificity(modelExpand, c.instrument, text);
+
 
 
   // Ensure breakdown skeleton + final table heading, then normalize entry zone rendering
