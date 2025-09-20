@@ -2825,10 +2825,12 @@ function _applyRawSwingMap(text: string): string {
 
   // Robust line parser: accepts extra tokens, optional parentheses, flexible spacing.
   function parseLine(tf: TF) {
+      // Accept bullets and markdown (e.g., "- **4H:**"), and constrain BOS to up|down|none
     const re = new RegExp(
-      `^\\s*[-•]?\\s*\\*?\\*?${tf}\\*?\\*?\\s*:\\s*swings\\s*=\\s*([^;\\n]+);\\s*last_BOS\\s*=\\s*([^;\\n]+);\\s*verdict\\s*=\\s*(Uptrend|Downtrend|Range)\\b.*$`,
-      "im"
+      String.raw`^\s*(?:[-•]?\s*)?(?:\*\*)?\s*${tf}\s*:?(?:\*\*)?\s*:\s*swings\s*=\s*([^;\n]+?)\s*;\s*last_BOS\s*=\s*(up|down|none)\s*;\s*verdict\s*=\s*(Uptrend|Downtrend|Range)\s*$`,
+      'im'
     );
+
     const mm = block.match(re);
     if (!mm) return null;
     return {
