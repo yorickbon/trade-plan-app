@@ -3408,28 +3408,21 @@ function _fixChartVerdictsBlock(src: string): string {
        text-based logic if detection fails.
    ========================================================================= */
 
-/* soft-import jimp so builds don't fail if it isn't installed */
+/* soft-import jimp without forcing Next/Vercel to resolve it at build time */
 let Jimp: any = null;
 try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  Jimp = require("jimp");
+  // Indirect require so the bundler won't statically analyze "jimp"
+  const modName = 'jimp';
+  // eslint-disable-next-line no-eval
+  const _req: any = (typeof require === 'function' ? require : eval('require'));
+  if (_req) {
+    const mod = _req(modName);
+    Jimp = (mod && (mod.default || mod)) || null;
+  }
 } catch {
-  Jimp = null; // pixel extractor will auto-skip if null
+  Jimp = null; // pixel extractor will auto-skip if unavailable
 }
 
-/** Convert a data-url (image) to Jimp image. */
-async function loadJimpFromDataUrl(dataUrl: string): Promise<any | null> {
-  if (!dataUrl || !Jimp) return null;
-  try {
-    const comma = dataUrl.indexOf(",");
-    const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
-    const buf = Buffer.from(b64, "base64");
-    const img = await Jimp.read(buf);
-    return img;
-  } catch {
-    return null;
-  }
-}
 
 /** Basic grayscale / brightness helper. */
 function brightnessAtPixel(img: any, x: number, y: number): number {
