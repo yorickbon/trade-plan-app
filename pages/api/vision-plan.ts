@@ -2771,14 +2771,15 @@ function _reconcileHTFTrendFromText(text: string): string {
   const mentions1m = /\b1m\b/i.test(raw) || /Used\s*Chart:\s*1M/i.test(raw);
   const line1m = mentions1m ? `Trend: ${microWord(d1m)} — timing only; CHOCH/BOS micro-shift for entry` : 'not used';
 
-  const newXray =
+   const newXray =
 `Detected Structures (X-ray)
-• 4H: ${line4}
-• 1H: ${line1}
-• 15m: ${line15}
-• 5m: ${line5}
-• 1m: ${line1m}
+- 4H: ${line4}
+- 1H: ${line1}
+- 15m: ${line15}
+- 5m: ${line5}
+- 1m: ${line1m}
 `;
+
 
   const xraySectRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
   let out = raw;
