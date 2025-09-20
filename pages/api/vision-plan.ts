@@ -1395,8 +1395,16 @@ function messagesFull(args: {
     args.scalpingHard
   ),
   "",
-  "OUTPUT format (in this exact order):",
+    "OUTPUT format (in this exact order):",
+  "RAW SWING MAP (first)",
+  "4H: swings=<comma-separated HH/HL/LH/LL sequence>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "1H: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "15m: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "5m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "1m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "",
   "Quick Plan (Actionable)",
+
   "• Direction: Long | Short | Stay Flat",
   "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
   "• Trigger: (state timeframes explicitly, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)')",
@@ -1500,8 +1508,16 @@ function messagesFastStage1(args: {
     args.scalpingHard
   ),
   "",
-  "OUTPUT ONLY:",
+   "OUTPUT ONLY:",
+  "RAW SWING MAP (first)",
+  "4H: swings=<comma-separated HH/HL/LH/LL sequence>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "1H: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "15m: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "5m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "1m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "",
   "Quick Plan (Actionable)",
+
   "• Direction: Long | Short | Stay Flat",
   "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
   "• Trigger: (state timeframes explicitly, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)')",
@@ -2778,7 +2794,87 @@ function _reconcileHTFTrendFromText(text: string): string {
 
   return out;
 }
-// ---- END _reconcileHTFTrendFromText (v6) ----
+ // ---- END _reconcileHTFTrendFromText (v6) ----
+
+/** Enforce HTF/LTF structure strictly from a mandatory RAW SWING MAP block.
+ *  The RAW SWING MAP must appear at the top, before Quick Plan. Example lines:
+ *    4H: swings=HH,HL,HH,HL; last_BOS=up; verdict=Uptrend
+ *    1H: swings=LH,LL,LH,LL; last_BOS=down; verdict=Downtrend
+ *  This parser is tolerant to extra spaces/case and missing 5m/1m lines.
+ *  It updates:
+ *    - Detected Structures (X-ray)
+ *    - Technical View lines for 4H/1H/15m
+ *  and applies the 4H truth table (1H/15m cannot override 4H; they may be counter-trend only).
+ */
+function _applyRawSwingMap(text: string): string {
+  if (!text) return text;
+
+  // 1) Grab the RAW SWING MAP block (top section, before Quick Plan)
+  const mapRe = /(RAW\s*SWING\s*MAP\s*\(first\)[\s\S]*?)(?=\n\s*Quick\s*Plan\s*\(Actionable\)|\n\s*Option\s*1|\n\s*Full\s*Breakdown|$)/i;
+  const m = text.match(mapRe);
+  if (!m) return text; // nothing to enforce
+
+  const block = m[1];
+
+  type Verdict = 'Uptrend'|'Downtrend'|'Range';
+  type TF = '4H'|'1H'|'15m'|'5m'|'1m';
+
+  const lines: Partial<Record<TF, { swings:string; bos:string; verdict:Verdict }>> = {};
+
+  function take(tf: TF) {
+    const re = new RegExp(`^\\s*${tf}\\s*:\\s*swings\\s*=\\s*([^;\\n]+);\\s*last_BOS\\s*=\\s*([^;\\n]+);\\s*verdict\\s*=\\s*(Uptrend|Downtrend|Range)\\s*$`, 'im');
+    const mm = block.match(re);
+    if (!mm) return;
+    lines[tf] = { swings: (mm[1]||'').trim(), bos: (mm[2]||'').trim().toLowerCase(), verdict: mm[3] as Verdict };
+  }
+
+  (['4H','1H','15m','5m','1m'] as TF[]).forEach(take);
+
+  // Must have at least 4H,1H,15m verdicts to be useful
+  if (!lines['4H'] || !lines['1H'] || !lines['15m']) return text;
+
+  // 2) Truth table: 4H verdict anchors; 1H/15m can be counter-trend but cannot flip HTF wording.
+  const v4 = lines['4H']!.verdict;
+  const v1 = lines['1H']!.verdict;
+  const v15 = lines['15m']!.verdict;
+
+  const ct15 = (v4 !== 'Range' && v15 !== 'Range' && v15 !== v4);
+
+  // 3) Build normalized wording for X-ray + Technical View
+  const tail4 =
+    v4 === 'Uptrend'   ? '— bullish structure (HH/HL confirmed)'
+  : v4 === 'Downtrend' ? '— bearish structure (LH/LL confirmed)'
+                       : '— consolidation / range';
+
+  const ctx1 = '— at support/demand; monitor continuation vs pullback';
+  const line4 = `Trend: ${v4} ${tail4}`;
+  const line1 = `Trend: ${v1} ${ctx1}`;
+  const anchor15 = 'Execution anchors refined from 1H';
+  const line15 = `Trend: ${v15} — ${anchor15}${ct15 ? ' (counter-trend)' : ''}`;
+
+  // 4) Replace X-ray section deterministically
+  const newX =
+`Detected Structures (X-ray)
+• 4H: ${line4}
+• 1H: ${line1}
+• 15m: ${line15}
+• 5m: ${lines['5m'] ? \`Trend: \${lines['5m']!.verdict === 'Uptrend' ? 'Micro up' : lines['5m']!.verdict === 'Downtrend' ? 'Micro down' : 'Micro range'} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)\` : 'Trend: Micro range — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)'}
+• 1m: ${lines['1m'] ? \`Trend: \${lines['1m']!.verdict === 'Uptrend' ? 'Micro up' : lines['1m']!.verdict === 'Downtrend' ? 'Micro down' : 'Micro range'} — timing only; CHOCH/BOS micro-shift for entry\` : 'not used'}
+`;
+
+  const xrayRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
+  let out = text;
+  if (xrayRe.test(out)) out = out.replace(xrayRe, (_m)=>newX);
+  else out = out.replace(/(\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown)/i, `\n${newX}\n$1`);
+
+  // 5) Sync Technical View lines
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line4}`);
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line1}`);
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line15}`);
+
+  return out;
+}
+
 
 /** Ensure Option 1 aligns with fundamentals when possible; also prefers confirmation-based option when Option 1 uses Limit but trigger says BOS. */
 function enforceOptionOrderByBias(text: string, fundamentalsSign: number): string {
@@ -3124,12 +3220,15 @@ if (mode === "expand") {
 
   let text = await callOpenAI(modelExpand, messages);
 
-  // Minimum scaffold & options
+   // Minimum scaffold & options
   text = await enforceQuickPlan(modelExpand, c.instrument, text);
   text = await enforceOption1(modelExpand, c.instrument, text);
   text = await enforceOption2(modelExpand, c.instrument, text);
 
-  // Replace placeholder tournament injection with deterministic diversity/scoring
+  // Enforce structure directly from RAW SWING MAP (truth source)
+  text = _applyRawSwingMap(text);
+
+  // Replace placeholder tournament injection...
   text = await enforceTournamentDiversity(modelExpand, c.instrument, text);
   text = dedupeTournamentSections(text); // keep only the best tournament block before Final Table
 
@@ -3143,6 +3242,7 @@ if (mode === "expand") {
   text = normalizeTriggerSpacing(text); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
   text = _reconcileHTFTrendFromText(text);
   text = await enforceTriggerSpecificity(modelExpand, c.instrument, text);
+
 
   // Ensure breakdown skeleton + final table heading, then normalize entry zone rendering
   text = await enforceFullBreakdownSkeleton(modelExpand, c.instrument, text);
@@ -3369,6 +3469,9 @@ if (mode === "expand") {
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
 
+        // Enforce structure directly from RAW SWING MAP (truth source)
+    textFull = _applyRawSwingMap(textFull);
+
     // Replace placeholder tournament injection with deterministic diversity/scoring
     textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
     textFull = dedupeTournamentSections(textFull); // keep only the best tournament block before Final Table
@@ -3379,6 +3482,7 @@ if (mode === "expand") {
     textFull = normalizeTriggerSpacing(textFull); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
     textFull = _reconcileHTFTrendFromText(textFull);
     textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
+
 
     // Execution & risk guards
     textFull = enforceEntryZoneUsage(textFull, instrument);
