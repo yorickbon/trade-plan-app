@@ -3310,17 +3310,36 @@ Full Breakdown
         const passed = results.filter(r => r.pass).length;
         const failed = results.length - passed;
 
-        return res.status(failed ? 500 : 200).json({
-          ok: failed === 0,
-          qa_summary: { total: results.length, passed, failed },
-          results
-        });
+               if (failed === 0) {
+          // Conform to Ok: put the QA report in 'text'
+          const reportLines = [
+            "# QA Report",
+            `Total: ${results.length} | Passed: ${passed} | Failed: ${failed}`,
+            "",
+            ...results.map(r => `- ${r.pass ? "✅" : "❌"} ${r.name}${r.pass ? "" : (r.detail ? ` — ${r.detail}` : "")}`)
+          ];
+          return res.status(200).json({
+            ok: true,
+            text: reportLines.join("\n")
+          });
+        } else {
+          // Conform to Err: summarize failures in 'reason'
+          const fails = results
+            .filter(r => !r.pass)
+            .map(r => `${r.name}${r.detail ? ` (${r.detail})` : ""}`)
+            .join("; ");
+          return res.status(500).json({
+            ok: false,
+            reason: `QA failed: ${failed}/${results.length} checks failed — ${fails}`
+          });
+        }
       } catch (e: any) {
         return res.status(500).json({
           ok: false,
-          qa_error: e?.message || String(e)
+          reason: `QA harness error: ${e?.message || String(e)}`
         });
       }
+
     }
 
 
