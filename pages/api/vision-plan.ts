@@ -3298,6 +3298,329 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
   } catch {}
   return null;
 }
+/* =========================================================================
+   PIXEL-BASED CHART SWING EXTRACTOR (drop-in)
+   Purpose:
+     - Extract candlestick OHLC approximation directly from chart images
+       (black/white TradingView-like charts), detect swings and produce a
+       RAW SWING MAP block that the rest of the pipeline consumes.
+     - Insert BEFORE: the line "// ---------- Provenance footer ----------"
+   Notes:
+     - Requires `jimp` (npm install jimp).
+     - Heuristics only: works best with simple black-on-white candlesticks.
+     - Falls back (returns null) if confidence is low; does not override existing
+       text-based logic if detection fails.
+   ========================================================================= */
+
+import Jimp from "jimp";
+
+type SwingResult = {
+  rawSwingMap: string | null;
+  confidence: number; // 0..1
+  details?: any;
+};
+
+/** Convert a data-url (image) to Jimp image. */
+async function loadJimpFromDataUrl(dataUrl: string): Promise<Jimp | null> {
+  if (!dataUrl) return null;
+  try {
+    const comma = dataUrl.indexOf(",");
+    const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+    const buf = Buffer.from(b64, "base64");
+    const img = await Jimp.read(buf);
+    return img;
+  } catch (e) {
+    return null;
+  }
+}
+
+/** Basic grayscale / brightness helper. */
+function brightnessAtPixel(img: Jimp, x: number, y: number): number {
+  const idx = img.getPixelColor(x, y);
+  // Jimp's color integer -> extract RGB
+  const { r, g, b } = Jimp.intToRGBA(idx);
+  // luminance
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
+/**
+ * Estimate OHLC per column by scanning vertical pixels for dark clusters.
+ * Returns an array of { o,h,l,c } sampled across width.
+ * columnsToSample - how many columns to sample (defaults to ~200 for large images).
+ */
+function estimateOHLCFromImage(img: Jimp, columnsToSample = 200) {
+  const w = img.bitmap.width;
+  const h = img.bitmap.height;
+  const step = Math.max(1, Math.floor(w / columnsToSample));
+  const result: { o: number; h: number; l: number; c: number }[] = [];
+
+  // compute global brightness stats to adapt to black/white charts
+  let sum = 0, cnt = 0;
+  for (let y = 0; y < h; y += Math.max(2, Math.floor(h / 50))) {
+    for (let x = 0; x < w; x += Math.max(2, Math.floor(w / 50))) {
+      sum += brightnessAtPixel(img, x, y);
+      cnt++;
+    }
+  }
+  const avg = sum / Math.max(1, cnt);
+  // darker pixels than threshold are considered "ink"
+  const inkThreshold = Math.max(15, Math.min(240, avg - 30)); // adaptive
+
+  // For each sampled column, find topmost and bottommost "ink" pixel (high/low),
+  // and estimate body (open/close) as the densest mid-block (heuristic).
+  for (let x = 0; x < w; x += step) {
+    let topInk = -1, bottomInk = -1;
+    const inkRows: number[] = [];
+
+    for (let y = 0; y < h; y++) {
+      const b = brightnessAtPixel(img, x, y);
+      if (b < inkThreshold) {
+        inkRows.push(y);
+        if (topInk === -1) topInk = y;
+        bottomInk = y;
+      }
+    }
+
+    if (inkRows.length === 0) {
+      // no candle at this column — replicate previous or skip
+      if (result.length) {
+        const last = result[result.length - 1];
+        result.push({ ...last });
+      } else {
+        // seed with centerline
+        const mid = Math.floor(h / 2);
+        result.push({ o: mid, h: mid, l: mid, c: mid });
+      }
+      continue;
+    }
+
+    // Heuristic: high = topInk, low = bottomInk
+    const high = topInk;
+    const low = bottomInk;
+
+    // Estimate body region: find longest contiguous run in inkRows
+    let bestStart = inkRows[0], bestEnd = inkRows[0], curStart = inkRows[0], curPrev = inkRows[0];
+    for (let i = 1; i < inkRows.length; i++) {
+      const r = inkRows[i];
+      if (r === curPrev + 1) {
+        curPrev = r;
+      } else {
+        if ((curPrev - curStart) > (bestEnd - bestStart)) {
+          bestStart = curStart;
+          bestEnd = curPrev;
+        }
+        curStart = r;
+        curPrev = r;
+      }
+    }
+    if ((curPrev - curStart) > (bestEnd - bestStart)) {
+      bestStart = curStart;
+      bestEnd = curPrev;
+    }
+
+    // body center -> estimate open/close: we can't know direction by single column.
+    const bodyMid = Math.round((bestStart + bestEnd) / 2);
+
+    // For relative orientation, sample a small horizontal window to estimate body darkness asymmetry:
+    let leftDark = 0, rightDark = 0;
+    for (let dx = -2; dx <= 2; dx++) {
+      const xx = Math.min(w - 1, Math.max(0, x + dx));
+      const bm = brightnessAtPixel(img, xx, bodyMid);
+      if (bm < inkThreshold) {
+        if (dx <= 0) leftDark++; else rightDark++;
+      }
+    }
+    // Use asymmetry to guess open vs close: arbitrary but consistent.
+    // Map pixel row to price scale: top -> high price, bottom -> low price. We'll produce "price" as scaled values 0..1 (relative).
+    const toPrice = (rowY: number) => 1 - rowY / (h - 1); // 1 = top, 0 = bottom
+
+    // If left side darker (leftDark > rightDark) assume descending body (close < open)
+    const openRow = leftDark > rightDark ? bestStart : bestEnd;
+    const closeRow = leftDark > rightDark ? bestEnd : bestStart;
+
+    const o = toPrice(openRow);
+    const c = toPrice(closeRow);
+    const hh = toPrice(high);
+    const ll = toPrice(low);
+
+    result.push({ o, h: hh, l: ll, c });
+  }
+
+  return result;
+}
+
+/**
+ * Convert series of normalized prices (0..1) to numeric scale preserving relative
+ * shape. We keep actual numeric values in 0..1 to detect swings.
+ */
+function seriesFromOHLC(ohlc: { o: number; h: number; l: number; c: number }[]) {
+  // Use 'close' series for swing detection (simpler)
+  return ohlc.map((d) => d.c);
+}
+
+/**
+ * Find local swing highs/lows (peaks/troughs). Returns an array of indices and labels.
+ * windowSize controls sensitivity: larger -> smoother (less swings).
+ */
+function detectSwings(prices: number[], windowSize = 6) {
+  const swings: { idx: number; type: "H" | "L"; value: number }[] = [];
+  const n = prices.length;
+  for (let i = windowSize; i < n - windowSize; i++) {
+    const v = prices[i];
+    let isHigh = true, isLow = true;
+    for (let j = i - windowSize; j <= i + windowSize; j++) {
+      if (prices[j] > v + 1e-9) isHigh = false;
+      if (prices[j] < v - 1e-9) isLow = false;
+      if (!isHigh && !isLow) break;
+    }
+    if (isHigh) swings.push({ idx: i, type: "H", value: v });
+    else if (isLow) swings.push({ idx: i, type: "L", value: v });
+  }
+  return swings;
+}
+
+/**
+ * Convert swings list into a human-readable "Swings: ..." sequence,
+ * and produce Verdict: Uptrend/Downtrend/Range heuristics.
+ */
+function swingsToVerdict(swings: { idx: number; type: "H" | "L"; value: number }[]) {
+  if (!swings || swings.length < 2) return { swingsText: "insufficient", verdict: "Range / consolidation" };
+  // Build simplified alternating sequence like HH, HL, LH, LL by comparing extremes.
+  // We'll compress swings into price extrema order.
+  const highs = swings.filter(s => s.type === "H").map(s => s.value);
+  const lows = swings.filter(s => s.type === "L").map(s => s.value);
+  const lastHigh = highs.length ? highs[highs.length - 1] : null;
+  const lastLow = lows.length ? lows[lows.length - 1] : null;
+
+  // Heuristic: compare last two swing highs and lows to infer HH/HL or LH/LL.
+  let up = 0, down = 0;
+  for (let i = 1; i < swings.length; i++) {
+    const prev = swings[i - 1], cur = swings[i];
+    if (prev.type === "H" && cur.type === "H") {
+      if (cur.value > prev.value) up++; else down++;
+    } else if (prev.type === "L" && cur.type === "L") {
+      if (cur.value > prev.value) up++; else down++;
+    }
+  }
+
+  const swingsSeq = swings.map(s => s.type === "H" ? "HH/HL?" : "LH/LL?").join(", ");
+  let verdict = "Range / consolidation";
+  if (up > down && up >= 1) verdict = "Uptrend (HH/HL)";
+  else if (down > up && down >= 1) verdict = "Downtrend (LH/LL)";
+  else {
+    // fallback: check relative lastHigh vs lastLow
+    if (lastHigh != null && lastLow != null) {
+      if (lastHigh > lastLow + 0.05) verdict = "Uptrend (HH/HL)";
+      else if (lastLow < lastHigh - 0.05) verdict = "Downtrend (LH/LL)";
+    }
+  }
+  return { swingsText: swingsSeq || "mixed", verdict };
+}
+
+/**
+ * Build RAW SWING MAP text for a given TF using the image data-url.
+ * timeLabel should be one of "4H","1H","15m","5m","1m"
+ */
+async function buildRawSwingForTF(dataUrl: string | null, timeLabel: string): Promise<{ block: string | null; confidence: number }> {
+  if (!dataUrl) return { block: null, confidence: 0 };
+  const img = await loadJimpFromDataUrl(dataUrl);
+  if (!img) return { block: null, confidence: 0 };
+
+  // downscale large images for speed
+  const MAX_W = 1200;
+  if (img.bitmap.width > MAX_W) {
+    img.resize(MAX_W, Jimp.AUTO);
+  }
+
+  // sample columns based on width
+  const sampleCount = Math.max(80, Math.min(240, Math.floor(img.bitmap.width / 3)));
+  const ohlc = estimateOHLCFromImage(img, sampleCount);
+  const series = seriesFromOHLC(ohlc);
+
+  // compute swings and confidence
+  const swings = detectSwings(series, Math.max(3, Math.floor(sampleCount / 30)));
+  const detectConfidence = Math.min(1, Math.max(0, swings.length / 6)); // heuristic
+
+  // convert swings to readable text
+  const { swingsText, verdict } = swingsToVerdict(swings);
+
+  const block = `**${timeLabel}:**  
+- Swings: ${swingsText}  
+- Last BOS: ${detectConfidence > 0.5 ? (verdict.startsWith("Uptrend") ? "Up" : (verdict.startsWith("Downtrend") ? "Down" : "Neutral")) : "Unknown"}  
+- Verdict: ${verdict}`;
+
+  return { block, confidence: detectConfidence };
+}
+
+/**
+ * Public function: given the maps of images for TFs, produce a RAW SWING MAP text block.
+ * Accepts an object with keys: h4,h1,m15,m5,m1 (data URLs or null).
+ * Returns { rawSwingMap, confidence, details } where rawSwingMap is the full markdown block or null.
+ */
+export async function generateRawSwingMapFromImages(images: {
+  h4?: string | null;
+  h1?: string | null;
+  m15?: string | null;
+  m5?: string | null;
+  m1?: string | null;
+}): Promise<SwingResult> {
+  try {
+    // Run parallel builds
+    const tasks = await Promise.all([
+      buildRawSwingForTF(images.h4 ?? null, "4H"),
+      buildRawSwingForTF(images.h1 ?? null, "1H"),
+      buildRawSwingForTF(images.m15 ?? null, "15m"),
+      buildRawSwingForTF(images.m5 ?? null, "5m"),
+      buildRawSwingForTF(images.m1 ?? null, "1m"),
+    ]);
+
+    const [r4, r1, r15, r5, r1m] = tasks;
+    // compute aggregate confidence
+    const confidences = [r4.confidence, r1.confidence, r15.confidence, r5.confidence, r1m.confidence].filter(c => c != null);
+    const aggConfidence = confidences.length ? (confidences.reduce((a, b) => a + b, 0) / confidences.length) : 0;
+
+    // If aggregate confidence is low, return null to let text-based logic remain primary.
+    if (aggConfidence < 0.35) {
+      return { rawSwingMap: null, confidence: aggConfidence, details: { r4, r1, r15, r5, r1m } };
+    }
+
+    // Otherwise build RAW SWING MAP markdown (keep only the TFs we have images for; prefer 4H/1H/15m/5m)
+    const lines: string[] = [];
+    lines.push("## RAW SWING MAP\n");
+    if (r4.block) lines.push(r4.block + "\n");
+    if (r1.block) lines.push(r1.block + "\n");
+    if (r15.block) lines.push(r15.block + "\n");
+    if (r5.block) lines.push(r5.block + "\n");
+    if (r1m.block && !r5.block) lines.push(r1m.block + "\n"); // include 1m if no 5m
+
+    const rawSwingMap = lines.join("\n");
+    return { rawSwingMap, confidence: aggConfidence, details: { r4, r1, r15, r5, r1m } };
+  } catch (e) {
+    return { rawSwingMap: null, confidence: 0, details: { error: String(e) } };
+  }
+}
+
+/**
+ * Helper integration used in the handler:
+ * - If this returns a non-null rawSwingMap, inject it into the `textFull` before further processing.
+ * - Usage (example):
+ *    const swing = await generateRawSwingMapFromImages({ h4, h1, m15, m5, m1 });
+ *    if (swing.rawSwingMap) textFull = `${swing.rawSwingMap}\n\n${textFull}`;
+ *
+ * Note: this function does not modify the rest of pipeline — it only produces the RAW SWING MAP block.
+ */
+export async function tryInjectRawSwingMapIntoText(textFull: string, imgs: { h4?: string | null; h1?: string | null; m15?: string | null; m5?: string | null; m1?: string | null; }) {
+  const res = await generateRawSwingMapFromImages(imgs);
+  if (res.rawSwingMap) {
+    // Prepend the detected RAW SWING MAP so downstream logic treats it as authoritative.
+    return { text: `${res.rawSwingMap}\n---\n${textFull}`, confidence: res.confidence, details: res.details };
+  }
+  return { text: textFull, confidence: res.confidence, details: res.details };
+}
+
+/* =========================================================================
+   END PIXEL-BASED CHART SWING EXTRACTOR
+   ========================================================================= */
 
 // ---------- Provenance footer ----------
 function buildServerProvenanceFooter(args: {
