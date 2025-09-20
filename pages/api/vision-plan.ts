@@ -2302,7 +2302,7 @@ function enforceOption2DistinctHardSync(instrument: string, text: string): strin
   return text;
 }
 
-/** Final table row filler (with entry zone enforcement). */
+/** Final table row filler (with entry zone enforcement, fixed thousands parsing). */
 function fillFinalTableSummaryRow(text: string, instrument: string) {
   if (!text) return text;
 
@@ -2318,7 +2318,10 @@ function fillFinalTableSummaryRow(text: string, instrument: string) {
     return m ? stripMd(m[1]) : null;
   }
 
-  // Bias & Conviction from Quick Plan
+  const NUM_RE = /(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?/g;
+  const toNum = (s: string) => Number(String(s).replace(/,/g, ""));
+
+  // Bias & Conviction
   const bias = grab(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(?:\*\*)?\s*(Long|Short|Stay\s*Flat)/i) || "...";
   const sl   = grab(/Quick\s*Plan[\s\S]*?Stop\s*Loss\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "...";
   const tps  = grab(/Quick\s*Plan[\s\S]*?Take\s*Profit\(s\)\s*:\s*(?:\*\*)?\s*([^\n]+)/i)
@@ -2326,7 +2329,6 @@ function fillFinalTableSummaryRow(text: string, instrument: string) {
             || "";
   const conv = grab(/Quick\s*Plan[\s\S]*?Conviction\s*:\s*(?:\*\*)?\s*(\d{1,3})\s*%/i) || "...";
 
-  // Entry zone: prefer ai_meta.zone {min,max}; else derive from QP line
   function fmtZone(min: number, max: number): string {
     const lo = Math.min(min, max);
     const hi = Math.max(min, max);
@@ -2337,12 +2339,13 @@ function fillFinalTableSummaryRow(text: string, instrument: string) {
     );
     return `${lo.toFixed(dec)} – ${hi.toFixed(dec)}`;
   }
+
   let entryZone = "...";
   if (ai?.zone && Number.isFinite(+ai.zone.min) && Number.isFinite(+ai.zone.max)) {
     entryZone = fmtZone(Number(ai.zone.min), Number(ai.zone.max));
   } else {
     const raw = grab(/Quick\s*Plan[\s\S]*?Entry\s*(?:\(zone\s*or\s*single\))?\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "";
-    const nums = (raw.match(/[0-9]+(?:\.[0-9]+)?/g) || []).map(Number).filter(Number.isFinite);
+    const nums = (raw.match(NUM_RE) || []).map(toNum).filter(Number.isFinite);
     if (nums.length >= 2) entryZone = fmtZone(nums[0], nums[1]);
     else if (nums.length === 1) {
       const entry = nums[0];
@@ -2353,15 +2356,15 @@ function fillFinalTableSummaryRow(text: string, instrument: string) {
     }
   }
 
-  // TP parsing (unchanged)
+  // TP parsing (support thousands)
   let tp1 = "...", tp2 = "...";
   if (tps) {
-    const mm1 = tps.match(/TP1[:\s]*([0-9.]+)/i);
-    const mm2 = tps.match(/TP2[:\s]*([0-9.]+)/i);
+    const mm1 = tps.match(/TP1[:\s]*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)/i);
+    const mm2 = tps.match(/TP2[:\s]*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)/i);
     if (mm1) tp1 = stripMd(mm1[1]);
     if (mm2) tp2 = stripMd(mm2[1]);
     if (tp1 === "..." || tp2 === "...") {
-      const nums = (tps.match(/[0-9.]+/g) || []).map(stripMd);
+      const nums = (tps.match(NUM_RE) || []).map((s) => stripMd(s));
       if (tp1 === "..." && nums[0]) tp1 = nums[0];
       if (tp2 === "..." && nums[1]) tp2 = nums[1];
     }
@@ -2382,6 +2385,7 @@ ${newRow}\n`;
   if (rowRe.test(text)) return text.replace(rowRe, newRow);
   return text.replace(headerRe, (m) => m + newRow + "\n");
 }
+
 
 
 function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
@@ -2490,14 +2494,14 @@ function _normalizeOrderTypeByTrigger(text: string): string {
   return out;
 }
 
-/** Enforce "Entry (zone or single)" to be a zone (min–max).
- *  - Prefer ai_meta.zone {min,max} if present.
- *  - Fallback: derive symmetric ±10 pips (or ±10 * 10^-d) around single price.
- */
+/** Enforce "Entry (zone or single)" to be a zone (min–max), thousands-aware. */
 function enforceEntryZoneUsage(text: string, instrument: string): string {
   if (!text) return text;
   const ai = extractAiMeta(text) || {};
   const z = ai?.zone;
+
+  const NUM_RE = /(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?/g;
+  const toNum = (s: string) => Number(String(s).replace(/,/g, ""));
 
   function fmtZone(min: number, max: number): string {
     const lo = Math.min(min, max);
@@ -2511,7 +2515,7 @@ function enforceEntryZoneUsage(text: string, instrument: string): string {
   }
 
   function deriveZoneFromLine(line: string): string | null {
-    const nums = (line.match(/[0-9]+(?:\.[0-9]+)?/g) || []).map(Number).filter(Number.isFinite);
+    const nums = (line.match(NUM_RE) || []).map(toNum).filter(Number.isFinite);
     if (nums.length >= 2) return fmtZone(nums[0], nums[1]);
     if (nums.length === 1) {
       const entry = nums[0];
@@ -2556,6 +2560,7 @@ function enforceEntryZoneUsage(text: string, instrument: string): string {
 }
 
 
+
 /** NEW: Clarify BOS wording (no numbers needed). */
 function _clarifyBOSWording(text: string): string {
   return text
@@ -2563,12 +2568,20 @@ function _clarifyBOSWording(text: string): string {
     .replace(/BOS\s*needed\s*for\s*confirmation/gi, "BOS needed for confirmation (break/close of recent swing)");
 }
 
+/** Normalize '• Trigger:' spacing to exactly one space after colon. */
+function normalizeTriggerSpacing(text: string): string {
+  if (!text) return text;
+  // Start-of-line bullets only; collapse any/none spaces after colon → one space
+  return text.replace(/^\s*•\s*Trigger\s*:\s*/gmi, '• Trigger: ');
+}
+
 /** FINAL POLISH: vocabulary guard & cleanup (post-generation, pre-ai_meta).
  *  - Never allow 'mixed' on calendar lines; convert to 'neutral'.
  *  - Keep scope tight: only touch lines that explicitly start with 'Calendar:' or 'Calendar bias for ...'.
  *  - BUGFIX: preserve instrument name in "Calendar bias for <INSTRUMENT>:" lines.
  */
-function _finalPolish(text: string): string {
+
+ function _finalPolish(text: string): string {
   if (!text) return text;
   let out = text;
 
@@ -2606,10 +2619,10 @@ function _reconcileHTFTrendFromText(text: string): string {
   const raw = text;
   const lower = raw.toLowerCase();
 
-  // Helpers to read prior lines from X-ray / Technical View
+  // ---------- helpers ----------
   function readTF(tf: '4H'|'1H'|'15m'|'5m'|'1m'): string {
     const tfEsc = tf.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
-    const reX = new RegExp(`^\\s*[-•]\\s*${tfEsc}\\s*(?:\\(if\\s*used\\))?\\s*:\\s*([^\\n]*)`, 'mi');
+    const reX  = new RegExp(`^\\s*[-•]\\s*${tfEsc}\\s*(?:\\(if\\s*used\\))?\\s*:\\s*([^\\n]*)`, 'mi');
     const reTV = new RegExp(`(Technical\\s*View[\\s\\S]{0,800}?${tfEsc}:\\s*)([^\\n]*)`, 'i');
     const mX = raw.match(reX);
     if (mX) return (mX[1] || '').trim();
@@ -2618,18 +2631,31 @@ function _reconcileHTFTrendFromText(text: string): string {
     return '';
   }
 
-  // Classifier
   type Dir = 'up'|'down'|'range'|'';
+
+  // Strict swing classifier (prefer explicit HH/HL | LH/LL tokens found anywhere in doc for the TF lines)
   function classify(desc: string): Dir {
     const s = (desc || '').toLowerCase();
     if (!s) return '';
-    if (/\b(uptrend|bullish)\b/.test(s)) return 'up';
-    if (/\b(downtrend|bearish)\b/.test(s)) return 'down';
-    if (/\b(range|sideways|consolidation|chop)\b/.test(s)) return 'range';
+
+    const hasHHHL = /\b(hh\/hl|higher\s*highs?\s*\/\s*higher\s*lows?|higher\s*highs?\b.*\bhigher\s*lows?\b)/i.test(s);
+    const hasLHLL = /\b(lh\/ll|lower\s*highs?\s*\/\s*lower\s*lows?|lower\s*highs?\b.*\blower\s*lows?\b)/i.test(s);
+    const saysUp  = /\b(uptrend|bullish)\b/.test(s);
+    const saysDn  = /\b(downtrend|bearish)\b/.test(s);
+    const saysRg  = /\b(range|sideways|consolidation|chop)\b/.test(s);
+
+    // Conflicts → range
+    if ((hasHHHL && hasLHLL) || ((saysUp && saysDn))) return 'range';
+
+    // Priority: explicit swing tokens > words
+    if (hasHHHL) return 'up';
+    if (hasLHLL) return 'down';
+    if (saysRg)  return 'range';
+    if (saysUp)  return 'up';
+    if (saysDn)  return 'down';
     return '';
   }
 
-  // Plan direction fallback
   function planDirSign(): -1|0|1 {
     const mQP = raw.match(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(Long|Short)/i);
     const mO1 = raw.match(/Option\s*1[\s\S]*?Direction\s*:\s*(Long|Short)/i);
@@ -2637,35 +2663,33 @@ function _reconcileHTFTrendFromText(text: string): string {
     return d === 'long' ? 1 : d === 'short' ? -1 : 0;
   }
 
-  // Pull prior lines
-  const prior4 = readTF('4H');
-  const prior1 = readTF('1H');
+  const prior4  = readTF('4H');
+  const prior1  = readTF('1H');
   const prior15 = readTF('15m');
-  const prior5 = readTF('5m');
+  const prior5  = readTF('5m');
   const prior1m = readTF('1m');
 
-  // Decide HTF regimes
-  let d4: Dir = classify(prior4);
-  let d1: Dir = classify(prior1);
+  let d4: Dir  = classify(prior4);
+  let d1: Dir  = classify(prior1);
+  let d15: Dir = classify(prior15);
 
   if (!d4) {
     const sign = planDirSign();
     d4 = sign === 1 ? 'up' : sign === -1 ? 'down' : 'range';
   }
   if (!d1) d1 = d4;
+  if (!d15) d15 = d1;
 
-  // Friendly words
   const word = (d: Dir) => d === 'up' ? 'Uptrend' : d === 'down' ? 'Downtrend' : 'Range';
   const microWord = (d: Dir) => d === 'up' ? 'Micro up' : d === 'down' ? 'Micro down' : 'Micro range';
 
-  // 4H canonical line
   const tail4 =
-    d4 === 'up' ? '— bullish structure (HH/HL implied)'
-  : d4 === 'down' ? '— bearish structure (LH/LL implied)'
-                  : '— larger consolidation';
+      d4 === 'up'   ? '— bullish structure (HH/HL confirmed)'
+    : d4 === 'down' ? '— bearish structure (LH/LL confirmed)'
+                    : '— consolidation / range';
   const line4 = `Trend: ${word(d4)} ${tail4}`;
 
-  // 1H canonical line (context wording from presence of supply/resistance vs demand/support)
+  // Context wording for 1H based on support/resistance mentions in the whole doc (only a hint for phrasing)
   const supCount = (lower.match(/\b(support|demand)\b/gi) || []).length;
   const resCount = (lower.match(/\b(resistance|supply)\b/gi) || []).length;
   const ctx1 = resCount > supCount
@@ -2673,10 +2697,8 @@ function _reconcileHTFTrendFromText(text: string): string {
     : '— at support/demand; monitor continuation vs pullback';
   const line1 = `Trend: ${word(d1)} ${ctx1}`;
 
-  // 15m trend: try classify; else inherit 1H
-  let d15: Dir = classify(prior15) || d1;
-  // 15m anchors pulled from doc cues
-  function anchor15(): string {
+  const ctNote = (d4 && d15 && d15 !== d4 && d15 !== d1) ? ' (counter-trend)' : '';
+  const anchor15 = (() => {
     const s = (prior15 || '').trim();
     if (s) return s;
     if (/\bob\b/i.test(lower) && /(fvg|fair\s*value\s*gap|imbalance)/i.test(lower)) return 'OB+FVG confluence';
@@ -2685,21 +2707,15 @@ function _reconcileHTFTrendFromText(text: string): string {
     if (/\b(trendline|channel|wedge|triangle)\b/i.test(lower)) return 'Trendline/channel structure';
     if (/\brange\b|rotation|eq\s*of\s*range/i.test(lower)) return 'Range bounds & EQ rotation';
     return 'Execution anchors refined from 1H';
-  }
-  const ctNote = (d4 && d15 && d15 !== d4 && d15 !== d1) ? ' (counter-trend)' : '';
-  const line15 = `Trend: ${word(d15)} — ${anchor15()}${ctNote}`;
+  })();
+  const line15 = `Trend: ${word(d15)} — ${anchor15}${ctNote}`;
 
-  // 5m/1m micro
-  let d5: Dir = classify(prior5) || 'range';
-  const line5 = `Trend: ${microWord(d5)} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`;
-
+  const d5  : Dir = classify(prior5)  || 'range';
+  const d1m : Dir = classify(prior1m) || 'range';
+  const line5  = `Trend: ${microWord(d5)} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`;
   const mentions1m = /\b1m\b/i.test(raw) || /Used\s*Chart:\s*1M/i.test(raw);
-  let d1m: Dir = classify(prior1m) || 'range';
-  const line1m = mentions1m
-    ? `Trend: ${microWord(d1m)} — timing only; CHOCH/BOS micro-shift for entry`
-    : 'not used';
+  const line1m = mentions1m ? `Trend: ${microWord(d1m)} — timing only; CHOCH/BOS micro-shift for entry` : 'not used';
 
-  // Build deterministic X-ray block (always emits explicit Trend:)
   const newXray =
 `Detected Structures (X-ray)
 • 4H: ${line4}
@@ -2709,31 +2725,21 @@ function _reconcileHTFTrendFromText(text: string): string {
 • 1m: ${line1m}
 `;
 
-  // Replace/insert X-ray
   const xraySectRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
   let out = raw;
-  if (xraySectRe.test(out)) {
-    out = out.replace(xraySectRe, (_m) => newXray);
-  } else if (/Final\s*Table\s*Summary:/i.test(out)) {
-    out = out.replace(/(\n\s*Final\s*Table\s*Summary:)/i, `\n${newXray}\n$1`);
-  } else if (/Full\s*Breakdown/i.test(out)) {
-    out = out.replace(/(\n\s*Full\s*Breakdown)/i, `\n${newXray}\n$1`);
-  } else {
-    out = `${out}\n\n${newXray}`;
-  }
+  if (xraySectRe.test(out)) out = out.replace(xraySectRe, (_m) => newXray);
+  else if (/Final\s*Table\s*Summary:/i.test(out)) out = out.replace(/(\n\s*Final\s*Table\s*Summary:)/i, `\n${newXray}\n$1`);
+  else if (/Full\s*Breakdown/i.test(out)) out = out.replace(/(\n\s*Full\s*Breakdown)/i, `\n${newXray}\n$1`);
+  else out = `${out}\n\n${newXray}`;
 
-  // Sync Technical View 4H/1H lines to explicit Trend:
+  // Sync "Technical View" lines too
   out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line4}`);
   out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line1}`);
-
-  // Ensure 15m bullet under Technical View carries Trend: token too, if present
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m, p1, _old) => `${p1}${line15}`);
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line15}`);
 
   return out;
 }
-// ---- END _reconcileHTFTrendFromText (v5) ----
-
-
+// ---- END _reconcileHTFTrendFromText (v6) ----
 
 /** Ensure Option 1 aligns with fundamentals when possible; also prefers confirmation-based option when Option 1 uses Limit but trigger says BOS. */
 function enforceOptionOrderByBias(text: string, fundamentalsSign: number): string {
@@ -3288,7 +3294,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let aiMetaFull = extractAiMeta(textFull) || {};
     if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
-    // === Post-processing enforcement ===
+       // === Post-processing enforcement ===
     textFull = await enforceQuickPlan(MODEL, instrument, textFull);
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
@@ -3298,6 +3304,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
     textFull = _clarifyBOSWording(textFull);
+    textFull = normalizeTriggerSpacing(textFull);            // NEW: prevents "Trigger:Alternative" (forces "Trigger: Alternative")
     textFull = _reconcileHTFTrendFromText(textFull);
     textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
     textFull = dedupeTournamentSections(textFull);
@@ -3307,6 +3314,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
     textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
     textFull = enforceFinalTableSummary(textFull, instrument);
+
 
     const fundamentalsSnapshotFull = computeIndependentFundamentals({
       instrument,
