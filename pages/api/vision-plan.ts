@@ -3527,12 +3527,15 @@ if (mode === "expand") {
     textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
     textFull = dedupeTournamentSections(textFull); // keep only the best tournament block before Final Table
 
-    // Polish & structure guards
+       // Polish & structure guards
     textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
     textFull = _clarifyBOSWording(textFull);
     textFull = normalizeTriggerSpacing(textFull); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
     textFull = _reconcileHTFTrendFromText(textFull);
+    // NEW: enforce HTF/LTF structure from RAW SWING MAP (map has final authority over X-ray/TV lines)
+    textFull = _applyRawSwingMap(textFull);
     textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
+
 
 
     // Execution & risk guards
