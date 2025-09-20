@@ -3091,51 +3091,81 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let mode: "full" | "fast" | "expand" = urlMode === "fast" ? "fast" : urlMode === "expand" ? "expand" : "full";
     const debugQuery = String(req.query.debug || "").trim() === "1";
 
-    // ---------- expand ----------
-    if (mode === "expand") {
-      const modelExpand = pickModelFromFields(req);
-      const cacheKey = String(req.query.cache || "").trim();
-      const c = getCache(cacheKey);
-      if (!c) return res.status(400).json({ ok: false, reason: "Expand failed: cache expired or not found." });
+ // ---------- expand ----------
+if (mode === "expand") {
+  const modelExpand = pickModelFromFields(req);
+  const cacheKey = String(req.query.cache || "").trim();
+  const c = getCache(cacheKey);
+  if (!c) return res.status(400).json({ ok: false, reason: "Expand failed: cache expired or not found." });
 
-      const dateStr = new Date().toISOString().slice(0, 10);
-      const calAdv = await fetchCalendarForAdvisory(req, c.instrument);
-      const provHint = { headlines_present: !!c.headlinesText, calendar_status: c.calendar ? "image-ocr" : (calAdv.status || "unavailable") };
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const calAdv = await fetchCalendarForAdvisory(req, c.instrument);
+  const provHint = {
+    headlines_present: !!c.headlinesText,
+    calendar_status: c.calendar ? "image-ocr" : (calAdv.status || "unavailable")
+  };
 
-      const messages = messagesFull({
-        instrument: c.instrument, dateStr,
-        m15: c.m15, h1: c.h1, h4: c.h4, m5: c.m5 || null, m1: null,
-        calendarDataUrl: c.calendar || undefined,
-        headlinesText: c.headlinesText || undefined,
-        sentimentText: c.sentimentText || undefined,
-        calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText, evidence: calAdv.evidence || [] },
-        provenance: provHint,
-        scalping: false,
-        scalpingHard: false
-      });
+  const messages = messagesFull({
+    instrument: c.instrument, dateStr,
+    m15: c.m15, h1: c.h1, h4: c.h4, m5: c.m5 || null, m1: null,
+    calendarDataUrl: c.calendar || undefined,
+    headlinesText: c.headlinesText || undefined,
+    sentimentText: c.sentimentText || undefined,
+    calendarAdvisory: {
+      warningMinutes: calAdv.warningMinutes,
+      biasNote: calAdv.biasNote,
+      advisoryText: calAdv.advisoryText,
+      evidence: calAdv.evidence || []
+    },
+    provenance: provHint,
+    scalping: false,
+    scalpingHard: false
+  });
 
-      let text = await callOpenAI(modelExpand, messages);
-      text = await enforceQuickPlan(modelExpand, c.instrument, text);
-      text = await enforceOption1(modelExpand, c.instrument, text);
-      text = await enforceOption2(modelExpand, c.instrument, text);
+  let text = await callOpenAI(modelExpand, messages);
 
-      // Calendar visibility + stamps
-      text = ensureCalendarVisibilityInQuickPlan(text, { instrument: c.instrument, preReleaseOnly: false, biasLine: calAdv.text || null });
-      const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
-      text = stampM5Used(text, usedM5);
+  // Minimum scaffold & options
+  text = await enforceQuickPlan(modelExpand, c.instrument, text);
+  text = await enforceOption1(modelExpand, c.instrument, text);
+  text = await enforceOption2(modelExpand, c.instrument, text);
 
-      const footer = buildServerProvenanceFooter({
-        headlines_provider: "expand-uses-stage1",
-        calendar_status: c.calendar ? "image-ocr" : (calAdv?.status || "unavailable"),
-        calendar_provider: c.calendar ? "image-ocr" : calAdv?.provider || null,
-        csm_time: null,
-        extras: { vp_version: VP_VERSION, model: modelExpand, mode: "expand" },
-      });
-      text = `${text}\n${footer}`;
+  // Replace placeholder tournament injection with deterministic diversity/scoring
+  text = await enforceTournamentDiversity(modelExpand, c.instrument, text);
+  text = dedupeTournamentSections(text); // keep only the best tournament block before Final Table
 
-      res.setHeader("Cache-Control", "no-store");
-      return res.status(200).json({ ok: true, text, meta: { instrument: c.instrument, cacheKey, model: modelExpand, vp_version: VP_VERSION } });
-    }
+  // Calendar visibility + stamps
+  text = ensureCalendarVisibilityInQuickPlan(text, { instrument: c.instrument, preReleaseOnly: false, biasLine: calAdv.text || null });
+  const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
+  text = stampM5Used(text, usedM5);
+
+  // Polish & structure guards (spacing + BOS wording + HTF reconciliation + trigger specificity)
+  text = _clarifyBOSWording(text);
+  text = normalizeTriggerSpacing(text); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
+  text = _reconcileHTFTrendFromText(text);
+  text = await enforceTriggerSpecificity(modelExpand, c.instrument, text);
+
+  // Ensure breakdown skeleton + final table heading, then normalize entry zone rendering
+  text = await enforceFullBreakdownSkeleton(modelExpand, c.instrument, text);
+  text = enforceFinalTableSummary(text, c.instrument);
+  text = enforceEntryZoneUsage(text, c.instrument);
+
+  // Provenance footer
+  const footer = buildServerProvenanceFooter({
+    headlines_provider: "expand-uses-stage1",
+    calendar_status: c.calendar ? "image-ocr" : (calAdv?.status || "unavailable"),
+    calendar_provider: c.calendar ? "image-ocr" : calAdv?.provider || null,
+    csm_time: null,
+    extras: { vp_version: VP_VERSION, model: modelExpand, mode: "expand" }
+  });
+  text = `${text}\n${footer}`;
+
+  res.setHeader("Cache-Control", "no-store");
+  return res.status(200).json({
+    ok: true,
+    text,
+    meta: { instrument: c.instrument, cacheKey, model: modelExpand, vp_version: VP_VERSION }
+  });
+}
 
     // ---------- multipart ----------
     if (!isMultipart(req)) {
