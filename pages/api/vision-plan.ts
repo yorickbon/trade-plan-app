@@ -2811,79 +2811,81 @@ function _reconcileHTFTrendFromText(text: string): string {
 function _applyRawSwingMap(text: string): string {
   if (!text) return text;
 
-  // 1) Locate RAW SWING MAP block (must be before Quick Plan / Option / Full Breakdown)
-  // Accept RAW SWING MAP with or without "(first)", tolerate markdown/bullets/spaces
-    // Accept bold, bullets, and optional “(first)” after the header; capture only the map body
-  const mapRe = new RegExp(
-    String.raw`^\s*(?:#+\s*)?(?:[-•]\s*)?(?:\*\*)?\s*RAW\s*SWING\s*MAP(?:\s*\(first\))?(?:\*\*)?\s*\r?\n([\s\S]*?)(?=\n\s*(?:Quick\s*Plan\s*\(Actionable\)|Option\s*1|Full\s*Breakdown|$))`,
-    'i'
-  );
-
+  // 1) Grab the RAW SWING MAP block (top section, before Quick Plan)
+  //    - Accept BOTH "RAW SWING MAP (first)" and plain "RAW SWING MAP"
+  //    - Robust to extra newlines/markdown
+  const mapRe = /(RAW\s*SWING\s*MAP(?:\s*\(first\))?[\s\S]*?)(?=\n\s*Quick\s*Plan\s*\(Actionable\)|\n\s*Option\s*1|\n\s*Full\s*Breakdown|$)/i;
   const m = text.match(mapRe);
-  if (!m) return text;
+  if (!m) return text; // nothing to enforce
 
-    const block = m[1]; // (unchanged variable name; now uses the capture group content)
+  const block = m[1];
 
-  type Verdict = 'Uptrend' | 'Downtrend' | 'Range';
-  type TF = '4H' | '1H' | '15m' | '5m' | '1m';
+  type Verdict = 'Uptrend'|'Downtrend'|'Range';
+  type TF = '4H'|'1H'|'15m'|'5m'|'1m';
 
-  // Robust line parser: accepts extra tokens, optional parentheses, flexible spacing.
-  function parseLine(tf: TF) {
-      // Accept bullets and markdown (e.g., "- **4H:**"), and constrain BOS to up|down|none
+  const lines: Partial<Record<TF, { swings:string; bos:string; verdict:Verdict }>> = {};
+
+  // Accept formats like:
+  // "- **4H:** swings=..., last_BOS=..., verdict=Downtrend"
+  // "- 4H: swings=..., ..."
+  // "4H: swings=..., ..."
+  function take(tf: TF) {
+    const tfEsc = tf.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
     const re = new RegExp(
-      String.raw`^\s*(?:[-•]?\s*)?(?:\*\*)?\s*${tf}\s*:?(?:\*\*)?\s*:\s*swings\s*=\s*([^;\n]+?)\s*;\s*last_BOS\s*=\s*(up|down|none)\s*;\s*verdict\s*=\s*(Uptrend|Downtrend|Range)\s*$`,
+      `^\\s*(?:[-•]\\s*)?(?:\\*\\*)?${tfEsc}(?:\\*\\*)?\\s*:\\s*` + // tolerant TF label (bullets + bold)
+      `swings\\s*=\\s*([^;\\n]+);\\s*` +                            // swings
+      `last_BOS\\s*=\\s*([^;\\n]+);\\s*` +                          // last_BOS
+      `verdict\\s*=\\s*(Uptrend|Downtrend|Range)\\s*$`,             // verdict
       'im'
     );
-
     const mm = block.match(re);
-    if (!mm) return null;
-    return {
-      swings: (mm[1] || "").trim(),
-      bos: (mm[2] || "").trim().toLowerCase(),
-      verdict: (mm[3] as Verdict)
+    if (!mm) return;
+    lines[tf] = {
+      swings: (mm[1] || '').trim(),
+      bos: (mm[2] || '').trim().toLowerCase(),
+      verdict: mm[3] as Verdict
     };
   }
 
-  const lines: Partial<Record<TF, { swings: string; bos: string; verdict: Verdict }>> = {};
-  (['4H','1H','15m','5m','1m'] as TF[]).forEach(tf => {
-    const row = parseLine(tf as TF);
-    if (row) lines[tf as TF] = row;
-  });
+  (['4H','1H','15m','5m','1m'] as TF[]).forEach(take);
 
-  // Require HTF presence (4H + 1H) and 15m for execution anchoring
+  // Must have at least 4H,1H,15m verdicts to be useful
   if (!lines['4H'] || !lines['1H'] || !lines['15m']) return text;
 
-  const v4  = lines['4H']!.verdict;
-  const v1  = lines['1H']!.verdict;
+  // 2) Truth table: 4H verdict anchors; 1H/15m can be counter-trend but cannot flip HTF wording.
+  const v4 = lines['4H']!.verdict;
+  const v1 = lines['1H']!.verdict;
   const v15 = lines['15m']!.verdict;
 
-  const isCT_15 = (v4 !== 'Range' && v15 !== 'Range' && v15 !== v4);
+  const ct15 = (v4 !== 'Range' && v15 !== 'Range' && v15 !== v4);
 
-  // Helpers to build normalized wording
-  const tailHTF = (v: Verdict) =>
-      v === 'Uptrend'   ? '— bullish structure (HH/HL confirmed)'
-    : v === 'Downtrend' ? '— bearish structure (LH/LL confirmed)'
-                        : '— consolidation / range';
+  // 3) Build normalized wording for X-ray + Technical View
+  const tail4 =
+    v4 === 'Uptrend'   ? '— bullish structure (HH/HL confirmed)'
+  : v4 === 'Downtrend' ? '— bearish structure (LH/LL confirmed)'
+                       : '— consolidation / range';
 
-  const microWord = (v: Verdict) =>
-      v === 'Uptrend'   ? 'Micro up'
-    : v === 'Downtrend' ? 'Micro down'
-                        : 'Micro range';
+  // Heuristic context line for 1H kept deterministic & stable
+  const ctx1 = '— at support/demand; monitor continuation vs pullback';
 
-  const line4  = `Trend: ${v4} ${tailHTF(v4)}`;
-  const line1  = `Trend: ${v1} — at ${v1 === 'Downtrend' ? 'resistance/supply' : v1 === 'Uptrend' ? 'support/demand' : 'range bounds'}; monitor rejection vs break`;
-  const line15 = `Trend: ${v15} — Execution anchors refined from 1H${isCT_15 ? ' (counter-trend)' : ''}`;
+  const line4 = `Trend: ${v4} ${tail4}`;
+  const line1 = `Trend: ${v1} ${ctx1}`;
+  const anchor15 = 'Execution anchors refined from 1H';
+  const line15 = `Trend: ${v15} — ${anchor15}${ct15 ? ' (counter-trend)' : ''}`;
 
-  const line5  = lines['5m']
-    ? `Trend: ${microWord(lines['5m']!.verdict)} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`
-    : 'not used';
+  // Micro TFs (5m/1m) are timing-only
+  const line5 =
+    lines['5m']
+      ? `Trend: ${lines['5m']!.verdict === 'Uptrend' ? 'Micro up' : lines['5m']!.verdict === 'Downtrend' ? 'Micro down' : 'Micro range'} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`
+      : 'Trend: Micro range — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)';
 
-  const line1m = lines['1m']
-    ? `Trend: ${microWord(lines['1m']!.verdict)} — timing only; CHOCH/BOS micro-shift for entry`
-    : 'not used';
+  const line1m =
+    lines['1m']
+      ? `Trend: ${lines['1m']!.verdict === 'Uptrend' ? 'Micro up' : lines['1m']!.verdict === 'Downtrend' ? 'Micro down' : 'Micro range'} — timing only; CHOCH/BOS micro-shift for entry`
+      : 'not used';
 
-  // 2) Deterministically rewrite X-ray section to match the map (no guessing, no carryover noise)
-  const newXray =
+  // 4) Replace X-ray section deterministically (no nested template literals)
+  const newX =
 `Detected Structures (X-ray)
 • 4H: ${line4}
 • 1H: ${line1}
@@ -2894,31 +2896,17 @@ function _applyRawSwingMap(text: string): string {
 
   const xrayRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
   let out = text;
-  if (xrayRe.test(out)) {
-    out = out.replace(xrayRe, (_m) => newXray);
-  } else if (/Final\s*Table\s*Summary:/i.test(out)) {
-    out = out.replace(/(\n\s*Final\s*Table\s*Summary:)/i, `\n${newXray}\n$1`);
-  } else if (/Full\s*Breakdown/i.test(out)) {
-    out = out.replace(/(\n\s*Full\s*Breakdown)/i, `\n${newXray}\n$1`);
-  } else {
-    out = `${out}\n\n${newXray}`;
-  }
+  if (xrayRe.test(out)) out = out.replace(xrayRe, (_m)=>newX);
+  else out = out.replace(/(\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown)/i, `\n${newX}\n$1`);
 
-  // 3) Sync "Technical View" lines (4H / 1H / 15m only; 5m/1m are timing-only and may be absent in TV)
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line4}`);
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line1}`);
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line15}`);
-
-  // 4) Ensure absent micro TFs do not hallucinate structure in X-ray/TV
-  if (!lines['5m']) {
-    out = out.replace(/(Detected\s*Structures\s*\(X-ray\)[\s\S]*?- 5m:\s*)([^\n]*)/i, (_m, p1) => `${p1}not used`);
-  }
-  if (!lines['1m']) {
-    out = out.replace(/(Detected\s*Structures\s*\(X-ray\)[\s\S]*?- 1m:\s*)([^\n]*)/i, (_m, p1) => `${p1}not used`);
-  }
+  // 5) Sync Technical View lines with RAW SWING MAP truth
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line4}`);
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line1}`);
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line15}`);
 
   return out;
 }
+
 
 
 
