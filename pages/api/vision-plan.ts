@@ -3542,6 +3542,162 @@ if (mode === "expand") {
   text = enforceFinalTableSummary(text, c.instrument);
   text = enforceEntryZoneUsage(text, c.instrument);
 
+/* === PATCH: Vision Swing Fix (v1) — drop-in, sync, no deps ===
+   Purpose:
+   - Parse RAW SWING MAP → derive 4H/1H/15m/5m verdicts (Uptrend/Downtrend/Range).
+   - Enforce HTF truth table: 4H is the anchor; 1H can be counter-trend (explicit); 15m/5m never override HTF bias.
+   - Normalize "Technical View" wording to match verdicts.
+   - If 4H & 1H align clearly, align Direction in Quick Plan / Options (don’t touch prices/SL/TP).
+   How to install:
+   - Paste this whole block right before the line: `// Provenance footer`
+   - It rewrites `textFull` in-place. No other changes required.
+*/
+textFull = (function _fixSwingMapAndTechView(text) {
+  if (!text) return text;
+
+  // ---- tiny utils ----
+  const clean = (s) => String(s || "").trim();
+  const verdictToken = (v) => {
+    v = (v || "").toLowerCase();
+    if (/uptrend|hh\s*\/\s*hl|hh\W*hl/.test(v)) return "up";
+    if (/downtrend|lh\s*\/\s*ll|lh\W*ll/.test(v)) return "down";
+    if (/range|consolidation|sideways/.test(v)) return "range";
+    return null;
+  };
+  const verdictWord = (tok) =>
+    tok === "up" ? "Uptrend (HH/HL)" :
+    tok === "down" ? "Downtrend (LH/LL)" :
+    "Range / consolidation";
+
+  // ---- 1) Extract RAW SWING MAP block + each TF verdict ----
+  const rawSwingMatch = text.match(/##\s*RAW\s*SWING\s*MAP[\s\S]*?(?=\n-{3,}|\n##|$)/i);
+  const rawSwing = rawSwingMatch ? rawSwingMatch[0] : "";
+
+  function extractVerdict(tfLabel) {
+    // e.g., "**4H:** ... \n- Verdict: Downtrend (LH/LL)"
+    const re = new RegExp(`\\*\\*${tfLabel}\\s*:\\*\\*[\\s\\S]*?^-\\s*Verdict:\\s*([^\\n]+)`, "mi");
+    const m = rawSwing.match(re);
+    if (!m) return null;
+    return verdictToken(m[1]);
+  }
+
+  const v4 = extractVerdict("4H");
+  const v1 = extractVerdict("1H");
+  const v15 = extractVerdict("15m");
+  const v5 = extractVerdict("5m");
+
+  // If no RAW SWING MAP found, do nothing.
+  if (!v4 && !v1 && !v15 && !v5) return text;
+
+  // ---- 2) Truth table enforcement / inheritance notes ----
+  // Anchor = 4H. If 4H unknown, do nothing.
+  const anchor = v4 || null;
+
+  // Build normalized map while preserving valid counter-trend notes.
+  const norm = {
+    "4H": anchor || v4 || "range",
+    "1H": v1 || (anchor || "range"),
+    "15m": v15 || (anchor || "range"),
+    "5m": v5 || (v15 || anchor || "range"),
+  };
+
+  // If 1H conflicts with 4H, mark it as counter-trend in text later.
+  const oneHourCounter = anchor && v1 && v1 !== anchor;
+
+  // ---- 3) Rewrite RAW SWING MAP verdict lines to normalized wording ----
+  function rewriteRawSwing(src) {
+    if (!rawSwing) return src;
+    let block = rawSwing;
+
+    function rep(tf) {
+      const re = new RegExp(`(^\\s*-\\s*Verdict:\\s*)([^\\n]+)(?=\\n)`, "mi");
+      // Limit replacement to the sub-block of that TF
+      const tfRe = new RegExp(`(\\*\\*${tf}\\s*:\\*\\*[\\s\\S]*?)(?=\\n\\*\\*|$)`, "i");
+      const m = block.match(tfRe);
+      if (!m) return;
+      const sub = m[1].replace(re, (_a, p1) => `${p1}${verdictWord(norm[tf])}`);
+      block = block.replace(m[1], sub);
+    }
+    ["4H", "1H", "15m", "5m"].forEach(rep);
+
+    return src.replace(rawSwing, block);
+  }
+
+  // ---- 4) Normalize "Technical View" section lines to match normalized verdicts ----
+  function rewriteTechnicalView(src) {
+    const tvMatch = src.match(/(\*\*Technical\s*View[^\n]*:\*\*)[\s\S]*?(?=\n\*\*Fundamental\s*View|\n##|$)/i);
+    if (!tvMatch) return src;
+    const tv = tvMatch[0];
+    let out = tv;
+
+    function lineRegex(tf) {
+      // e.g., "- **4H:** Downtrend (LH/LL) with recent BOS down"
+      return new RegExp(`(^\\s*-\\s*\\*\\*${tf}\\s*:\\*\\*\\s*)([^\\n]+)`, "mi");
+    }
+    function rewrite(tf) {
+      const re = lineRegex(tf);
+      if (!re.test(out)) {
+        // add missing line in standard order
+        out = out.trimEnd() + `\n- **${tf}:** ${verdictWord(norm[tf])}`;
+        return;
+      }
+      out = out.replace(re, (_m, p1) => `${p1}${verdictWord(norm[tf])}`);
+    }
+    ["4H", "1H", "15m", "5m"].forEach(rewrite);
+
+    // Call out explicit counter-trend on 1H if needed
+    if (oneHourCounter) {
+      out = out.replace(
+        new RegExp(`(^\\s*-\\s*\\*\\*1H\\s*:\\*\\*\\s*)${verdictWord(norm["1H"]).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "mi"),
+        (_m, p1) => `${p1}${verdictWord(norm["1H"])} (counter-trend vs 4H)`
+      );
+    }
+
+    return src.replace(tv, out);
+  }
+
+  // ---- 5) If 4H & 1H align clearly, nudge Direction in Quick Plan / Option blocks ----
+  function impliedDirection() {
+    if (!anchor || !v1) return null;
+    if (anchor === "up" && v1 === "up") return "Long";
+    if (anchor === "down" && v1 === "down") return "Short";
+    return null;
+    // if range or conflict, leave user choice intact
+  }
+  const wantDir = impliedDirection();
+
+  function rewriteDirectionBlocks(src) {
+    if (!wantDir) return src;
+
+    const blocks = [
+      /(\n##\s*Quick\s*Plan[\s\S]*?)(?=\n##|\n---|$)/i,
+      /(\n##\s*Option\s*1[\s\S]*?)(?=\n##|\n---|$)/i,
+      /(\n##\s*Option\s*2[\s\S]*?)(?=\n##|\n---|$)/i,
+    ];
+
+    let out = src;
+    for (const re of blocks) {
+      const m = out.match(re);
+      if (!m) continue;
+      const b = m[1].replace(
+        /(^\s*-\s*\*\*Direction:\*\*\s*)(Long|Short)/mi,
+        (_m, p1) => `${p1}${wantDir}`
+      );
+      out = out.replace(m[1], b);
+    }
+    return out;
+  }
+
+  // ---- 6) Apply in order ----
+  let out = text;
+  out = rewriteRawSwing(out);
+  out = rewriteTechnicalView(out);
+  out = rewriteDirectionBlocks(out);
+
+  return out;
+})(textFull);
+
+  
   // Provenance footer
   const footer = buildServerProvenanceFooter({
     headlines_provider: "expand-uses-stage1",
