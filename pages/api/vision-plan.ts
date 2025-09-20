@@ -15,15 +15,26 @@ import sharp from "sharp";
 // ---------- config ----------
 export const config = { api: { bodyParser: false, sizeLimit: "25mb" } };
 
-type Ok = {
-  ok: true;
-  text: string;
-  meta?: any;
-  // Optional diagnostics used by QA / dry-run paths
-  qa_summary?: { total: number; passed: number; failed: number };
-  results?: any;
-};
-type Err = { ok: false; reason: string };
+// ---------- response types (unified & forward-compatible) ----------
+type QaSummary = { total: number; passed: number; failed: number };
+
+type ApiResponse =
+  | {
+      ok: true;
+      text?: string;            // normal path
+      meta?: any;
+      // optional QA payload (only when running the QA routine)
+      qa_summary?: QaSummary;
+      results?: any[];          // array because code uses results.length
+    }
+  | {
+      ok: false;
+      reason: string;           // error path
+      // allow QA keys even on error to avoid TS friction during QA runs
+      qa_summary?: QaSummary;
+      results?: any[];
+    };
+
 
 const VP_VERSION = "2025-09-18-vp-AtoL-rc1";
 
@@ -3189,7 +3200,7 @@ function buildServerProvenanceFooter(args: {
 }
 
 // ---------- Handler ----------
-export default async function handler(req: NextApiRequest, res: NextApiResponse<Ok | Err>) {
+export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiResponse>) {
   try {
     if (req.method !== "POST") return res.status(405).json({ ok: false, reason: "Method not allowed" });
     if (!OPENAI_API_KEY) return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
