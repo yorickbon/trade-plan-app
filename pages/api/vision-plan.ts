@@ -114,7 +114,7 @@ async function callOpenAI(model: string, messages: any[]) {
   return String(out || "");
 }
 
- 
+
 /// ---------- market data keys ----------
 const TD_KEY = process.env.TWELVEDATA_API_KEY || "";
 
