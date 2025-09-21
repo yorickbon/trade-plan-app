@@ -3865,24 +3865,39 @@ if (mode === "expand") {
 
 let text = await callOpenAI(modelExpand, messages);
 
-// mark which TF images we actually have (used by reconciliation)
-PROVIDED_TFS = {
-  h4: !!c.h4,
-  h1: !!c.h1,
-  m15: !!c.m15,
-  m5: !!c.m5,
-  m1: false
+// ===== UNIFIED RAW SWING MAP PATCH (IDENTICAL for full / fast / scalping) =====
+
+// Resolve TF images regardless of mode (supports both `c.*` and bare vars)
+const IMG = {
+  h4: (typeof c !== "undefined" && c?.h4 !== undefined) ? c.h4 : (typeof h4 !== "undefined" ? h4 : null),
+  h1: (typeof c !== "undefined" && c?.h1 !== undefined) ? c.h1 : (typeof h1 !== "undefined" ? h1 : null),
+  m15: (typeof c !== "undefined" && c?.m15 !== undefined) ? c.m15 : (typeof m15 !== "undefined" ? m15 : null),
+  m5: (typeof c !== "undefined" && c?.m5 !== undefined) ? c.m5 : (typeof m5 !== "undefined" ? m5 : null),
+  m1: (typeof c !== "undefined" && c?.m1 !== undefined) ? c.m1 : (typeof m1 !== "undefined" ? m1 : null),
 };
 
-// single pixel-based RAW SWING MAP injection (images → map)
-const _injExp = await tryInjectRawSwingMapIntoText(text, {
-  h4: c.h4,
-  h1: c.h1,
-  m15: c.m15,
-  m5: c.m5 || null,
-  m1: null
-});
-text = _injExp.text;
+// Mark which TF images are actually present (used by reconciliation)
+PROVIDED_TFS = {
+  h4: !!IMG.h4,
+  h1: !!IMG.h1,
+  m15: !!IMG.m15,
+  m5: !!IMG.m5,
+  m1: !!IMG.m1
+};
+
+// Single pixel-based RAW SWING MAP injection (images → map)
+{
+  const inj = await tryInjectRawSwingMapIntoText(text, IMG);
+  text = inj.text;
+}
+
+// One structure/polish pass (RAW MAP is the final authority)
+text = _clarifyBOSWording(text);
+text = normalizeTriggerSpacing(text);
+text = _reconcileHTFTrendFromText(text);
+text = _applyRawSwingMap(text);
+
+// ===== END UNIFIED RAW SWING MAP PATCH =====
 
 // Minimum scaffold & options
 text = await enforceQuickPlan(modelExpand, c.instrument, text);
