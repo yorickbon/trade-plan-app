@@ -1,3 +1,4 @@
+
 {
   "name": "trade-plan-app",
   "private": true,
@@ -25,6 +26,6 @@
     "@types/node": "^20.11.30"
   },
   "engines": {
-    "node": "18.x"
+    "node": "22.x"
   }
 }
