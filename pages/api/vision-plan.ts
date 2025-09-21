@@ -1617,9 +1617,12 @@ async function messagesFastStage1(args: {
     const swing = await generateRawSwingMapFromImages({
       h4: args.h4, h1: args.h1, m15: args.m15, m5: args.m5 || null, m1: args.m1 || null
     });
-    if (swing?.rawSwingMap && swing.confidence >= 0.35) {
-      userContent = `${swing.rawSwingMap}\n---\n${parts}`;
-    }
+if (swing?.rawSwingMap && swing.confidence >= 0.35) {
+  const headerText = `${swing.rawSwingMap}\n---\n`;
+  // Prepend RAW SWING MAP as a text content part, keep the rest of the parts intact
+  userContent = [{ type: "text", text: headerText }, ...parts];
+}
+
   } catch {
     // fail-safe: keep original parts
     userContent = parts;
