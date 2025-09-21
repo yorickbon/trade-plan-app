@@ -1509,7 +1509,7 @@ function messagesFull(args: {
   ];
 }
 
-function messagesFastStage1(args: {
+async function messagesFastStage1(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string; m5?: string | null; m1?: string | null;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null;
@@ -1519,86 +1519,85 @@ function messagesFastStage1(args: {
   scalpingHard?: boolean;
 }) {
 
- const system = [
-  systemCore(
-    args.instrument,
-    args.calendarAdvisory,
-    args.scalping,
-    args.scalpingHard
-  ),
-  "",
-   "OUTPUT ONLY:",
-  "RAW SWING MAP (first)",
-  "4H: swings=<comma-separated HH/HL/LH/LL sequence>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "1H: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "15m: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "5m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "1m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "",
-  "Quick Plan (Actionable)",
+  // 1) Keep the existing FAST system instructions intact.
+  const system = [
+    systemCore(
+      args.instrument,
+      args.calendarAdvisory,
+      args.scalping,
+      args.scalpingHard
+    ),
+    "",
+    "OUTPUT ONLY:",
+    "RAW SWING MAP (first)",
+    "4H: swings=<comma-separated HH/HL/LH/LL sequence>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+    "1H: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+    "15m: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+    "5m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+    "1m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+    "",
+    "Quick Plan (Actionable)",
 
-  "• Direction: Long | Short | Stay Flat",
-  "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-  "• Trigger: (state timeframes explicitly, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)')",
-  "• Entry (zone or single):",
-  "• Stop Loss:",
-  "• Take Profit(s): TP1 / TP2",
-  "• Conviction: <0–100>%",
-  "• Setup:",
-  "• Short Reasoning:",
-  "",
-  "Option 1 (Primary)",
-  "• Direction: ...",
-  "• Order Type: ...",
-  "• Trigger:",
-  "• Entry (zone or single):",
-  "• Stop Loss:",
-  "• Take Profit(s): TP1 / TP2",
-  "• Conviction: <0–100>%",
-  "• Why this is primary:",
-  "",
-  "Option 2 (Alternative)",
-  "• Direction: ...",
-  "• Order Type: ...",
-  "• Trigger:",
-  "• Entry (zone or single):",
-  "• Stop Loss:",
-  "• Take Profit(s): TP1 / TP2",
-  "• Conviction: <0–100>%",
-  "• Why this alternative:",
-   "",
-  "Management: Partials at ~1R; move to BE at 1R; time-stop 20m (scalping) / 15m (scalping-hard) / 15–20m default; max attempts 3 (scalping) / 2 (hard).",
-  "",
-  "Under Full Breakdown, include 'Fundamental Bias Snapshot' with Calendar, Headlines, CSM, COT, and the Final Fundamental Bias (score + label).",
-  "",
+    "• Direction: Long | Short | Stay Flat",
+    "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
+    "• Trigger: (state timeframes explicitly, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)')",
+    "• Entry (zone or single):",
+    "• Stop Loss:",
+    "• Take Profit(s): TP1 / TP2",
+    "• Conviction: <0–100>%",
+    "• Setup:",
+    "• Short Reasoning:",
+    "",
+    "Option 1 (Primary)",
+    "• Direction: ...",
+    "• Order Type: ...",
+    "• Trigger:",
+    "• Entry (zone or single):",
+    "• Stop Loss:",
+    "• Take Profit(s): TP1 / TP2",
+    "• Conviction: <0–100>%",
+    "• Why this is primary:",
+    "",
+    "Option 2 (Alternative)",
+    "• Direction: ...",
+    "• Order Type: ...",
+    "• Trigger:",
+    "• Entry (zone or single):",
+    "• Stop Loss:",
+    "• Take Profit(s): TP1 / TP2",
+    "• Conviction: <0–100>%",
+    "• Why this alternative:",
+    "",
+    "Management: Partials at ~1R; move to BE at 1R; time-stop 20m (scalping) / 15m (scalping-hard) / 15–20m default; max attempts 3 (scalping) / 2 (hard).",
+    "",
+    "Under Full Breakdown, include 'Fundamental Bias Snapshot' with Calendar, Headlines, CSM, COT, and the Final Fundamental Bias (score + label).",
+    "",
+    "Detected Structures (X-ray):",
+    "• 4H: Classify as Uptrend only if clear HH/HL are present. Classify as Downtrend only if LH/LL are confirmed. Do not mark Downtrend when higher highs are visible.",
+    "• 1H: Apply same HH/HL vs LH/LL rules as 4H. If mixed signals are present, label as Range/Neutral.",
+    "• 15m: Confirm BOS/CHOCH strictly. Use HH/HL vs LH/LL for classification. If unclear, default to Neutral instead of forcing a bias.",
+    "• 5m (if used): Use only for execution timing. Must still follow HH/HL vs LH/LL rules to avoid false bias calls.",
+    "• 1m (if used): Execution timing only — never overrides higher timeframe structure.",
+    "",
+    "Candidate Scores (tournament):",
+    "- All strategy scores must be consistent with the detected structures above.",
+    "- Trend-Following: Score higher only if two or more HTFs (4H, 1H, 15m) show HH/HL (uptrend) or LH/LL (downtrend).",
+    "- BOS Strategy: Score only when BOS/CHOCH confirmed across at least two timeframes.",
+    "- Liquidity-Sweep: Score only if explicit sweep wicks are detected (esp. on 5m/15m).",
+    "- Breakout Strategy: Score only on clean breakout beyond HTF key levels, aligned with structure.",
+    "- Mean Reversion: Score only if repeated rejection at OB/FVG with opposite HTF bias, not randomly.",
+    "",
+    "Final Table Summary:",
+    `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |`,
+    `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
+    "",
+    "Append ONLY a fenced JSON block labeled ai_meta.",
+    "",
+    "provenance_hint:",
+    JSON.stringify(args.provenance || {}, null, 2),
+  ].join("\n");
 
-  "Detected Structures (X-ray):",
-"• 4H: Classify as Uptrend only if clear HH/HL are present. Classify as Downtrend only if LH/LL are confirmed. Do not mark Downtrend when higher highs are visible.",
-"• 1H: Apply same HH/HL vs LH/LL rules as 4H. If mixed signals are present, label as Range/Neutral.",
-"• 15m: Confirm BOS/CHOCH strictly. Use HH/HL vs LH/LL for classification. If unclear, default to Neutral instead of forcing a bias.",
-"• 5m (if used): Use only for execution timing. Must still follow HH/HL vs LH/LL rules to avoid false bias calls.",
-"• 1m (if used): Execution timing only — never overrides higher timeframe structure.",
-"",
-"Candidate Scores (tournament):",
-"- All strategy scores must be consistent with the detected structures above.",
-"- Trend-Following: Score higher only if two or more HTFs (4H, 1H, 15m) show HH/HL (uptrend) or LH/LL (downtrend).",
-"- BOS Strategy: Score only when BOS/CHOCH confirmed across at least two timeframes.",
-"- Liquidity-Sweep: Score only if explicit sweep wicks are detected (esp. on 5m/15m).",
-"- Breakout Strategy: Score only on clean breakout beyond HTF key levels, aligned with structure.",
-"- Mean Reversion: Score only if repeated rejection at OB/FVG with opposite HTF bias, not randomly.",
-"",
-"Final Table Summary:",
-
-  `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |`,
-  `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
-  "",
-  "Append ONLY a fenced JSON block labeled ai_meta.",
-  "",
-  "provenance_hint:",
-  JSON.stringify(args.provenance || {}, null, 2),
-].join("\n");
-
-
+  // 2) Build the original user parts (unchanged).
   const parts = buildUserPartsBase({
     instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4, m5: args.m5 || null, m1: args.m1 || null,
     calendarDataUrl: args.calendarDataUrl,
@@ -1610,8 +1609,25 @@ function messagesFastStage1(args: {
     debugOCRRows: args.calendarAdvisory?.debugRows || null,
   });
 
-  return [{ role: "system", content: system }, { role: "user", content: parts }];
+  // 3) ***NEW*** Extract pixel-based RAW SWING MAP from the actual chart images and
+  //    prepend it to the user content so the LLM reasons over it (like FULL/EXPAND).
+  //    If detection is low-confidence, we simply fall back to the original parts.
+  let userContent = parts;
+  try {
+    const swing = await generateRawSwingMapFromImages({
+      h4: args.h4, h1: args.h1, m15: args.m15, m5: args.m5 || null, m1: args.m1 || null
+    });
+    if (swing?.rawSwingMap && swing.confidence >= 0.35) {
+      userContent = `${swing.rawSwingMap}\n---\n${parts}`;
+    }
+  } catch {
+    // fail-safe: keep original parts
+    userContent = parts;
+  }
+
+  return [{ role: "system", content: system }, { role: "user", content: userContent }];
 }
+
 
 // ---------- Enforcement helpers (UPDATED) ----------
 
