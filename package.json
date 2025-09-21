@@ -1,8 +1,8 @@
-
 {
   "name": "trade-plan-app",
   "private": true,
   "version": "0.1.0",
+  "engines": { "node": "22.x" },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -17,15 +17,11 @@
     "xml2js": "^0.6.2",
     "openai": "^4.0.0",
     "formidable": "^3.5.1",
-    "sharp": "^0.33.3",
-    "jimp": "^0.22.12"
+    "sharp": "^0.33.3"
   },
   "devDependencies": {
     "typescript": "^5.4.2",
     "@types/react": "^18.2.66",
     "@types/node": "^20.11.30"
-  },
-  "engines": {
-    "node": "22.x"
   }
 }
