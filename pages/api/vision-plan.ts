@@ -4408,10 +4408,7 @@ if (aiMetaFullNow && invalidOrderRelativeToPrice(aiMetaFullNow)) {
 // Sync RAW SWING MAP verdicts to X-ray & Technical View (truth-guard)
 textFull = _fixChartVerdictsBlock(textFull);
 
-// Final guards: ensure Calendar snapshot line & never 'mixed', and force two-row Final Table if O2 exists
-textFull = _normalizeCalendarSnapshotLines(textFull);
-textFull = _expandFinalTableToTwoRows(textFull, instrument);
-
+// (cleanup) Already handled by _applyMegaPostGenChain()
     
     // Provenance footer
     const footer = buildServerProvenanceFooter({
