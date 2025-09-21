@@ -51,9 +51,31 @@ function pickModelFromFields(req: NextApiRequest, fields?: Record<string, any>) 
   return DEFAULT_MODEL || "gpt-4o";
 }
 
-// ---------- market data keys ----------
+/// ---------- market data keys ----------
 const TD_KEY = process.env.TWELVEDATA_API_KEY || "";
-const FH_KEY = process.env.FINNHUB_API_KEY || process.env.FINNHUB_APT_KEY || "";
+
+// Accept common Finnhub env names; preferred is FINNHUB_API_KEY
+// Back-compat note: FINNHUB_APT_KEY was a typo and is intentionally NOT used anymore.
+const FH_KEY =
+  process.env.FINNHUB_API_KEY ||
+  process.env.FINNHUB_APIKEY ||
+  process.env.FINNHUB_TOKEN ||
+  "";
+
+/**
+ * Optional: dev warning to catch missing Finnhub config early.
+ * (No effect in production; safe in serverless.)
+ */
+(function assertProviderKeys() {
+  if (process.env.NODE_ENV !== "production") {
+    if (!FH_KEY) {
+      console.warn(
+        "[vision-plan] Finnhub key missing. Set FINNHUB_API_KEY (preferred). Also accepted: FINNHUB_APIKEY, FINNHUB_TOKEN."
+      );
+    }
+  }
+})();
+
 const POLY_KEY = process.env.POLYGON_API_KEY || "";
 
 // ---------- small utils ----------
