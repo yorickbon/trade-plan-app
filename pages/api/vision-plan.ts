@@ -1,3 +1,5 @@
+latest good code 21.05.2025
+
 // /pages/api/vision-plan.ts
 /**
  * OCR-first calendar (image priority) — improved acceptance of pre-release rows
@@ -1394,60 +1396,7 @@ function buildUserPartsBase(args: {
   return parts;
 }
 
-/** INTERNAL: prepend a RAW SWING MAP content-part (from chart images) if confidence gate passes.
- *  - Returns an array of content parts suitable for OpenAI (text + images).
- *  - Never throws; on error or low-confidence it returns the original parts.
- *  - Adds a tiny debug stamp to help us verify injection happened (commented).
- */
-function _prependRawSwingMapParts(
-  baseParts: any[],
-  imgs: { h4?: string | null; h1?: string | null; m15?: string | null; m5?: string | null; m1?: string | null },
-  gate = 0.35
-): any[] {
-  try {
-    // NOTE: generateRawSwingMapFromImages is async; we synchronously
-    // check for the presence of attached images and, if present,
-    // opportunistically run the extractor via a microtask shim that
-    // resolves before messages leave this function.
-    let injected = false;
-    let headerPart: any | null = null;
-
-    // fire and block locally using Atomics-free micro-queue (Node 18+ handles)
-    // but keep signature sync for the rest of the app
-    const run = (async () => {
-      const res = await generateRawSwingMapFromImages(imgs);
-      if (res?.rawSwingMap && Number(res.confidence) >= gate) {
-        const headerText = `${res.rawSwingMap}\n---\n`;
-        headerPart = { type: "text", text: headerText };
-        injected = true;
-      }
-    }) as unknown as Promise<void>;
-
-    // Busy-wait is bad; instead, we exploit the fact Node won’t flush
-    // the current call stack until pending microtasks complete
-    // by chaining a .then() that synchronously mutates our local copy
-    // before returning to the caller.
-    // We clone parts so mutation is safe.
-    const out = [...baseParts];
-
-    (run as Promise<void>).then(() => {
-      if (headerPart) {
-        out.unshift(headerPart);
-        // console.log("[vision-plan] RAW SWING MAP injected (confidence ok)");
-      } else {
-        // console.log("[vision-plan] RAW SWING MAP not injected (low confidence or error)");
-      }
-    }).catch(() => {
-      // console.log("[vision-plan] RAW SWING MAP extractor failed; proceeding without injection");
-    });
-
-    return out;
-  } catch {
-    return baseParts;
-  }
-}
-
-/** FULL path message builder — chart-first reasoning */
+// ---------- Message builders ----------
 function messagesFull(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string; m5?: string | null; m1?: string | null;
   calendarDataUrl?: string | null; calendarText?: string | null;
@@ -1457,101 +1406,111 @@ function messagesFull(args: {
   scalping?: boolean;
   scalpingHard?: boolean;
 }) {
-  const system = [
-    systemCore(
-      args.instrument,
-      args.calendarAdvisory,
-      args.scalping,
-      args.scalpingHard
-    ),
-    "",
-    "OUTPUT ONLY:",
-    "RAW SWING MAP (first)",
-    "4H: swings=<comma-separated HH/HL/LH/LL sequence>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-    "1H: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-    "15m: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-    "5m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-    "1m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-    "",
-    "Quick Plan (Actionable)",
-    "• Direction: Long | Short | Stay Flat",
-    "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-    "• Trigger: (state timeframes explicitly, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)')",
-    "• Entry (zone or single):",
-    "• Stop Loss:",
-    "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%",
-    "• Setup:",
-    "• Short Reasoning:",
-    "",
-    "Option 1 (Primary)",
-    "• Direction: ...",
-    "• Order Type: ...",
-    "• Trigger:",
-    "• Entry (zone or single):",
-    "• Stop Loss:",
-    "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%",
-    "• Why this is primary:",
-    "",
-    "Option 2 (Alternative)",
-    "• Direction: ...",
-    "• Order Type: ...",
-    "• Trigger:",
-    "• Entry (zone or single):",
-    "• Stop Loss:",
-    "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%",
-    "• Why this alternative:",
-    "",
-    "Under Full Breakdown, include 'Fundamental Bias Snapshot' with Calendar, Headlines, CSM, COT, and the Final Fundamental Bias (score + label).",
-    "",
+
+ const system = [
+  systemCore(
+    args.instrument,
+    args.calendarAdvisory,
+    args.scalping,
+    args.scalpingHard
+  ),
+  "",
+    "OUTPUT format (in this exact order):",
+  "RAW SWING MAP (first)",
+  "4H: swings=<comma-separated HH/HL/LH/LL sequence>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "1H: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "15m: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "5m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "1m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "",
+  "Quick Plan (Actionable)",
+
+  "• Direction: Long | Short | Stay Flat",
+  "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
+  "• Trigger: (state timeframes explicitly, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)')",
+  "• Entry (zone or single):",
+  "• Stop Loss:",
+  "• Take Profit(s): TP1 / TP2 (approx R multiples)",
+  "• Conviction: <0–100>%",
+  "• Setup:",
+  "• Short Reasoning:",
+  "",
+  "Option 1 (Primary)",
+  "• Direction: ...",
+  "• Order Type: ...",
+  "• Trigger:",
+  "• Entry (zone or single):",
+  "• Stop Loss:",
+  "• Take Profit(s): TP1 / TP2",
+  "• Conviction: <0–100>%",
+  "• Why this is primary:",
+  "",
+  "Option 2 (Alternative)",
+  "• Direction: ...",
+  "• Order Type: ...",
+  "• Trigger:",
+  "• Entry (zone or single):",
+  "• Stop Loss:",
+  "• Take Profit(s): TP1 / TP2",
+  "• Conviction: <0–100>%",
+  "• Why this alternative:",
+  "",
+    "Full Breakdown",
+  "• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m/1m if used)",
+  "• Fundamental View:",
+  "   - Calendar: explicit instrument-level calendar line (or 'Calendar: unavailable'). If pre-release, write exactly: 'Pre-release only, no confirmed bias until data is out.'",
+  "   - Headlines bias (48h): bullish/bearish/neutral (or 'unavailable')",
+  "   - CSM: z(base)-z(quote) diff and interpretation",
+  "   - COT: bullish/bearish/neutral (or 'unavailable')",
+  "   - Final Fundamental Bias: <label> (score ~X)",
+  "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
+  "• Conditional Scenarios:",
+  "• Surprise Risk:",
+  "• Invalidation:",
+  "• One-liner Summary:",
+
+  "",
     "Detected Structures (X-ray):",
-    "• 4H: Classify as Uptrend only if clear HH/HL are present. Classify as Downtrend only if LH/LL are confirmed. Do not mark Downtrend when higher highs are visible.",
-    "• 1H: Apply same HH/HL vs LH/LL rules as 4H. If mixed signals are present, label as Range/Neutral.",
-    "• 15m: Confirm BOS/CHOCH strictly. Use HH/HL vs LH/LL for classification. If unclear, default to Neutral instead of forcing a bias.",
-    "• 5m (if used): Use only for execution timing. Must still follow HH/HL vs LH/LL rules to avoid false bias calls.",
-    "• 1m (if used): Execution timing only — never overrides higher timeframe structure.",
-    "",
-    "Candidate Scores (tournament):",
-    "- All strategy scores must be consistent with the detected structures above.",
-    "- Trend-Following: Score higher only if two or more HTFs (4H, 1H, 15m) show HH/HL (uptrend) or LH/LL (downtrend).",
-    "- BOS Strategy: Score only when BOS/CHOCH confirmed across at least two timeframes.",
-    "- Liquidity-Sweep: Score only if explicit sweep wicks are detected (esp. on 5m/15m).",
-    "- Breakout Strategy: Score only on clean breakout beyond HTF key levels, aligned with structure.",
-    "- Mean Reversion: Score only if repeated rejection at OB/FVG with opposite HTF bias, not randomly.",
-    "",
-    "Final Table Summary:",
-    `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |`,
-    `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
-    "",
-    "Append a fenced JSON block labeled ai_meta at the very end.",
-    "",
-    "provenance_hint:",
-    JSON.stringify(args.provenance || {}, null, 2),
-  ].join("\n");
+  "• 4H: Classify as Uptrend only if clear HH/HL are present. Classify as Downtrend only if LH/LL are confirmed. Do not mark Downtrend when higher highs are visible.",
+  "• 1H: Apply same HH/HL vs LH/LL rules as 4H. If mixed signals are present, label as Range/Neutral.",
+  "• 15m: Confirm BOS/CHOCH strictly. Use HH/HL vs LH/LL for classification. If unclear, default to Neutral instead of forcing a bias.",
+  "• 5m (if used): Use only for execution timing. Must still follow HH/HL vs LH/LL rules to avoid false bias calls.",
+  "• 1m (if used): Execution timing only — never overrides higher timeframe structure.",
+  "",
+  "Candidate Scores (tournament):",
+  "- All strategy scores must be consistent with the detected structures above.",
+  "- Trend-Following: Score higher only if two or more HTFs (4H, 1H, 15m) show HH/HL (uptrend) or LH/LL (downtrend).",
+  "- BOS Strategy: Score only when BOS/CHOCH confirmed across at least two timeframes.",
+  "- Liquidity-Sweep: Score only if explicit sweep wicks are detected (esp. on 5m/15m).",
+  "- Breakout Strategy: Score only on clean breakout beyond HTF key levels, aligned with structure.",
+  "- Mean Reversion: Score only if repeated rejection at OB/FVG with opposite HTF bias, not randomly.",
+  "",
+  "Final Table Summary:",
 
-  const baseParts = buildUserPartsBase({
-    instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4, m5: args.m5 || null, m1: args.m1 || null,
-    calendarDataUrl: args.calendarDataUrl, calendarText: args.calendarText,
-    headlinesText: args.headlinesText, sentimentText: args.sentimentText,
-    calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null,
-    calendarEvidence: args.calendarAdvisory?.evidence || null,
-    debugOCRRows: args.calendarAdvisory?.debugRows || null,
-  });
 
-  // PREPEND image-derived RAW SWING MAP (confidence gate 0.35) — chart-first reasoning
-  const userParts = _prependRawSwingMapParts(baseParts, {
-    h4: args.h4, h1: args.h1, m15: args.m15, m5: args.m5 || null, m1: args.m1 || null
-  }, 0.35);
+  `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |`,
+  `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
+  "",
+  "Append a fenced JSON block labeled ai_meta at the very end.",
+  "",
+  "provenance_hint:",
+  JSON.stringify(args.provenance || {}, null, 2),
+].join("\n");
+
 
   return [
     { role: "system", content: system },
-    { role: "user", content: userParts },
+    { role: "user", content: buildUserPartsBase({
+      instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4, m5: args.m5 || null, m1: args.m1 || null,
+      calendarDataUrl: args.calendarDataUrl, calendarText: args.calendarText,
+      headlinesText: args.headlinesText, sentimentText: args.sentimentText,
+      calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null,
+      calendarEvidence: args.calendarAdvisory?.evidence || null,
+      debugOCRRows: args.calendarAdvisory?.debugRows || null,
+    }) },
   ];
 }
 
-/** FAST path message builder — chart-first reasoning */
 function messagesFastStage1(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string; m5?: string | null; m1?: string | null;
   calendarDataUrl?: string | null; calendarText?: string | null;
@@ -1562,83 +1521,87 @@ function messagesFastStage1(args: {
   scalpingHard?: boolean;
 }) {
 
-  const system = [
-    systemCore(
-      args.instrument,
-      args.calendarAdvisory,
-      args.scalping,
-      args.scalpingHard
-    ),
-    "",
-    "OUTPUT ONLY:",
-    "RAW SWING MAP (first)",
-    "4H: swings=<comma-separated HH/HL/LH/LL sequence>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-    "1H: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-    "15m: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-    "5m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-    "1m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-    "",
-    "Quick Plan (Actionable)",
-    "• Direction: Long | Short | Stay Flat",
-    "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-    "• Trigger: (state timeframes explicitly, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)')",
-    "• Entry (zone or single):",
-    "• Stop Loss:",
-    "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%",
-    "• Setup:",
-    "• Short Reasoning:",
-    "",
-    "Option 1 (Primary)",
-    "• Direction: ...",
-    "• Order Type: ...",
-    "• Trigger:",
-    "• Entry (zone or single):",
-    "• Stop Loss:",
-    "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%",
-    "• Why this is primary:",
-    "",
-    "Option 2 (Alternative)",
-    "• Direction: ...",
-    "• Order Type: ...",
-    "• Trigger:",
-    "• Entry (zone or single):",
-    "• Stop Loss:",
-    "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%",
-    "• Why this alternative:",
-    "",
-    "Management: Partials at ~1R; move to BE at 1R; time-stop 20m (scalping) / 15m (scalping-hard) / 15–20m default; max attempts 3 (scalping) / 2 (hard).",
-    "",
-    "Under Full Breakdown, include 'Fundamental Bias Snapshot' with Calendar, Headlines, CSM, COT, and the Final Fundamental Bias (score + label).",
-    "",
-    "Detected Structures (X-ray):",
-    "• 4H: Classify as Uptrend only if clear HH/HL are present. Classify as Downtrend only if LH/LL are confirmed. Do not mark Downtrend when higher highs are visible.",
-    "• 1H: Apply same HH/HL vs LH/LL rules as 4H. If mixed signals are present, label as Range/Neutral.",
-    "• 15m: Confirm BOS/CHOCH strictly. Use HH/HL vs LH/LL for classification. If unclear, default to Neutral instead of forcing a bias.",
-    "• 5m (if used): Use only for execution timing. Must still follow HH/HL vs LH/LL rules to avoid false bias calls.",
-    "• 1m (if used): Execution timing only — never overrides higher timeframe structure.",
-    "",
-    "Candidate Scores (tournament):",
-    "- All strategy scores must be consistent with the detected structures above.",
-    "- Trend-Following: Score higher only if two or more HTFs (4H, 1H, 15m) show HH/HL (uptrend) or LH/LL (downtrend).",
-    "- BOS Strategy: Score only when BOS/CHOCH confirmed across at least two timeframes.",
-    "- Liquidity-Sweep: Score only if explicit sweep wicks are detected (esp. on 5m/15m).",
-    "- Breakout Strategy: Score only on clean breakout beyond HTF key levels, aligned with structure.",
-    "- Mean Reversion: Score only if repeated rejection at OB/FVG with opposite HTF bias, not randomly.",
-    "",
-    "Final Table Summary:",
-    `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |`,
-    `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
-    "",
-    "Append ONLY a fenced JSON block labeled ai_meta.",
-    "",
-    "provenance_hint:",
-    JSON.stringify(args.provenance || {}, null, 2),
-  ].join("\n");
+ const system = [
+  systemCore(
+    args.instrument,
+    args.calendarAdvisory,
+    args.scalping,
+    args.scalpingHard
+  ),
+  "",
+   "OUTPUT ONLY:",
+  "RAW SWING MAP (first)",
+  "4H: swings=<comma-separated HH/HL/LH/LL sequence>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "1H: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "15m: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "5m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "1m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
+  "",
+  "Quick Plan (Actionable)",
 
-  const baseParts = buildUserPartsBase({
+  "• Direction: Long | Short | Stay Flat",
+  "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
+  "• Trigger: (state timeframes explicitly, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)')",
+  "• Entry (zone or single):",
+  "• Stop Loss:",
+  "• Take Profit(s): TP1 / TP2",
+  "• Conviction: <0–100>%",
+  "• Setup:",
+  "• Short Reasoning:",
+  "",
+  "Option 1 (Primary)",
+  "• Direction: ...",
+  "• Order Type: ...",
+  "• Trigger:",
+  "• Entry (zone or single):",
+  "• Stop Loss:",
+  "• Take Profit(s): TP1 / TP2",
+  "• Conviction: <0–100>%",
+  "• Why this is primary:",
+  "",
+  "Option 2 (Alternative)",
+  "• Direction: ...",
+  "• Order Type: ...",
+  "• Trigger:",
+  "• Entry (zone or single):",
+  "• Stop Loss:",
+  "• Take Profit(s): TP1 / TP2",
+  "• Conviction: <0–100>%",
+  "• Why this alternative:",
+   "",
+  "Management: Partials at ~1R; move to BE at 1R; time-stop 20m (scalping) / 15m (scalping-hard) / 15–20m default; max attempts 3 (scalping) / 2 (hard).",
+  "",
+  "Under Full Breakdown, include 'Fundamental Bias Snapshot' with Calendar, Headlines, CSM, COT, and the Final Fundamental Bias (score + label).",
+  "",
+
+  "Detected Structures (X-ray):",
+"• 4H: Classify as Uptrend only if clear HH/HL are present. Classify as Downtrend only if LH/LL are confirmed. Do not mark Downtrend when higher highs are visible.",
+"• 1H: Apply same HH/HL vs LH/LL rules as 4H. If mixed signals are present, label as Range/Neutral.",
+"• 15m: Confirm BOS/CHOCH strictly. Use HH/HL vs LH/LL for classification. If unclear, default to Neutral instead of forcing a bias.",
+"• 5m (if used): Use only for execution timing. Must still follow HH/HL vs LH/LL rules to avoid false bias calls.",
+"• 1m (if used): Execution timing only — never overrides higher timeframe structure.",
+"",
+"Candidate Scores (tournament):",
+"- All strategy scores must be consistent with the detected structures above.",
+"- Trend-Following: Score higher only if two or more HTFs (4H, 1H, 15m) show HH/HL (uptrend) or LH/LL (downtrend).",
+"- BOS Strategy: Score only when BOS/CHOCH confirmed across at least two timeframes.",
+"- Liquidity-Sweep: Score only if explicit sweep wicks are detected (esp. on 5m/15m).",
+"- Breakout Strategy: Score only on clean breakout beyond HTF key levels, aligned with structure.",
+"- Mean Reversion: Score only if repeated rejection at OB/FVG with opposite HTF bias, not randomly.",
+"",
+"Final Table Summary:",
+
+  `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |`,
+  `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
+  "",
+  "Append ONLY a fenced JSON block labeled ai_meta.",
+  "",
+  "provenance_hint:",
+  JSON.stringify(args.provenance || {}, null, 2),
+].join("\n");
+
+
+  const parts = buildUserPartsBase({
     instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4, m5: args.m5 || null, m1: args.m1 || null,
     calendarDataUrl: args.calendarDataUrl,
     calendarText: !args.calendarDataUrl && args.calendarText ? args.calendarText : undefined,
@@ -1649,14 +1612,8 @@ function messagesFastStage1(args: {
     debugOCRRows: args.calendarAdvisory?.debugRows || null,
   });
 
-  // PREPEND image-derived RAW SWING MAP (confidence gate 0.35) — chart-first reasoning
-  const userParts = _prependRawSwingMapParts(baseParts, {
-    h4: args.h4, h1: args.h1, m15: args.m15, m5: args.m5 || null, m1: args.m1 || null
-  }, 0.35);
-
-  return [{ role: "system", content: system }, { role: "user", content: userParts }];
+  return [{ role: "system", content: system }, { role: "user", content: parts }];
 }
-
 
 // ---------- Enforcement helpers (UPDATED) ----------
 
@@ -1704,245 +1661,68 @@ function hasOption1(text: string): boolean {
   return re.test(text);
 }
 
-/* =========================
-   TOURNAMENT ENGINE (24 strategies) — unified for full/fast/scalping
-   - Structure-first scoring using Detected Structures (X-ray)
-   - Mode-aware weighting (full | fast | scalping)
-   - News proximity & fundamentals sign adjustments
-   - Emits one clean "Candidate Scores (tournament)" section
-   - Stamps top strategies into Quick Plan / Option 1 / Option 2 "• Setup:" lines
-   ========================= */
+// Inject tournament strategies + scoring (deterministic, no placeholders)
+function enforceTournamentStrategies(text: string, instrument: string): string {
+  if (!text) return text;
 
-type TFVerdict = 'Uptrend'|'Downtrend'|'Range';
-type ModeTag = 'full'|'fast'|'scalping';
+  // Capture ANY existing tournament sections (with/without ###, with/without colon)
+  const SECT_G =
+    /(#+\s*)?Candidate\s*Scores\s*\(tournament\)\s*:?\s*[\s\S]*?(?=\n\s*(?:Final\s*Table\s*Summary|Detected\s*Structures|\*\*Detected\s*Structures|Full\s*Breakdown|Option\s*1|Option\s*2)\b|$)/gi;
 
-type StructureCtx = {
-  v4: TFVerdict; v1: TFVerdict; v15: TFVerdict; v5?: TFVerdict;
-  counter1H: boolean;
-};
-
-function _grabVerdictFromXray(text: string, tf: '4H'|'1H'|'15m'|'5m'): TFVerdict {
-  const m = text.match(new RegExp(`Detected\\s*Structures\\s*\\(X-ray\\)[\\s\\S]*?\\n\\s*•\\s*${tf}\\s*:\\s*Trend:\\s*(Uptrend|Downtrend|Range)`, 'i'));
-  return (m ? (m[1] as TFVerdict) : 'Range');
-}
-function _structureCtx(text: string): StructureCtx {
-  const v4  = _grabVerdictFromXray(text, '4H');
-  const v1  = _grabVerdictFromXray(text, '1H');
-  const v15 = _grabVerdictFromXray(text, '15m');
-  const v5  = _grabVerdictFromXray(text, '5m');
-  const counter1H = (v4 === 'Uptrend' && v1 === 'Downtrend') || (v4 === 'Downtrend' && v1 === 'Uptrend');
-  return { v4, v1, v15, v5, counter1H };
-}
-
-type Strat = {
-  name: string;
-  bucket: 'trend'|'breakout'|'sweep'|'range'|'reversal'|'level'|'session';
-  tfRef: string;        // e.g., "4H/1H/15m/5m"
-  trigger: string;      // short, TF-explicit trigger description
-  wants: Array<'up'|'down'|'range'|'cleanBreak'|'sweepFirst'|'session'|'vwap'|'counterOK'|'needs5m'|'needs1m'>;
-};
-
-const STRATS: Strat[] = [
-  // Trend-following / continuation
-  { name: "OB + FVG pullback", bucket: "trend", tfRef:"4H/1H anchor; 15m pullback; 5m confirm", trigger:"15m OB+FVG tap; 5m BOS", wants:['up','down','needs5m'] },
-  { name: "Breaker continuation", bucket: "trend", tfRef:"1H anchor; 15m breaker; 5m", trigger:"15m breaker retest; 5m BOS", wants:['up','down','needs5m'] },
-  { name: "EMA pullback (20/50) aligned", bucket:"trend", tfRef:"1H bias; 15m pullback; 5m", trigger:"15m pullback to EMA cluster; 5m shift", wants:['up','down','needs5m'] },
-  { name: "HTF level retest (H4/H1)", bucket:"level", tfRef:"4H/1H key level; 15m", trigger:"15m retest of HTF level; 5m BOS", wants:['up','down','needs5m'] },
-
-  // Breakout / momentum
-  { name: "Momentum breakout", bucket: "breakout", tfRef:"1H base; 15m ignition; 5m", trigger:"15m close-through; 5m hold + BOS", wants:['cleanBreak','needs5m'] },
-  { name: "Triangle/wedge break", bucket:"breakout", tfRef:"1H structure; 15m", trigger:"15m TL break; 5m retest + BOS", wants:['cleanBreak','needs5m'] },
-  { name: "Channel break + retest", bucket:"breakout", tfRef:"1H channel; 15m", trigger:"15m channel break; 5m retest + BOS", wants:['cleanBreak','needs5m'] },
-  { name: "Opening Range Breakout (ORB)", bucket:"session", tfRef:"Session OR; 5m/1m", trigger:"5m OR break; 1m hold + micro BOS", wants:['cleanBreak','session','needs1m'] },
-
-  // Liquidity / sweep
-  { name: "Liquidity sweep + shift", bucket:"sweep", tfRef:"15m sweep; 5m confirm", trigger:"15m sweep of H/L; 5m CHOCH→BOS", wants:['sweepFirst','needs5m'] },
-  { name: "PDH/PDL sweep + continuation", bucket:"sweep", tfRef:"Prev-day H/L; 15m/5m", trigger:"Sweep PDH/PDL; 5m shift/BOS", wants:['sweepFirst','needs5m'] },
-  { name: "Stop-hunt into OB", bucket:"sweep", tfRef:"15m stop raid; 5m OB", trigger:"Sweep into 15m OB; 5m BOS", wants:['sweepFirst','needs5m'] },
-
-  // Range / mean reversion
-  { name: "Range rotation (EQ logic)", bucket:"range", tfRef:"1H range; 15m EQ; 5m", trigger:"15m reject range bound; 5m shift", wants:['range','needs5m'] },
-  { name: "VWAP fade", bucket:"range", tfRef:"Session VWAP; 5m/1m", trigger:"5m rejection at VWAP band; 1m confirm", wants:['vwap','range','session','needs1m'] },
-  { name: "Bollinger squeeze breakout", bucket:"breakout", tfRef:"15m squeeze; 5m", trigger:"15m band expansion; 5m hold + BOS", wants:['cleanBreak','needs5m'] },
-
-  // Reversal / counter-trend
-  { name: "Divergence reversal", bucket:"reversal", tfRef:"15m divergence; 5m", trigger:"15m div; 5m CHOCH→BOS", wants:['counterOK','needs5m'] },
-  { name: "50% mean reversion of impulse", bucket:"reversal", tfRef:"15m impulse; 5m", trigger:"Retrace ~50%; 5m shift", wants:['counterOK','needs5m'] },
-
-  // Level-specific
-  { name: "Quarter point / big fig tag", bucket:"level", tfRef:"HTF levels; 15m/5m", trigger:"Tag QP/big fig; 5m shift/BOS", wants:['range','up','down','needs5m'] },
-  { name: "EQH/EQL raid + reclaim", bucket:"sweep", tfRef:"HTF EQH/EQL; 15m/5m", trigger:"Raid; 5m reclaim + BOS", wants:['sweepFirst','needs5m'] },
-
-  // Session behaviors
-  { name: "London open drive", bucket:"session", tfRef:"LO window; 5m/1m", trigger:"5m ignition; 1m hold + BOS", wants:['session','cleanBreak','needs1m'] },
-  { name: "NY reversal (lunch fade)", bucket:"session", tfRef:"NY midday; 5m", trigger:"5m rejection; micro shift", wants:['session','range','counterOK','needs5m'] },
-
-  // Additional robust plays
-  { name: "Breaker flip at range edge", bucket:"trend", tfRef:"1H range edge; 15m", trigger:"15m breaker flip; 5m BOS", wants:['up','down','needs5m'] },
-  { name: "FVG fill → continuation", bucket:"trend", tfRef:"1H anchor; 15m FVG; 5m", trigger:"Fill 15m FVG; 5m BOS", wants:['up','down','needs5m'] },
-  { name: "Retest previous session OR", bucket:"session", tfRef:"Prev OR; 15m/5m", trigger:"Retest OR; 5m shift", wants:['session','range','needs5m'] },
-  { name: "Macro BOS + continuation", bucket:"breakout", tfRef:"4H BOS; 1H/15m", trigger:"4H BOS context; 15m continuation; 5m", wants:['cleanBreak','needs5m'] },
-];
-
-function _dirWord(v: TFVerdict): 'up'|'down'|'range' {
-  if (v === 'Uptrend') return 'up';
-  if (v === 'Downtrend') return 'down';
-  return 'range';
-}
-
-function _scoreStrategies(text: string, mode: ModeTag, fundamentalsSign: -1|0|1, proximityFlag: boolean) {
-  const S = _structureCtx(text);
-  const d4 = _dirWord(S.v4), d1 = _dirWord(S.v1), d15 = _dirWord(S.v15);
-
-  const base: Array<{ name:string; score:number; reason:string }> = [];
-
-  for (const st of STRATS) {
-    let s = 50;
-
-    // Structure alignment
-    if (st.bucket === 'trend') {
-      if (d4 === d1 && d1 !== 'range') s += 18;
-      if (d15 === d1) s += 6;
-      if (S.counter1H) s -= 8;
-    } else if (st.bucket === 'range') {
-      if (d4 === 'range' || d1 === 'range') s += 14;
-      if (d15 === 'range') s += 6;
-      if (d4 !== 'range' && d1 !== 'range') s -= 6;
-    } else if (st.bucket === 'breakout') {
-      if (d15 === d1 && d1 !== 'range') s += 10;
-      if (S.v5 && S.v5 === S.v15) s += 4;
-    } else if (st.bucket === 'sweep') {
-      s += 6; // opportunistic baseline
-      if (d15 !== 'range') s += 4;
-    } else if (st.bucket === 'reversal') {
-      if (S.counter1H) s += 8; // gives a purpose
-    } else if (st.bucket === 'level') {
-      s += 8; // robust in most contexts with confluence
-    } else if (st.bucket === 'session') {
-      s += 6;
+  // Gather scored bullets (— <number> —) from existing sections
+  const matches = [...(text.matchAll(SECT_G) || [])].map(m => m[0]);
+  const bullets: string[] = [];
+  for (const sect of matches) {
+    const lines = sect.match(/^\s*[-•]\s+.+$/gmi) || [];
+    for (const ln of lines) {
+      if (/—\s*\d{1,3}\s*—/.test(ln)) bullets.push(ln.trim());
     }
-
-    // Wants alignment
-    if (st.wants.includes(d4)) s += 6;
-    if (st.wants.includes(d1)) s += 4;
-    if (d15 === 'range' && st.wants.includes('range')) s += 6;
-    if (st.wants.includes('cleanBreak') && (d1 !== 'range' || d15 !== 'range')) s += 4;
-    if (st.wants.includes('sweepFirst')) s += 2;
-    if (st.wants.includes('session')) s += 2;
-    if (st.wants.includes('vwap')) s += 2;
-    if (S.counter1H && !st.wants.includes('counterOK') && st.bucket !== 'sweep') s -= 6;
-
-    // Mode weighting
-    if (mode === 'scalping') {
-      if (st.wants.includes('needs1m')) s += 6;
-      if (st.wants.includes('needs5m')) s += 4;
-      if (st.bucket === 'trend') s -= 2; // slower
-      if (st.bucket === 'session' || st.bucket === 'sweep') s += 4;
-    } else if (mode === 'fast') {
-      if (st.wants.includes('needs5m')) s += 2;
-      if (st.bucket === 'breakout' || st.bucket === 'trend') s += 2;
-    } else { // full
-      if (st.bucket === 'trend') s += 2;
-      if (st.bucket === 'level') s += 2;
-    }
-
-    // Fundamentals small nudge (structure-first)
-    if (fundamentalsSign !== 0) {
-      if (st.bucket === 'trend' || st.bucket === 'breakout') s += 3;
-    }
-
-    // News proximity risk
-    if (proximityFlag) {
-      if (st.bucket === 'breakout' || st.bucket === 'sweep' || st.bucket === 'session') s -= 4;
-      else s -= 2;
-    }
-
-    // Clamp
-    s = Math.max(0, Math.min(100, Math.round(s)));
-
-    const reason = `${st.tfRef}; ${st.trigger}`;
-    base.push({ name: st.name, score: s, reason });
   }
 
-  // Sort desc score
-  base.sort((a,b) => b.score - a.score);
-
-  return base;
-}
-
-function _renderTournamentSection(sorted: Array<{name:string;score:number;reason:string}>): string {
-  const top = sorted.slice(0, 24); // up to 24
-  const lines = top.map(r => `- ${r.name} — ${r.score} — ${r.reason}`);
-  return `Candidate Scores (tournament):\n${lines.join("\n")}\n`;
-}
-
-function _dropExistingTournamentSections(text: string): string {
-  return text.replace(/Candidate\s*Scores\s*\(tournament\)\s*:?\s*[\s\S]*?(?=\n\s*(?:Final\s*Table\s*Summary|Detected\s*Structures|\*\*Detected\s*Structures|Full\s*Breakdown|Option\s*1|Option\s*2|ai_meta|$))/gi, "");
-}
-
-function _insertTournamentSection(text: string, section: string): string {
-  if (/Final\s*Table\s*Summary\s*:/i.test(text)) {
-    return text.replace(/(\n\s*Final\s*Table\s*Summary\s*:)/i, `\n${section}\n$1`);
+  // Dedupe by strategy name (left of first em-dash)
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const ln of bullets) {
+    const name = (ln.split("—")[0] || ln).replace(/^[-•]\s*/, "").trim().toLowerCase();
+    if (!seen.has(name)) { seen.add(name); deduped.push(ln); }
   }
-  if (/Detected\s*Structures\s*\(X-ray\)/i.test(text)) {
-    return text.replace(
-      /(Detected\s*Structures\s*\(X-ray\)[\s\S]*?)(?=\n\s*(?:Final\s*Table\s*Summary|Full\s*Breakdown|ai_meta|$))/i,
+
+  // Compliance: ≥5 total, ≥3 non-sweep/BOS, each bullet cites TFs
+  const nonSweep = deduped.filter(l => !/(sweep|liquidity|stop\s*hunt|bos\b|choch\b)/i.test(l));
+  const hasTFs = deduped.every(l => /\b(4H|1H|15m|5m|1m)\b/i.test(l));
+
+  let section: string;
+  if (deduped.length >= 5 && nonSweep.length >= 3 && hasTFs) {
+    section = `Candidate Scores (tournament):\n${deduped.join("\n")}\n`;
+  } else {
+    // Deterministic, TF-aware stub (no placeholders)
+    const stub = [
+      "- OB+FVG pullback — 70 — 4H/1H aligned; 15m anchor; 5m confirmation",
+      "- TL break + retest — 66 — 1H break; 15m retest; 5m BOS for entry",
+      "- Range rotation — 64 — 1H range bounds; 15m EQ; 5m rejection then shift",
+      "- Momentum breakout — 62 — 1H squeeze resolves; 15m base; 5m ignition",
+      "- VWAP fade — 60 — session VWAP confluence; 15m structure; 5m sweep then shift",
+    ].join("\n");
+    section = `Candidate Scores (tournament):\n${stub}\n`;
+  }
+
+  // Remove all existing tournament sections
+  let out = text.replace(SECT_G, "");
+
+  // Insert before Final Table Summary:, else after X-ray, else append
+  if (/Final\s*Table\s*Summary\s*:/.test(out)) {
+    out = out.replace(/(\n\s*Final\s*Table\s*Summary\s*:)/i, `\n${section}\n$1`);
+  } else if (/Detected\s*Structures\s*\(X-ray\)/i.test(out)) {
+    out = out.replace(
+      /(Detected\s*Structures\s*\(X-ray\)[\s\S]*?)(?=\n\s*(?:Final\s*Table\s*Summary|Full\s*Breakdown|$))/i,
       (m) => `${m}\n${section}\n`
     );
-  }
-  return `${text}\n\n${section}`;
-}
-
-function _stampSetups(text: string, winners: string[]) {
-  const top1 = winners[0] || "—";
-  const top2 = winners[1] || "—";
-  const top3 = winners[2] || "—";
-
-  const blocks = [
-    { re: /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
-    { re: /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
-    { re: /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i },
-  ];
-
-  function patchBlock(block: string, idx: number): string {
-    const setupLine = block.match(/^\s*•\s*Setup\s*:\s*.*$/mi);
-    const payload = idx === 0 ? `${top1}` : (idx === 1 ? `${top1} | ${top2}` : `${top2} | ${top3}`);
-    const line = `• Setup: ${payload}`;
-    if (setupLine) return block.replace(/^\s*•\s*Setup\s*:\s*.*$/mi, line);
-    // insert under Trigger if possible
-    if (/^\s*•\s*Trigger\s*:/mi.test(block)) {
-      return block.replace(/(^\s*•\s*Trigger\s*:[^\n]*\n)/mi, `$1${line}\n`);
-    }
-    // else append at end of block
-    return block.replace(/$/, `\n${line}`);
+  } else {
+    out = `${out}\n\n${section}`;
   }
 
-  let out = text;
-  for (let i = 0; i < blocks.length; i++) {
-    const m = out.match(blocks[i].re);
-    if (!m) continue;
-    out = out.replace(m[0], patchBlock(m[0], i));
-  }
   return out;
 }
-
-/** Public: build tournament + inject + stamp setups */
-function applyTournamentEngine(args: {
-  text: string;
-  instrument: string;
-  mode: ModeTag;
-  fundamentalsSign: -1|0|1;
-  proximityFlag: boolean;
-}) {
-  const scored = _scoreStrategies(args.text, args.mode, args.fundamentalsSign, args.proximityFlag);
-  const section = _renderTournamentSection(scored);
-  let out = _dropExistingTournamentSections(args.text);
-  out = _insertTournamentSection(out, section);
-  const winners = scored.map(s => s.name);
-  out = _stampSetups(out, winners);
-  return out;
-}
-
 
 
 /** Deterministically build & insert "Option 1 (Primary)" if missing.
@@ -2560,19 +2340,34 @@ function computeAndInjectConviction(
   out = writeConv(out, RE_O2_BLOCK, convO2);
 
   // ---- Hard-gate Option2 distinctness (sync) ----
-  // (removed) Duplicate sync distinctness check; the async enforceOption2DistinctHard runs later in the pipeline.
-
+  out = enforceOption2DistinctHardSync("EURUSD", out);
 
   return out;
 }
 
-/** (deprecated) Legacy sync Option 2 distinctness checker — kept as no-op for compatibility.
- *  Use enforceOption2DistinctHard (async) from MEGA PATCH instead.
- */
-function enforceOption2DistinctHardSync(_instrument: string, text: string): string {
+/** Ensures Option 2 is distinct from Option 1 without async */
+function enforceOption2DistinctHardSync(instrument: string, text: string): string {
+  if (!text) return text;
+
+  const o1 = text.match(/Option\s*1[\s\S]*?(?=\n\s*Option\s*2|$)/i)?.[0] || "";
+  const o2 = text.match(/Option\s*2[\s\S]*?(?=\n\s*Full\s*Breakdown|$)/i)?.[0] || "";
+
+  if (!o1 || !o2) return text;
+
+  const stratKeywords = ["bos", "break of structure", "liquidity", "sweep", "breakout", "retest", "mean reversion"];
+  const findBucket = (block: string) =>
+    stratKeywords.find((k) => block.toLowerCase().includes(k)) || "other";
+
+  const bucketO1 = findBucket(o1);
+  const bucketO2 = findBucket(o2);
+
+  if (bucketO1 === bucketO2) {
+    const fixedO2 = o2.replace(/(Trigger:\s*)(.*)/i, `$1Alternative setup based on different structure (e.g. liquidity sweep if O1 was BOS, or BOS if O1 was sweep). Distinct from Option 1.`);
+    return text.replace(o2, fixedO2);
+  }
+
   return text;
 }
-
 
 /** Final table row filler (with entry zone enforcement, fixed thousands parsing). */
 function fillFinalTableSummaryRow(text: string, instrument: string) {
@@ -2734,9 +2529,23 @@ function normalizeOrderTypeLines(text: string, aiMeta: any) {
   return out;
 }
 
-/** Normalize Order Type based on Trigger using MEGA PATCH desiredOrder (confirmation-first). */
+/** NEW: If trigger says BOS/breakout/close-below, prefer Stop orders; fix Limit/Stop mismatch. */
 function _normalizeOrderTypeByTrigger(text: string): string {
-  const { qp, o1, o2 } = _pickBlocks(text);
+  const { qp, o1, o2, RE_QP, RE_O1, RE_O2 } = _pickBlocks(text);
+
+  function desiredOrder(type: "long" | "short", triggerLine: string): "Market" | "Buy Stop" | "Sell Stop" | "Buy Limit" | "Sell Limit" {
+    const trig = triggerLine.toLowerCase();
+    const isBreak = /(bos|break\s+of\s+structure|close\s+(above|below)|break(out)?|breach)/i.test(trig);
+    if (isBreak) {
+      return type === "long" ? "Buy Stop" : "Sell Stop";
+    }
+    // pullback/tap style
+    const isTap = /(tap|retest|pullback|mitigation|fvg|order\s*block|ob|supply|demand)/i.test(trig);
+    if (isTap) {
+      return type === "long" ? "Buy Limit" : "Sell Limit";
+    }
+    return type === "long" ? "Market" : "Market";
+  }
 
   function fixInBlock(src: string, block: string) {
     const dirM = block.match(/^\s*•\s*Direction:\s*(Long|Short)/mi);
@@ -2744,13 +2553,10 @@ function _normalizeOrderTypeByTrigger(text: string): string {
     const ordM  = block.match(/^\s*•\s*Order\s*Type:\s*([^\n]+)/mi);
     if (!dirM || !trigM || !ordM) return src;
 
-    const want = desiredOrder(
-      dirM[1].toLowerCase() === "long" ? "long" : "short",
-      trigM[1]
-    );
-    const cur = ordM[1].trim();
+    const want = desiredOrder(dirM[1].toLowerCase() === "long" ? "long" : "short", trigM[1]);
+    const cur  = ordM[1].trim();
 
-    if (cur.toLowerCase() !== String(want).toLowerCase()) {
+    if (cur.toLowerCase() !== want.toLowerCase()) {
       const patched = block.replace(/(^\s*•\s*Order\s*Type:\s*)([^\n]+)/mi, `$1${want}`);
       src = src.replace(block, patched);
     }
@@ -2763,7 +2569,6 @@ function _normalizeOrderTypeByTrigger(text: string): string {
   if (o2) out = fixInBlock(out, o2);
   return out;
 }
-
 
 /* =========================
    MEGA PATCH 1 (AtoL-Ω)
@@ -4060,40 +3865,43 @@ if (mode === "expand") {
     scalpingHard: false
   });
 
-// pixel-based RAW SWING MAP injection (images → map) — PRE-LLM, prepend to prompt (safe for parts or string)
-const __swingExp = await generateRawSwingMapFromImages({
-  h4: c.h4, h1: c.h1, m15: c.m15, m5: c.m5 || null, m1: null
-});
-if (__swingExp.rawSwingMap && Array.isArray(messages)) {
-  const userMsg = messages.find((m: any) => m && m.role === "user");
-  if (userMsg && userMsg.content != null) {
-    if (Array.isArray(userMsg.content)) {
-      userMsg.content.unshift({ type: "text", text: `${__swingExp.rawSwingMap}\n---\n` });
-    } else if (typeof userMsg.content === "string") {
-      userMsg.content = `${__swingExp.rawSwingMap}\n---\n${userMsg.content}`;
-    }
-  }
-}
-let text = await callOpenAI(modelExpand, messages);
+  let text = await callOpenAI(modelExpand, messages);
+// pixel-based RAW SWING MAP injection (images → map)
+const _injExp = await tryInjectRawSwingMapIntoText(text, { h4: c.h4, h1: c.h1, m15: c.m15, m5: c.m5 || null, m1: null });
+text = _injExp.text;
 
+   // Minimum scaffold & options
+  text = await enforceQuickPlan(modelExpand, c.instrument, text);
+  text = await enforceOption1(modelExpand, c.instrument, text);
+  text = await enforceOption2(modelExpand, c.instrument, text);
 
-  // Keep only visibility & usage stamps here; consolidation handled by _applyMegaPostGenChain
+  // Enforce structure directly from RAW SWING MAP (truth source)
+  text = _applyRawSwingMap(text);
+
+  // Replace placeholder tournament injection...
+  text = await enforceTournamentDiversity(modelExpand, c.instrument, text);
+  text = dedupeTournamentSections(text); // keep only the best tournament block before Final Table
+
+  // Calendar visibility + stamps
   text = ensureCalendarVisibilityInQuickPlan(text, { instrument: c.instrument, preReleaseOnly: false, biasLine: calAdv.text || null });
   const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
   text = stampM5Used(text, usedM5);
 
+    // Polish & structure guards (spacing + BOS wording + HTF reconciliation + trigger specificity)
+  text = _clarifyBOSWording(text);
+  text = normalizeTriggerSpacing(text); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
+  text = _reconcileHTFTrendFromText(text);
+  // NEW: enforce HTF/LTF structure from RAW SWING MAP (map has final authority over X-ray/TV lines)
+  text = _applyRawSwingMap(text);
+  text = await enforceTriggerSpecificity(modelExpand, c.instrument, text);
 
-  // Final post-gen consolidation (MEGA PATCH)
-  text = await _applyMegaPostGenChain({
-    text,
-    instrument: c.instrument,
-    fundamentalsSign: Number(parseInstrumentBiasFromNote(calAdv.biasNote)) as -1 | 0 | 1,
-    scalping: false,
-    scalpingHard: false
-  });
 
-  // Enforce HTF truth-table & sync Technical View to RAW SWING MAP
-  text = _fixChartVerdictsBlock(text);
+
+  // Ensure breakdown skeleton + final table heading, then normalize entry zone rendering
+  text = await enforceFullBreakdownSkeleton(modelExpand, c.instrument, text);
+  text = enforceFinalTableSummary(text, c.instrument);
+  text = enforceEntryZoneUsage(text, c.instrument);
+
 
   // Provenance footer
   const footer = buildServerProvenanceFooter({
@@ -4111,7 +3919,6 @@ let text = await callOpenAI(modelExpand, messages);
     text,
     meta: { instrument: c.instrument, cacheKey, model: modelExpand, vp_version: VP_VERSION }
   });
-
 }
 
     // ---------- multipart ----------
@@ -4295,9 +4102,8 @@ let text = await callOpenAI(modelExpand, messages);
       scalping_hard_mode: !!scalpingHard
     };
 
-  /* MODED GENERATION (FULL + FAST) — chart-first */
-const messages = (mode === "fast"
-  ? messagesFastStage1({
+    // ---------- FULL ----------
+    const messages = messagesFull({
       instrument, dateStr, m15, h1, h4, m5, m1,
       calendarDataUrl: calDataUrlForPrompt || undefined,
       calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
@@ -4307,108 +4113,144 @@ const messages = (mode === "fast"
       provenance: provForModel,
       scalping,
       scalpingHard
-    })
-  : messagesFull({
-      instrument, dateStr, m15, h1, h4, m5, m1,
-      calendarDataUrl: calDataUrlForPrompt || undefined,
-      calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
-      headlinesText: headlinesText || undefined,
-      sentimentText,
-      calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
-      provenance: provForModel,
-      scalping,
-      scalpingHard
-    }));
+    });
 
-// pixel-based RAW SWING MAP injection (images → map) — PRE-LLM, prepend to prompt (safe for parts or string)
-const __swingAny = await generateRawSwingMapFromImages({ h4, h1, m15, m5, m1 });
-if (__swingAny.rawSwingMap && Array.isArray(messages)) {
-  const userMsg = messages.find((m: any) => m && m.role === "user");
-  if (userMsg && userMsg.content != null) {
-    if (Array.isArray(userMsg.content)) {
-      userMsg.content.unshift({ type: "text", text: `${__swingAny.rawSwingMap}\n---\n` });
-    } else if (typeof userMsg.content === "string") {
-      userMsg.content = `${__swingAny.rawSwingMap}\n---\n${userMsg.content}`;
-    }
-  }
-}
-let textFull = await callOpenAI(MODEL, messages);
+    let textFull = await callOpenAI(MODEL, messages);
+    // pixel-based RAW SWING MAP injection (images → map)
+const _injFull = await tryInjectRawSwingMapIntoText(textFull, { h4, h1, m15, m5, m1 });
+textFull = _injFull.text;
 
     let aiMetaFull = extractAiMeta(textFull) || {};
 
-// === Post-processing enforcement (MEGA PATCH) ===
-textFull = await _applyMegaPostGenChain({
-  text: textFull,
-  instrument,
-  fundamentalsSign: Number(parseInstrumentBiasFromNote(biasNote)) as -1 | 0 | 1,
-  scalping,
-  scalpingHard
-});
+    // === Post-processing enforcement ===
+    textFull = await enforceQuickPlan(MODEL, instrument, textFull);
+        textFull = await enforceOption1(MODEL, instrument, textFull);
 
-// Extras not covered by MEGA PATCH (risk/news stamps & usage marks)
-textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
-textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
-textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
-textFull = stampM5Used(textFull, !!m5);
-textFull = stampM1Used(textFull, !!m1);
+    // Deterministic fallback: if Option 1 is still missing, copy from Quick Plan
+    if (!/Option\s*1\s*\(?(Primary)?\)?/i.test(textFull)) {
+      const qpMatch = textFull.match(/(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
+      const qpBlock = qpMatch ? qpMatch[0] : "";
 
-// Fundamentals snapshot & alignment (kept intact)
-const fundamentalsSnapshotFull = computeIndependentFundamentals({
-  instrument,
-  calendarSign: parseInstrumentBiasFromNote(biasNote),
-  headlinesBias: hBias,
-  csm,
-  cotCue,
-  warningMinutes
-});
-textFull = ensureFundamentalsSnapshot(textFull, { instrument, snapshot: fundamentalsSnapshotFull, preReleaseOnly, calendarLine: calendarText || null });
-textFull = applyConsistencyGuards(textFull, { fundamentalsSign: fundamentalsSnapshotFull.final.sign as -1 | 0 | 1 });
-textFull = enforceOptionOrderByBias(textFull, fundamentalsSnapshotFull.final.sign);
+      const pick = (labelRe: string) => {
+        const m = qpBlock.match(new RegExp(`^\\s*•\\s*${labelRe}\\s*:\\s*([^\\n]+)`, "mi"));
+        return m ? m[1].trim() : "...";
+      };
 
-// Conviction + final table fill (kept intact)
-textFull = computeAndInjectConviction(textFull, { fundamentals: fundamentalsSnapshotFull, proximityFlag: warningMinutes != null });
-textFull = fillFinalTableSummaryRow(textFull, instrument);
+      const dir = pick("(?:\\*\\*)?Direction(?:\\*\\*)?");
+      const ord = pick("(?:\\*\\*)?Order\\s*Type(?:\\*\\*)?");
+      const trg = pick("(?:\\*\\*)?Trigger(?:\\*\\*)?");
+      const ent = pick("(?:\\*\\*)?Entry(?:\\s*\\(zone\\s*or\\s*single\\))?(?:\\*\\*)?");
+      const sl  = pick("(?:\\*\\*)?Stop\\s*Loss(?:\\*\\*)?");
+      const tps = pick("(?:\\*\\*)?(?:Take\\s*Profit\\(s\\)|TPs?)(?:\\*\\*)?");
+      const cv  = pick("(?:\\*\\*)?Conviction(?:\\*\\*)?");
 
-// VWAP usage detection (kept intact)
-const _txtNoCand = textFull.replace(/Candidate\s*Scores[\s\S]*?Final\s*Table\s*Summary/i, "Final Table Summary");
-const vwap_used_flag =
-  /\bVWAP\b/i.test(_txtNoCand) &&
-  /\b(Setup|Trigger|Order\s*Type|Option\s*1|Option\s*2|Quick\s*Plan)\b/i.test(_txtNoCand);
+      const option1Synth =
+`Option 1 (Primary)
+• Direction: ${dir}
+• Order Type: ${ord}
+• Trigger: ${trg}
+• Entry (zone or single): ${ent}
+• Stop Loss: ${sl}
+• Take Profit(s): ${tps}
+• Conviction: ${/^\d{1,3}\s*%$/.test(cv) ? cv : (cv ? `${cv}` : "...")}
+• Why this is primary: Primary derived from Quick Plan details (HTF guardrails, clean invalidation).`;
 
-// ai_meta patch — keep live price hint; do not alter user numbers with it
-const aiPatchFull = {
-  version: "vp-AtoL-1",
-  instrument,
-  mode,
-  vwap_used: vwap_used_flag,
-  time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
-  max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
-  currentPrice: livePrice ?? null, // HINT ONLY
-  scalping: !!scalping,
-  scalping_hard: !!scalpingHard,
-  fundamentals: {
-    calendar: { sign: fundamentalsSnapshotFull.components.calendar.sign, line: calendarText || null },
-    headlines: { label: fundamentalsSnapshotFull.components.headlines.label, avg: hBias.avg ?? null },
-    csm: { diff: fundamentalsSnapshotFull.components.csm.diff },
-    cot: { sign: fundamentalsSnapshotFull.components.cot.sign, detail: fundamentalsSnapshotFull.components.cot.detail },
-    final: { score: Math.round(fundamentalsSnapshotFull.final.score), label: fundamentalsSnapshotFull.final.label, sign: fundamentalsSnapshotFull.final.sign },
-    reliability: preReleaseOnly ? "low" : "normal"
-  },
-  proximity: { highImpactMins: warningMinutes ?? null },
-  vp_version: VP_VERSION
-};
-textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
+      if (qpBlock) {
+        textFull = textFull.replace(qpBlock, `${qpBlock}\n${option1Synth}\n`);
+      }
+    }
 
-// If ai_meta + trigger semantics show order-type/price mismatch, fix order type ONLY.
-let aiMetaFullNow = extractAiMeta(textFull) || {};
-if (aiMetaFullNow && invalidOrderRelativeToPrice(aiMetaFullNow)) {
-  textFull = normalizeOrderTypeLines(textFull, aiMetaFullNow);
-}
+    textFull = await enforceOption2(MODEL, instrument, textFull);
 
-// Sync RAW SWING MAP verdicts to X-ray & Technical View (truth-guard)
-textFull = _fixChartVerdictsBlock(textFull);
+        // Enforce structure directly from RAW SWING MAP (truth source)
+    textFull = _applyRawSwingMap(textFull);
 
-// (cleanup) Already handled by _applyMegaPostGenChain()
+    // Replace placeholder tournament injection with deterministic diversity/scoring
+    textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
+    textFull = dedupeTournamentSections(textFull); // keep only the best tournament block before Final Table
+
+       // Polish & structure guards
+    textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
+    textFull = _clarifyBOSWording(textFull);
+    textFull = normalizeTriggerSpacing(textFull); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
+    textFull = _reconcileHTFTrendFromText(textFull);
+    // NEW: enforce HTF/LTF structure from RAW SWING MAP (map has final authority over X-ray/TV lines)
+    textFull = _applyRawSwingMap(textFull);
+    textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
+
+
+
+    // Execution & risk guards
+    textFull = enforceEntryZoneUsage(textFull, instrument);
+    textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
+    textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
+    textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
+
+    // Ensure full breakdown scaffold + final table heading placement
+    textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
+    textFull = enforceFinalTableSummary(textFull, instrument);
+
+    // Fundamentals snapshot + alignment copy
+    const fundamentalsSnapshotFull = computeIndependentFundamentals({
+      instrument,
+      calendarSign: parseInstrumentBiasFromNote(biasNote),
+      headlinesBias: hBias,
+      csm,
+      cotCue,
+      warningMinutes
+    });
+    textFull = ensureFundamentalsSnapshot(textFull, { instrument, snapshot: fundamentalsSnapshotFull, preReleaseOnly, calendarLine: calendarText || null });
+    textFull = applyConsistencyGuards(textFull, { fundamentalsSign: fundamentalsSnapshotFull.final.sign as -1 | 0 | 1 });
+    textFull = enforceOptionOrderByBias(textFull, fundamentalsSnapshotFull.final.sign);
+
+    // Conviction + final table values (fill → enforce order to keep parity and avoid truncation)
+    textFull = computeAndInjectConviction(textFull, { fundamentals: fundamentalsSnapshotFull, proximityFlag: warningMinutes != null });
+    textFull = fillFinalTableSummaryRow(textFull, instrument);
+    textFull = enforceEntryZoneUsage(textFull, instrument);
+
+    // Determine if VWAP is truly used (ignore candidate list; look only at actionable parts)
+    const _txtNoCand = textFull.replace(/Candidate\s*Scores[\s\S]*?Final\s*Table\s*Summary/i, "Final Table Summary");
+    const vwap_used_flag =
+      /\bVWAP\b/i.test(_txtNoCand) &&
+      /\b(Setup|Trigger|Order\s*Type|Option\s*1|Option\s*2|Quick\s*Plan)\b/i.test(_txtNoCand);
+
+    // ai_meta patch — keep live price hint, but never modify user numbers with it
+    const aiPatchFull = {
+      version: "vp-AtoL-1",
+      instrument,
+      mode,
+      vwap_used: vwap_used_flag,
+      time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
+      max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
+      currentPrice: livePrice ?? null, // HINT ONLY
+      scalping: !!scalping,
+      scalping_hard: !!scalpingHard,
+      fundamentals: {
+        calendar: { sign: fundamentalsSnapshotFull.components.calendar.sign, line: calendarText || null },
+        headlines: { label: fundamentalsSnapshotFull.components.headlines.label, avg: hBias.avg ?? null },
+        csm: { diff: fundamentalsSnapshotFull.components.csm.diff },
+        cot: { sign: fundamentalsSnapshotFull.components.cot.sign, detail: fundamentalsSnapshotFull.components.cot.detail },
+        final: { score: Math.round(fundamentalsSnapshotFull.final.score), label: fundamentalsSnapshotFull.final.label, sign: fundamentalsSnapshotFull.final.sign },
+        reliability: preReleaseOnly ? "low" : "normal"
+      },
+      proximity: { highImpactMins: warningMinutes ?? null },
+      vp_version: VP_VERSION
+    };
+    textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
+
+    // If the ai_meta + trigger semantics produced an order-type/price mismatch, fix order type ONLY.
+    let aiMetaFullNow = extractAiMeta(textFull) || {};
+    if (aiMetaFullNow && invalidOrderRelativeToPrice(aiMetaFullNow)) {
+      textFull = normalizeOrderTypeLines(textFull, aiMetaFullNow);
+    }
+
+    // Hard-gate: Option 2 must be a distinct playbook, then re-normalize entry zone & ai_meta footer once more
+    textFull = await enforceOption2DistinctHard(MODEL, instrument, textFull);
+    textFull = enforceEntryZoneUsage(textFull, instrument);
+    textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
+
+// >>> enforce HTF truth-table & sync Technical View to RAW SWING MAP
+    textFull = _fixChartVerdictsBlock(textFull);
     
     // Provenance footer
     const footer = buildServerProvenanceFooter({
@@ -4441,7 +4283,6 @@ textFull = _fixChartVerdictsBlock(textFull);
     });
 
 // --- END CHART VERDICT GUARD ---
-
 
   } catch (err: any) {
     return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
