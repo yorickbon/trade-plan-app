@@ -2734,23 +2734,9 @@ function normalizeOrderTypeLines(text: string, aiMeta: any) {
   return out;
 }
 
-/** NEW: If trigger says BOS/breakout/close-below, prefer Stop orders; fix Limit/Stop mismatch. */
+/** Normalize Order Type based on Trigger using MEGA PATCH desiredOrder (confirmation-first). */
 function _normalizeOrderTypeByTrigger(text: string): string {
-  const { qp, o1, o2, RE_QP, RE_O1, RE_O2 } = _pickBlocks(text);
-
-  function desiredOrder(type: "long" | "short", triggerLine: string): "Market" | "Buy Stop" | "Sell Stop" | "Buy Limit" | "Sell Limit" {
-    const trig = triggerLine.toLowerCase();
-    const isBreak = /(bos|break\s+of\s+structure|close\s+(above|below)|break(out)?|breach)/i.test(trig);
-    if (isBreak) {
-      return type === "long" ? "Buy Stop" : "Sell Stop";
-    }
-    // pullback/tap style
-    const isTap = /(tap|retest|pullback|mitigation|fvg|order\s*block|ob|supply|demand)/i.test(trig);
-    if (isTap) {
-      return type === "long" ? "Buy Limit" : "Sell Limit";
-    }
-    return type === "long" ? "Market" : "Market";
-  }
+  const { qp, o1, o2 } = _pickBlocks(text);
 
   function fixInBlock(src: string, block: string) {
     const dirM = block.match(/^\s*•\s*Direction:\s*(Long|Short)/mi);
@@ -2758,10 +2744,13 @@ function _normalizeOrderTypeByTrigger(text: string): string {
     const ordM  = block.match(/^\s*•\s*Order\s*Type:\s*([^\n]+)/mi);
     if (!dirM || !trigM || !ordM) return src;
 
-    const want = desiredOrder(dirM[1].toLowerCase() === "long" ? "long" : "short", trigM[1]);
-    const cur  = ordM[1].trim();
+    const want = desiredOrder(
+      dirM[1].toLowerCase() === "long" ? "long" : "short",
+      trigM[1]
+    );
+    const cur = ordM[1].trim();
 
-    if (cur.toLowerCase() !== want.toLowerCase()) {
+    if (cur.toLowerCase() !== String(want).toLowerCase()) {
       const patched = block.replace(/(^\s*•\s*Order\s*Type:\s*)([^\n]+)/mi, `$1${want}`);
       src = src.replace(block, patched);
     }
@@ -2774,6 +2763,7 @@ function _normalizeOrderTypeByTrigger(text: string): string {
   if (o2) out = fixInBlock(out, o2);
   return out;
 }
+
 
 /* =========================
    MEGA PATCH 1 (AtoL-Ω)
