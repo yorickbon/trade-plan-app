@@ -17,6 +17,7 @@
     "openai": "^4.0.0",
     "formidable": "^3.5.1",
     "sharp": "^0.33.3"
+    "jimp": "^0.22.10",
   },
   "devDependencies": {
     "typescript": "^5.4.2",
