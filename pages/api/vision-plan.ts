@@ -432,7 +432,7 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
 }
 
 
-// ---------- CSM (intraday, patched for speed + correctness) ----------
+// ---------- CSM (intraday, robust & null-safe) ----------
 const G8 = ["USD", "EUR", "JPY", "GBP", "CHF", "CAD", "AUD", "NZD"];
 const USD_PAIRS = ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDJPY", "USDCHF", "USDCAD"];
 type Series = { t: number[]; c: number[] };
@@ -445,7 +445,7 @@ function kbarReturn(closes: number[], k: number): number | null {
   return Math.log(a / b);
 }
 
-// ------------------ Providers ------------------
+// Providers (unchanged signatures). Each may return null; we pick the first that works.
 async function tdSeries15(pair: string): Promise<Series | null> {
   if (!TD_KEY) return null;
   try {
@@ -484,7 +484,7 @@ async function fhSeries15(pair: string): Promise<Series | null> {
 async function polySeries15(pair: string): Promise<Series | null> {
   if (!POLY_KEY) return null;
   try {
-    const ticker = `C:${pair}`;
+    const ticker = `C:${pair}`; // Verified/adjusted in Patch E; safe to try here.
     const to = new Date();
     const from = new Date(to.getTime() - 6 * 60 * 60 * 1000);
     const fmt = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -500,39 +500,37 @@ async function polySeries15(pair: string): Promise<Series | null> {
   } catch { return null; }
 }
 
-// ------------------ Parallel Fetch ------------------
+// Pick first successful provider (TD → FH → Polygon) for each pair.
 async function fetchSeries15(pair: string): Promise<Series | null> {
-  const [td, fh, pg] = await Promise.allSettled([
-    tdSeries15(pair),
-    fhSeries15(pair),
-    polySeries15(pair)
-  ]);
-
-  const results = [td, fh, pg]
-    .map(r => (r.status === "fulfilled" ? r.value : null))
-    .filter(Boolean) as Series[];
-
+  const [td, fh, pg] = await Promise.allSettled([tdSeries15(pair), fhSeries15(pair), polySeries15(pair)]);
+  const results = [td, fh, pg].map((r) => (r.status === "fulfilled" ? r.value : null)).filter(Boolean) as Series[];
   return results.length > 0 ? results[0] : null;
 }
 
+// Compute CSM using whatever pairs are available; if coverage too low, return null to trigger fallback/neutral path.
 function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnapshot | null {
   const weights = { r60: 0.6, r240: 0.4 };
   const curScore: Record<string, number> = Object.fromEntries(G8.map((c) => [c, 0]));
+  let usedPairs = 0;
 
   for (const pair of USD_PAIRS) {
     const S = seriesMap[pair];
     if (!S || !Array.isArray(S.c) || S.c.length < 17) continue;
 
-    // 60m ≈ 4 bars of 15m, 240m ≈ 16 bars
-    const r60 = kbarReturn(S.c, 4) ?? 0;
-    const r240 = kbarReturn(S.c, 16) ?? 0;
+    const r60 = kbarReturn(S.c, 4) ?? 0;   // 60m ≈ 4×15m
+    const r240 = kbarReturn(S.c, 16) ?? 0; // 240m ≈ 16×15m
     const r = r60 * weights.r60 + r240 * weights.r240;
 
     const base = pair.slice(0, 3);
     const quote = pair.slice(3);
     curScore[base] += r;
     curScore[quote] -= r;
+    usedPairs++;
   }
+
+  // Require a minimal coverage; otherwise caller will return neutral/last-cache
+  const MIN_COVERAGE = 4; // out of 7 USD majors
+  if (usedPairs < MIN_COVERAGE) return null;
 
   const vals = G8.map((c) => curScore[c]);
   if (!vals.every((v) => Number.isFinite(v))) return null;
@@ -553,13 +551,24 @@ function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnaps
   };
 }
 
+// Build a neutral snapshot (all zeros) that keeps type compatibility and avoids crashes downstream.
+function neutralCSMSnapshot(): CsmSnapshot {
+  const zeroScores = Object.fromEntries(G8.map((c) => [c, 0]));
+  return {
+    tsISO: new Date().toISOString(),
+    ranks: [...G8],        // alphabetical/constant order is fine when neutral
+    scores: zeroScores as Record<string, number>,
+    ttl: Date.now() + 5 * 60 * 1000, // short TTL; we’ll try again soon
+  };
+}
+
 async function getCSM(): Promise<CsmSnapshot> {
-  // Use cache only if snapshot is still fresh
+  // Fresh cache?
   if (CSM_CACHE && Date.now() < CSM_CACHE.ttl) {
     return CSM_CACHE;
   }
 
-  // Fetch all pairs in parallel for speed
+  // Fetch all pairs concurrently
   const entries = await Promise.all(
     USD_PAIRS.map(async (p) => [p, await fetchSeries15(p)] as [string, Series | null])
   );
@@ -568,16 +577,25 @@ async function getCSM(): Promise<CsmSnapshot> {
   const snap = computeCSMFromPairs(seriesMap);
 
   if (!snap) {
-    // Fallback to last cached snapshot if available
+    // Dev-time visibility into coverage problems
+    if (process.env.NODE_ENV !== "production") {
+      const have = USD_PAIRS.filter((p) => seriesMap[p]?.c?.length).length;
+      console.warn(`[vision-plan] CSM coverage low or providers unavailable (have=${have}/${USD_PAIRS.length}). Using cache or neutral.`);
+    }
+    // Prefer last valid cache if still within TTL (double-check)
     if (CSM_CACHE && Date.now() < CSM_CACHE.ttl) {
       return CSM_CACHE;
     }
-    throw new Error("CSM unavailable (fetch failed and no valid cache).");
+    // Final fallback: neutral snapshot (never throw)
+    const neutral = neutralCSMSnapshot();
+    CSM_CACHE = neutral;
+    return neutral;
   }
 
   CSM_CACHE = snap;
   return snap;
 }
+
 
 // ---------- COT cue (optional via headlines) ----------
 type CotCue = { method: "headline_fallback"; reportDate: null; summary: string; net: Record<string, number>; };
