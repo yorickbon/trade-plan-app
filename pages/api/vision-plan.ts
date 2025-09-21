@@ -4086,12 +4086,22 @@ if (mode === "expand") {
     scalpingHard: false
   });
 
-// pixel-based RAW SWING MAP injection (images → map) — PRE-LLM, prepend to prompt
-const __swingExp = await generateRawSwingMapFromImages({ h4: c.h4, h1: c.h1, m15: c.m15, m5: c.m5 || null, m1: null });
-if (__swingExp.rawSwingMap && Array.isArray(messages) && messages[1] && (messages[1] as any).content) {
-  messages[1] = { ...(messages[1] as any), content: `${__swingExp.rawSwingMap}\n---\n${(messages[1] as any).content}` };
+// pixel-based RAW SWING MAP injection (images → map) — PRE-LLM, prepend to prompt (safe for parts or string)
+const __swingExp = await generateRawSwingMapFromImages({
+  h4: c.h4, h1: c.h1, m15: c.m15, m5: c.m5 || null, m1: null
+});
+if (__swingExp.rawSwingMap && Array.isArray(messages)) {
+  const userMsg = messages.find((m: any) => m && m.role === "user");
+  if (userMsg && userMsg.content != null) {
+    if (Array.isArray(userMsg.content)) {
+      userMsg.content.unshift({ type: "text", text: `${__swingExp.rawSwingMap}\n---\n` });
+    } else if (typeof userMsg.content === "string") {
+      userMsg.content = `${__swingExp.rawSwingMap}\n---\n${userMsg.content}`;
+    }
+  }
 }
 let text = await callOpenAI(modelExpand, messages);
+
 
 
    // Minimum scaffold & options
