@@ -2338,7 +2338,8 @@ function computeAndInjectConviction(
   out = writeConv(out, RE_O2_BLOCK, convO2);
 
   // ---- Hard-gate Option2 distinctness (sync) ----
-  out = enforceOption2DistinctHardSync("EURUSD", out);
+  // (removed) Duplicate sync distinctness check; the async enforceOption2DistinctHard runs later in the pipeline.
+
 
   return out;
 }
