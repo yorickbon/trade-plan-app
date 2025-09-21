@@ -303,6 +303,7 @@ function headlinesToPromptLines(items: AnyHeadline[], limit = 6): string | null 
 }
 
 // Cache for headline parsing to avoid reprocessing identical text
+// KEY NOW INCLUDES TITLES **AND** SENTIMENT SCORES to avoid stale cache when scores change.
 const HEADLINE_CACHE = new Map<string, HeadlineBias>();
 
 function computeHeadlinesBias(items: AnyHeadline[]): HeadlineBias {
@@ -310,16 +311,24 @@ function computeHeadlinesBias(items: AnyHeadline[]): HeadlineBias {
     return { label: "unavailable", avg: null, count: 0 };
   }
 
-  // Use concatenated text as cache key
-  const rawKey = items.map(h => h?.title || "").join("|");
+  // Include both title and score in the cache key to prevent stale bias on score updates
+  const rawKey = items
+    .map((h) => {
+      const title = h?.title || "";
+      const sc = typeof h?.sentiment?.score === "number" ? Number(h.sentiment!.score).toFixed(3) : "ns";
+      return `${title}::${sc}`;
+    })
+    .join("|");
+
   if (HEADLINE_CACHE.has(rawKey)) {
     return HEADLINE_CACHE.get(rawKey)!;
   }
 
   const scores = items
-    .map(h => (typeof h?.sentiment?.score === "number" ? Number(h.sentiment!.score) : null))
-    .filter(v => Number.isFinite(v)) as number[];
+    .map((h) => (typeof h?.sentiment?.score === "number" ? Number(h.sentiment!.score) : null))
+    .filter((v) => Number.isFinite(v)) as number[];
 
+  // If we have headlines but no numeric scores, bias is "unavailable" (we do NOT fabricate)
   if (scores.length === 0) {
     const out: HeadlineBias = { label: "unavailable", avg: null, count: 0 };
     HEADLINE_CACHE.set(rawKey, out);
@@ -342,20 +351,33 @@ async function fetchedHeadlinesViaServer(
   req: NextApiRequest,
   instrument: string
 ): Promise<{ items: AnyHeadline[]; promptText: string | null; provider: string }> {
-  try {
-    const base = originFromReq(req);
-    const url = `${base}/api/news?instrument=${encodeURIComponent(instrument)}&hours=48&max=12&_t=${Date.now()}`;
+  const base = originFromReq(req);
+  const url = `${base}/api/news?instrument=${encodeURIComponent(instrument)}&hours=48&max=12&_t=${Date.now()}`;
 
-    // Parallelize fetch + json parse
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(2500) });
+  // Small helper: one attempt with 3s timeout
+  const fetchOnce = async () => {
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(3000) });
     if (!r.ok) throw new Error(`Headlines fetch failed: ${r.status}`);
     const j: any = await r.json().catch(() => ({}));
+    return j;
+  };
+
+  try {
+    let j = await fetchOnce();
+    // Retry once if items are missing/empty (network hiccup or cold start)
+    if (!j || !Array.isArray(j?.items) || j.items.length === 0) {
+      try {
+        j = await fetchOnce();
+      } catch {
+        // swallow retry error; will fall through to empty below
+      }
+    }
 
     const items: AnyHeadline[] = Array.isArray(j?.items) ? j.items : [];
     const provider = String(j?.provider || "unknown");
 
-    // Deduplicate & sanitize items
-    const deduped = Array.from(new Map(items.map(i => [i.title, i])).values());
+    // Deduplicate by title
+    const deduped = Array.from(new Map(items.map((i) => [i.title, i])).values());
 
     return { items: deduped, promptText: headlinesToPromptLines(deduped, 6), provider };
   } catch (err) {
