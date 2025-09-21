@@ -3864,10 +3864,13 @@ if (mode === "expand") {
     scalpingHard: false
   });
 
-  let text = await callOpenAI(modelExpand, messages);
-// pixel-based RAW SWING MAP injection (images → map)
-const _injExp = await tryInjectRawSwingMapIntoText(text, { h4: c.h4, h1: c.h1, m15: c.m15, m5: c.m5 || null, m1: null });
-text = _injExp.text;
+// pixel-based RAW SWING MAP injection (images → map) — PRE-LLM, prepend to prompt
+const __swingExp = await generateRawSwingMapFromImages({ h4: c.h4, h1: c.h1, m15: c.m15, m5: c.m5 || null, m1: null });
+if (__swingExp.rawSwingMap && Array.isArray(messages) && messages[1] && (messages[1] as any).content) {
+  messages[1] = { ...(messages[1] as any), content: `${__swingExp.rawSwingMap}\n---\n${(messages[1] as any).content}` };
+}
+let text = await callOpenAI(modelExpand, messages);
+
 
    // Minimum scaffold & options
   text = await enforceQuickPlan(modelExpand, c.instrument, text);
