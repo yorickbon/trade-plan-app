@@ -2853,8 +2853,14 @@ function _applyRawSwingMap(text: string): string {
 
 /* -------------------------
    7) Heuristic reconciliation when RAW SWING MAP missing (REPLACE)
-   - Keep old behavior but normalize output to match the new X-ray bullets
+   - STRICT: only print TFs that were actually provided by the client
+   - Works for full / fast / scalping because the same writer is used
    ------------------------- */
+
+// Populated by the pixel injector below. Safe default = none.
+let PROVIDED_TFS: {h4:boolean;h1:boolean;m15:boolean;m5:boolean;m1:boolean} =
+  {h4:false,h1:false,m15:false,m5:false,m1:false};
+
 function _reconcileHTFTrendFromText(text: string): string {
   if (!text) return text;
 
@@ -2864,7 +2870,12 @@ function _reconcileHTFTrendFromText(text: string): string {
 
   const raw = text;
   const lower = raw.toLowerCase();
-  function readTF(tf: '4H'|'1H'|'15m'|'5m'|'1m'): string {
+
+  type Dir = 'up'|'down'|'range'|'';
+  const word  = (d: Dir) => d === 'up' ? 'Uptrend'  : d === 'down' ? 'Downtrend'  : 'Range';
+  const micro = (d: Dir) => d === 'up' ? 'Micro up' : d === 'down' ? 'Micro down' : 'Micro range';
+
+  function readLine(tf: '4H'|'1H'|'15m'|'5m'|'1m'): string {
     const tfEsc = tf.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
     const reX  = new RegExp(`^\\s*[-•]\\s*${tfEsc}\\s*(?:\\(if\\s*used\\))?\\s*:\\s*([^\\n]*)`, 'mi');
     const reTV = new RegExp(`(Technical\\s*View[\\s\\S]{0,800}?${tfEsc}:\\s*)([^\\n]*)`, 'i');
@@ -2874,12 +2885,12 @@ function _reconcileHTFTrendFromText(text: string): string {
     if (mT) return (mT[2] || '').trim();
     return '';
   }
-  type Dir = 'up'|'down'|'range'|'';
+
   function classify(desc: string): Dir {
     const s = (desc || '').toLowerCase();
     if (!s) return '';
-    const hasHHHL = /\bhh\/hl|higher\s*highs?\b.*\bhigher\s*lows?\b/i.test(s);
-    const hasLHLL = /\blh\/ll|lower\s*highs?\b.*\blower\s*lows?\b/i.test(s);
+    const hasHHHL = /\bhigher\s*highs?\b.*\bhigher\s*lows?\b|\bhh\/hl\b/i.test(s);
+    const hasLHLL = /\blower\s*highs?\b.*\blower\s*lows?\b|\blh\/ll\b/i.test(s);
     const saysUp  = /\b(uptrend|bullish)\b/.test(s);
     const saysDn  = /\b(downtrend|bearish)\b/.test(s);
     const saysRg  = /\b(range|sideways|consolidation|chop)\b/.test(s);
@@ -2891,6 +2902,7 @@ function _reconcileHTFTrendFromText(text: string): string {
     if (saysDn)  return 'down';
     return '';
   }
+
   function planDirSign(): -1|0|1 {
     const mQP = raw.match(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(Long|Short)/i);
     const mO1 = raw.match(/Option\s*1[\s\S]*?Direction\s*:\s*(Long|Short)/i);
@@ -2898,57 +2910,37 @@ function _reconcileHTFTrendFromText(text: string): string {
     return d === 'long' ? 1 : d === 'short' ? -1 : 0;
   }
 
-  const prior4  = readTF('4H');
-  const prior1  = readTF('1H');
-  const prior15 = readTF('15m');
-  const prior5  = readTF('5m');
-  const prior1m = readTF('1m');
+  // Hints
+  const p4  = readLine('4H');
+  const p1  = readLine('1H');
+  const p15 = readLine('15m');
+  const p5  = readLine('5m');
+  const p1m = readLine('1m');
 
-  let d4: Dir  = classify(prior4);
-  let d1: Dir  = classify(prior1);
-  let d15: Dir = classify(prior15);
-
-  if (!d4) {
-    const sign = planDirSign();
-    d4 = sign === 1 ? 'up' : sign === -1 ? 'down' : 'range';
-  }
-  if (!d1) d1 = d4;
-  if (!d15) d15 = d1;
-
-  const word = (d: Dir) => d === 'up' ? 'Uptrend' : d === 'down' ? 'Downtrend' : 'Range';
-  const microWord = (d: Dir) => d === 'up' ? 'Micro up' : d === 'down' ? 'Micro down' : 'Micro range';
-
-  const tail4 =
-      d4 === 'up'   ? '— bullish structure (HH/HL confirmed)'
-    : d4 === 'down' ? '— bearish structure (LH/LL confirmed)'
-                    : '— consolidation / range';
-  const line4 = `Trend: ${word(d4)} ${tail4}`;
+  // Classify with fallbacks
+  let d4: Dir  = classify(p4)  || (planDirSign()===1 ? 'up' : planDirSign()===-1 ? 'down' : 'range');
+  let d1: Dir  = classify(p1)  || d4;
+  let d15: Dir = classify(p15) || d1;
+  let d5: Dir  = classify(p5)  || 'range';
+  let d1m: Dir = classify(p1m) || 'range';
 
   const supCount = (lower.match(/\b(support|demand)\b/gi) || []).length;
   const resCount = (lower.match(/\b(resistance|supply)\b/gi) || []).length;
   const ctx1 = resCount > supCount
     ? '— at resistance/supply; monitor rejection vs break'
     : '— at support/demand; monitor continuation vs pullback';
-  const line1 = `Trend: ${word(d1)} ${ctx1}`;
+  const ct15 = (d4 && d15 && d15 !== d4 && d15 !== d1) ? ' (counter-trend)' : '';
 
-  const ctNote = (d4 && d15 && d15 !== d4 && d15 !== d1) ? ' (counter-trend)' : '';
-  const anchor15 = (prior15 || 'Execution anchors refined from 1H').trim();
-  const line15 = `Trend: ${word(d15)} — ${anchor15}${ctNote}`;
+  // Compose ONLY the TFs actually provided
+  const lines: string[] = [];
+  lines.push(`Detected Structures (X-ray)`);
+  if (PROVIDED_TFS.h4)  lines.push(`• 4H: Trend: ${word(d4)} ${d4==='up'?'— bullish structure (HH/HL confirmed)':d4==='down'?'— bearish structure (LH/LL confirmed)':'— consolidation / range'}`);
+  if (PROVIDED_TFS.h1)  lines.push(`• 1H: Trend: ${word(d1)} ${ctx1}`);
+  if (PROVIDED_TFS.m15) lines.push(`• 15m: Trend: ${word(d15)} — Execution anchors refined from 1H${ct15}`);
+  if (PROVIDED_TFS.m5)  lines.push(`• 5m: Trend: ${micro(d5)} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`);
+  if (PROVIDED_TFS.m1)  lines.push(`• 1m: Trend: ${micro(d1m)} — timing only; CHOCH/BOS micro-shift for entry`);
 
-  const d5  : Dir = classify(prior5)  || 'range';
-  const d1m : Dir = classify(prior1m) || 'range';
-  const line5  = `Trend: ${microWord(d5)} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`;
-  const mentions1m = /\b1m\b/i.test(raw) || /Used\s*Chart:\s*1M/i.test(raw);
-  const line1m = mentions1m ? `Trend: ${microWord(d1m)} — timing only; CHOCH/BOS micro-shift for entry` : 'not used';
-
-  const newX =
-`Detected Structures (X-ray)
-• 4H: ${line4}
-• 1H: ${line1}
-• 15m: ${line15}
-• 5m: ${line5}
-• 1m: ${line1m}
-`;
+  const newX = lines.join('\n') + '\n';
 
   const xraySectRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
   let out = raw;
@@ -2957,9 +2949,10 @@ function _reconcileHTFTrendFromText(text: string): string {
   else if (/Full\s*Breakdown/i.test(out)) out = out.replace(/(\n\s*Full\s*Breakdown)/i, `\n${newX}\n$1`);
   else out = `${out}\n\n${newX}`;
 
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line4}`);
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line1}`);
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line15}`);
+  // Sync Technical View lines that exist
+  if (PROVIDED_TFS.h4)  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m, p1) => `${p1}Trend: ${word(d4)} ${d4==='up'?'— bullish structure (HH/HL confirmed)':d4==='down'?'— bearish structure (LH/LL confirmed)':'— consolidation / range'}`);
+  if (PROVIDED_TFS.h1)  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m, p1) => `${p1}Trend: ${word(d1)} ${ctx1}`);
+  if (PROVIDED_TFS.m15) out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m, p1) => `${p1}Trend: ${word(d15)} — Execution anchors refined from 1H${ct15}`);
 
   return out;
 }
