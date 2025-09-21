@@ -2566,29 +2566,13 @@ function computeAndInjectConviction(
   return out;
 }
 
-/** Ensures Option 2 is distinct from Option 1 without async */
-function enforceOption2DistinctHardSync(instrument: string, text: string): string {
-  if (!text) return text;
-
-  const o1 = text.match(/Option\s*1[\s\S]*?(?=\n\s*Option\s*2|$)/i)?.[0] || "";
-  const o2 = text.match(/Option\s*2[\s\S]*?(?=\n\s*Full\s*Breakdown|$)/i)?.[0] || "";
-
-  if (!o1 || !o2) return text;
-
-  const stratKeywords = ["bos", "break of structure", "liquidity", "sweep", "breakout", "retest", "mean reversion"];
-  const findBucket = (block: string) =>
-    stratKeywords.find((k) => block.toLowerCase().includes(k)) || "other";
-
-  const bucketO1 = findBucket(o1);
-  const bucketO2 = findBucket(o2);
-
-  if (bucketO1 === bucketO2) {
-    const fixedO2 = o2.replace(/(Trigger:\s*)(.*)/i, `$1Alternative setup based on different structure (e.g. liquidity sweep if O1 was BOS, or BOS if O1 was sweep). Distinct from Option 1.`);
-    return text.replace(o2, fixedO2);
-  }
-
+/** (deprecated) Legacy sync Option 2 distinctness checker — kept as no-op for compatibility.
+ *  Use enforceOption2DistinctHard (async) from MEGA PATCH instead.
+ */
+function enforceOption2DistinctHardSync(_instrument: string, text: string): string {
   return text;
 }
+
 
 /** Final table row filler (with entry zone enforcement, fixed thousands parsing). */
 function fillFinalTableSummaryRow(text: string, instrument: string) {
