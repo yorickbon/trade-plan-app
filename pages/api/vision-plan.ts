@@ -1,5 +1,3 @@
-latest good code 21.05.2025
-
 // /pages/api/vision-plan.ts
 /**
  * OCR-first calendar (image priority) — improved acceptance of pre-release rows
