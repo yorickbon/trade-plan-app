@@ -3550,18 +3550,15 @@ type SwingResult = {
 /** Build RAW SWING MAP block for a TF from its image data URL */
 async function buildRawSwingForTF(dataUrl: string | null, timeLabel: string): Promise<{ block: string | null; confidence: number }> {
   if (!dataUrl) return { block: null, confidence: 0 };
-  const img = await loadJimpFromDataUrl(dataUrl);
+  const img = await loadJimpFromDataUrl(dataUrl); // now uses sharp-based loader
   if (!img) return { block: null, confidence: 0 };
-
-  const MAX_W = 1200;
-  if (img.bitmap.width > MAX_W) img.resize(MAX_W, Jimp.AUTO);
 
   const sampleCount = Math.max(80, Math.min(240, Math.floor(img.bitmap.width / 3)));
   const ohlc = estimateOHLCFromImage(img, sampleCount);
   const series = seriesFromOHLC(ohlc);
 
   const swings = detectSwings(series, Math.max(3, Math.floor(sampleCount / 30)));
-  const detectConfidence = Math.min(1, Math.max(0, swings.length / 6)); // heuristic
+  const detectConfidence = Math.min(1, Math.max(0, swings.length / 6));
 
   const { swingsText, verdict } = swingsToVerdict(swings);
 
@@ -3573,6 +3570,7 @@ async function buildRawSwingForTF(dataUrl: string | null, timeLabel: string): Pr
 
   return { block, confidence: detectConfidence };
 }
+
 
 /** Images (4H/1H/15m/5m/1m) → RAW SWING MAP */
 export async function generateRawSwingMapFromImages(images: {
