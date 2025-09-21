@@ -545,24 +545,73 @@ async function fhSeries15(pair: string): Promise<Series | null> {
   } catch { return null; }
 }
 
+// Polygon FX: be strict about support/limits/empties and quietly auto-skip when unsuitable.
 async function polySeries15(pair: string): Promise<Series | null> {
   if (!POLY_KEY) return null;
+
   try {
-    const ticker = `C:${pair}`; // Verified/adjusted in Patch E; safe to try here.
+    // Basic sanity on pair format (e.g., EURUSD, USDJPY, etc.)
+    const P = String(pair || "").toUpperCase();
+    if (!/^[A-Z]{6,10}$/.test(P)) return null;
+
+    // Polygon FX uses the "C:" currency ticker namespace, e.g., C:EURUSD
+    const ticker = `C:${P}`;
+
+    // 6 hours window, 15m bars
     const to = new Date();
     const from = new Date(to.getTime() - 6 * 60 * 60 * 1000);
-    const fmt = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-    const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}/range/15/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=asc&apiKey=${POLY_KEY}`;
+    const fmt = (d: Date) =>
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+    const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(
+      ticker
+    )}/range/15/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=asc&apiKey=${POLY_KEY}`;
+
     const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(2500) });
-    if (!r.ok) return null;
-    const j: any = await r.json();
-    if (!Array.isArray(j?.results)) return null;
-    const t: number[] = j.results.map((x: any) => Math.floor(x.t / 1000));
+
+    // Auto-skip on auth/plan/limit errors (403/429/401) or general network failure
+    if (!r || !r.ok) {
+      if (process.env.NODE_ENV !== "production") {
+        console.warn(`[vision-plan] Polygon FX fetch skipped for ${ticker}: status=${r?.status}`);
+      }
+      return null;
+    }
+
+    const j: any = await r.json().catch(() => ({}));
+    // Known shapes: { status: "OK", results, resultsCount, queryCount } or { status: "ERROR", error }
+    if (!j || j.status !== "OK" || !Array.isArray(j.results) || j.results.length === 0 || j.queryCount === 0) {
+      if (process.env.NODE_ENV !== "production") {
+        const why =
+          !j
+            ? "no-json"
+            : j.status !== "OK"
+            ? `status=${j.status}`
+            : !Array.isArray(j.results) || j.results.length === 0
+            ? "no-results"
+            : "queryCount=0";
+        console.warn(`[vision-plan] Polygon FX returned unusable data for ${ticker} (${why}); auto-skip.`);
+      }
+      return null;
+    }
+
+    // Map to Series and validate numeric closes
+    const t: number[] = j.results.map((x: any) => Math.floor(Number(x.t) / 1000));
     const c: number[] = j.results.map((x: any) => Number(x.c));
-    if (!c.every((x: number) => isFinite(x))) return null;
-    return { t, c };
-  } catch { return null; }
+
+    if (!t.length || !c.length || !c.every((x: number) => Number.isFinite(x))) return null;
+
+    // Require at least 17 closes so kbarReturn(16) is defined downstream; otherwise skip.
+    if (c.length < 17) return null;
+
+     return { t, c };
+  } catch (err) {
+    if (process.env.NODE_ENV !== "production") {
+      console.warn(`[vision-plan] Polygon FX error for ${pair}:`, err);
+    }
+    return null;
+  }
 }
+
 
 // Pick first successful provider (TD → FH → Polygon) for each pair.
 async function fetchSeries15(pair: string): Promise<Series | null> {
