@@ -4149,8 +4149,9 @@ let text = await callOpenAI(modelExpand, messages);
       scalping_hard_mode: !!scalpingHard
     };
 
-    // ---------- FULL ----------
-    const messages = messagesFull({
+  /* MODED GENERATION (FULL + FAST) — chart-first */
+const messages = (mode === "fast"
+  ? messagesFastStage1({
       instrument, dateStr, m15, h1, h4, m5, m1,
       calendarDataUrl: calDataUrlForPrompt || undefined,
       calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
@@ -4160,14 +4161,26 @@ let text = await callOpenAI(modelExpand, messages);
       provenance: provForModel,
       scalping,
       scalpingHard
-    });
+    })
+  : messagesFull({
+      instrument, dateStr, m15, h1, h4, m5, m1,
+      calendarDataUrl: calDataUrlForPrompt || undefined,
+      calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
+      headlinesText: headlinesText || undefined,
+      sentimentText,
+      calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
+      provenance: provForModel,
+      scalping,
+      scalpingHard
+    }));
 
-   // pixel-based RAW SWING MAP injection (images → map) — PRE-LLM, prepend to prompt
-const __swingFull = await generateRawSwingMapFromImages({ h4, h1, m15, m5, m1 });
-if (__swingFull.rawSwingMap && Array.isArray(messages) && messages[1] && (messages[1] as any).content) {
-  messages[1] = { ...(messages[1] as any), content: `${__swingFull.rawSwingMap}\n---\n${(messages[1] as any).content}` };
+// pixel-based RAW SWING MAP injection (images → map) — PRE-LLM, prepend to prompt
+const __swingAny = await generateRawSwingMapFromImages({ h4, h1, m15, m5, m1 });
+if (__swingAny.rawSwingMap && Array.isArray(messages) && messages[1] && (messages[1] as any).content) {
+  messages[1] = { ...(messages[1] as any), content: `${__swingAny.rawSwingMap}\n---\n${(messages[1] as any).content}` };
 }
 let textFull = await callOpenAI(MODEL, messages);
+
 
     let aiMetaFull = extractAiMeta(textFull) || {};
 
@@ -4230,10 +4243,13 @@ let textFull = await callOpenAI(MODEL, messages);
 
 
     // Execution & risk guards
-    textFull = enforceEntryZoneUsage(textFull, instrument);
-    textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
-    textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
-    textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
+  textFull = enforceEntryZoneUsage(textFull, instrument);
+textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
+textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
+textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
+textFull = stampM5Used(textFull, !!m5);
+textFull = stampM1Used(textFull, !!m1);
+
 
     // Ensure full breakdown scaffold + final table heading placement
     textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
