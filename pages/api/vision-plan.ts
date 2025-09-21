@@ -4102,9 +4102,15 @@ let text = await callOpenAI(modelExpand, messages);
   // Enforce structure directly from RAW SWING MAP (truth source)
   text = _applyRawSwingMap(text);
 
-  // Replace placeholder tournament injection...
-  text = await enforceTournamentDiversity(modelExpand, c.instrument, text);
-  text = dedupeTournamentSections(text); // keep only the best tournament block before Final Table
+  // Tournament engine (24 strategies) — structure-first
+text = applyTournamentEngine({
+  text,
+  instrument: c.instrument,
+  mode: 'full',
+  fundamentalsSign: Number(parseInstrumentBiasFromNote(calAdv.biasNote)) as -1 | 0 | 1,
+  proximityFlag: calAdv.warningMinutes != null
+});
+
 
   // Calendar visibility + stamps
   text = ensureCalendarVisibilityInQuickPlan(text, { instrument: c.instrument, preReleaseOnly: false, biasLine: calAdv.text || null });
