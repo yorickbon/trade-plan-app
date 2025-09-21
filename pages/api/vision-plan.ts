@@ -4353,13 +4353,19 @@ const messages = (mode === "fast"
       scalpingHard
     }));
 
-// pixel-based RAW SWING MAP injection (images → map) — PRE-LLM, prepend to prompt
+// pixel-based RAW SWING MAP injection (images → map) — PRE-LLM, prepend to prompt (safe for parts or string)
 const __swingAny = await generateRawSwingMapFromImages({ h4, h1, m15, m5, m1 });
-if (__swingAny.rawSwingMap && Array.isArray(messages) && messages[1] && (messages[1] as any).content) {
-  messages[1] = { ...(messages[1] as any), content: `${__swingAny.rawSwingMap}\n---\n${(messages[1] as any).content}` };
+if (__swingAny.rawSwingMap && Array.isArray(messages)) {
+  const userMsg = messages.find((m: any) => m && m.role === "user");
+  if (userMsg && userMsg.content != null) {
+    if (Array.isArray(userMsg.content)) {
+      userMsg.content.unshift({ type: "text", text: `${__swingAny.rawSwingMap}\n---\n` });
+    } else if (typeof userMsg.content === "string") {
+      userMsg.content = `${__swingAny.rawSwingMap}\n---\n${userMsg.content}`;
+    }
+  }
 }
 let textFull = await callOpenAI(MODEL, messages);
-
 
     let aiMetaFull = extractAiMeta(textFull) || {};
 
