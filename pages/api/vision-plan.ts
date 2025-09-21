@@ -4363,106 +4363,78 @@ let textFull = await callOpenAI(MODEL, messages);
 
     let aiMetaFull = extractAiMeta(textFull) || {};
 
-// === Post-processing enforcement ===
-textFull = await enforceQuickPlan(MODEL, instrument, textFull);
-textFull = await enforceOption1(MODEL, instrument, textFull);
-textFull = await enforceOption2(MODEL, instrument, textFull);
-
-// Enforce structure directly from RAW SWING MAP (truth source)
-textFull = _applyRawSwingMap(textFull);
-
-// Tournament engine (24+ strategies) — structure-first, no default strategy
-textFull = applyTournamentEngine({
+// === Post-processing enforcement (MEGA PATCH) ===
+textFull = await _applyMegaPostGenChain({
   text: textFull,
   instrument,
-  mode: (mode === 'fast' ? 'fast' : 'full'),
   fundamentalsSign: Number(parseInstrumentBiasFromNote(biasNote)) as -1 | 0 | 1,
-  proximityFlag: warningMinutes != null
+  scalping,
+  scalpingHard
 });
 
-// Calendar visibility + structure guards
-textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
-textFull = _clarifyBOSWording(textFull);
-textFull = normalizeTriggerSpacing(textFull); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
-textFull = _reconcileHTFTrendFromText(textFull);
-// RAW MAP re-assert (map has authority over X-ray/TV lines)
-textFull = _applyRawSwingMap(textFull);
-textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
-
-    // Execution & risk guards
-  textFull = enforceEntryZoneUsage(textFull, instrument);
+// Extras not covered by MEGA PATCH (risk/news stamps & usage marks)
 textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
 textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
 textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
 textFull = stampM5Used(textFull, !!m5);
 textFull = stampM1Used(textFull, !!m1);
 
+// Fundamentals snapshot & alignment (kept intact)
+const fundamentalsSnapshotFull = computeIndependentFundamentals({
+  instrument,
+  calendarSign: parseInstrumentBiasFromNote(biasNote),
+  headlinesBias: hBias,
+  csm,
+  cotCue,
+  warningMinutes
+});
+textFull = ensureFundamentalsSnapshot(textFull, { instrument, snapshot: fundamentalsSnapshotFull, preReleaseOnly, calendarLine: calendarText || null });
+textFull = applyConsistencyGuards(textFull, { fundamentalsSign: fundamentalsSnapshotFull.final.sign as -1 | 0 | 1 });
+textFull = enforceOptionOrderByBias(textFull, fundamentalsSnapshotFull.final.sign);
 
-    // Ensure full breakdown scaffold + final table heading placement
-    textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
-    textFull = enforceFinalTableSummary(textFull, instrument);
+// Conviction + final table fill (kept intact)
+textFull = computeAndInjectConviction(textFull, { fundamentals: fundamentalsSnapshotFull, proximityFlag: warningMinutes != null });
+textFull = fillFinalTableSummaryRow(textFull, instrument);
 
-    // Fundamentals snapshot + alignment copy
-    const fundamentalsSnapshotFull = computeIndependentFundamentals({
-      instrument,
-      calendarSign: parseInstrumentBiasFromNote(biasNote),
-      headlinesBias: hBias,
-      csm,
-      cotCue,
-      warningMinutes
-    });
-    textFull = ensureFundamentalsSnapshot(textFull, { instrument, snapshot: fundamentalsSnapshotFull, preReleaseOnly, calendarLine: calendarText || null });
-    textFull = applyConsistencyGuards(textFull, { fundamentalsSign: fundamentalsSnapshotFull.final.sign as -1 | 0 | 1 });
-    textFull = enforceOptionOrderByBias(textFull, fundamentalsSnapshotFull.final.sign);
+// VWAP usage detection (kept intact)
+const _txtNoCand = textFull.replace(/Candidate\s*Scores[\s\S]*?Final\s*Table\s*Summary/i, "Final Table Summary");
+const vwap_used_flag =
+  /\bVWAP\b/i.test(_txtNoCand) &&
+  /\b(Setup|Trigger|Order\s*Type|Option\s*1|Option\s*2|Quick\s*Plan)\b/i.test(_txtNoCand);
 
-    // Conviction + final table values (fill → enforce order to keep parity and avoid truncation)
-    textFull = computeAndInjectConviction(textFull, { fundamentals: fundamentalsSnapshotFull, proximityFlag: warningMinutes != null });
-    textFull = fillFinalTableSummaryRow(textFull, instrument);
-    textFull = enforceEntryZoneUsage(textFull, instrument);
+// ai_meta patch — keep live price hint; do not alter user numbers with it
+const aiPatchFull = {
+  version: "vp-AtoL-1",
+  instrument,
+  mode,
+  vwap_used: vwap_used_flag,
+  time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
+  max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
+  currentPrice: livePrice ?? null, // HINT ONLY
+  scalping: !!scalping,
+  scalping_hard: !!scalpingHard,
+  fundamentals: {
+    calendar: { sign: fundamentalsSnapshotFull.components.calendar.sign, line: calendarText || null },
+    headlines: { label: fundamentalsSnapshotFull.components.headlines.label, avg: hBias.avg ?? null },
+    csm: { diff: fundamentalsSnapshotFull.components.csm.diff },
+    cot: { sign: fundamentalsSnapshotFull.components.cot.sign, detail: fundamentalsSnapshotFull.components.cot.detail },
+    final: { score: Math.round(fundamentalsSnapshotFull.final.score), label: fundamentalsSnapshotFull.final.label, sign: fundamentalsSnapshotFull.final.sign },
+    reliability: preReleaseOnly ? "low" : "normal"
+  },
+  proximity: { highImpactMins: warningMinutes ?? null },
+  vp_version: VP_VERSION
+};
+textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
 
-    // Determine if VWAP is truly used (ignore candidate list; look only at actionable parts)
-    const _txtNoCand = textFull.replace(/Candidate\s*Scores[\s\S]*?Final\s*Table\s*Summary/i, "Final Table Summary");
-    const vwap_used_flag =
-      /\bVWAP\b/i.test(_txtNoCand) &&
-      /\b(Setup|Trigger|Order\s*Type|Option\s*1|Option\s*2|Quick\s*Plan)\b/i.test(_txtNoCand);
+// If ai_meta + trigger semantics show order-type/price mismatch, fix order type ONLY.
+let aiMetaFullNow = extractAiMeta(textFull) || {};
+if (aiMetaFullNow && invalidOrderRelativeToPrice(aiMetaFullNow)) {
+  textFull = normalizeOrderTypeLines(textFull, aiMetaFullNow);
+}
 
-    // ai_meta patch — keep live price hint, but never modify user numbers with it
-    const aiPatchFull = {
-      version: "vp-AtoL-1",
-      instrument,
-      mode,
-      vwap_used: vwap_used_flag,
-      time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
-      max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
-      currentPrice: livePrice ?? null, // HINT ONLY
-      scalping: !!scalping,
-      scalping_hard: !!scalpingHard,
-      fundamentals: {
-        calendar: { sign: fundamentalsSnapshotFull.components.calendar.sign, line: calendarText || null },
-        headlines: { label: fundamentalsSnapshotFull.components.headlines.label, avg: hBias.avg ?? null },
-        csm: { diff: fundamentalsSnapshotFull.components.csm.diff },
-        cot: { sign: fundamentalsSnapshotFull.components.cot.sign, detail: fundamentalsSnapshotFull.components.cot.detail },
-        final: { score: Math.round(fundamentalsSnapshotFull.final.score), label: fundamentalsSnapshotFull.final.label, sign: fundamentalsSnapshotFull.final.sign },
-        reliability: preReleaseOnly ? "low" : "normal"
-      },
-      proximity: { highImpactMins: warningMinutes ?? null },
-      vp_version: VP_VERSION
-    };
-    textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
+// Sync RAW SWING MAP verdicts to X-ray & Technical View (truth-guard)
+textFull = _fixChartVerdictsBlock(textFull);
 
-    // If the ai_meta + trigger semantics produced an order-type/price mismatch, fix order type ONLY.
-    let aiMetaFullNow = extractAiMeta(textFull) || {};
-    if (aiMetaFullNow && invalidOrderRelativeToPrice(aiMetaFullNow)) {
-      textFull = normalizeOrderTypeLines(textFull, aiMetaFullNow);
-    }
-
-    // Hard-gate: Option 2 must be a distinct playbook, then re-normalize entry zone & ai_meta footer once more
-    textFull = await enforceOption2DistinctHard(MODEL, instrument, textFull);
-    textFull = enforceEntryZoneUsage(textFull, instrument);
-    textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
-
-// >>> enforce HTF truth-table & sync Technical View to RAW SWING MAP
-    textFull = _fixChartVerdictsBlock(textFull);
     
     // Provenance footer
     const footer = buildServerProvenanceFooter({
