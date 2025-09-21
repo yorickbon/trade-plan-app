@@ -757,27 +757,8 @@ function evidenceLine(it: any, cur: string): string | null {
   return `${cur} — ${it.title}: actual ${a}${comps ? " " + comps : ""} → ${verdict} ${cur}`;
 }
 
-// ---------- OpenAI core ----------
-async function callOpenAI(model: string, messages: any[]) {
-  const body: any = { model, messages };
-  if (!/^gpt-5/i.test(model)) {
-    body.temperature = 0;
-  }
+// (removed; superseded by the vision-safe callOpenAI defined above in Patch D)
 
-  const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: JSON.stringify(body),
-  });
-  const json = await rsp.json().catch(() => ({} as any));
-  if (!rsp.ok) throw new Error(`OpenAI request failed: ${rsp.status} ${JSON.stringify(json)}`);
-  const out =
-    json?.choices?.[0]?.message?.content ??
-    (Array.isArray(json?.choices?.[0]?.message?.content)
-      ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
-      : "");
-  return String(out || "");
-}
 
 function tryParseJsonBlock(s: string): any | null {
   if (!s) return null;
