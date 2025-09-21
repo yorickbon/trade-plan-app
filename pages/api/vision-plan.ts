@@ -1,3 +1,4 @@
+
 // /pages/api/vision-plan.ts
 /**
  * OCR-first calendar (image priority) — improved acceptance of pre-release rows
@@ -38,108 +39,22 @@ type ApiResponse =
 
 const VP_VERSION = "2025-09-18-vp-AtoL-rc1";
 
-// ---------- OpenAI / Model pick (vision-safe) ----------
+// ---------- OpenAI / Model pick ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
 const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
+const DEFAULT_MODEL = process.env.OPENAI_MODEL_ALT || "gpt-4o";
+const ALT_MODEL     = process.env.OPENAI_MODEL     || "gpt-5";
 
-// Clear, non-inverted envs:
-// - OPENAI_MODEL: primary model (defaults to gpt-4o, vision-capable)
-// - OPENAI_MODEL_ALT: secondary model (defaults to gpt-5 if provided, else same as primary)
-const MODEL_PRIMARY = (process.env.OPENAI_MODEL || "gpt-4o").trim();
-const MODEL_ALT = (process.env.OPENAI_MODEL_ALT || process.env.OPENAI_MODEL || "gpt-5").trim();
-
-/** Basic vision capability detector for chat/completions + image_url */
-function isVisionCapable(model: string): boolean {
-  const m = (model || "").toLowerCase();
-  return m.startsWith("gpt-4o") || m.startsWith("gpt-5"); // both families support vision in /chat/completions here
-}
-
-/** Caller preference (URL/body `model`) with sane defaults */
 function pickModelFromFields(req: NextApiRequest, fields?: Record<string, any>) {
   const raw = String((fields?.model as string) || (req.query.model as string) || "").trim().toLowerCase();
-  if (!raw) return MODEL_PRIMARY || "gpt-4o";
-  if (raw.startsWith("gpt-5"))  return MODEL_ALT || "gpt-5";
-  if (raw.startsWith("gpt-4o")) return MODEL_PRIMARY || "gpt-4o";
-  return MODEL_PRIMARY || "gpt-4o";
+  if (raw.startsWith("gpt-5"))  return ALT_MODEL || "gpt-5";
+  if (raw.startsWith("gpt-4o")) return DEFAULT_MODEL || "gpt-4o";
+  return DEFAULT_MODEL || "gpt-4o";
 }
 
-/** Detect if any message uses image_url content (vision needed) */
-function messagesRequireVision(messages: any[]): boolean {
-  try {
-    for (const m of messages || []) {
-      const content = (m && m.content) || [];
-      if (typeof content === "string") continue;
-      if (Array.isArray(content)) {
-        for (const part of content) {
-          if (part && part.type === "image_url" && part.image_url && part.image_url.url) {
-            return true;
-          }
-        }
-      }
-    }
-  } catch { /* ignore */ }
-  return false;
-}
-
-async function callOpenAI(model: string, messages: any[]) {
-  // If images present, ensure we use a vision-capable model; prefer env models before hard fallback.
-  if (messagesRequireVision(messages) && !isVisionCapable(model)) {
-    const candidates = [MODEL_PRIMARY, MODEL_ALT, "gpt-4o"];
-    const picked = candidates.find(isVisionCapable) || "gpt-4o";
-    if (process.env.NODE_ENV !== "production") {
-      console.warn(`[vision-plan] Switched to vision-capable model: ${picked} (was ${model})`);
-    }
-    model = picked;
-  }
-
-  const body: any = { model, messages };
-  // Keep deterministic responses for non-gpt-5 by default
-  if (!/^gpt-5/i.test(model)) body.temperature = 0;
-
-  const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: JSON.stringify(body),
-  });
-
-  const json = await rsp.json().catch(() => ({} as any));
-  if (!rsp.ok) throw new Error(`OpenAI request failed: ${rsp.status} ${JSON.stringify(json)}`);
-
-  const out =
-    json?.choices?.[0]?.message?.content ??
-    (Array.isArray(json?.choices?.[0]?.message?.content)
-      ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
-      : "");
-
-  return String(out || "");
-}
-
-
-/// ---------- market data keys ----------
+// ---------- market data keys ----------
 const TD_KEY = process.env.TWELVEDATA_API_KEY || "";
-
-// Accept common Finnhub env names; preferred is FINNHUB_API_KEY
-// Back-compat note: FINNHUB_APT_KEY was a typo and is intentionally NOT used anymore.
-const FH_KEY =
-  process.env.FINNHUB_API_KEY ||
-  process.env.FINNHUB_APIKEY ||
-  process.env.FINNHUB_TOKEN ||
-  "";
-
-/**
- * Optional: dev warning to catch missing Finnhub config early.
- * (No effect in production; safe in serverless.)
- */
-(function assertProviderKeys() {
-  if (process.env.NODE_ENV !== "production") {
-    if (!FH_KEY) {
-      console.warn(
-        "[vision-plan] Finnhub key missing. Set FINNHUB_API_KEY (preferred). Also accepted: FINNHUB_APIKEY, FINNHUB_TOKEN."
-      );
-    }
-  }
-})();
-
+const FH_KEY = process.env.FINNHUB_API_KEY || process.env.FINNHUB_APT_KEY || "";
 const POLY_KEY = process.env.POLYGON_API_KEY || "";
 
 // ---------- small utils ----------
@@ -367,7 +282,6 @@ function headlinesToPromptLines(items: AnyHeadline[], limit = 6): string | null 
 }
 
 // Cache for headline parsing to avoid reprocessing identical text
-// KEY NOW INCLUDES TITLES **AND** SENTIMENT SCORES to avoid stale cache when scores change.
 const HEADLINE_CACHE = new Map<string, HeadlineBias>();
 
 function computeHeadlinesBias(items: AnyHeadline[]): HeadlineBias {
@@ -375,24 +289,16 @@ function computeHeadlinesBias(items: AnyHeadline[]): HeadlineBias {
     return { label: "unavailable", avg: null, count: 0 };
   }
 
-  // Include both title and score in the cache key to prevent stale bias on score updates
-  const rawKey = items
-    .map((h) => {
-      const title = h?.title || "";
-      const sc = typeof h?.sentiment?.score === "number" ? Number(h.sentiment!.score).toFixed(3) : "ns";
-      return `${title}::${sc}`;
-    })
-    .join("|");
-
+  // Use concatenated text as cache key
+  const rawKey = items.map(h => h?.title || "").join("|");
   if (HEADLINE_CACHE.has(rawKey)) {
     return HEADLINE_CACHE.get(rawKey)!;
   }
 
   const scores = items
-    .map((h) => (typeof h?.sentiment?.score === "number" ? Number(h.sentiment!.score) : null))
-    .filter((v) => Number.isFinite(v)) as number[];
+    .map(h => (typeof h?.sentiment?.score === "number" ? Number(h.sentiment!.score) : null))
+    .filter(v => Number.isFinite(v)) as number[];
 
-  // If we have headlines but no numeric scores, bias is "unavailable" (we do NOT fabricate)
   if (scores.length === 0) {
     const out: HeadlineBias = { label: "unavailable", avg: null, count: 0 };
     HEADLINE_CACHE.set(rawKey, out);
@@ -415,33 +321,20 @@ async function fetchedHeadlinesViaServer(
   req: NextApiRequest,
   instrument: string
 ): Promise<{ items: AnyHeadline[]; promptText: string | null; provider: string }> {
-  const base = originFromReq(req);
-  const url = `${base}/api/news?instrument=${encodeURIComponent(instrument)}&hours=48&max=12&_t=${Date.now()}`;
+  try {
+    const base = originFromReq(req);
+    const url = `${base}/api/news?instrument=${encodeURIComponent(instrument)}&hours=48&max=12&_t=${Date.now()}`;
 
-  // Small helper: one attempt with 3s timeout
-  const fetchOnce = async () => {
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(3000) });
+    // Parallelize fetch + json parse
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(2500) });
     if (!r.ok) throw new Error(`Headlines fetch failed: ${r.status}`);
     const j: any = await r.json().catch(() => ({}));
-    return j;
-  };
-
-  try {
-    let j = await fetchOnce();
-    // Retry once if items are missing/empty (network hiccup or cold start)
-    if (!j || !Array.isArray(j?.items) || j.items.length === 0) {
-      try {
-        j = await fetchOnce();
-      } catch {
-        // swallow retry error; will fall through to empty below
-      }
-    }
 
     const items: AnyHeadline[] = Array.isArray(j?.items) ? j.items : [];
     const provider = String(j?.provider || "unknown");
 
-    // Deduplicate by title
-    const deduped = Array.from(new Map(items.map((i) => [i.title, i])).values());
+    // Deduplicate & sanitize items
+    const deduped = Array.from(new Map(items.map(i => [i.title, i])).values());
 
     return { items: deduped, promptText: headlinesToPromptLines(deduped, 6), provider };
   } catch (err) {
@@ -496,7 +389,7 @@ function invalidOrderRelativeToPrice(aiMeta: any): string | null {
 }
 
 
-// ---------- CSM (intraday, robust & null-safe) ----------
+// ---------- CSM (intraday, patched for speed + correctness) ----------
 const G8 = ["USD", "EUR", "JPY", "GBP", "CHF", "CAD", "AUD", "NZD"];
 const USD_PAIRS = ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDJPY", "USDCHF", "USDCAD"];
 type Series = { t: number[]; c: number[] };
@@ -509,7 +402,7 @@ function kbarReturn(closes: number[], k: number): number | null {
   return Math.log(a / b);
 }
 
-// Providers (unchanged signatures). Each may return null; we pick the first that works.
+// ------------------ Providers ------------------
 async function tdSeries15(pair: string): Promise<Series | null> {
   if (!TD_KEY) return null;
   try {
@@ -545,105 +438,58 @@ async function fhSeries15(pair: string): Promise<Series | null> {
   } catch { return null; }
 }
 
-// Polygon FX: be strict about support/limits/empties and quietly auto-skip when unsuitable.
 async function polySeries15(pair: string): Promise<Series | null> {
   if (!POLY_KEY) return null;
-
   try {
-    // Basic sanity on pair format (e.g., EURUSD, USDJPY, etc.)
-    const P = String(pair || "").toUpperCase();
-    if (!/^[A-Z]{6,10}$/.test(P)) return null;
-
-    // Polygon FX uses the "C:" currency ticker namespace, e.g., C:EURUSD
-    const ticker = `C:${P}`;
-
-    // 6 hours window, 15m bars
+    const ticker = `C:${pair}`;
     const to = new Date();
     const from = new Date(to.getTime() - 6 * 60 * 60 * 1000);
-    const fmt = (d: Date) =>
-      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-
-    const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(
-      ticker
-    )}/range/15/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=asc&apiKey=${POLY_KEY}`;
-
+    const fmt = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}/range/15/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=asc&apiKey=${POLY_KEY}`;
     const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(2500) });
-
-    // Auto-skip on auth/plan/limit errors (403/429/401) or general network failure
-    if (!r || !r.ok) {
-      if (process.env.NODE_ENV !== "production") {
-        console.warn(`[vision-plan] Polygon FX fetch skipped for ${ticker}: status=${r?.status}`);
-      }
-      return null;
-    }
-
-    const j: any = await r.json().catch(() => ({}));
-    // Known shapes: { status: "OK", results, resultsCount, queryCount } or { status: "ERROR", error }
-    if (!j || j.status !== "OK" || !Array.isArray(j.results) || j.results.length === 0 || j.queryCount === 0) {
-      if (process.env.NODE_ENV !== "production") {
-        const why =
-          !j
-            ? "no-json"
-            : j.status !== "OK"
-            ? `status=${j.status}`
-            : !Array.isArray(j.results) || j.results.length === 0
-            ? "no-results"
-            : "queryCount=0";
-        console.warn(`[vision-plan] Polygon FX returned unusable data for ${ticker} (${why}); auto-skip.`);
-      }
-      return null;
-    }
-
-    // Map to Series and validate numeric closes
-    const t: number[] = j.results.map((x: any) => Math.floor(Number(x.t) / 1000));
+    if (!r.ok) return null;
+    const j: any = await r.json();
+    if (!Array.isArray(j?.results)) return null;
+    const t: number[] = j.results.map((x: any) => Math.floor(x.t / 1000));
     const c: number[] = j.results.map((x: any) => Number(x.c));
-
-    if (!t.length || !c.length || !c.every((x: number) => Number.isFinite(x))) return null;
-
-    // Require at least 17 closes so kbarReturn(16) is defined downstream; otherwise skip.
-    if (c.length < 17) return null;
-
-     return { t, c };
-  } catch (err) {
-    if (process.env.NODE_ENV !== "production") {
-      console.warn(`[vision-plan] Polygon FX error for ${pair}:`, err);
-    }
-    return null;
-  }
+    if (!c.every((x: number) => isFinite(x))) return null;
+    return { t, c };
+  } catch { return null; }
 }
 
-
-// Pick first successful provider (TD → FH → Polygon) for each pair.
+// ------------------ Parallel Fetch ------------------
 async function fetchSeries15(pair: string): Promise<Series | null> {
-  const [td, fh, pg] = await Promise.allSettled([tdSeries15(pair), fhSeries15(pair), polySeries15(pair)]);
-  const results = [td, fh, pg].map((r) => (r.status === "fulfilled" ? r.value : null)).filter(Boolean) as Series[];
+  const [td, fh, pg] = await Promise.allSettled([
+    tdSeries15(pair),
+    fhSeries15(pair),
+    polySeries15(pair)
+  ]);
+
+  const results = [td, fh, pg]
+    .map(r => (r.status === "fulfilled" ? r.value : null))
+    .filter(Boolean) as Series[];
+
   return results.length > 0 ? results[0] : null;
 }
 
-// Compute CSM using whatever pairs are available; if coverage too low, return null to trigger fallback/neutral path.
 function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnapshot | null {
   const weights = { r60: 0.6, r240: 0.4 };
   const curScore: Record<string, number> = Object.fromEntries(G8.map((c) => [c, 0]));
-  let usedPairs = 0;
 
   for (const pair of USD_PAIRS) {
     const S = seriesMap[pair];
     if (!S || !Array.isArray(S.c) || S.c.length < 17) continue;
 
-    const r60 = kbarReturn(S.c, 4) ?? 0;   // 60m ≈ 4×15m
-    const r240 = kbarReturn(S.c, 16) ?? 0; // 240m ≈ 16×15m
+    // 60m ≈ 4 bars of 15m, 240m ≈ 16 bars
+    const r60 = kbarReturn(S.c, 4) ?? 0;
+    const r240 = kbarReturn(S.c, 16) ?? 0;
     const r = r60 * weights.r60 + r240 * weights.r240;
 
     const base = pair.slice(0, 3);
     const quote = pair.slice(3);
     curScore[base] += r;
     curScore[quote] -= r;
-    usedPairs++;
   }
-
-  // Require a minimal coverage; otherwise caller will return neutral/last-cache
-  const MIN_COVERAGE = 4; // out of 7 USD majors
-  if (usedPairs < MIN_COVERAGE) return null;
 
   const vals = G8.map((c) => curScore[c]);
   if (!vals.every((v) => Number.isFinite(v))) return null;
@@ -664,24 +510,13 @@ function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnaps
   };
 }
 
-// Build a neutral snapshot (all zeros) that keeps type compatibility and avoids crashes downstream.
-function neutralCSMSnapshot(): CsmSnapshot {
-  const zeroScores = Object.fromEntries(G8.map((c) => [c, 0]));
-  return {
-    tsISO: new Date().toISOString(),
-    ranks: [...G8],        // alphabetical/constant order is fine when neutral
-    scores: zeroScores as Record<string, number>,
-    ttl: Date.now() + 5 * 60 * 1000, // short TTL; we’ll try again soon
-  };
-}
-
 async function getCSM(): Promise<CsmSnapshot> {
-  // Fresh cache?
+  // Use cache only if snapshot is still fresh
   if (CSM_CACHE && Date.now() < CSM_CACHE.ttl) {
     return CSM_CACHE;
   }
 
-  // Fetch all pairs concurrently
+  // Fetch all pairs in parallel for speed
   const entries = await Promise.all(
     USD_PAIRS.map(async (p) => [p, await fetchSeries15(p)] as [string, Series | null])
   );
@@ -690,25 +525,16 @@ async function getCSM(): Promise<CsmSnapshot> {
   const snap = computeCSMFromPairs(seriesMap);
 
   if (!snap) {
-    // Dev-time visibility into coverage problems
-    if (process.env.NODE_ENV !== "production") {
-      const have = USD_PAIRS.filter((p) => seriesMap[p]?.c?.length).length;
-      console.warn(`[vision-plan] CSM coverage low or providers unavailable (have=${have}/${USD_PAIRS.length}). Using cache or neutral.`);
-    }
-    // Prefer last valid cache if still within TTL (double-check)
+    // Fallback to last cached snapshot if available
     if (CSM_CACHE && Date.now() < CSM_CACHE.ttl) {
       return CSM_CACHE;
     }
-    // Final fallback: neutral snapshot (never throw)
-    const neutral = neutralCSMSnapshot();
-    CSM_CACHE = neutral;
-    return neutral;
+    throw new Error("CSM unavailable (fetch failed and no valid cache).");
   }
 
   CSM_CACHE = snap;
   return snap;
 }
-
 
 // ---------- COT cue (optional via headlines) ----------
 type CotCue = { method: "headline_fallback"; reportDate: null; summary: string; net: Record<string, number>; };
@@ -806,8 +632,27 @@ function evidenceLine(it: any, cur: string): string | null {
   return `${cur} — ${it.title}: actual ${a}${comps ? " " + comps : ""} → ${verdict} ${cur}`;
 }
 
-// (removed; superseded by the vision-safe callOpenAI defined above in Patch D)
+// ---------- OpenAI core ----------
+async function callOpenAI(model: string, messages: any[]) {
+  const body: any = { model, messages };
+  if (!/^gpt-5/i.test(model)) {
+    body.temperature = 0;
+  }
 
+  const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: JSON.stringify(body),
+  });
+  const json = await rsp.json().catch(() => ({} as any));
+  if (!rsp.ok) throw new Error(`OpenAI request failed: ${rsp.status} ${JSON.stringify(json)}`);
+  const out =
+    json?.choices?.[0]?.message?.content ??
+    (Array.isArray(json?.choices?.[0]?.message?.content)
+      ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
+      : "");
+  return String(out || "");
+}
 
 function tryParseJsonBlock(s: string): any | null {
   if (!s) return null;
@@ -3009,14 +2854,8 @@ function _applyRawSwingMap(text: string): string {
 
 /* -------------------------
    7) Heuristic reconciliation when RAW SWING MAP missing (REPLACE)
-   - STRICT: only print TFs that were actually provided by the client
-   - Works for full / fast / scalping because the same writer is used
+   - Keep old behavior but normalize output to match the new X-ray bullets
    ------------------------- */
-
-// Populated by the pixel injector below. Safe default = none.
-let PROVIDED_TFS: {h4:boolean;h1:boolean;m15:boolean;m5:boolean;m1:boolean} =
-  {h4:false,h1:false,m15:false,m5:false,m1:false};
-
 function _reconcileHTFTrendFromText(text: string): string {
   if (!text) return text;
 
@@ -3026,12 +2865,7 @@ function _reconcileHTFTrendFromText(text: string): string {
 
   const raw = text;
   const lower = raw.toLowerCase();
-
-  type Dir = 'up'|'down'|'range'|'';
-  const word  = (d: Dir) => d === 'up' ? 'Uptrend'  : d === 'down' ? 'Downtrend'  : 'Range';
-  const micro = (d: Dir) => d === 'up' ? 'Micro up' : d === 'down' ? 'Micro down' : 'Micro range';
-
-  function readLine(tf: '4H'|'1H'|'15m'|'5m'|'1m'): string {
+  function readTF(tf: '4H'|'1H'|'15m'|'5m'|'1m'): string {
     const tfEsc = tf.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
     const reX  = new RegExp(`^\\s*[-•]\\s*${tfEsc}\\s*(?:\\(if\\s*used\\))?\\s*:\\s*([^\\n]*)`, 'mi');
     const reTV = new RegExp(`(Technical\\s*View[\\s\\S]{0,800}?${tfEsc}:\\s*)([^\\n]*)`, 'i');
@@ -3041,12 +2875,12 @@ function _reconcileHTFTrendFromText(text: string): string {
     if (mT) return (mT[2] || '').trim();
     return '';
   }
-
+  type Dir = 'up'|'down'|'range'|'';
   function classify(desc: string): Dir {
     const s = (desc || '').toLowerCase();
     if (!s) return '';
-    const hasHHHL = /\bhigher\s*highs?\b.*\bhigher\s*lows?\b|\bhh\/hl\b/i.test(s);
-    const hasLHLL = /\blower\s*highs?\b.*\blower\s*lows?\b|\blh\/ll\b/i.test(s);
+    const hasHHHL = /\bhh\/hl|higher\s*highs?\b.*\bhigher\s*lows?\b/i.test(s);
+    const hasLHLL = /\blh\/ll|lower\s*highs?\b.*\blower\s*lows?\b/i.test(s);
     const saysUp  = /\b(uptrend|bullish)\b/.test(s);
     const saysDn  = /\b(downtrend|bearish)\b/.test(s);
     const saysRg  = /\b(range|sideways|consolidation|chop)\b/.test(s);
@@ -3058,7 +2892,6 @@ function _reconcileHTFTrendFromText(text: string): string {
     if (saysDn)  return 'down';
     return '';
   }
-
   function planDirSign(): -1|0|1 {
     const mQP = raw.match(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(Long|Short)/i);
     const mO1 = raw.match(/Option\s*1[\s\S]*?Direction\s*:\s*(Long|Short)/i);
@@ -3066,37 +2899,57 @@ function _reconcileHTFTrendFromText(text: string): string {
     return d === 'long' ? 1 : d === 'short' ? -1 : 0;
   }
 
-  // Hints
-  const p4  = readLine('4H');
-  const p1  = readLine('1H');
-  const p15 = readLine('15m');
-  const p5  = readLine('5m');
-  const p1m = readLine('1m');
+  const prior4  = readTF('4H');
+  const prior1  = readTF('1H');
+  const prior15 = readTF('15m');
+  const prior5  = readTF('5m');
+  const prior1m = readTF('1m');
 
-  // Classify with fallbacks
-  let d4: Dir  = classify(p4)  || (planDirSign()===1 ? 'up' : planDirSign()===-1 ? 'down' : 'range');
-  let d1: Dir  = classify(p1)  || d4;
-  let d15: Dir = classify(p15) || d1;
-  let d5: Dir  = classify(p5)  || 'range';
-  let d1m: Dir = classify(p1m) || 'range';
+  let d4: Dir  = classify(prior4);
+  let d1: Dir  = classify(prior1);
+  let d15: Dir = classify(prior15);
+
+  if (!d4) {
+    const sign = planDirSign();
+    d4 = sign === 1 ? 'up' : sign === -1 ? 'down' : 'range';
+  }
+  if (!d1) d1 = d4;
+  if (!d15) d15 = d1;
+
+  const word = (d: Dir) => d === 'up' ? 'Uptrend' : d === 'down' ? 'Downtrend' : 'Range';
+  const microWord = (d: Dir) => d === 'up' ? 'Micro up' : d === 'down' ? 'Micro down' : 'Micro range';
+
+  const tail4 =
+      d4 === 'up'   ? '— bullish structure (HH/HL confirmed)'
+    : d4 === 'down' ? '— bearish structure (LH/LL confirmed)'
+                    : '— consolidation / range';
+  const line4 = `Trend: ${word(d4)} ${tail4}`;
 
   const supCount = (lower.match(/\b(support|demand)\b/gi) || []).length;
   const resCount = (lower.match(/\b(resistance|supply)\b/gi) || []).length;
   const ctx1 = resCount > supCount
     ? '— at resistance/supply; monitor rejection vs break'
     : '— at support/demand; monitor continuation vs pullback';
-  const ct15 = (d4 && d15 && d15 !== d4 && d15 !== d1) ? ' (counter-trend)' : '';
+  const line1 = `Trend: ${word(d1)} ${ctx1}`;
 
-  // Compose ONLY the TFs actually provided
-  const lines: string[] = [];
-  lines.push(`Detected Structures (X-ray)`);
-  if (PROVIDED_TFS.h4)  lines.push(`• 4H: Trend: ${word(d4)} ${d4==='up'?'— bullish structure (HH/HL confirmed)':d4==='down'?'— bearish structure (LH/LL confirmed)':'— consolidation / range'}`);
-  if (PROVIDED_TFS.h1)  lines.push(`• 1H: Trend: ${word(d1)} ${ctx1}`);
-  if (PROVIDED_TFS.m15) lines.push(`• 15m: Trend: ${word(d15)} — Execution anchors refined from 1H${ct15}`);
-  if (PROVIDED_TFS.m5)  lines.push(`• 5m: Trend: ${micro(d5)} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`);
-  if (PROVIDED_TFS.m1)  lines.push(`• 1m: Trend: ${micro(d1m)} — timing only; CHOCH/BOS micro-shift for entry`);
+  const ctNote = (d4 && d15 && d15 !== d4 && d15 !== d1) ? ' (counter-trend)' : '';
+  const anchor15 = (prior15 || 'Execution anchors refined from 1H').trim();
+  const line15 = `Trend: ${word(d15)} — ${anchor15}${ctNote}`;
 
-  const newX = lines.join('\n') + '\n';
+  const d5  : Dir = classify(prior5)  || 'range';
+  const d1m : Dir = classify(prior1m) || 'range';
+  const line5  = `Trend: ${microWord(d5)} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`;
+  const mentions1m = /\b1m\b/i.test(raw) || /Used\s*Chart:\s*1M/i.test(raw);
+  const line1m = mentions1m ? `Trend: ${microWord(d1m)} — timing only; CHOCH/BOS micro-shift for entry` : 'not used';
+
+  const newX =
+`Detected Structures (X-ray)
+• 4H: ${line4}
+• 1H: ${line1}
+• 15m: ${line15}
+• 5m: ${line5}
+• 1m: ${line1m}
+`;
 
   const xraySectRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
   let out = raw;
@@ -3105,10 +2958,9 @@ function _reconcileHTFTrendFromText(text: string): string {
   else if (/Full\s*Breakdown/i.test(out)) out = out.replace(/(\n\s*Full\s*Breakdown)/i, `\n${newX}\n$1`);
   else out = `${out}\n\n${newX}`;
 
-  // Sync Technical View lines that exist
-  if (PROVIDED_TFS.h4)  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m, p1) => `${p1}Trend: ${word(d4)} ${d4==='up'?'— bullish structure (HH/HL confirmed)':d4==='down'?'— bearish structure (LH/LL confirmed)':'— consolidation / range'}`);
-  if (PROVIDED_TFS.h1)  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m, p1) => `${p1}Trend: ${word(d1)} ${ctx1}`);
-  if (PROVIDED_TFS.m15) out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m, p1) => `${p1}Trend: ${word(d15)} — Execution anchors refined from 1H${ct15}`);
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line4}`);
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line1}`);
+  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line15}`);
 
   return out;
 }
@@ -3449,163 +3301,150 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
   return null;
 }
 /* =========================================================================
-   PIXEL-ACCURATE CHART SWING EXTRACTOR (AtoL-Ω)
+   PIXEL-BASED CHART SWING EXTRACTOR (drop-in)
    Purpose:
-     - Read black/white candles on gray background (no indicators/text).
-     - Detect OHLC per sampled column robustly via adaptive binarization.
-     - Produce explicit HH/HL/LH/LL sequence, last_BOS, and verdict.
-     - Feed a RAW SWING MAP block that downstream logic treats as truth.
+     - Extract candlestick OHLC approximation directly from chart images
+       (black/white TradingView-like charts), detect swings and produce a
+       RAW SWING MAP block that the rest of the pipeline consumes.
+     - Insert BEFORE provenance footer section in the file.
    Notes:
-     - Uses Jimp (soft import). If unavailable, extractor auto-skips.
-     - Idempotent: calling multiple times won’t duplicate sections.
+     - Heuristics only: works best with simple black-on-white candlesticks.
+     - Falls back (returns null) if confidence is low; does not override existing
+       text-based logic if detection fails.
    ========================================================================= */
 
+// soft-import jimp so builds don't fail if it isn't installed
 let Jimp: any = null;
 try {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   Jimp = require("jimp");
 } catch {
-  Jimp = null; // extractor will auto-skip if null
+  Jimp = null; // pixel extractor will auto-skip if null
 }
 
-/** Decode a data URL → Jimp image */
+/** Convert a data-url (image) to Jimp image. */
 async function loadJimpFromDataUrl(dataUrl: string): Promise<any | null> {
   if (!dataUrl || !Jimp) return null;
   try {
     const comma = dataUrl.indexOf(",");
     const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
     const buf = Buffer.from(b64, "base64");
-    return await Jimp.read(buf);
+    const img = await Jimp.read(buf);
+    return img;
   } catch {
     return null;
   }
 }
 
-/** Stats helpers */
-function meanStd(vals: number[]) {
-  const n = Math.max(1, vals.length);
-  const m = vals.reduce((a, b) => a + b, 0) / n;
-  const v = Math.sqrt(vals.reduce((a, b) => a + (b - m) * (b - m), 0) / n);
-  return { mean: m, stdev: v };
-}
-
-/** Convert pixel → luma (0=black, 255=white) */
-function lum(px: number) {
-  const { r, g, b } = Jimp.intToRGBA(px);
+/** Basic grayscale / brightness helper. */
+function brightnessAtPixel(img: any, x: number, y: number): number {
+  const idx = img.getPixelColor(x, y);
+  const { r, g, b } = Jimp.intToRGBA(idx);
   return 0.299 * r + 0.587 * g + 0.114 * b;
 }
 
-/** Adaptive thresholding tuned for gray backgrounds + black/white candles */
-function computeAdaptiveThreshold(img: any) {
-  const w = img.bitmap.width, h = img.bitmap.height;
+/**
+ * Estimate OHLC per column by scanning vertical pixels for dark clusters.
+ * Returns an array of { o,h,l,c } sampled across width.
+ */
+function estimateOHLCFromImage(img: any, columnsToSample = 200) {
+  const w = img.bitmap.width;
+  const h = img.bitmap.height;
+  const step = Math.max(1, Math.floor(w / columnsToSample));
+  const result: { o: number; h: number; l: number; c: number }[] = [];
 
-  // Sample corners + edges as background proxy
-  const samplePts: number[] = [];
-  const grid = 18;
-  for (let i = 0; i <= grid; i++) {
-    const xL = 0, xR = w - 1, y = Math.round((i / grid) * (h - 1));
-    samplePts.push(lum(img.getPixelColor(xL, y)));
-    samplePts.push(lum(img.getPixelColor(xR, y)));
-  }
-  for (let i = 0; i <= grid; i++) {
-    const yT = 0, yB = h - 1, x = Math.round((i / grid) * (w - 1));
-    samplePts.push(lum(img.getPixelColor(x, yT)));
-    samplePts.push(lum(img.getPixelColor(x, yB)));
-  }
-
-  const { mean: bgMean, stdev: bgStd } = meanStd(samplePts);
-  // Candle ink is darker than background. Be conservative but robust.
-  const inkThreshold = Math.max(10, Math.min(240, bgMean - Math.max(18, 0.9 * bgStd + 14)));
-  return inkThreshold;
-}
-
-/** Extract OHLC per sampled column (robust body+wick scan) */
-function estimateOHLCFromImage(img: any, columnsToSample = 240) {
-  const w = img.bitmap.width, h = img.bitmap.height;
-  if (w > 1400) img.resize(1400, Jimp.AUTO); // normalize big charts
-  const step = Math.max(1, Math.floor(img.bitmap.width / columnsToSample));
-  const th = computeAdaptiveThreshold(img);
-
-  type Bar = { o: number; h: number; l: number; c: number };
-  const rowsInkCache: number[][] = [];
-
-  // Scan columns: gather ink rows (dark pixels)
-  for (let x = 0; x < img.bitmap.width; x += step) {
-    const inkRows: number[] = [];
-    for (let y = 0; y < img.bitmap.height; y++) {
-      const L = lum(img.getPixelColor(x, y));
-      if (L < th) inkRows.push(y);
+  // compute global brightness stats to adapt to black/white charts
+  let sum = 0, cnt = 0;
+  for (let y = 0; y < h; y += Math.max(2, Math.floor(h / 50))) {
+    for (let x = 0; x < w; x += Math.max(2, Math.floor(w / 50))) {
+      sum += brightnessAtPixel(img, x, y);
+      cnt++;
     }
-    rowsInkCache.push(inkRows);
   }
+  const avg = sum / Math.max(1, cnt);
+  // darker pixels than threshold are considered "ink"
+  const inkThreshold = Math.max(15, Math.min(240, avg - 30)); // adaptive
 
-  // Build OHLC by locating wicks + body core
-  const bars: Bar[] = [];
-  const H = img.bitmap.height;
-  const toPrice = (rowY: number) => 1 - rowY / (H - 1); // 1.0 top, 0.0 bottom
+  for (let x = 0; x < w; x += step) {
+    let topInk = -1, bottomInk = -1;
+    const inkRows: number[] = [];
 
-  for (const inkRows of rowsInkCache) {
-    if (!inkRows.length) {
-      // carry-forward last bar (flat) if missing ink in a sparse column
-      if (bars.length) { bars.push({ ...bars[bars.length - 1] }); continue; }
-      const mid = 0.5;
-      bars.push({ o: mid, h: mid, l: mid, c: mid });
+    for (let y = 0; y < h; y++) {
+      const b = brightnessAtPixel(img, x, y);
+      if (b < inkThreshold) {
+        inkRows.push(y);
+        if (topInk === -1) topInk = y;
+        bottomInk = y;
+      }
+    }
+
+    if (inkRows.length === 0) {
+      if (result.length) {
+        const last = result[result.length - 1];
+        result.push({ ...last });
+      } else {
+        const mid = Math.floor(h / 2);
+        result.push({ o: mid, h: mid, l: mid, c: mid } as any);
+      }
       continue;
     }
 
-    // Wicks: high/low are extreme ink rows
-    const hiRow = Math.min(...inkRows);
-    const loRow = Math.max(...inkRows);
+    const high = topInk;
+    const low = bottomInk;
 
-    // Body region: longest contiguous streak
-    let bestStart = inkRows[0], bestEnd = inkRows[0], curS = inkRows[0], prev = inkRows[0];
+    // Estimate body region: find longest contiguous run in inkRows
+    let bestStart = inkRows[0], bestEnd = inkRows[0], curStart = inkRows[0], curPrev = inkRows[0];
     for (let i = 1; i < inkRows.length; i++) {
       const r = inkRows[i];
-      if (r === prev + 1) prev = r;
+      if (r === curPrev + 1) curPrev = r;
       else {
-        if (prev - curS > bestEnd - bestStart) { bestStart = curS; bestEnd = prev; }
-        curS = r; prev = r;
+        if ((curPrev - curStart) > (bestEnd - bestStart)) {
+          bestStart = curStart; bestEnd = curPrev;
+        }
+        curStart = r; curPrev = r;
       }
     }
-    if (prev - curS > bestEnd - bestStart) { bestStart = curS; bestEnd = prev; }
+    if ((curPrev - curStart) > (bestEnd - bestStart)) {
+      bestStart = curStart; bestEnd = curPrev;
+    }
 
-    // Estimate open/close: use left-vs-right darkness around body center (works on B/W candles)
+    // body center -> estimate open/close orientation via left/right darkness
     const bodyMid = Math.round((bestStart + bestEnd) / 2);
     let leftDark = 0, rightDark = 0;
-    for (let dx = -3; dx <= 3; dx++) {
-      const xx = Math.max(0, Math.min(img.bitmap.width - 1, Math.round((rowsInkCache.indexOf(inkRows) * step) + dx)));
-      const L = lum(img.getPixelColor(xx, bodyMid));
-      if (L < th) { if (dx <= 0) leftDark++; else rightDark++; }
+    for (let dx = -2; dx <= 2; dx++) {
+      const xx = Math.min(w - 1, Math.max(0, x + dx));
+      const bm = brightnessAtPixel(img, xx, bodyMid);
+      if (bm < inkThreshold) { if (dx <= 0) leftDark++; else rightDark++; }
     }
+
+    const toPrice = (rowY: number) => 1 - rowY / (h - 1); // 1 = top, 0 = bottom
     const openRow = leftDark > rightDark ? bestStart : bestEnd;
     const closeRow = leftDark > rightDark ? bestEnd : bestStart;
 
-    bars.push({
-      o: toPrice(openRow),
-      c: toPrice(closeRow),
-      h: toPrice(hiRow),
-      l: toPrice(loRow),
-    });
+    const o = toPrice(openRow);
+    const c = toPrice(closeRow);
+    const hh = toPrice(high);
+    const ll = toPrice(low);
+
+    result.push({ o, h: hh, l: ll, c });
   }
 
-  return bars;
+  return result;
 }
 
-/** Get a close series from OHLC for swing finding */
-function seriesFromOHLC(ohlc: { c: number }[]) {
-  return ohlc.map(d => d.c);
+/** Close series for swing detection */
+function seriesFromOHLC(ohlc: { o: number; h: number; l: number; c: number }[]) {
+  return ohlc.map((d) => d.c);
 }
 
-/** Peak/trough detection with de-noise window */
-function detectSwings(prices: number[], window = 6) {
+/** Peak/trough detector */
+function detectSwings(prices: number[], windowSize = 6) {
   const swings: { idx: number; type: "H" | "L"; value: number }[] = [];
   const n = prices.length;
-  const W = Math.max(3, Math.min(20, window));
-
-  for (let i = W; i < n - W; i++) {
+  for (let i = windowSize; i < n - windowSize; i++) {
     const v = prices[i];
     let isHigh = true, isLow = true;
-    for (let j = i - W; j <= i + W; j++) {
+    for (let j = i - windowSize; j <= i + windowSize; j++) {
       if (prices[j] > v + 1e-9) isHigh = false;
       if (prices[j] < v - 1e-9) isLow = false;
       if (!isHigh && !isLow) break;
@@ -3616,75 +3455,66 @@ function detectSwings(prices: number[], window = 6) {
   return swings;
 }
 
-/** Label HH/HL/LH/LL explicitly and compute last_BOS + verdict */
-function labelSwings(swings: { type: "H" | "L"; value: number }[]) {
-  type Tag = "HH" | "HL" | "LH" | "LL";
-  const out: Tag[] = [];
-  let lastH: number | null = null;
-  let lastL: number | null = null;
-
-  for (const s of swings) {
-    if (s.type === "H") {
-      if (lastH == null || s.value > lastH) out.push("HH"); else out.push("LH");
-      lastH = s.value;
-    } else {
-      if (lastL == null || s.value > lastL) out.push("HL"); else out.push("LL");
-      lastL = s.value;
-    }
+/** Swings → verdict */
+function swingsToVerdict(swings: { idx: number; type: "H" | "L"; value: number }[]) {
+  if (!swings || swings.length < 2) return { swingsText: "insufficient", verdict: "Range / consolidation" };
+  let up = 0, down = 0;
+  for (let i = 1; i < swings.length; i++) {
+    const prev = swings[i - 1], cur = swings[i];
+    if (prev.type === "H" && cur.type === "H") { if (cur.value > prev.value) up++; else down++; }
+    else if (prev.type === "L" && cur.type === "L") { if (cur.value > prev.value) up++; else down++; }
   }
-
-  // Determine last_BOS and verdict
-  const seq = out.join(", ");
-  let last_BOS: "up" | "down" | "none" = "none";
-  let upVotes = 0, dnVotes = 0;
-
-  // Simple read: HH + HL pairs imply up; LH + LL pairs imply down
-  for (let i = 1; i < out.length; i++) {
-    const a = out[i - 1], b = out[i];
-    if ((a === "HL" && b === "HH") || (a === "HH" && b === "HL")) { upVotes++; last_BOS = "up"; }
-    if ((a === "LH" && b === "LL") || (a === "LL" && b === "LH")) { dnVotes++; last_BOS = "down"; }
-  }
-
-  let verdict: "Uptrend" | "Downtrend" | "Range";
-  if (upVotes >= 2 && upVotes > dnVotes) verdict = "Uptrend";
-  else if (dnVotes >= 2 && dnVotes > upVotes) verdict = "Downtrend";
-  else verdict = "Range";
-
-  return { sequence: seq || "insufficient", last_BOS, verdict };
+  const swingsSeq = swings.map(s => s.type === "H" ? "HH/HL?" : "LH/LL?").join(", ");
+  let verdict = "Range / consolidation";
+  if (up > down && up >= 1) verdict = "Uptrend (HH/HL)";
+  else if (down > up && down >= 1) verdict = "Downtrend (LH/LL)";
+  return { swingsText: swingsSeq || "mixed", verdict };
 }
 
-/** Main: build RAW SWING MAP block from a single TF image */
-async function buildRawSwingForTF(dataUrl: string | null, label: string): Promise<{ block: string | null; confidence: number }> {
+/** local type for return */
+type SwingResult = {
+  rawSwingMap: string | null;
+  confidence: number; // 0..1
+  details?: any;
+};
+
+/** Build RAW SWING MAP block for a TF from its image data URL */
+async function buildRawSwingForTF(dataUrl: string | null, timeLabel: string): Promise<{ block: string | null; confidence: number }> {
   if (!dataUrl) return { block: null, confidence: 0 };
   const img = await loadJimpFromDataUrl(dataUrl);
   if (!img) return { block: null, confidence: 0 };
 
-  const ohlc = estimateOHLCFromImage(img, 220);
+  const MAX_W = 1200;
+  if (img.bitmap.width > MAX_W) img.resize(MAX_W, Jimp.AUTO);
+
+  const sampleCount = Math.max(80, Math.min(240, Math.floor(img.bitmap.width / 3)));
+  const ohlc = estimateOHLCFromImage(img, sampleCount);
   const series = seriesFromOHLC(ohlc);
 
-  const swings = detectSwings(series, Math.max(4, Math.floor(series.length / 30)));
-  const conf = Math.min(1, swings.length / 8); // more swings → more confidence
+  const swings = detectSwings(series, Math.max(3, Math.floor(sampleCount / 30)));
+  const detectConfidence = Math.min(1, Math.max(0, swings.length / 6)); // heuristic
 
-  const tags = labelSwings(swings);
+  const { swingsText, verdict } = swingsToVerdict(swings);
+
   const block =
-`**${label}:**
-- Swings: ${tags.sequence}
-- Last BOS: ${tags.last_BOS}
-- Verdict: ${tags.verdict}`;
+`**${timeLabel}:**  
+- Swings: ${swingsText}  
+- Last BOS: ${detectConfidence > 0.5 ? (verdict.startsWith("Uptrend") ? "Up" : (verdict.startsWith("Downtrend") ? "Down" : "Neutral")) : "Unknown"}  
+- Verdict: ${verdict}`;
 
-  return { block, confidence: conf };
+  return { block, confidence: detectConfidence };
 }
 
-/** Multi-TF map from images */
+/** Images (4H/1H/15m/5m/1m) → RAW SWING MAP */
 export async function generateRawSwingMapFromImages(images: {
   h4?: string | null;
   h1?: string | null;
   m15?: string | null;
   m5?: string | null;
   m1?: string | null;
-}): Promise<{ rawSwingMap: string | null; confidence: number; details?: any }> {
+}): Promise<SwingResult> {
   try {
-    const [r4, r1, r15, r5, r1m] = await Promise.all([
+    const tasks = await Promise.all([
       buildRawSwingForTF(images.h4 ?? null, "4H"),
       buildRawSwingForTF(images.h1 ?? null, "1H"),
       buildRawSwingForTF(images.m15 ?? null, "15m"),
@@ -3692,46 +3522,50 @@ export async function generateRawSwingMapFromImages(images: {
       buildRawSwingForTF(images.m1 ?? null, "1m"),
     ]);
 
-    const confs = [r4.confidence, r1.confidence, r15.confidence, r5.confidence, r1m.confidence].filter(x => x != null) as number[];
-    const agg = confs.length ? confs.reduce((a, b) => a + b, 0) / confs.length : 0;
+    const [r4, r1, r15, r5, r1m] = tasks;
+    const confidences = [r4.confidence, r1.confidence, r15.confidence, r5.confidence, r1m.confidence].filter(c => c != null) as number[];
+    const aggConfidence = confidences.length ? (confidences.reduce((a, b) => a + b, 0) / confidences.length) : 0;
 
-    if (agg < 0.35) {
-      return { rawSwingMap: null, confidence: agg, details: { r4, r1, r15, r5, r1m } };
+    if (aggConfidence < 0.35) {
+      return { rawSwingMap: null, confidence: aggConfidence, details: { r4, r1, r15, r5, r1m } };
     }
 
-    const lines: string[] = ["## RAW SWING MAP\n"];
+    const lines: string[] = [];
+    lines.push("## RAW SWING MAP\n");
     if (r4.block)  lines.push(r4.block + "\n");
     if (r1.block)  lines.push(r1.block + "\n");
     if (r15.block) lines.push(r15.block + "\n");
     if (r5.block)  lines.push(r5.block + "\n");
-    if (r1m.block && !r5.block) lines.push(r1m.block + "\n");
+    if (r1m.block && !r5.block) lines.push(r1m.block + "\n"); // include 1m if no 5m
 
-    return { rawSwingMap: lines.join("\n"), confidence: agg, details: { r4, r1, r15, r5, r1m } };
+    const rawSwingMap = lines.join("\n");
+    return { rawSwingMap, confidence: aggConfidence, details: { r4, r1, r15, r5, r1m } };
   } catch (e) {
     return { rawSwingMap: null, confidence: 0, details: { error: String(e) } };
   }
 }
 
-/** Inject RAW SWING MAP at the very top; idempotent */
+/** Helper: inject the RAW SWING MAP (if detected) at the top of textFull */
 export async function tryInjectRawSwingMapIntoText(
-  text: string,
+  textFull: string,
   imgs: { h4?: string | null; h1?: string | null; m15?: string | null; m5?: string | null; m1?: string | null; }
 ) {
-  if (/##\s*RAW\s*SWING\s*MAP/i.test(text)) return { text, confidence: 1, details: null };
   const res = await generateRawSwingMapFromImages(imgs);
   if (res.rawSwingMap) {
-    return { text: `${res.rawSwingMap}\n---\n${text}`, confidence: res.confidence, details: res.details };
+    return { text: `${res.rawSwingMap}\n---\n${textFull}`, confidence: res.confidence, details: res.details };
   }
-  return { text, confidence: res.confidence, details: res.details };
+  return { text: textFull, confidence: res.confidence, details: res.details };
 }
 
 /* -------------------------------
-   CHART VERDICT GUARD (syncer)
-   - Normalize RAW SWING MAP verdicts
-   - Sync into X-ray & Technical View
+   CHART VERDICT GUARD
+   Sync RAW SWING MAP verdicts with Detected Structures (X-ray)
+   and Technical View lines.
 -------------------------------- */
 function _fixChartVerdictsBlock(src: string): string {
   if (!src) return src;
+
+  // 1) Find RAW SWING MAP block
   const mapRe = /(##\s*RAW\s*SWING\s*MAP[\s\S]*?)(?:\n-{3,}|\n##|\nFull\s*Breakdown|\n$)/i;
   const m = src.match(mapRe);
   if (!m) return src;
@@ -3746,8 +3580,8 @@ function _fixChartVerdictsBlock(src: string): string {
   };
 
   function swingVerdictFrom(swings: string, lastBOS: string): string {
-    const s = (swings || "").toUpperCase();
-    const bos = (lastBOS || "").toLowerCase();
+    const s = String(swings || "").toUpperCase();
+    const bos = String(lastBOS || "").toLowerCase();
     const hasHHHL = /\bHH\b.*\bHL\b|\bHL\b.*\bHH\b/.test(s);
     const hasLHLL = /\bLH\b.*\bLL\b|\bLL\b.*\bLH\b/.test(s);
     if (hasHHHL && !hasLHLL) return "Uptrend (HH/HL)";
@@ -3758,13 +3592,12 @@ function _fixChartVerdictsBlock(src: string): string {
   }
 
   function grab(tf: string) {
-    const sectRe = new RegExp(`\\*\\*${tf}\\*\\*:[\\s\\S]*?(?:\\n-\\s*Swings:\\s*([^\\n]+))?[\\s\\S]*?(?:\\n-\\s*Last\\s*BOS:\\s*([^\\n]+))?[\\s\\S]*?(?:\\n-\\s*Verdict:\\s*([^\\n]+))`, "i");
-    const mm = block.match(sectRe);
-    rows[tf] = {
-      swings: (mm?.[1] || "").trim(),
-      bos: (mm?.[2] || "").trim(),
-      verdict: (mm?.[3] || "").trim(),
-    };
+    const sectRe = new RegExp(`\\*\\*${tf}\\*\\*:\\s*[\\r\\n]+([\\s\\S]*?)(?:\\n\\*\\*|\\n-{3,}|\\n##|\\n$)`, "i");
+    const s = block.match(sectRe)?.[1] || "";
+    const swings = s.match(/Swings:\s*([^\n]+)/i)?.[1]?.trim() || "";
+    const bos    = s.match(/Last\s*BOS:\s*([^\n]+)/i)?.[1]?.trim() || "";
+    const verdict= s.match(/Verdict:\s*([^\n]+)/i)?.[1]?.trim() || "";
+    rows[tf] = { swings, bos, verdict };
   }
   tfs.forEach(grab);
 
@@ -3777,18 +3610,24 @@ function _fixChartVerdictsBlock(src: string): string {
     (v4.startsWith("Uptrend") && v1.startsWith("Downtrend")) ||
     (v4.startsWith("Downtrend") && v1.startsWith("Uptrend"));
 
+  const vFix: Record<string, string> = { "4H": v4, "1H": v1, "15m": v15, "5m": v5 };
+
+  // 2) Rewrite RAW SWING MAP verdict lines to normalized wording
   function setVerdict(tf: string, verdictText: string) {
     const sectRe = new RegExp(`(\\*\\*${tf}\\*\\*:[\\s\\S]*?\\n)(-\\s*Verdict:\\s*)([^\\n]+)`, "i");
-    if (sectRe.test(block)) block = block.replace(sectRe, (_m, head, vlabel) => `${head}${vlabel}${verdictText}`);
+    block = block.replace(sectRe, (_m, head, vlabel) => `${head}${vlabel}${verdictText}`);
   }
-  setVerdict("4H", v4);
-  setVerdict("1H", v1 + (counter1H ? " — counter-trend vs 4H" : ""));
-  setVerdict("15m", v15);
-  setVerdict("5m", v5);
+  tfs.forEach(tf => setVerdict(tf, vFix[tf]));
 
+  if (counter1H) {
+    const oneHRe = /(\*\*1H\*\*:[\s\S]*?)(\n-\s*Verdict:\s*[^\n]+)/i;
+    block = block.replace(oneHRe, (_m, head, verdictLine) => `${head}${verdictLine} — counter-trend vs 4H`);
+  }
+
+  // put RAW SWING MAP back
   let out = src.replace(m[1], block);
 
-  // Sync into Technical View bullets
+  // 3) Sync **Technical View** lines to match the normalized verdicts
   const tvRe = /(\*\*Technical\s*View[^\n]*\*\*:[\s\S]*?)(?:\n\*\*Fundamental|\nFundamental\s*Bias\s*Snapshot|\n##|\n$)/i;
   const tvBlock = out.match(tvRe)?.[1];
   if (!tvBlock) return out;
@@ -3796,19 +3635,25 @@ function _fixChartVerdictsBlock(src: string): string {
 
   function replaceTV(tf: string, verdictText: string) {
     const lineRe = new RegExp(`(-\\s*\\*\\*${tf}\\*\\*:\\s*)([^\\n]+)`, "i");
-    if (lineRe.test(tv)) tv = tv.replace(lineRe, (_m, pre) => `${pre}${verdictText}`);
-    else tv = tv.trimEnd() + `\n- **${tf}:** ${verdictText}`;
+    if (lineRe.test(tv)) {
+      tv = tv.replace(lineRe, (_m, pre) => `${pre}${verdictText}`);
+    } else {
+      tv = tv.trimEnd() + `\n- **${tf}:** ${verdictText}`;
+    }
   }
-  replaceTV("4H",  v4);
-  replaceTV("1H",  v1 + (counter1H ? " — counter-trend vs 4H" : ""));
-  replaceTV("15m", v15);
-  replaceTV("5m",  v5);
+  replaceTV("4H",  vFix["4H"]);
+  replaceTV("1H",  vFix["1H"] + (counter1H ? " — counter-trend vs 4H" : ""));
+  replaceTV("15m", vFix["15m"]);
+  replaceTV("5m",  vFix["5m"]);
 
-  return out.replace(tvBlock, tv);
+  out = out.replace(tvBlock, tv);
+  return out;
 }
 /* =========================================================================
-   END PIXEL-ACCURATE CHART SWING EXTRACTOR (AtoL-Ω)
+   END PIXEL-BASED CHART SWING EXTRACTOR
    ========================================================================= */
+
+
 
 // ---------- Provenance footer ----------
 function buildServerProvenanceFooter(args: {
@@ -4019,39 +3864,18 @@ if (mode === "expand") {
     scalpingHard: false
   });
 
-let text = await callOpenAI(modelExpand, messages);
-
-// mark which TF images we actually have (used by reconciliation)
-PROVIDED_TFS = {
-  h4: !!c.h4,
-  h1: !!c.h1,
-  m15: !!c.m15,
-  m5: !!c.m5,
-  m1: false
-};
-
-// single pixel-based RAW SWING MAP injection (images → map)
-const _injExp = await tryInjectRawSwingMapIntoText(text, {
-  h4: c.h4,
-  h1: c.h1,
-  m15: c.m15,
-  m5: c.m5 || null,
-  m1: null
-});
+  let text = await callOpenAI(modelExpand, messages);
+// pixel-based RAW SWING MAP injection (images → map)
+const _injExp = await tryInjectRawSwingMapIntoText(text, { h4: c.h4, h1: c.h1, m15: c.m15, m5: c.m5 || null, m1: null });
 text = _injExp.text;
 
-// Minimum scaffold & options
-text = await enforceQuickPlan(modelExpand, c.instrument, text);
-text = await enforceOption1(modelExpand, c.instrument, text);
-text = await enforceOption2(modelExpand, c.instrument, text);
+   // Minimum scaffold & options
+  text = await enforceQuickPlan(modelExpand, c.instrument, text);
+  text = await enforceOption1(modelExpand, c.instrument, text);
+  text = await enforceOption2(modelExpand, c.instrument, text);
 
-// Structure + polish (single pass)
-text = _clarifyBOSWording(text);
-text = normalizeTriggerSpacing(text); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
-text = _reconcileHTFTrendFromText(text);
-text = _applyRawSwingMap(text); // RAW MAP is final authority (one pass)
-text = await enforceTriggerSpecificity(modelExpand, c.instrument, text);
-
+  // Enforce structure directly from RAW SWING MAP (truth source)
+  text = _applyRawSwingMap(text);
 
   // Replace placeholder tournament injection...
   text = await enforceTournamentDiversity(modelExpand, c.instrument, text);
