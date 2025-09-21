@@ -4116,6 +4116,17 @@ text = applyTournamentEngine({
   text = enforceFinalTableSummary(text, c.instrument);
   text = enforceEntryZoneUsage(text, c.instrument);
 
+  // Final post-gen consolidation (MEGA PATCH)
+  text = await _applyMegaPostGenChain({
+    text,
+    instrument: c.instrument,
+    fundamentalsSign: Number(parseInstrumentBiasFromNote(calAdv.biasNote)) as -1 | 0 | 1,
+    scalping: false,
+    scalpingHard: false
+  });
+
+  // Enforce HTF truth-table & sync Technical View to RAW SWING MAP
+  text = _fixChartVerdictsBlock(text);
 
   // Provenance footer
   const footer = buildServerProvenanceFooter({
@@ -4133,6 +4144,7 @@ text = applyTournamentEngine({
     text,
     meta: { instrument: c.instrument, cacheKey, model: modelExpand, vp_version: VP_VERSION }
   });
+
 }
 
     // ---------- multipart ----------
