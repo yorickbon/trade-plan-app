@@ -4367,63 +4367,31 @@ let textFull = await callOpenAI(MODEL, messages);
 
     let aiMetaFull = extractAiMeta(textFull) || {};
 
-    // === Post-processing enforcement ===
-    textFull = await enforceQuickPlan(MODEL, instrument, textFull);
-        textFull = await enforceOption1(MODEL, instrument, textFull);
+// === Post-processing enforcement ===
+textFull = await enforceQuickPlan(MODEL, instrument, textFull);
+textFull = await enforceOption1(MODEL, instrument, textFull);
+textFull = await enforceOption2(MODEL, instrument, textFull);
 
-    // Deterministic fallback: if Option 1 is still missing, copy from Quick Plan
-    if (!/Option\s*1\s*\(?(Primary)?\)?/i.test(textFull)) {
-      const qpMatch = textFull.match(/(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
-      const qpBlock = qpMatch ? qpMatch[0] : "";
+// Enforce structure directly from RAW SWING MAP (truth source)
+textFull = _applyRawSwingMap(textFull);
 
-      const pick = (labelRe: string) => {
-        const m = qpBlock.match(new RegExp(`^\\s*•\\s*${labelRe}\\s*:\\s*([^\\n]+)`, "mi"));
-        return m ? m[1].trim() : "...";
-      };
+// Tournament engine (24+ strategies) — structure-first, no default strategy
+textFull = applyTournamentEngine({
+  text: textFull,
+  instrument,
+  mode: (mode === 'fast' ? 'fast' : 'full'),
+  fundamentalsSign: Number(parseInstrumentBiasFromNote(biasNote)) as -1 | 0 | 1,
+  proximityFlag: warningMinutes != null
+});
 
-      const dir = pick("(?:\\*\\*)?Direction(?:\\*\\*)?");
-      const ord = pick("(?:\\*\\*)?Order\\s*Type(?:\\*\\*)?");
-      const trg = pick("(?:\\*\\*)?Trigger(?:\\*\\*)?");
-      const ent = pick("(?:\\*\\*)?Entry(?:\\s*\\(zone\\s*or\\s*single\\))?(?:\\*\\*)?");
-      const sl  = pick("(?:\\*\\*)?Stop\\s*Loss(?:\\*\\*)?");
-      const tps = pick("(?:\\*\\*)?(?:Take\\s*Profit\\(s\\)|TPs?)(?:\\*\\*)?");
-      const cv  = pick("(?:\\*\\*)?Conviction(?:\\*\\*)?");
-
-      const option1Synth =
-`Option 1 (Primary)
-• Direction: ${dir}
-• Order Type: ${ord}
-• Trigger: ${trg}
-• Entry (zone or single): ${ent}
-• Stop Loss: ${sl}
-• Take Profit(s): ${tps}
-• Conviction: ${/^\d{1,3}\s*%$/.test(cv) ? cv : (cv ? `${cv}` : "...")}
-• Why this is primary: Primary derived from Quick Plan details (HTF guardrails, clean invalidation).`;
-
-      if (qpBlock) {
-        textFull = textFull.replace(qpBlock, `${qpBlock}\n${option1Synth}\n`);
-      }
-    }
-
-    textFull = await enforceOption2(MODEL, instrument, textFull);
-
-        // Enforce structure directly from RAW SWING MAP (truth source)
-    textFull = _applyRawSwingMap(textFull);
-
-    // Replace placeholder tournament injection with deterministic diversity/scoring
-    textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
-    textFull = dedupeTournamentSections(textFull); // keep only the best tournament block before Final Table
-
-       // Polish & structure guards
-    textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
-    textFull = _clarifyBOSWording(textFull);
-    textFull = normalizeTriggerSpacing(textFull); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
-    textFull = _reconcileHTFTrendFromText(textFull);
-    // NEW: enforce HTF/LTF structure from RAW SWING MAP (map has final authority over X-ray/TV lines)
-    textFull = _applyRawSwingMap(textFull);
-    textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
-
-
+// Calendar visibility + structure guards
+textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
+textFull = _clarifyBOSWording(textFull);
+textFull = normalizeTriggerSpacing(textFull); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
+textFull = _reconcileHTFTrendFromText(textFull);
+// RAW MAP re-assert (map has authority over X-ray/TV lines)
+textFull = _applyRawSwingMap(textFull);
+textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
 
     // Execution & risk guards
   textFull = enforceEntryZoneUsage(textFull, instrument);
