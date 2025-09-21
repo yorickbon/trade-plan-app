@@ -4117,10 +4117,12 @@ let text = await callOpenAI(modelExpand, messages);
       scalpingHard
     });
 
-    let textFull = await callOpenAI(MODEL, messages);
-    // pixel-based RAW SWING MAP injection (images → map)
-const _injFull = await tryInjectRawSwingMapIntoText(textFull, { h4, h1, m15, m5, m1 });
-textFull = _injFull.text;
+   // pixel-based RAW SWING MAP injection (images → map) — PRE-LLM, prepend to prompt
+const __swingFull = await generateRawSwingMapFromImages({ h4, h1, m15, m5, m1 });
+if (__swingFull.rawSwingMap && Array.isArray(messages) && messages[1] && (messages[1] as any).content) {
+  messages[1] = { ...(messages[1] as any), content: `${__swingFull.rawSwingMap}\n---\n${(messages[1] as any).content}` };
+}
+let textFull = await callOpenAI(MODEL, messages);
 
     let aiMetaFull = extractAiMeta(textFull) || {};
 
