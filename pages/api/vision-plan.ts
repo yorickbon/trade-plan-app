@@ -38,19 +38,83 @@ type ApiResponse =
 
 const VP_VERSION = "2025-09-18-vp-AtoL-rc1";
 
-// ---------- OpenAI / Model pick ----------
+// ---------- OpenAI / Model pick (vision-safe) ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
 const OPENAI_API_BASE = process.env.OPENAI_API_BASE || "https://api.openai.com/v1";
-const DEFAULT_MODEL = process.env.OPENAI_MODEL_ALT || "gpt-4o";
-const ALT_MODEL     = process.env.OPENAI_MODEL     || "gpt-5";
 
-function pickModelFromFields(req: NextApiRequest, fields?: Record<string, any>) {
-  const raw = String((fields?.model as string) || (req.query.model as string) || "").trim().toLowerCase();
-  if (raw.startsWith("gpt-5"))  return ALT_MODEL || "gpt-5";
-  if (raw.startsWith("gpt-4o")) return DEFAULT_MODEL || "gpt-4o";
-  return DEFAULT_MODEL || "gpt-4o";
+// Clear, non-inverted envs:
+// - OPENAI_MODEL: primary model (defaults to gpt-4o, vision-capable)
+// - OPENAI_MODEL_ALT: secondary model (defaults to gpt-5 if provided, else same as primary)
+const MODEL_PRIMARY = (process.env.OPENAI_MODEL || "gpt-4o").trim();
+const MODEL_ALT = (process.env.OPENAI_MODEL_ALT || process.env.OPENAI_MODEL || "gpt-5").trim();
+
+/** Basic vision capability detector for chat/completions + image_url */
+function isVisionCapable(model: string): boolean {
+  const m = (model || "").toLowerCase();
+  return m.startsWith("gpt-4o") || m.startsWith("gpt-5"); // both families support vision in /chat/completions here
 }
 
+/** Caller preference (URL/body `model`) with sane defaults */
+function pickModelFromFields(req: NextApiRequest, fields?: Record<string, any>) {
+  const raw = String((fields?.model as string) || (req.query.model as string) || "").trim().toLowerCase();
+  if (!raw) return MODEL_PRIMARY || "gpt-4o";
+  if (raw.startsWith("gpt-5"))  return MODEL_ALT || "gpt-5";
+  if (raw.startsWith("gpt-4o")) return MODEL_PRIMARY || "gpt-4o";
+  return MODEL_PRIMARY || "gpt-4o";
+}
+
+/** Detect if any message uses image_url content (vision needed) */
+function messagesRequireVision(messages: any[]): boolean {
+  try {
+    for (const m of messages || []) {
+      const content = (m && m.content) || [];
+      if (typeof content === "string") continue;
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if (part && part.type === "image_url" && part.image_url && part.image_url.url) {
+            return true;
+          }
+        }
+      }
+    }
+  } catch { /* ignore */ }
+  return false;
+}
+
+async function callOpenAI(model: string, messages: any[]) {
+  // If images present, ensure we use a vision-capable model; prefer env models before hard fallback.
+  if (messagesRequireVision(messages) && !isVisionCapable(model)) {
+    const candidates = [MODEL_PRIMARY, MODEL_ALT, "gpt-4o"];
+    const picked = candidates.find(isVisionCapable) || "gpt-4o";
+    if (process.env.NODE_ENV !== "production") {
+      console.warn(`[vision-plan] Switched to vision-capable model: ${picked} (was ${model})`);
+    }
+    model = picked;
+  }
+
+  const body: any = { model, messages };
+  // Keep deterministic responses for non-gpt-5 by default
+  if (!/^gpt-5/i.test(model)) body.temperature = 0;
+
+  const rsp = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: JSON.stringify(body),
+  });
+
+  const json = await rsp.json().catch(() => ({} as any));
+  if (!rsp.ok) throw new Error(`OpenAI request failed: ${rsp.status} ${JSON.stringify(json)}`);
+
+  const out =
+    json?.choices?.[0]?.message?.content ??
+    (Array.isArray(json?.choices?.[0]?.message?.content)
+      ? json.choices[0].message.content.map((c: any) => c?.text || "").join("\n")
+      : "");
+
+  return String(out || "");
+}
+
+ 
 /// ---------- market data keys ----------
 const TD_KEY = process.env.TWELVEDATA_API_KEY || "";
 
