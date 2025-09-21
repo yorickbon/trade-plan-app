@@ -4077,44 +4077,11 @@ if (__swingExp.rawSwingMap && Array.isArray(messages)) {
 let text = await callOpenAI(modelExpand, messages);
 
 
-
-   // Minimum scaffold & options
-  text = await enforceQuickPlan(modelExpand, c.instrument, text);
-  text = await enforceOption1(modelExpand, c.instrument, text);
-  text = await enforceOption2(modelExpand, c.instrument, text);
-
-  // Enforce structure directly from RAW SWING MAP (truth source)
-  text = _applyRawSwingMap(text);
-
-  // Tournament engine (24 strategies) — structure-first
-text = applyTournamentEngine({
-  text,
-  instrument: c.instrument,
-  mode: 'full',
-  fundamentalsSign: Number(parseInstrumentBiasFromNote(calAdv.biasNote)) as -1 | 0 | 1,
-  proximityFlag: calAdv.warningMinutes != null
-});
-
-
-  // Calendar visibility + stamps
+  // Keep only visibility & usage stamps here; consolidation handled by _applyMegaPostGenChain
   text = ensureCalendarVisibilityInQuickPlan(text, { instrument: c.instrument, preReleaseOnly: false, biasLine: calAdv.text || null });
   const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
   text = stampM5Used(text, usedM5);
 
-    // Polish & structure guards (spacing + BOS wording + HTF reconciliation + trigger specificity)
-  text = _clarifyBOSWording(text);
-  text = normalizeTriggerSpacing(text); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
-  text = _reconcileHTFTrendFromText(text);
-  // NEW: enforce HTF/LTF structure from RAW SWING MAP (map has final authority over X-ray/TV lines)
-  text = _applyRawSwingMap(text);
-  text = await enforceTriggerSpecificity(modelExpand, c.instrument, text);
-
-
-
-  // Ensure breakdown skeleton + final table heading, then normalize entry zone rendering
-  text = await enforceFullBreakdownSkeleton(modelExpand, c.instrument, text);
-  text = enforceFinalTableSummary(text, c.instrument);
-  text = enforceEntryZoneUsage(text, c.instrument);
 
   // Final post-gen consolidation (MEGA PATCH)
   text = await _applyMegaPostGenChain({
