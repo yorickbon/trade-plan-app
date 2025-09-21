@@ -1704,68 +1704,245 @@ function hasOption1(text: string): boolean {
   return re.test(text);
 }
 
-// Inject tournament strategies + scoring (deterministic, no placeholders)
-function enforceTournamentStrategies(text: string, instrument: string): string {
-  if (!text) return text;
+/* =========================
+   TOURNAMENT ENGINE (24 strategies) — unified for full/fast/scalping
+   - Structure-first scoring using Detected Structures (X-ray)
+   - Mode-aware weighting (full | fast | scalping)
+   - News proximity & fundamentals sign adjustments
+   - Emits one clean "Candidate Scores (tournament)" section
+   - Stamps top strategies into Quick Plan / Option 1 / Option 2 "• Setup:" lines
+   ========================= */
 
-  // Capture ANY existing tournament sections (with/without ###, with/without colon)
-  const SECT_G =
-    /(#+\s*)?Candidate\s*Scores\s*\(tournament\)\s*:?\s*[\s\S]*?(?=\n\s*(?:Final\s*Table\s*Summary|Detected\s*Structures|\*\*Detected\s*Structures|Full\s*Breakdown|Option\s*1|Option\s*2)\b|$)/gi;
+type TFVerdict = 'Uptrend'|'Downtrend'|'Range';
+type ModeTag = 'full'|'fast'|'scalping';
 
-  // Gather scored bullets (— <number> —) from existing sections
-  const matches = [...(text.matchAll(SECT_G) || [])].map(m => m[0]);
-  const bullets: string[] = [];
-  for (const sect of matches) {
-    const lines = sect.match(/^\s*[-•]\s+.+$/gmi) || [];
-    for (const ln of lines) {
-      if (/—\s*\d{1,3}\s*—/.test(ln)) bullets.push(ln.trim());
+type StructureCtx = {
+  v4: TFVerdict; v1: TFVerdict; v15: TFVerdict; v5?: TFVerdict;
+  counter1H: boolean;
+};
+
+function _grabVerdictFromXray(text: string, tf: '4H'|'1H'|'15m'|'5m'): TFVerdict {
+  const m = text.match(new RegExp(`Detected\\s*Structures\\s*\\(X-ray\\)[\\s\\S]*?\\n\\s*•\\s*${tf}\\s*:\\s*Trend:\\s*(Uptrend|Downtrend|Range)`, 'i'));
+  return (m ? (m[1] as TFVerdict) : 'Range');
+}
+function _structureCtx(text: string): StructureCtx {
+  const v4  = _grabVerdictFromXray(text, '4H');
+  const v1  = _grabVerdictFromXray(text, '1H');
+  const v15 = _grabVerdictFromXray(text, '15m');
+  const v5  = _grabVerdictFromXray(text, '5m');
+  const counter1H = (v4 === 'Uptrend' && v1 === 'Downtrend') || (v4 === 'Downtrend' && v1 === 'Uptrend');
+  return { v4, v1, v15, v5, counter1H };
+}
+
+type Strat = {
+  name: string;
+  bucket: 'trend'|'breakout'|'sweep'|'range'|'reversal'|'level'|'session';
+  tfRef: string;        // e.g., "4H/1H/15m/5m"
+  trigger: string;      // short, TF-explicit trigger description
+  wants: Array<'up'|'down'|'range'|'cleanBreak'|'sweepFirst'|'session'|'vwap'|'counterOK'|'needs5m'|'needs1m'>;
+};
+
+const STRATS: Strat[] = [
+  // Trend-following / continuation
+  { name: "OB + FVG pullback", bucket: "trend", tfRef:"4H/1H anchor; 15m pullback; 5m confirm", trigger:"15m OB+FVG tap; 5m BOS", wants:['up','down','needs5m'] },
+  { name: "Breaker continuation", bucket: "trend", tfRef:"1H anchor; 15m breaker; 5m", trigger:"15m breaker retest; 5m BOS", wants:['up','down','needs5m'] },
+  { name: "EMA pullback (20/50) aligned", bucket:"trend", tfRef:"1H bias; 15m pullback; 5m", trigger:"15m pullback to EMA cluster; 5m shift", wants:['up','down','needs5m'] },
+  { name: "HTF level retest (H4/H1)", bucket:"level", tfRef:"4H/1H key level; 15m", trigger:"15m retest of HTF level; 5m BOS", wants:['up','down','needs5m'] },
+
+  // Breakout / momentum
+  { name: "Momentum breakout", bucket: "breakout", tfRef:"1H base; 15m ignition; 5m", trigger:"15m close-through; 5m hold + BOS", wants:['cleanBreak','needs5m'] },
+  { name: "Triangle/wedge break", bucket:"breakout", tfRef:"1H structure; 15m", trigger:"15m TL break; 5m retest + BOS", wants:['cleanBreak','needs5m'] },
+  { name: "Channel break + retest", bucket:"breakout", tfRef:"1H channel; 15m", trigger:"15m channel break; 5m retest + BOS", wants:['cleanBreak','needs5m'] },
+  { name: "Opening Range Breakout (ORB)", bucket:"session", tfRef:"Session OR; 5m/1m", trigger:"5m OR break; 1m hold + micro BOS", wants:['cleanBreak','session','needs1m'] },
+
+  // Liquidity / sweep
+  { name: "Liquidity sweep + shift", bucket:"sweep", tfRef:"15m sweep; 5m confirm", trigger:"15m sweep of H/L; 5m CHOCH→BOS", wants:['sweepFirst','needs5m'] },
+  { name: "PDH/PDL sweep + continuation", bucket:"sweep", tfRef:"Prev-day H/L; 15m/5m", trigger:"Sweep PDH/PDL; 5m shift/BOS", wants:['sweepFirst','needs5m'] },
+  { name: "Stop-hunt into OB", bucket:"sweep", tfRef:"15m stop raid; 5m OB", trigger:"Sweep into 15m OB; 5m BOS", wants:['sweepFirst','needs5m'] },
+
+  // Range / mean reversion
+  { name: "Range rotation (EQ logic)", bucket:"range", tfRef:"1H range; 15m EQ; 5m", trigger:"15m reject range bound; 5m shift", wants:['range','needs5m'] },
+  { name: "VWAP fade", bucket:"range", tfRef:"Session VWAP; 5m/1m", trigger:"5m rejection at VWAP band; 1m confirm", wants:['vwap','range','session','needs1m'] },
+  { name: "Bollinger squeeze breakout", bucket:"breakout", tfRef:"15m squeeze; 5m", trigger:"15m band expansion; 5m hold + BOS", wants:['cleanBreak','needs5m'] },
+
+  // Reversal / counter-trend
+  { name: "Divergence reversal", bucket:"reversal", tfRef:"15m divergence; 5m", trigger:"15m div; 5m CHOCH→BOS", wants:['counterOK','needs5m'] },
+  { name: "50% mean reversion of impulse", bucket:"reversal", tfRef:"15m impulse; 5m", trigger:"Retrace ~50%; 5m shift", wants:['counterOK','needs5m'] },
+
+  // Level-specific
+  { name: "Quarter point / big fig tag", bucket:"level", tfRef:"HTF levels; 15m/5m", trigger:"Tag QP/big fig; 5m shift/BOS", wants:['range','up','down','needs5m'] },
+  { name: "EQH/EQL raid + reclaim", bucket:"sweep", tfRef:"HTF EQH/EQL; 15m/5m", trigger:"Raid; 5m reclaim + BOS", wants:['sweepFirst','needs5m'] },
+
+  // Session behaviors
+  { name: "London open drive", bucket:"session", tfRef:"LO window; 5m/1m", trigger:"5m ignition; 1m hold + BOS", wants:['session','cleanBreak','needs1m'] },
+  { name: "NY reversal (lunch fade)", bucket:"session", tfRef:"NY midday; 5m", trigger:"5m rejection; micro shift", wants:['session','range','counterOK','needs5m'] },
+
+  // Additional robust plays
+  { name: "Breaker flip at range edge", bucket:"trend", tfRef:"1H range edge; 15m", trigger:"15m breaker flip; 5m BOS", wants:['up','down','needs5m'] },
+  { name: "FVG fill → continuation", bucket:"trend", tfRef:"1H anchor; 15m FVG; 5m", trigger:"Fill 15m FVG; 5m BOS", wants:['up','down','needs5m'] },
+  { name: "Retest previous session OR", bucket:"session", tfRef:"Prev OR; 15m/5m", trigger:"Retest OR; 5m shift", wants:['session','range','needs5m'] },
+  { name: "Macro BOS + continuation", bucket:"breakout", tfRef:"4H BOS; 1H/15m", trigger:"4H BOS context; 15m continuation; 5m", wants:['cleanBreak','needs5m'] },
+];
+
+function _dirWord(v: TFVerdict): 'up'|'down'|'range' {
+  if (v === 'Uptrend') return 'up';
+  if (v === 'Downtrend') return 'down';
+  return 'range';
+}
+
+function _scoreStrategies(text: string, mode: ModeTag, fundamentalsSign: -1|0|1, proximityFlag: boolean) {
+  const S = _structureCtx(text);
+  const d4 = _dirWord(S.v4), d1 = _dirWord(S.v1), d15 = _dirWord(S.v15);
+
+  const base: Array<{ name:string; score:number; reason:string }> = [];
+
+  for (const st of STRATS) {
+    let s = 50;
+
+    // Structure alignment
+    if (st.bucket === 'trend') {
+      if (d4 === d1 && d1 !== 'range') s += 18;
+      if (d15 === d1) s += 6;
+      if (S.counter1H) s -= 8;
+    } else if (st.bucket === 'range') {
+      if (d4 === 'range' || d1 === 'range') s += 14;
+      if (d15 === 'range') s += 6;
+      if (d4 !== 'range' && d1 !== 'range') s -= 6;
+    } else if (st.bucket === 'breakout') {
+      if (d15 === d1 && d1 !== 'range') s += 10;
+      if (S.v5 && S.v5 === S.v15) s += 4;
+    } else if (st.bucket === 'sweep') {
+      s += 6; // opportunistic baseline
+      if (d15 !== 'range') s += 4;
+    } else if (st.bucket === 'reversal') {
+      if (S.counter1H) s += 8; // gives a purpose
+    } else if (st.bucket === 'level') {
+      s += 8; // robust in most contexts with confluence
+    } else if (st.bucket === 'session') {
+      s += 6;
     }
+
+    // Wants alignment
+    if (st.wants.includes(d4)) s += 6;
+    if (st.wants.includes(d1)) s += 4;
+    if (d15 === 'range' && st.wants.includes('range')) s += 6;
+    if (st.wants.includes('cleanBreak') && (d1 !== 'range' || d15 !== 'range')) s += 4;
+    if (st.wants.includes('sweepFirst')) s += 2;
+    if (st.wants.includes('session')) s += 2;
+    if (st.wants.includes('vwap')) s += 2;
+    if (S.counter1H && !st.wants.includes('counterOK') && st.bucket !== 'sweep') s -= 6;
+
+    // Mode weighting
+    if (mode === 'scalping') {
+      if (st.wants.includes('needs1m')) s += 6;
+      if (st.wants.includes('needs5m')) s += 4;
+      if (st.bucket === 'trend') s -= 2; // slower
+      if (st.bucket === 'session' || st.bucket === 'sweep') s += 4;
+    } else if (mode === 'fast') {
+      if (st.wants.includes('needs5m')) s += 2;
+      if (st.bucket === 'breakout' || st.bucket === 'trend') s += 2;
+    } else { // full
+      if (st.bucket === 'trend') s += 2;
+      if (st.bucket === 'level') s += 2;
+    }
+
+    // Fundamentals small nudge (structure-first)
+    if (fundamentalsSign !== 0) {
+      if (st.bucket === 'trend' || st.bucket === 'breakout') s += 3;
+    }
+
+    // News proximity risk
+    if (proximityFlag) {
+      if (st.bucket === 'breakout' || st.bucket === 'sweep' || st.bucket === 'session') s -= 4;
+      else s -= 2;
+    }
+
+    // Clamp
+    s = Math.max(0, Math.min(100, Math.round(s)));
+
+    const reason = `${st.tfRef}; ${st.trigger}`;
+    base.push({ name: st.name, score: s, reason });
   }
 
-  // Dedupe by strategy name (left of first em-dash)
-  const deduped: string[] = [];
-  const seen = new Set<string>();
-  for (const ln of bullets) {
-    const name = (ln.split("—")[0] || ln).replace(/^[-•]\s*/, "").trim().toLowerCase();
-    if (!seen.has(name)) { seen.add(name); deduped.push(ln); }
+  // Sort desc score
+  base.sort((a,b) => b.score - a.score);
+
+  return base;
+}
+
+function _renderTournamentSection(sorted: Array<{name:string;score:number;reason:string}>): string {
+  const top = sorted.slice(0, 24); // up to 24
+  const lines = top.map(r => `- ${r.name} — ${r.score} — ${r.reason}`);
+  return `Candidate Scores (tournament):\n${lines.join("\n")}\n`;
+}
+
+function _dropExistingTournamentSections(text: string): string {
+  return text.replace(/Candidate\s*Scores\s*\(tournament\)\s*:?\s*[\s\S]*?(?=\n\s*(?:Final\s*Table\s*Summary|Detected\s*Structures|\*\*Detected\s*Structures|Full\s*Breakdown|Option\s*1|Option\s*2|ai_meta|$))/gi, "");
+}
+
+function _insertTournamentSection(text: string, section: string): string {
+  if (/Final\s*Table\s*Summary\s*:/i.test(text)) {
+    return text.replace(/(\n\s*Final\s*Table\s*Summary\s*:)/i, `\n${section}\n$1`);
   }
-
-  // Compliance: ≥5 total, ≥3 non-sweep/BOS, each bullet cites TFs
-  const nonSweep = deduped.filter(l => !/(sweep|liquidity|stop\s*hunt|bos\b|choch\b)/i.test(l));
-  const hasTFs = deduped.every(l => /\b(4H|1H|15m|5m|1m)\b/i.test(l));
-
-  let section: string;
-  if (deduped.length >= 5 && nonSweep.length >= 3 && hasTFs) {
-    section = `Candidate Scores (tournament):\n${deduped.join("\n")}\n`;
-  } else {
-    // Deterministic, TF-aware stub (no placeholders)
-    const stub = [
-      "- OB+FVG pullback — 70 — 4H/1H aligned; 15m anchor; 5m confirmation",
-      "- TL break + retest — 66 — 1H break; 15m retest; 5m BOS for entry",
-      "- Range rotation — 64 — 1H range bounds; 15m EQ; 5m rejection then shift",
-      "- Momentum breakout — 62 — 1H squeeze resolves; 15m base; 5m ignition",
-      "- VWAP fade — 60 — session VWAP confluence; 15m structure; 5m sweep then shift",
-    ].join("\n");
-    section = `Candidate Scores (tournament):\n${stub}\n`;
-  }
-
-  // Remove all existing tournament sections
-  let out = text.replace(SECT_G, "");
-
-  // Insert before Final Table Summary:, else after X-ray, else append
-  if (/Final\s*Table\s*Summary\s*:/.test(out)) {
-    out = out.replace(/(\n\s*Final\s*Table\s*Summary\s*:)/i, `\n${section}\n$1`);
-  } else if (/Detected\s*Structures\s*\(X-ray\)/i.test(out)) {
-    out = out.replace(
-      /(Detected\s*Structures\s*\(X-ray\)[\s\S]*?)(?=\n\s*(?:Final\s*Table\s*Summary|Full\s*Breakdown|$))/i,
+  if (/Detected\s*Structures\s*\(X-ray\)/i.test(text)) {
+    return text.replace(
+      /(Detected\s*Structures\s*\(X-ray\)[\s\S]*?)(?=\n\s*(?:Final\s*Table\s*Summary|Full\s*Breakdown|ai_meta|$))/i,
       (m) => `${m}\n${section}\n`
     );
-  } else {
-    out = `${out}\n\n${section}`;
+  }
+  return `${text}\n\n${section}`;
+}
+
+function _stampSetups(text: string, winners: string[]) {
+  const top1 = winners[0] || "—";
+  const top2 = winners[1] || "—";
+  const top3 = winners[2] || "—";
+
+  const blocks = [
+    { re: /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
+    { re: /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
+    { re: /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i },
+  ];
+
+  function patchBlock(block: string, idx: number): string {
+    const setupLine = block.match(/^\s*•\s*Setup\s*:\s*.*$/mi);
+    const payload = idx === 0 ? `${top1}` : (idx === 1 ? `${top1} | ${top2}` : `${top2} | ${top3}`);
+    const line = `• Setup: ${payload}`;
+    if (setupLine) return block.replace(/^\s*•\s*Setup\s*:\s*.*$/mi, line);
+    // insert under Trigger if possible
+    if (/^\s*•\s*Trigger\s*:/mi.test(block)) {
+      return block.replace(/(^\s*•\s*Trigger\s*:[^\n]*\n)/mi, `$1${line}\n`);
+    }
+    // else append at end of block
+    return block.replace(/$/, `\n${line}`);
   }
 
+  let out = text;
+  for (let i = 0; i < blocks.length; i++) {
+    const m = out.match(blocks[i].re);
+    if (!m) continue;
+    out = out.replace(m[0], patchBlock(m[0], i));
+  }
   return out;
 }
+
+/** Public: build tournament + inject + stamp setups */
+function applyTournamentEngine(args: {
+  text: string;
+  instrument: string;
+  mode: ModeTag;
+  fundamentalsSign: -1|0|1;
+  proximityFlag: boolean;
+}) {
+  const scored = _scoreStrategies(args.text, args.mode, args.fundamentalsSign, args.proximityFlag);
+  const section = _renderTournamentSection(scored);
+  let out = _dropExistingTournamentSections(args.text);
+  out = _insertTournamentSection(out, section);
+  const winners = scored.map(s => s.name);
+  out = _stampSetups(out, winners);
+  return out;
+}
+
 
 
 /** Deterministically build & insert "Option 1 (Primary)" if missing.
