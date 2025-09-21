@@ -3312,208 +3312,138 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
        text-based logic if detection fails.
    ========================================================================= */
 
-// ---------- Pixel reader (Sharp-based, no Jimp) ----------
-// Works with TradingView "Copy link to image" URLs (PNG) and data-URLs.
-// If anything fails, it returns null so your text logic still runs.
-
-import type { IncomingHttpHeaders } from "http";
-
-let _sharp: any = null;
-function sharp() {
-  if (_sharp) return _sharp;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    _sharp = require("sharp");
-  } catch {
-    _sharp = null;
-  }
-  return _sharp;
+// soft-import jimp so builds don't fail if it isn't installed
+let Jimp: any = null;
+try {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  Jimp = require("jimp");
+} catch {
+  Jimp = null; // pixel extractor will auto-skip if null
 }
 
-// Fetch bytes from http(s) URL with a TradingView-friendly UA
-async function fetchBytes(url: string): Promise<Buffer | null> {
+/** Convert a data-url (image) to Jimp image. */
+async function loadJimpFromDataUrl(dataUrl: string): Promise<any | null> {
+  if (!dataUrl || !Jimp) return null;
   try {
-    const headers: Partial<IncomingHttpHeaders> = {
-      "user-agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-      "accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-      "referer": "https://www.tradingview.com/"
-    };
-    const r = await fetch(url, { headers: headers as HeadersInit });
-    if (!r.ok) return null;
-    const ab = await r.arrayBuffer();
-    return Buffer.from(ab);
+    const comma = dataUrl.indexOf(",");
+    const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+    const buf = Buffer.from(b64, "base64");
+    const img = await Jimp.read(buf);
+    return img;
   } catch {
     return null;
   }
 }
 
-// Convert data URL or http(s) URL -> lightweight image with getPixel + size
-async function loadJimpFromDataUrl(dataUrlOrHttp: string): Promise<any | null> {
-  const S = sharp();
-  if (!S) return null;
-  try {
-    let buf: Buffer | null = null;
-
-    if (/^data:image/i.test(dataUrlOrHttp)) {
-      const comma = dataUrlOrHttp.indexOf(",");
-      const b64 = comma >= 0 ? dataUrlOrHttp.slice(comma + 1) : dataUrlOrHttp;
-      buf = Buffer.from(b64, "base64");
-    } else if (/^https?:\/\//i.test(dataUrlOrHttp)) {
-      buf = await fetchBytes(dataUrlOrHttp);
-    } else {
-      // Assume already base64 string (no data: prefix)
-      buf = Buffer.from(dataUrlOrHttp, "base64");
-    }
-    if (!buf) return null;
-
-    // Decode
-    let img = S(buf);
-
-    // Optional: clamp max width to keep processing quick
-    const meta = await img.metadata();
-    const w = meta.width || 0;
-    if (w > 1400) img = img.resize(1400);
-
-    // Normalize to raw RGBA, with a contrast boost for white-background charts
-    img = img.gamma().linear(1.15, 0).toColorspace("rgb");
-
-    const raw = await img.raw().ensureAlpha().toBuffer({ resolveWithObject: true });
-    const width = raw.info.width;
-    const height = raw.info.height;
-    const data = raw.data; // RGBA Uint8Array
-
-    const getPixel = (x: number, y: number) => {
-      const xi = Math.max(0, Math.min(width - 1, x | 0));
-      const yi = Math.max(0, Math.min(height - 1, y | 0));
-      const o = (yi * width + xi) * 4;
-      const r = data[o];
-      const g = data[o + 1];
-      const b = data[o + 2];
-      return { r, g, b };
-    };
-
-    // Jimp-like shim so existing code keeps working
-    return {
-      bitmap: { width, height },
-      getPixelColor: (x: number, y: number) => {
-        const { r, g, b } = getPixel(x, y);
-        // Pack RGB to a single int so we can reuse brightnessAtPixel
-        return (255 << 24) | (r << 16) | (g << 8) | b;
-      },
-      __getPixelRGB: getPixel
-    };
-  } catch {
-    return null;
-  }
-}
-
-// drop-in replacement for your old brightness function
+/** Basic grayscale / brightness helper. */
 function brightnessAtPixel(img: any, x: number, y: number): number {
-  // Unpack our shimmed pixel int back to r,g,b
   const idx = img.getPixelColor(x, y);
-  const r = (idx >> 16) & 255;
-  const g = (idx >> 8) & 255;
-  const b = idx & 255;
-  // Luma
+  const { r, g, b } = Jimp.intToRGBA(idx);
   return 0.299 * r + 0.587 * g + 0.114 * b;
 }
 
-// Estimate OHLC by scanning columns for dark "ink" (candles/wicks)
-function estimateOHLCFromImage(img: any, columnsToSample = 220) {
+/**
+ * Estimate OHLC per column by scanning vertical pixels for dark clusters.
+ * Returns an array of { o,h,l,c } sampled across width.
+ */
+function estimateOHLCFromImage(img: any, columnsToSample = 200) {
   const w = img.bitmap.width;
   const h = img.bitmap.height;
   const step = Math.max(1, Math.floor(w / columnsToSample));
-  const out: { o: number; h: number; l: number; c: number }[] = [];
+  const result: { o: number; h: number; l: number; c: number }[] = [];
 
-  // Adaptive threshold (assume white background, black candles)
-  let samp = 0, sum = 0;
-  for (let y = 0; y < h; y += Math.max(2, Math.floor(h / 60))) {
-    for (let x = 0; x < w; x += Math.max(2, Math.floor(w / 60))) {
+  // compute global brightness stats to adapt to black/white charts
+  let sum = 0, cnt = 0;
+  for (let y = 0; y < h; y += Math.max(2, Math.floor(h / 50))) {
+    for (let x = 0; x < w; x += Math.max(2, Math.floor(w / 50))) {
       sum += brightnessAtPixel(img, x, y);
-      samp++;
+      cnt++;
     }
   }
-  const avg = samp ? sum / samp : 200;
-  const inkThresh = Math.max(10, Math.min(240, avg - 45)); // a bit lower than avg to be robust
+  const avg = sum / Math.max(1, cnt);
+  // darker pixels than threshold are considered "ink"
+  const inkThreshold = Math.max(15, Math.min(240, avg - 30)); // adaptive
 
   for (let x = 0; x < w; x += step) {
-    let top = -1, bottom = -1;
+    let topInk = -1, bottomInk = -1;
     const inkRows: number[] = [];
 
     for (let y = 0; y < h; y++) {
       const b = brightnessAtPixel(img, x, y);
-      if (b < inkThresh) {
+      if (b < inkThreshold) {
         inkRows.push(y);
-        if (top === -1) top = y;
-        bottom = y;
+        if (topInk === -1) topInk = y;
+        bottomInk = y;
       }
     }
 
     if (inkRows.length === 0) {
-      if (out.length) out.push({ ...out[out.length - 1] });
-      else {
+      if (result.length) {
+        const last = result[result.length - 1];
+        result.push({ ...last });
+      } else {
         const mid = Math.floor(h / 2);
-        out.push({ o: mid, h: mid, l: mid, c: mid });
+        result.push({ o: mid, h: mid, l: mid, c: mid } as any);
       }
       continue;
     }
 
-    // High/Low in pixel coords
-    const highY = top;
-    const lowY = bottom;
+    const high = topInk;
+    const low = bottomInk;
 
-    // Find longest contiguous "body" run
-    let bestS = inkRows[0], bestE = inkRows[0], s = inkRows[0], p = inkRows[0];
+    // Estimate body region: find longest contiguous run in inkRows
+    let bestStart = inkRows[0], bestEnd = inkRows[0], curStart = inkRows[0], curPrev = inkRows[0];
     for (let i = 1; i < inkRows.length; i++) {
-      const y = inkRows[i];
-      if (y === p + 1) p = y;
+      const r = inkRows[i];
+      if (r === curPrev + 1) curPrev = r;
       else {
-        if (p - s > bestE - bestS) { bestS = s; bestE = p; }
-        s = y; p = y;
+        if ((curPrev - curStart) > (bestEnd - bestStart)) {
+          bestStart = curStart; bestEnd = curPrev;
+        }
+        curStart = r; curPrev = r;
       }
     }
-    if (p - s > bestE - bestS) { bestS = s; bestE = p; }
+    if ((curPrev - curStart) > (bestEnd - bestStart)) {
+      bestStart = curStart; bestEnd = curPrev;
+    }
 
-    // Orientation hint: check left/right darkness near body mid
-    const bodyMid = Math.round((bestS + bestE) / 2);
+    // body center -> estimate open/close orientation via left/right darkness
+    const bodyMid = Math.round((bestStart + bestEnd) / 2);
     let leftDark = 0, rightDark = 0;
-    for (let dx = -3; dx <= 3; dx++) {
-      const xx = Math.max(0, Math.min(w - 1, x + dx));
-      const b = brightnessAtPixel(img, xx, bodyMid);
-      if (b < inkThresh) {
-        if (dx <= 0) leftDark++; else rightDark++;
-      }
+    for (let dx = -2; dx <= 2; dx++) {
+      const xx = Math.min(w - 1, Math.max(0, x + dx));
+      const bm = brightnessAtPixel(img, xx, bodyMid);
+      if (bm < inkThreshold) { if (dx <= 0) leftDark++; else rightDark++; }
     }
 
     const toPrice = (rowY: number) => 1 - rowY / (h - 1); // 1 = top, 0 = bottom
-    const openY = leftDark > rightDark ? bestS : bestE;
-    const closeY = leftDark > rightDark ? bestE : bestS;
+    const openRow = leftDark > rightDark ? bestStart : bestEnd;
+    const closeRow = leftDark > rightDark ? bestEnd : bestStart;
 
-    out.push({
-      o: toPrice(openY),
-      h: toPrice(highY),
-      l: toPrice(lowY),
-      c: toPrice(closeY)
-    });
+    const o = toPrice(openRow);
+    const c = toPrice(closeRow);
+    const hh = toPrice(high);
+    const ll = toPrice(low);
+
+    result.push({ o, h: hh, l: ll, c });
   }
 
-  return out;
+  return result;
 }
 
+/** Close series for swing detection */
 function seriesFromOHLC(ohlc: { o: number; h: number; l: number; c: number }[]) {
-  return ohlc.map(d => d.c);
+  return ohlc.map((d) => d.c);
 }
 
+/** Peak/trough detector */
 function detectSwings(prices: number[], windowSize = 6) {
   const swings: { idx: number; type: "H" | "L"; value: number }[] = [];
   const n = prices.length;
-  const w = Math.max(3, windowSize | 0);
-
-  for (let i = w; i < n - w; i++) {
+  for (let i = windowSize; i < n - windowSize; i++) {
     const v = prices[i];
     let isHigh = true, isLow = true;
-    for (let j = i - w; j <= i + w; j++) {
+    for (let j = i - windowSize; j <= i + windowSize; j++) {
       if (prices[j] > v + 1e-9) isHigh = false;
       if (prices[j] < v - 1e-9) isLow = false;
       if (!isHigh && !isLow) break;
@@ -3524,21 +3454,21 @@ function detectSwings(prices: number[], windowSize = 6) {
   return swings;
 }
 
+/** Swings → verdict */
 function swingsToVerdict(swings: { idx: number; type: "H" | "L"; value: number }[]) {
   if (!swings || swings.length < 2) return { swingsText: "insufficient", verdict: "Range / consolidation" };
   let up = 0, down = 0;
   for (let i = 1; i < swings.length; i++) {
-    const a = swings[i - 1], b = swings[i];
-    if (a.type === "H" && b.type === "H") { if (b.value > a.value) up++; else down++; }
-    if (a.type === "L" && b.type === "L") { if (b.value > a.value) up++; else down++; }
+    const prev = swings[i - 1], cur = swings[i];
+    if (prev.type === "H" && cur.type === "H") { if (cur.value > prev.value) up++; else down++; }
+    else if (prev.type === "L" && cur.type === "L") { if (cur.value > prev.value) up++; else down++; }
   }
-  const swingsText = swings.map(s => (s.type === "H" ? "HH?" : "LL?")).join(", ");
+  const swingsSeq = swings.map(s => s.type === "H" ? "HH/HL?" : "LH/LL?").join(", ");
   let verdict = "Range / consolidation";
   if (up > down && up >= 1) verdict = "Uptrend (HH/HL)";
   else if (down > up && down >= 1) verdict = "Downtrend (LH/LL)";
-  return { swingsText, verdict };
+  return { swingsText: swingsSeq || "mixed", verdict };
 }
-// ---------- End Sharp-based pixel reader ----------
 
 /** local type for return */
 type SwingResult = {
@@ -3550,15 +3480,18 @@ type SwingResult = {
 /** Build RAW SWING MAP block for a TF from its image data URL */
 async function buildRawSwingForTF(dataUrl: string | null, timeLabel: string): Promise<{ block: string | null; confidence: number }> {
   if (!dataUrl) return { block: null, confidence: 0 };
-  const img = await loadJimpFromDataUrl(dataUrl); // now uses sharp-based loader
+  const img = await loadJimpFromDataUrl(dataUrl);
   if (!img) return { block: null, confidence: 0 };
+
+  const MAX_W = 1200;
+  if (img.bitmap.width > MAX_W) img.resize(MAX_W, Jimp.AUTO);
 
   const sampleCount = Math.max(80, Math.min(240, Math.floor(img.bitmap.width / 3)));
   const ohlc = estimateOHLCFromImage(img, sampleCount);
   const series = seriesFromOHLC(ohlc);
 
   const swings = detectSwings(series, Math.max(3, Math.floor(sampleCount / 30)));
-  const detectConfidence = Math.min(1, Math.max(0, swings.length / 6));
+  const detectConfidence = Math.min(1, Math.max(0, swings.length / 6)); // heuristic
 
   const { swingsText, verdict } = swingsToVerdict(swings);
 
@@ -3570,7 +3503,6 @@ async function buildRawSwingForTF(dataUrl: string | null, timeLabel: string): Pr
 
   return { block, confidence: detectConfidence };
 }
-
 
 /** Images (4H/1H/15m/5m/1m) → RAW SWING MAP */
 export async function generateRawSwingMapFromImages(images: {
