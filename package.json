@@ -9,19 +9,22 @@
     "lint": "next lint"
   },
   "dependencies": {
-  "next": "14.2.4",
-  "react": "18.2.0",
-  "react-dom": "18.2.0",
-  "axios": "^1.7.7",
-  "xml2js": "^0.6.2",
-  "openai": "^4.0.0",
-  "formidable": "^3.5.1",
-  "sharp": "^0.33.3",
-  "jimp": "^0.22.12"
+    "next": "14.2.4",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "axios": "^1.7.7",
+    "xml2js": "^0.6.2",
+    "openai": "^4.0.0",
+    "formidable": "^3.5.1",
+    "sharp": "^0.33.3",
+    "jimp": "^0.22.12"
   },
   "devDependencies": {
     "typescript": "^5.4.2",
     "@types/react": "^18.2.66",
     "@types/node": "^20.11.30"
+  },
+  "engines": {
+    "node": "18.x"
   }
 }
