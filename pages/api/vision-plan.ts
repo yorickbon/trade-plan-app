@@ -3863,19 +3863,39 @@ if (mode === "expand") {
     scalpingHard: false
   });
 
-  let text = await callOpenAI(modelExpand, messages);
-  const _injFast = await tryInjectRawSwingMapIntoText(text, { h4: c.h4, h1: c.h1, m15: c.m15, m5: c.m5 || null, m1: null }); text = _injFast.text;
-// pixel-based RAW SWING MAP injection (images → map)
-const _injExp = await tryInjectRawSwingMapIntoText(text, { h4: c.h4, h1: c.h1, m15: c.m15, m5: c.m5 || null, m1: null });
+let text = await callOpenAI(modelExpand, messages);
+
+// mark which TF images we actually have (used by reconciliation)
+PROVIDED_TFS = {
+  h4: !!c.h4,
+  h1: !!c.h1,
+  m15: !!c.m15,
+  m5: !!c.m5,
+  m1: false
+};
+
+// single pixel-based RAW SWING MAP injection (images → map)
+const _injExp = await tryInjectRawSwingMapIntoText(text, {
+  h4: c.h4,
+  h1: c.h1,
+  m15: c.m15,
+  m5: c.m5 || null,
+  m1: null
+});
 text = _injExp.text;
 
-   // Minimum scaffold & options
-  text = await enforceQuickPlan(modelExpand, c.instrument, text);
-  text = await enforceOption1(modelExpand, c.instrument, text);
-  text = await enforceOption2(modelExpand, c.instrument, text);
+// Minimum scaffold & options
+text = await enforceQuickPlan(modelExpand, c.instrument, text);
+text = await enforceOption1(modelExpand, c.instrument, text);
+text = await enforceOption2(modelExpand, c.instrument, text);
 
-  // Enforce structure directly from RAW SWING MAP (truth source)
-  text = _applyRawSwingMap(text);
+// Structure + polish (single pass)
+text = _clarifyBOSWording(text);
+text = normalizeTriggerSpacing(text); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
+text = _reconcileHTFTrendFromText(text);
+text = _applyRawSwingMap(text); // RAW MAP is final authority (one pass)
+text = await enforceTriggerSpecificity(modelExpand, c.instrument, text);
+
 
   // Replace placeholder tournament injection...
   text = await enforceTournamentDiversity(modelExpand, c.instrument, text);
