@@ -1721,10 +1721,35 @@ if (calUrlOrig) {
         aiMeta = extractAiMeta(text) || aiMeta;
       }
 
-    text = await enforceOption1(MODEL, instrument, text);
+  text = await enforceOption1(MODEL, instrument, text);
       text = await enforceOption2(MODEL, instrument, text);
 
-      
+      // CRITICAL: Validate entry prices are reasonable relative to current market price
+      if (livePrice && aiMeta) {
+        const entries: number[] = [];
+        
+        // Extract entry prices from text
+        const entryMatch = text.match(/Entry.*?:.*?([\d.]+)/i);
+        if (entryMatch) entries.push(Number(entryMatch[1]));
+        
+        // Check zone min/max if available
+        if (aiMeta.zone?.min) entries.push(Number(aiMeta.zone.min));
+        if (aiMeta.zone?.max) entries.push(Number(aiMeta.zone.max));
+        
+        // Validate: entries should be within 10% of current price
+        for (const entry of entries) {
+          if (isFinite(entry) && entry > 0) {
+            const pctDiff = Math.abs((entry - livePrice) / livePrice);
+            if (pctDiff > 0.10) { // More than 10% away
+              console.error(`[VISION-PLAN] Price validation FAILED: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
+              return res.status(400).json({ 
+                ok: false, 
+                reason: `Chart misread detected. Current price is ${livePrice} but suggested entry is ${entry} (${(pctDiff*100).toFixed(1)}% away). Please retry with clearer/zoomed-in charts showing current price levels clearly.` 
+              });
+            }
+          }
+        }
+      }
 
       // Stamp 5M/1M execution if used
       const usedM5 = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
@@ -1733,7 +1758,7 @@ if (calUrlOrig) {
       text = stampM1Used(text, usedM1);
 
       text = applyConsistencyGuards(text, {
-        instrument,
+      instrument,
         headlinesSign: computeHeadlinesSign(hBias),
         csmSign: computeCSMInstrumentSign(csm, instrument).sign,
         calendarSign: parseInstrumentBiasFromNote(biasNote)
@@ -1791,10 +1816,36 @@ if (calUrlOrig) {
 
     if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
-  textFull = await enforceOption1(MODEL, instrument, textFull);
+textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
 
        
+      // CRITICAL: Validate entry prices are reasonable relative to current market price
+      if (livePrice && aiMetaFull) {
+        const entries: number[] = [];
+        
+        // Extract entry prices from text
+        const entryMatch = textFull.match(/Entry.*?:.*?([\d.]+)/i);
+        if (entryMatch) entries.push(Number(entryMatch[1]));
+        
+        // Check zone min/max if available
+        if (aiMetaFull.zone?.min) entries.push(Number(aiMetaFull.zone.min));
+        if (aiMetaFull.zone?.max) entries.push(Number(aiMetaFull.zone.max));
+        
+        // Validate: entries should be within 10% of current price
+        for (const entry of entries) {
+          if (isFinite(entry) && entry > 0) {
+            const pctDiff = Math.abs((entry - livePrice) / livePrice);
+            if (pctDiff > 0.10) { // More than 10% away
+              console.error(`[VISION-PLAN] Price validation FAILED: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
+              return res.status(400).json({ 
+                ok: false, 
+                reason: `Chart misread detected. Current price is ${livePrice} but suggested entry is ${entry} (${(pctDiff*100).toFixed(1)}% away). Please retry with clearer/zoomed-in charts showing current price levels clearly.` 
+              });
+            }
+          }
+        }
+      }
 
     // Stamp 5M/1M execution if used
     const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
