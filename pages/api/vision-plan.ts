@@ -1759,8 +1759,7 @@ if (featuresFromAi) {
     text = await enforceOption1(MODEL, instrument, text);
       text = await enforceOption2(MODEL, instrument, text);
 
-      // Ensure calendar visibility in Quick Plan
-      text = ensureCalendarVisibilityInQuickPlan(text, { instrument, preReleaseOnly, biasLine: calendarText });
+      
 
       // Stamp 5M/1M execution if used
       const usedM5 = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
@@ -1879,8 +1878,7 @@ if (featuresFromAiFull) {
   textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
 
-    // Ensure calendar visibility in Quick Plan
-    
+       
 
     // Stamp 5M/1M execution if used
     const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
