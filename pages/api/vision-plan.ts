@@ -886,6 +886,8 @@ function systemCore(
     "- Score each candidate T_candidate = clamp( 0.5*HTF_fit(4H) + 0.3*Context_fit(1H) + 0.2*Trigger_fit(15m & optional 5m), 0, 100 ).",
     "- Penalize conflicts with HTF (-15 to -30). Reward multi-signal confluence (+10 to +20) and clean invalidation/asymmetric R:R (+5 to +15).",
     "- Pick TOP 1 as 'Option 1 (Primary)' and a DISTINCT runner-up for 'Option 2 (Alternative)'.",
+    "- Each option must report its own Conviction %, computed per the rule above (no shared caps).",
+
     "- Provide a compact tournament table (name — score — reason).",
     "",
     "Fundamentals Scoring (0–100, no hard caps):",
@@ -900,12 +902,12 @@ function systemCore(
     "- If a high-impact event is within ≤60 min, reduce by 25%: F = clamp( RawF * (1 - 0.25*proximityFlag), 0, 100 ), where proximityFlag=1 if warning ≤60 min else 0.",
     "- Unavailable components fall back to 50 (except calendar sign, which may be neutral).",
     "",
-    "Conviction (0–100) from TECH & FUND alignment:",
-    "- Compute T as the best tournament score (0–100).",
-    "- Use the fundamentals F above (0–100).",
-    "- Determine direction sign from technical primary vs fundamentals net sign; alignment bonus: +8 if same sign, else -8.",
-    "- If a high-impact event is within ≤60 min, apply final scaling 15%: Conv = clamp( (0.55*T + 0.45*F + align) * (1 - 0.15*proximityFlag), 0, 100 ).",
-    "- Do not apply any other caps.",
+   "Conviction (0–100) — per option (independent):",
+"- For **each** trade option, compute Conv using that option’s own tournament score T_option (0–100) and the same Fundamentals F (0–100).",
+"- Alignment: if the option’s technical direction matches the fundamentals net sign → +8; if it conflicts → -8.",
+"- If a high-impact event is within ≤60 min, apply a final scaling of 15%: Conv_option = clamp( (0.55*T_option + 0.45*F + align) * (1 - 0.15*proximityFlag), 0, 100 ).",
+"- Output **distinct Conviction** for Option 1 and Option 2. Quick Plan uses Option 1’s Conviction.",
+"- Do not apply any other caps.",
     "",
     "Consistency rule:",
     "- If Calendar/Headlines/CSM align, do not say 'contradicting'; say 'aligning'.",
@@ -1333,7 +1335,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const { fields, files } = await parseMultipart(req);
 
     const MODEL = pickModelFromFields(req, fields);
-    const instrument = String(fields.instrument || fields.code || "EURUSD").toUpperCase().replace(/\s+/g, "");
+    const rawInstr = String(fields.instrument || fields.code || "").trim().toUpperCase().replace(/\s+/g, "");
+if (!rawInstr) {
+  return res.status(400).json({ ok: false, reason: "Missing 'instrument'. Provide instrument code (e.g., EURUSD)." });
+}
+const instrument = rawInstr;
+
     const requestedMode = String(fields.mode || "").toLowerCase();
     if (requestedMode === "fast") mode = "fast";
 
@@ -1410,63 +1417,123 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
     const hBias = computeHeadlinesBias(headlineItems);
 
-    // Calendar (OCR-first STRICT pre-release handling, fallback to API)
-    let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
-    let calendarProvider: string | null = null;
-    let calendarText: string | null = null;
-    let calendarEvidence: string[] = [];
-    let warningMinutes: number | null = null;
-    let biasNote: string | null = null;
-    let advisoryText: string | null = null;
-    let debugRows: any[] | null = null;
-    let preReleaseOnly = false;
+   // ---------- Calendar Handling (Improved) ----------
+let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
+let calendarProvider: string | null = null;
+let calendarText: string | null = null;
+let calendarEvidence: string[] = [];
+let warningMinutes: number | null = null;
+let biasNote: string | null = null;
+let advisoryText: string | null = null;
+let debugRows: any[] | null = null;
+let preReleaseOnly = false;
 
-    let calDataUrlForPrompt: string | null = calUrlOrig;
+let calDataUrlForPrompt: string | null = calUrlOrig;
 
-    if (calUrlOrig) {
-      const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch(() => null);
-      if (ocr && Array.isArray(ocr.items)) {
-        const relCurs = new Set(relevantCurrenciesFromInstrument(instrument));
-        const usableForInstr = (ocr.items || []).some((r) => relCurs.has(String(r?.currency || "")) && hasUsableFields(r));
-        calendarStatus = "image-ocr";
-        calendarProvider = "image-ocr";
-        if (usableForInstr) {
-          const analyzed = analyzeCalendarOCR(ocr, instrument);
-          calendarText = analyzed.biasLine;                    // pre-release line or bias line
-          calendarEvidence = analyzed.evidenceLines;           // only post-result rows (≤72h)
-          warningMinutes = analyzed.warningMinutes;
-          biasNote = analyzed.preReleaseOnly ? null : analyzed.biasNote; // no biasNote if pre-release
-          preReleaseOnly = analyzed.preReleaseOnly;
-          debugRows = analyzed.rowsForDebug || null;
-          calDataUrlForPrompt = calUrlOrig; // keep image in prompt
-          if (preReleaseOnly) {
-            advisoryText = calendarText; // surface pre-release line in prompt too
-          }
-        } else {
-          calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
-          calDataUrlForPrompt = null;
-        }
-      } else {
-        const calAdv = await fetchCalendarForAdvisory(req, instrument);
-        calendarStatus = calAdv.status;
-        calendarProvider = calAdv.provider;
-        calendarText = calAdv.text;
-        advisoryText = calAdv.advisoryText || null;
-        calendarEvidence = calAdv.evidence || [];
-        warningMinutes = calAdv.warningMinutes;
-        biasNote = calAdv.biasNote;
-        calDataUrlForPrompt = null;
-      }
+function evaluateCalendarItems(items: any[], instrument: string) {
+
+  const relCurs = new Set(relevantCurrenciesFromInstrument(instrument));
+  const usable = items.filter(r => relCurs.has(String(r?.currency || "")) && hasUsableFields(r));
+
+  if (usable.length === 0) {
+    return {
+      bias: "neutral",
+      reasoning: [`Calendar provided, but no relevant info for ${instrument}.`],
+      evidence: []
+    };
+  }
+
+  let score = 0;
+  const reasoning: string[] = [];
+  for (const ev of usable) {
+    const { currency, actual, forecast, previous, title } = ev;
+    if (actual == null || forecast == null) continue;
+
+    const surprise = actual - forecast;
+    const deltaPrev = forecast - previous;
+    let localBias = 0;
+
+    if (Math.abs(surprise) > Math.abs(deltaPrev)) {
+      localBias = surprise > 0 ? 1 : -1;
     } else {
-      const calAdv = await fetchCalendarForAdvisory(req, instrument);
-      calendarStatus = calAdv.status;
-      calendarProvider = calAdv.provider;
-      calendarText = calAdv.text;
-      calendarEvidence = calAdv.evidence || [];
-      warningMinutes = calAdv.warningMinutes;
-      biasNote = calAdv.biasNote;
-      calDataUrlForPrompt = null;
+      localBias = surprise >= 0 ? 0.5 : -0.5;
     }
+
+    if (currency === "USD") localBias *= -1;
+    if (currency === "EUR") localBias *= 1;
+
+    score += localBias;
+    reasoning.push(`${currency} ${title || ""}: ${actual}/${forecast}/${previous} → ${localBias > 0 ? "bullish" : "bearish"}`);
+  }
+
+  const finalBias = score > 0 ? "bullish" : score < 0 ? "bearish" : "neutral";
+  return { bias: finalBias, reasoning, evidence: usable.map(u => `${u.currency} ${u.title || ""}: ${u.actual}/${u.forecast}/${u.previous}`) };
+}
+
+
+if (calUrlOrig) {
+  const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch(() => null);
+  if (ocr && Array.isArray(ocr.items)) {
+    const result = evaluateCalendarItems(ocr.items, instrument);
+    calendarProvider = "image-ocr";
+    calendarStatus = "image-ocr";
+    calendarText = result.bias;
+    calendarEvidence = result.evidence;
+    biasNote = result.reasoning.join("; ");
+    calDataUrlForPrompt = calUrlOrig;
+  } else {
+    // Fallback to API if OCR is present but unusable
+    const calAdv = await fetchCalendarForAdvisory(req, instrument);
+    calendarProvider = calAdv.provider;
+    calendarStatus = calAdv.status;
+    calendarText = calAdv.text || "Calendar unavailable.";
+    calendarEvidence = calAdv.evidence || [];
+    biasNote = calAdv.biasNote || null;
+    advisoryText = calAdv.advisoryText || null;
+    warningMinutes = calAdv.warningMinutes ?? null;
+    calDataUrlForPrompt = null;
+  }
+} else {
+  const calAdv = await fetchCalendarForAdvisory(req, instrument);
+  calendarProvider = calAdv.provider;
+  calendarStatus = calAdv.status;
+  calendarText = calAdv.text || "Calendar unavailable.";
+  calendarEvidence = calAdv.evidence || [];
+  biasNote = calAdv.biasNote || null;
+  advisoryText = calAdv.advisoryText || null;
+  warningMinutes = calAdv.warningMinutes ?? null;
+  calDataUrlForPrompt = null;
+}
+
+
+// ---------- Strategy Tournament + Conviction ----------
+function scoreStrategies(features: any, fundamentals: any) {
+  const scores: { [k: string]: number } = {};
+
+  scores["trendPullback"] = (features.emaSlope > 0 ? 60 : 40) + (fundamentals.calendar === "bullish" ? 10 : 0);
+  scores["breakout"] = features.volatility > features.atrAvg ? 70 : 50;
+  scores["liquiditySweep"] = features.sweepDetected ? 80 : 50;
+  scores["momentum"] = features.rsi > 55 && features.macdHist > 0 ? 75 : 55;
+  scores["rangeFade"] = features.rangeBound ? 65 : 40;
+  scores["meanReversion"] = features.distanceFromVWAP > features.atr ? 70 : 45;
+
+  return scores;
+}
+
+function computeConviction(strategyScore: number, fundamentals: any): number {
+  let base = strategyScore;
+  if (fundamentals.calendar === "bullish" && base > 50) base += 5;
+  if (fundamentals.calendar === "bearish" && base < 50) base += 5;
+  return Math.min(100, Math.max(0, base));
+}
+
+// Normalize calendar to a strict label for scoring/conviction
+const calendarLabel = (() => {
+  const s = parseInstrumentBiasFromNote(biasNote); // -1 | 0 | +1
+  return s > 0 ? "bullish" : s < 0 ? "bearish" : "neutral";
+})();
+
+/* tournament-scoring moved into FAST/FULL branches after aiMeta extraction — no code here */
 
     // Sentiment + price
     let csm: CsmSnapshot;
@@ -1516,6 +1583,57 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
       let text = await callOpenAI(MODEL, messages);
       let aiMeta = extractAiMeta(text) || {};
+
+// ---- Strategy Tournament (FAST) — only if model returned features ----
+const calendarLabel = (() => {
+  const s = parseInstrumentBiasFromNote(biasNote); // -1 | 0 | +1
+  return s > 0 ? "bullish" : s < 0 ? "bearish" : "neutral";
+})();
+
+const featuresFromAi = (aiMeta && typeof (aiMeta as any).features === "object") ? (aiMeta as any).features : null;
+
+let tournamentFast: any = null;
+if (featuresFromAi) {
+  const strategyScores = scoreStrategies(featuresFromAi, { calendar: calendarLabel });
+  const ranked = Object.entries(strategyScores).sort((a, b) => b[1] - a[1]);
+
+  if (ranked.length >= 1) {
+    const option1Strategy = ranked[0];
+    const opt1 = {
+      strategy: option1Strategy[0],
+      conviction: computeConviction(option1Strategy[1], { calendar: calendarLabel }),
+      direction: option1Strategy[0] === "liquiditySweep" ? "short" : "long",
+      entry: "see trade card",
+      sl: "see trade card",
+      tp1: "see trade card",
+      tp2: "see trade card",
+    };
+
+    const opt2 = ranked.length >= 2 ? (() => {
+      const option2Strategy = ranked[1];
+      return {
+        strategy: option2Strategy[0],
+        conviction: computeConviction(option2Strategy[1], { calendar: calendarLabel }),
+        direction: option2Strategy[0] === "liquiditySweep" ? "short" : "long",
+        entry: "see trade card",
+        sl: "see trade card",
+        tp1: "see trade card",
+        tp2: "see trade card",
+      };
+    })() : null;
+
+    tournamentFast = {
+      ranked: ranked.map(([name, score]) => ({ name, score })),
+      option1: opt1,
+      option2: opt2,
+      calendar: calendarLabel,
+    };
+  }
+}
+
+// attach to aiMeta so downstream can use it; if null, nothing is invented
+(aiMeta as any).tournament = tournamentFast;
+
       if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
 
       const bad = invalidOrderRelativeToPrice(aiMeta);
@@ -1592,6 +1710,57 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     let textFull = await callOpenAI(MODEL, messages);
     let aiMetaFull = extractAiMeta(textFull) || {};
+
+// ---- Strategy Tournament (FULL) — only if model returned features ----
+const calendarLabelFull = (() => {
+  const s = parseInstrumentBiasFromNote(biasNote); // -1 | 0 | +1
+  return s > 0 ? "bullish" : s < 0 ? "bearish" : "neutral";
+})();
+
+const featuresFromAiFull = (aiMetaFull && typeof (aiMetaFull as any).features === "object") ? (aiMetaFull as any).features : null;
+
+let tournamentFull: any = null;
+if (featuresFromAiFull) {
+  const strategyScores = scoreStrategies(featuresFromAiFull, { calendar: calendarLabelFull });
+  const ranked = Object.entries(strategyScores).sort((a, b) => b[1] - a[1]);
+
+  if (ranked.length >= 1) {
+    const option1Strategy = ranked[0];
+    const opt1 = {
+      strategy: option1Strategy[0],
+      conviction: computeConviction(option1Strategy[1], { calendar: calendarLabelFull }),
+      direction: option1Strategy[0] === "liquiditySweep" ? "short" : "long",
+      entry: "see trade card",
+      sl: "see trade card",
+      tp1: "see trade card",
+      tp2: "see trade card",
+    };
+
+    const opt2 = ranked.length >= 2 ? (() => {
+      const option2Strategy = ranked[1];
+      return {
+        strategy: option2Strategy[0],
+        conviction: computeConviction(option2Strategy[1], { calendar: calendarLabelFull }),
+        direction: option2Strategy[0] === "liquiditySweep" ? "short" : "long",
+        entry: "see trade card",
+        sl: "see trade card",
+        tp1: "see trade card",
+        tp2: "see trade card",
+      };
+    })() : null;
+
+    tournamentFull = {
+      ranked: ranked.map(([name, score]) => ({ name, score })),
+      option1: opt1,
+      option2: opt2,
+      calendar: calendarLabelFull,
+    };
+  }
+}
+
+// attach to aiMetaFull so downstream can use it; if null, nothing is invented
+(aiMetaFull as any).tournament = tournamentFull;
+
 
     if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
