@@ -684,12 +684,25 @@ const CURRENCIES = new Set(G8);
 function relevantCurrenciesFromInstrument(instr: string): string[] {
   const U = (instr || "").toUpperCase();
   const found = [...CURRENCIES].filter(c => U.includes(c));
-  if (found.length) return found;
-  // Minimal non-FX coverage → map instrument → USD relevance when appropriate
-  if (/(XAUUSD|BTCUSD)/.test(U)) return ["USD"];
+  
+  if (found.length >= 2) {
+    // For FX pairs, use BOTH currencies in the pair
+    return found.slice(0, 2);
+  } else if (found.length === 1) {
+    // Single currency found (e.g., XAUUSD) - use it plus correlations
+    const base = found[0];
+    if (base === "USD") return ["USD", "EUR", "GBP", "JPY", "CAD"]; // USD correlations
+    if (base === "EUR") return ["EUR", "USD", "GBP"]; // EUR correlations
+    return [base, "USD"]; // Default to base + USD
+  }
+  
+  // Non-FX instruments
+  if (/(XAUUSD|BTCUSD)/.test(U)) return ["USD", "EUR", "JPY"]; // Gold/Crypto affects multiple
   if (/(US500|SPX|SP500|S&P)/.test(U)) return ["USD"];
   if (U.endsWith("USD") || U.startsWith("USD")) return ["USD"];
-  return ["USD"];
+  
+  // Default: all G8 (professional traders look at ALL major currencies for risk sentiment)
+  return ["USD", "EUR", "GBP", "JPY", "CAD", "AUD", "CHF", "NZD"];
 }
 function hasUsableFields(r: OcrCalendarRow): boolean {
   // ACCEPT:
