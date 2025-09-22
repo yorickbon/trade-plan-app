@@ -1714,39 +1714,47 @@ if (calUrlOrig) {
 
       if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
 
-      const bad = invalidOrderRelativeToPrice(aiMeta);
-      if (bad) {
-        text = await enforceOption1(MODEL, instrument, text);
-        text = await enforceOption2(MODEL, instrument, text);
-        aiMeta = extractAiMeta(text) || aiMeta;
-      }
+    text = await enforceOption1(MODEL, instrument, text);
+      text = await enforceOption2(MODEL, instrument, text);
+      
+      // CRITICAL: Validate entry prices...
 
-  text = await enforceOption1(MODEL, instrument, text);
+text = await enforceOption1(MODEL, instrument, text);
       text = await enforceOption2(MODEL, instrument, text);
 
       // CRITICAL: Validate entry prices are reasonable relative to current market price
       if (livePrice && aiMeta) {
         const entries: number[] = [];
-        
-        // Extract entry prices from text
         const entryMatch = text.match(/Entry.*?:.*?([\d.]+)/i);
         if (entryMatch) entries.push(Number(entryMatch[1]));
-        
-        // Check zone min/max if available
         if (aiMeta.zone?.min) entries.push(Number(aiMeta.zone.min));
         if (aiMeta.zone?.max) entries.push(Number(aiMeta.zone.max));
         
-        // Validate: entries should be within 10% of current price
         for (const entry of entries) {
           if (isFinite(entry) && entry > 0) {
             const pctDiff = Math.abs((entry - livePrice) / livePrice);
-            if (pctDiff > 0.10) { // More than 10% away
+            if (pctDiff > 0.10) {
               console.error(`[VISION-PLAN] Price validation FAILED: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
-              return res.status(400).json({ 
-                ok: false, 
-                reason: `Chart misread detected. Current price is ${livePrice} but suggested entry is ${entry} (${(pctDiff*100).toFixed(1)}% away). Please retry with clearer/zoomed-in charts showing current price levels clearly.` 
-              });
+              return res.status(400).json({ ok: false, reason: `Chart misread detected. Current price is ${livePrice} but suggested entry is ${entry} (${(pctDiff*100).toFixed(1)}% away). Please retry with clearer/zoomed-in charts.` });
             }
+          }
+        }
+        
+        const dirMatch = text.match(/Direction:\s*(Long|Short)/i);
+        const orderMatch = text.match(/Order Type:\s*(Limit|Stop|Market)/i);
+        if (dirMatch && orderMatch && entries.length > 0) {
+          const direction = dirMatch[1].toLowerCase();
+          const orderType = orderMatch[1].toLowerCase();
+          const avgEntry = entries.reduce((a, b) => a + b, 0) / entries.length;
+          
+          if (direction === "long" && orderType === "limit" && avgEntry > livePrice) {
+            console.error(`[VISION-PLAN] Order logic FAILED: Long Limit at ${avgEntry} but price is ${livePrice}`);
+            return res.status(400).json({ ok: false, reason: `Order type error: Long Limit orders must be BELOW current price (${livePrice}), not above at ${avgEntry}. Model may have misread chart direction.` });
+          }
+          
+          if (direction === "short" && orderType === "limit" && avgEntry < livePrice) {
+            console.error(`[VISION-PLAN] Order logic FAILED: Short Limit at ${avgEntry} but price is ${livePrice}`);
+            return res.status(400).json({ ok: false, reason: `Order type error: Short Limit orders must be ABOVE current price (${livePrice}), not below at ${avgEntry}. Model may have misread chart direction.` });
           }
         }
       }
@@ -1823,26 +1831,36 @@ textFull = await enforceOption1(MODEL, instrument, textFull);
       // CRITICAL: Validate entry prices are reasonable relative to current market price
       if (livePrice && aiMetaFull) {
         const entries: number[] = [];
-        
-        // Extract entry prices from text
         const entryMatch = textFull.match(/Entry.*?:.*?([\d.]+)/i);
         if (entryMatch) entries.push(Number(entryMatch[1]));
-        
-        // Check zone min/max if available
         if (aiMetaFull.zone?.min) entries.push(Number(aiMetaFull.zone.min));
         if (aiMetaFull.zone?.max) entries.push(Number(aiMetaFull.zone.max));
         
-        // Validate: entries should be within 10% of current price
         for (const entry of entries) {
           if (isFinite(entry) && entry > 0) {
             const pctDiff = Math.abs((entry - livePrice) / livePrice);
-            if (pctDiff > 0.10) { // More than 10% away
+            if (pctDiff > 0.10) {
               console.error(`[VISION-PLAN] Price validation FAILED: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
-              return res.status(400).json({ 
-                ok: false, 
-                reason: `Chart misread detected. Current price is ${livePrice} but suggested entry is ${entry} (${(pctDiff*100).toFixed(1)}% away). Please retry with clearer/zoomed-in charts showing current price levels clearly.` 
-              });
+              return res.status(400).json({ ok: false, reason: `Chart misread detected. Current price is ${livePrice} but suggested entry is ${entry} (${(pctDiff*100).toFixed(1)}% away). Please retry with clearer/zoomed-in charts.` });
             }
+          }
+        }
+        
+        const dirMatch = textFull.match(/Direction:\s*(Long|Short)/i);
+        const orderMatch = textFull.match(/Order Type:\s*(Limit|Stop|Market)/i);
+        if (dirMatch && orderMatch && entries.length > 0) {
+          const direction = dirMatch[1].toLowerCase();
+          const orderType = orderMatch[1].toLowerCase();
+          const avgEntry = entries.reduce((a, b) => a + b, 0) / entries.length;
+          
+          if (direction === "long" && orderType === "limit" && avgEntry > livePrice) {
+            console.error(`[VISION-PLAN] Order logic FAILED: Long Limit at ${avgEntry} but price is ${livePrice}`);
+            return res.status(400).json({ ok: false, reason: `Order type error: Long Limit orders must be BELOW current price (${livePrice}), not above at ${avgEntry}. Model may have misread chart direction.` });
+          }
+          
+          if (direction === "short" && orderType === "limit" && avgEntry < livePrice) {
+            console.error(`[VISION-PLAN] Order logic FAILED: Short Limit at ${avgEntry} but price is ${livePrice}`);
+            return res.status(400).json({ ok: false, reason: `Order type error: Short Limit orders must be ABOVE current price (${livePrice}), not below at ${avgEntry}. Model may have misread chart direction.` });
           }
         }
       }
