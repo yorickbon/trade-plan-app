@@ -1430,7 +1430,8 @@ let preReleaseOnly = false;
 
 let calDataUrlForPrompt: string | null = calUrlOrig;
 
-ffunction evaluateCalendarItems(items: any[], instrument: string) {
+function evaluateCalendarItems(items: any[], instrument: string) {
+
   const relCurs = new Set(relevantCurrenciesFromInstrument(instrument));
   const usable = items.filter(r => relCurs.has(String(r?.currency || "")) && hasUsableFields(r));
 
