@@ -1266,8 +1266,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         scalping: false,
       });
 
-      let text = await callOpenAI(modelExpand, messages);
-      text = await enforceQuickPlan(modelExpand, c.instrument, text);
+     let text = await callOpenAI(modelExpand, messages);
       text = await enforceOption1(modelExpand, c.instrument, text);
       text = await enforceOption2(modelExpand, c.instrument, text);
 
