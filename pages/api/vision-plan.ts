@@ -905,8 +905,11 @@ function systemCore(
     "- Final calendar bias uses baseMinusQuote: net = baseSum - quoteSum; net>0 → bullish instrument; net<0 → bearish; only when BOTH currency sums are exactly 0 → neutral.",
     "- If no actuals in the last 72h for the pair’s currencies: 'Pre-release only, no confirmed bias until data is out.'",
     "",
-    "Under **Fundamental View**, if Calendar is unavailable, write exactly 'Calendar: unavailable'.",
-    "If Calendar is pre-release only, write exactly 'Pre-release only, no confirmed bias until data is out.' and do NOT claim a bullish/bearish/neutral calendar bias.",
+   "Under **Fundamental View**, you MUST include the complete calendar analysis provided.",
+"If calendar_status === 'image-ocr', use the calendar reasoning lines provided in the calendar evidence.",
+"Format: 'Calendar: [exact text from calendar analysis]' then list each event on new lines.",
+"NEVER write just 'Calendar: neutral' or 'Calendar: unavailable' without the supporting evidence lines.",
+"If truly no data exists, write: 'Calendar: [exact reason from analysis]'.",
   ];
 
   const scalpingLines = !scalping ? [] : [
@@ -950,9 +953,16 @@ function buildUserPartsBase(args: {
   if (args.m5) { parts.push({ type: "text", text: "Scalp 5M Chart" }); parts.push({ type: "image_url", image_url: { url: args.m5 } }); }
   if (args.m1) { parts.push({ type: "text", text: "Timing 1M Chart" }); parts.push({ type: "image_url", image_url: { url: args.m1 } }); }
   if (args.calendarDataUrl) { parts.push({ type: "text", text: "Economic Calendar Image:" }); parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } }); }
-  if (!args.calendarDataUrl && args.calendarText) { parts.push({ type: "text", text: `Calendar snapshot:\n${args.calendarText}` }); }
+ if (!args.calendarDataUrl && args.calendarText) { 
+  const calBlock = args.calendarEvidence && args.calendarEvidence.length > 0
+    ? `Calendar Analysis:\n${args.calendarText}\n\nEvents:\n${args.calendarEvidence.join("\n")}`
+    : `Calendar Analysis:\n${args.calendarText}`;
+  parts.push({ type: "text", text: calBlock }); 
+}
   if (args.calendarAdvisoryText) { parts.push({ type: "text", text: `Calendar advisory:\n${args.calendarAdvisoryText}` }); }
-  if (args.calendarEvidence && args.calendarEvidence.length) { parts.push({ type: "text", text: `Calendar fundamentals evidence:\n- ${args.calendarEvidence.join("\n- ")}` }); }
+  if (args.calendarEvidence && args.calendarEvidence.length && args.calendarDataUrl) { 
+  parts.push({ type: "text", text: `MANDATORY: Use this calendar analysis in your Fundamental View:\n${args.calendarEvidence.join("\n")}` }); 
+}
   if (args.headlinesText) { parts.push({ type: "text", text: `Headlines snapshot:\n${args.headlinesText}` }); }
   if (args.sentimentText) { parts.push({ type: "text", text: `Sentiment snapshot (server):\n${args.sentimentText}` }); }
   if (args.debugOCRRows && args.debugOCRRows.length) {
