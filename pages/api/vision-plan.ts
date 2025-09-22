@@ -983,31 +983,29 @@ function messagesFull(args: {
 }) {
   const system = [
     systemCore(args.instrument, args.calendarAdvisory, args.scalping), "",
-    "OUTPUT format (in this exact order):",
-    "Quick Plan (Actionable)",
-    "• Direction: Long | Short | Stay Flat",
-    "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-    "• Trigger:",
-    "• Entry (zone or single):",
-    "• Stop Loss:",
-    "• Take Profit(s): TP1 / TP2 (approx R multiples)",
-    "• Conviction: <0–100>%",
-    "• Setup:",
-    "• Short Reasoning:",
-    "",
+   "OUTPUT format (in this exact order):",
     "Option 1 (Primary)",
     "• Direction: ...",
     "• Order Type: ...",
     "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%", "• Why this is primary:",
-    "",
-    "Option 2 (Alternative)",
+   "• Conviction: <0–100>% (independent calculation for this option)",
+"• Why this is primary:",
+"",
+"Option 2 (Alternative)",
     "• Direction: ...",
     "• Order Type: ...",
     "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%", "• Why this alternative:",
-    "",
-    "Full Breakdown",
+   "• Conviction: <0–100>% (independent calculation - may be higher than Option 1)",
+"• Why this alternative:",
+"",
+"Trade Management",
+"• Entry execution: limit order placement, scaling in if applicable",
+"• Stop management: initial SL, move to BE rules, trailing stop conditions",
+"• Profit taking: TP1/TP2 execution, partial close strategy",
+"• Time management: max hold time, session considerations",
+"• Risk scenario: what to do if setup invalidates or market conditions change",
+"",
+"Full Breakdown",
     "• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m/1m if used)",
     "• Fundamental View (Calendar + Sentiment + Headlines) — include explicit Calendar bias for <PAIR> when available; if pre-release, say: 'Pre-release only, no confirmed bias until data is out.'",
     "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
@@ -1056,13 +1054,7 @@ function messagesFastStage1(args: {
   const system = [
     systemCore(args.instrument, args.calendarAdvisory, args.scalping), "",
     "OUTPUT ONLY:",
-    "Quick Plan (Actionable)",
-    "• Direction: Long | Short | Stay Flat",
-    "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%", "• Setup:", "• Short Reasoning:",
-    "",
-    "Option 1 (Primary)",
+"Option 1 (Primary)",
     "• Direction: ...",
     "• Order Type: ...",
     "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
@@ -1120,33 +1112,10 @@ async function enforceOption1(model: string, instrument: string, text: string) {
   ];
   return callOpenAI(model, messages);
 }
-function hasQuickPlan(text: string): boolean { return /Quick\s*Plan\s*\(Actionable\)/i.test(text || ""); }
-async function enforceQuickPlan(model: string, instrument: string, text: string) {
-  if (hasQuickPlan(text)) return text;
-  const messages = [
-    { role: "system", content: "Add a 'Quick Plan (Actionable)' section at the very top, copying primary trade details. Keep all other sections unchanged and in order." },
-    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd the Quick Plan section at the top.` },
-  ];
-  return callOpenAI(model, messages);
-}
+// Quick Plan removed - using Option 1 as primary trade card
 
 // ---------- Consistency + visibility guards ----------
-function ensureCalendarVisibilityInQuickPlan(text: string, args: { instrument: string; preReleaseOnly: boolean; biasLine: string | null }) {
-  if (!text) return text;
-  const hasQP = /Quick\s*Plan\s*\(Actionable\)/i.test(text);
-  if (!hasQP) return text;
-
-  const qpBlock = text.match(/Quick\s*Plan\s*\(Actionable\)[\s\S]*?(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i)?.[0] || "";
-  const hasCalendarMention = /Calendar\s*:/i.test(qpBlock) || /Calendar\s*bias\s*for\s*/i.test(qpBlock);
-  if (hasCalendarMention) return text; // already present
-
-  const inject = args.preReleaseOnly
-    ? `\n• Note: Pre-release only, no confirmed bias until data is out.`
-    : (args.biasLine ? `\n• Calendar bias for ${args.instrument}: ${args.biasLine.replace(/^Calendar bias for\s*[^:]+:\s*/i, "")}` : "");
-
-  if (!inject) return text;
-  return text.replace(/(Quick\s*Plan\s*\(Actionable\)[^\n]*\n)/i, `$1${inject}\n`);
-}
+// Quick Plan removed - calendar visibility now in Option 1 and Full Breakdown only
 
 function stampM5Used(text: string, used: boolean) {
   if (!used) return text;
@@ -1303,7 +1272,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       text = await enforceOption2(modelExpand, c.instrument, text);
 
       // Visibility and stamping
-      text = ensureCalendarVisibilityInQuickPlan(text, { instrument: c.instrument, preReleaseOnly: false, biasLine: calAdv.text || null });
+     
       const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
       text = stampM5Used(text, usedM5);
 
@@ -1788,8 +1757,7 @@ if (featuresFromAi) {
         aiMeta = extractAiMeta(text) || aiMeta;
       }
 
-      text = await enforceQuickPlan(MODEL, instrument, text);
-      text = await enforceOption1(MODEL, instrument, text);
+    text = await enforceOption1(MODEL, instrument, text);
       text = await enforceOption2(MODEL, instrument, text);
 
       // Ensure calendar visibility in Quick Plan
@@ -1909,12 +1877,11 @@ if (featuresFromAiFull) {
 
     if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
-    textFull = await enforceQuickPlan(MODEL, instrument, textFull);
-    textFull = await enforceOption1(MODEL, instrument, textFull);
+  textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
 
     // Ensure calendar visibility in Quick Plan
-    textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
+    
 
     // Stamp 5M/1M execution if used
     const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
