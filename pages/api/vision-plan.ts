@@ -1533,6 +1533,14 @@ if (calUrlOrig) {
     return null;
   });
   
+  // DIAGNOSTIC LOGGING
+  console.log("[DIAGNOSTIC] OCR items count:", ocr?.items?.length || 0);
+  if (ocr?.items) {
+    console.log("[DIAGNOSTIC] First 3 OCR items:", JSON.stringify(ocr.items.slice(0, 3), null, 2));
+  }
+  console.log("[DIAGNOSTIC] Instrument:", instrument);
+  console.log("[DIAGNOSTIC] Relevant currencies:", relevantCurrenciesFromInstrument(instrument));
+  
   if (ocr && Array.isArray(ocr.items) && ocr.items.length > 0) {
     // OCR succeeded - evaluate the calendar data
     const result = evaluateCalendarItems(ocr.items, instrument);
