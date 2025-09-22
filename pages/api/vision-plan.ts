@@ -1507,14 +1507,46 @@ function analyzeCalendarProfessional(ocrItems: OcrCalendarRow[], instrument: str
     const impactMult = impact === "High" ? 1.5 : impact === "Medium" ? 1.0 : 0.5;
     score *= impactMult;
     
-    currencyScores[cur] = (currencyScores[cur] || 0) + score;
+  currencyScores[cur] = (currencyScores[cur] || 0) + score;
     
     const dir = score > 0 ? "bullish" : score < 0 ? "bearish" : "neutral";
     reasoning.push(`${cur} ${title}: ${a} vs F:${f ?? "?"}/P:${p ?? "?"} = ${dir} (${score.toFixed(1)} pts, ${impact})`);
     evidence.push(`${cur} ${title}: ${a}/${f ?? "?"}/${p ?? "?"}`);
   }
 
-  // Calculate instrument bias (base - quote)
+  // Professional cross-currency correlations
+  // CAD/AUD/NZD weakness → USD strength (commodity correlation)
+  if (quote === "USD") {
+    const commodCurrencies = ["CAD", "AUD", "NZD"];
+    for (const c of commodCurrencies) {
+      if (currencyScores[c] && currencyScores[c] < 0) {
+        const transferScore = currencyScores[c] * -0.3; // 30% inverse correlation
+        currencyScores["USD"] = (currencyScores["USD"] || 0) + transferScore;
+        reasoning.push(`${c} weakness (${currencyScores[c].toFixed(1)}) → USD strength via commodity correlation (+${transferScore.toFixed(1)})`);
+      }
+    }
+  }
+  
+  // EUR/GBP correlation (European bloc)
+  if (base === "EUR" && currencyScores["GBP"]) {
+    const transferScore = currencyScores["GBP"] * 0.25; // 25% positive correlation
+    currencyScores["EUR"] = (currencyScores["EUR"] || 0) + transferScore;
+    reasoning.push(`GBP ${currencyScores["GBP"] > 0 ? "strength" : "weakness"} (${currencyScores["GBP"].toFixed(1)}) → EUR correlation (+${transferScore.toFixed(1)})`);
+  }
+  
+  // JPY as safe-haven (inverse risk correlation)
+  if ((base === "JPY" || quote === "JPY") && currencyScores["JPY"]) {
+    const riskCurrencies = ["AUD", "NZD", "CAD"];
+    const riskScore = riskCurrencies.reduce((sum, c) => sum + (currencyScores[c] || 0), 0);
+    if (Math.abs(riskScore) > 3) {
+      // Strong risk-on/off → inverse for JPY
+      const jpyAdjust = riskScore * -0.2;
+      currencyScores["JPY"] = (currencyScores["JPY"] || 0) + jpyAdjust;
+      reasoning.push(`Risk ${riskScore > 0 ? "on" : "off"} → JPY ${jpyAdjust > 0 ? "strength" : "weakness"} (${jpyAdjust.toFixed(1)})`);
+    }
+  }
+
+  // Calculate instrument bias (base - quote) AFTER correlations
   const baseScore = currencyScores[base] || 0;
   const quoteScore = currencyScores[quote] || 0;
   const netScore = baseScore - quoteScore;
