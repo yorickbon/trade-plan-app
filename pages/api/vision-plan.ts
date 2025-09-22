@@ -701,16 +701,19 @@ function hasUsableFields(r: OcrCalendarRow): boolean {
   return !!(hasActualSet || hasPreRelease);
 }
 
-// ---------- API calendar fallback ----------
+// ---------- API calendar (OCR-first, 72h, never "unavailable") ----------
 async function fetchCalendarRaw(req: NextApiRequest, instrument: string): Promise<any | null> {
   try {
     const base = originFromReq(req);
-    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=120&_t=${Date.now()}`;
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(5000) });
+    // 72h strict window; rely on server OCR to include grey numbers as numeric fields
+    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=72&_t=${Date.now()}`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(6000) });
     const j: any = await r.json().catch(() => ({}));
     return j?.ok ? j : null;
   } catch { return null; }
 }
+
+// Lightweight label builder retained for UI summaries
 function calendarShortText(resp: any, pair: string): string | null {
   if (!resp?.ok) return null;
   const instrBias = resp?.bias?.instrument;
@@ -724,6 +727,7 @@ function calendarShortText(resp: any, pair: string): string | null {
   if (!parts.length) parts.push("No strong calendar bias.");
   return `Calendar bias for ${pair}: ${parts.join("; ")}`;
 }
+
 function nearestHighImpactWithin(resp: any, minutes: number): number | null {
   if (!resp?.ok || !Array.isArray(resp?.items)) return null;
   const nowMs = Date.now(); let best: number | null = null;
@@ -737,17 +741,78 @@ function nearestHighImpactWithin(resp: any, minutes: number): number | null {
   }
   return best;
 }
+
+// --- Calendar bias computation v2 (deterministic) ---
+type CalEvent = { time: string; currency: string; name?: string; actual?: number|null; forecast?: number|null; previous?: number|null; impact?: string; };
+function _isHigherBetter(name: string): number {
+  const n = (name || "").toLowerCase();
+  // Lower is better
+  if (/\bunemployment\b|\bjobless\b|\bclaims\b|\bjobless claims\b|\binitial claims\b|\bcontinuing claims\b|\binflation rate\b.*(target)?\b/.test(n)) return -1;
+  // Higher is better
+  if (/\bcpi\b|\bcore cpi\b|\bpce\b|\bcore pce\b|\bgdp\b|\bretail sales\b|\bpmi\b|\bism\b|\bservices\b|\bmanufacturing\b|\bnew orders\b|\bconfidence\b|\bbuilding\b|\bhousing\b/.test(n)) return +1;
+  // Default neutral → treat higher as better
+  return +1;
+}
+function _impactWeight(impact?: string): number {
+  const s = String(impact || "").toLowerCase();
+  if (s === "high") return 1.0;
+  if (s === "medium" || s === "med") return 0.6;
+  if (s === "low") return 0.3;
+  return 0.5;
+}
+function _surprise(it: CalEvent): number {
+  // Use Actual vs Forecast if Actual exists, else expected lean from Forecast vs Previous
+  const hasActual = it.actual != null && !Number.isNaN(it.actual as any);
+  const ref = (hasActual ? (it.forecast ?? it.previous) : (it.previous ?? null));
+  const base = (hasActual ? it.actual : it.forecast);
+  if (base == null || ref == null) return 0;
+  const denom = Math.max(Math.abs(Number(ref)), 1e-9);
+  return Number((Number(base) - Number(ref)) / denom);
+}
+function _scoreEvent(it: CalEvent): number {
+  const dir = _isHigherBetter(it.name || "");
+  const s = _surprise(it);
+  return dir * s * _impactWeight(it.impact);
+}
+function _aggregateBias(resp: any, pair: string) {
+  const base = pair.slice(0,3), quote = pair.slice(3);
+  const nowMs = Date.now(), lo = nowMs - 72*3600*1000;
+  const items: CalEvent[] = Array.isArray(resp?.items) ? resp.items : [];
+  const rel = items.filter((it: any) => {
+    const t = new Date(it?.time || 0).getTime();
+    return t <= nowMs && t >= lo && it?.currency && (it.currency === base || it.currency === quote);
+  });
+  let per: Record<string, number> = {};
+  for (const it of rel) {
+    const c = it.currency;
+    per[c] = (per[c] || 0) + _scoreEvent(it);
+  }
+  const b = per[base] || 0, q = per[quote] || 0;
+  const net = b - q; // pair bias (base - quote)
+  function label(x: number): "bullish"|"bearish"|"neutral" {
+    if (x > +0.05) return "bullish";
+    if (x < -0.05) return "bearish";
+    return "neutral";
+  }
+  const perCurrency = {
+    [base]: { score: +b.toFixed(3), label: label(b) },
+    [quote]: { score: +q.toFixed(3), label: label(q) }
+  };
+  const instrument = { pair, score: +net.toFixed(3), label: label(net) };
+  return { perCurrency, instrument };
+}
+
 function postResultBiasNote(resp: any, pair: string): string | null {
   if (!resp?.ok) return null;
+  const agg = _aggregateBias(resp, pair);
   const base = pair.slice(0,3), quote = pair.slice(3);
-  const per = resp?.bias?.perCurrency || {};
-  const b = per[base]?.label || "neutral";
-  const q = per[quote]?.label || "neutral";
-  const instr = resp?.bias?.instrument?.label || null;
-  const scores = resp?.bias?.instrument ? `(score ${resp.bias.instrument.score})` : "";
-  const line = `Per-currency: ${base} ${b} vs ${quote} ${q}${instr ? `; Instrument bias: ${instr} ${scores}` : ""}`;
-  return line;
+  const b = agg.perCurrency[base]?.label || "neutral";
+  const q = agg.perCurrency[quote]?.label || "neutral";
+  const instr = agg.instrument?.label || "neutral";
+  const scores = `(score ${agg.instrument?.score ?? 0})`;
+  return `Per-currency: ${base} ${b} vs ${quote} ${q}; Instrument bias: ${instr} ${scores}`;
 }
+
 function buildCalendarEvidence(resp: any, pair: string): string[] {
   if (!resp?.ok || !Array.isArray(resp?.items)) return [];
   const base = pair.slice(0,3), quote = pair.slice(3);
@@ -762,35 +827,78 @@ function buildCalendarEvidence(resp: any, pair: string): string[] {
   }
   return lines;
 }
+
 async function fetchCalendarForAdvisory(req: NextApiRequest, instrument: string): Promise<{
-  text: string | null, status: "api" | "unavailable", provider: string | null,
+  text: string | null, status: "image-ocr" | "api", provider: string | null,
   warningMinutes: number | null, advisoryText: string | null, biasNote: string | null,
   raw?: any | null, evidence?: string[] | null
 }> {
   try {
-    const base = originFromReq(req);
-    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=48&_t=${Date.now()}`
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(4000) });
-    const j: any = await r.json().catch(() => ({}));
-    if (j?.ok) {
-      const t = calendarShortText(j, instrument) || `Calendar bias for ${instrument}: (no strong signal)`;
-      const warn = nearestHighImpactWithin(j, 60);
-      const bias = postResultBiasNote(j, instrument);
-      const advisory = [
-        warn != null ? `⚠️ High-impact event in ~${warn} min.` : null,
-        bias ? `Recent result alignment: ${bias}.` : null
-      ].filter(Boolean).join("\n");
-      const rawFull = await fetchCalendarRaw(req, instrument);
-      const evidence = rawFull ? buildCalendarEvidence(rawFull, instrument) : buildCalendarEvidence(j, instrument);
-      return { text: t, status: "api", provider: String(j?.provider || "mixed"), warningMinutes: warn ?? null, advisoryText: advisory || null, biasNote: bias || null, raw: j, evidence };
+    // 1) Fetch OCR/API result for last 72h, including grey numbers
+    const raw = await fetchCalendarRaw(req, instrument);
+
+    // If we couldn't fetch anything, still return an explicit reason (never "unavailable")
+    if (!raw?.ok || !Array.isArray(raw.items) || raw.items.length === 0) {
+      return {
+        text: `Calendar provided, but no instrument-relevant events for ${instrument} in the last 72h.`,
+        status: "image-ocr",
+        provider: String(raw?.provider || "image-ocr"),
+        warningMinutes: null,
+        advisoryText: "No AUD/USD-relevant rows with Actual/Forecast/Previous in the 72h window.",
+        biasNote: "Neutral — insufficient post-result data.",
+        raw: raw || null,
+        evidence: []
+      };
     }
-    return { text: "Calendar unavailable.", status: "unavailable", provider: null, warningMinutes: null, advisoryText: null, biasNote: null, raw: null, evidence: [] };
-  } catch {
-    return { text: "Calendar unavailable.", status: "unavailable", provider: null, warningMinutes: null, advisoryText: null, biasNote: null, raw: null, evidence: [] };
+
+    // 2) Build explicit bias (deterministic)
+    const bias = _aggregateBias(raw, instrument);
+    const short = calendarShortText({ ok: true, bias }, instrument)
+              || `Calendar bias for ${instrument}: ${bias.instrument.label} (${bias.instrument.score})`;
+
+    // 3) Warn if a high-impact event is within 60 minutes
+    const warn = nearestHighImpactWithin(raw, 60);
+
+    // 4) Compose advisory and evidence
+    const biasLine = postResultBiasNote({ ok: true, bias }, instrument) || null;
+    const evidence = buildCalendarEvidence(raw, instrument);
+
+    // 5) If we only have pre-release (Forecast/Previous but no Actuals) in last 72h,
+    // still return a reasoned "pre-release" note rather than "unavailable"
+    const hasActual = raw.items.some((it: any) => it.actual != null);
+    const advisory = [
+      warn != null ? `⚠️ High-impact event in ~${warn} min.` : null,
+      !hasActual ? "Pre-release window: results not out yet; computed lean from Forecast vs Previous." : null,
+      biasLine ? `Recent result alignment: ${biasLine}.` : null
+    ].filter(Boolean).join("\n");
+
+    return {
+      text: short,
+      status: String(raw?.provider || "image-ocr") === "api" ? "api" : "image-ocr",
+      provider: String(raw?.provider || "image-ocr"),
+      warningMinutes: warn ?? null,
+      advisoryText: advisory || null,
+      biasNote: biasLine || null,
+      raw,
+      evidence
+    };
+  } catch (e: any) {
+    // Explicit, actionable failure message (never "unavailable")
+    return {
+      text: `Calendar parsing failed for ${instrument}: ${e?.message || "unexpected error"}.`,
+      status: "image-ocr",
+      provider: "image-ocr",
+      warningMinutes: null,
+      advisoryText: "OCR/API error or timeout. Try re-uploading the Gyazo calendar image.",
+      biasNote: "Neutral — failed to compute bias.",
+      raw: null,
+      evidence: []
+    };
   }
 }
 
 // ---------- Composite bias (legacy for provenance only) ----------
+
 function splitFXPair(instr: string): { base: string|null; quote: string|null } {
   const U = (instr || "").toUpperCase();
   if (U.length >= 6) {
