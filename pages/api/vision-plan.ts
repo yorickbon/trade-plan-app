@@ -844,10 +844,10 @@ function systemCore(
     "- Use the Sentiment snapshot exactly as given (CSM + Headlines bias + optional COT cue).",
     "- Never use the word 'mixed' for calendar verdicts — use bullish/bearish/neutral only.",
     "",
-  "Execution clarity:",
+ "Execution clarity:",
     "- Prefer **Entry zones (min–max)** for OB/FVG/SR confluence; use a **single price** for tight breakout/trigger.",
-    "- Entries must be ACTIONABLE NOW: within 10-20 pips of current price for immediate execution.",
-    "- If current price is mid-trend, suggest entries AT or NEAR current level, not distant levels requiring significant moves first.",
+    "- **CRITICAL: Entries must be IMMEDIATELY ACTIONABLE** - within 10-20 pips (or 0.3% for indices/commodities) of the current price hint provided.",
+    "- If current price is mid-trend with clear momentum, suggest entries AT CURRENT LEVEL or very close, not distant levels requiring 50+ pip moves first.",
     "- SL behind structure; TP1/TP2 with R multiples; BE rules; invalidation.",
     "",
   "Multi-timeframe roles (fixed):",
@@ -1726,8 +1726,8 @@ if (calUrlOrig) {
           });
         }
         
-        const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
-        if (priceDiff > 0.02) { // More than 2% difference
+       const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
+      if (priceDiff > 0.05) { // More than 5% difference
           console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(1)}%`);
           return res.status(400).json({ 
             ok: false, 
@@ -1856,8 +1856,8 @@ text = await enforceOption1(MODEL, instrument, text);
         });
       }
       
-      const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
-      if (priceDiff > 0.02) { // More than 2% difference
+     const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
+      if (priceDiff > 0.05) { // More than 5% difference
         console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(1)}%`);
         return res.status(400).json({ 
           ok: false, 
