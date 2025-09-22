@@ -36,12 +36,12 @@ export default async function handler(
     const key = `${pair}_${timeframe}`;
     const existingEvents = BOS_CACHE.get(key) || [];
     
-    // Add new event with 4 hour expiry
+  // Add new event with 2 hour expiry (session-specific)
     existingEvents.push({
       bos,
       price,
       time,
-      timestamp: Date.now() + 4 * 60 * 60 * 1000
+      timestamp: Date.now() + 2 * 60 * 60 * 1000  // ← 2 hours instead of 4
     });
     
     // Keep only last 10 events
