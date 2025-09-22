@@ -1684,27 +1684,46 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
       headlinesText: headlinesText || undefined,
       sentimentText,
-      calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
+      calendarAdvisory: {
+        warningMinutes,
+        biasNote,
+        advisoryText,
+        evidence: calendarEvidence || [],
+        debugRows: debugOCR ? (debugRows || []) : [],
+        preReleaseOnly
+      },
       provenance: provForModel,
     });
-    if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
+
+    if (livePrice) {
+      (messages[0] as any).content =
+        (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`;
+    }
 
     let textFull = await callOpenAI(MODEL, messages);
     let aiMetaFull = extractAiMeta(textFull) || {};
 
-    if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
+    if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) {
+      aiMetaFull.currentPrice = livePrice;
+    }
 
+    // Enforce sections (we will remove Quick Plan in Patch 3)
     textFull = await enforceQuickPlan(MODEL, instrument, textFull);
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
 
-    // Ensure calendar visibility in Quick Plan
-    textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
+    // Ensure calendar visibility in Quick Plan (no-op after Patch 3)
+    textFull = ensureCalendarVisibilityInQuickPlan(textFull, {
+      instrument,
+      preReleaseOnly,
+      biasLine: calendarText
+    });
 
     // Stamp 5M execution if used
     const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
     textFull = stampM5Used(textFull, usedM5Full);
 
+    // Consistency guard
     textFull = applyConsistencyGuards(textFull, {
       instrument,
       headlinesSign: computeHeadlinesSign(hBias),
@@ -1712,21 +1731,35 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       calendarSign: parseInstrumentBiasFromNote(biasNote)
     });
 
+    // Provenance footer
     const footer = buildServerProvenanceFooter({
       headlines_provider: headlinesProvider || "unknown",
       calendar_status: calendarStatus,
       calendar_provider: calendarProvider,
       csm_time: csm.tsISO,
-      extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR },
+      extras: {
+        vp_version: VP_VERSION,
+        model: MODEL,
+        mode,
+        composite_cap: composite.cap,
+        composite_align: composite.align,
+        composite_conflict: composite.conflict,
+        pre_release: preReleaseOnly,
+        debug_ocr: !!debugOCR
+      },
     });
     textFull = `${textFull}\n${footer}`;
 
+    // Final response
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
       ok: true,
       text: textFull,
       meta: {
-        instrument, mode, vp_version: VP_VERSION, model: MODEL,
+        instrument,
+        mode,
+        vp_version: VP_VERSION,
+        model: MODEL,
         sources: {
           headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
           headlines_instrument: instrument,
@@ -1741,6 +1774,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       },
     });
   } catch (err: any) {
-    return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
+    return res.status(500).json({
+      ok: false,
+      reason: err?.message || "vision-plan failed"
+    });
   }
 }
+
