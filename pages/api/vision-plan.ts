@@ -973,13 +973,29 @@ function buildUserPartsBase(args: {
   calendarEvidence?: string[] | null;
   debugOCRRows?: { timeISO: string | null; title: string | null; currency: string | null; impact: any; actual: any; forecast: any; previous: any }[] | null;
 }) {
-  const parts: any[] = [
-    { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}` },
-    { type: "text", text: "STEP 1: ANALYZE CHARTS OBJECTIVELY (no fundamentals yet)\n\nHTF 4H Chart - Answer these:\n1. Is price making HIGHER HIGHS and HIGHER LOWS (uptrend) or LOWER HIGHS and LOWER LOWS (downtrend)?\n2. Where is price NOW relative to the last 50 candles - at the TOP (recent highs), MIDDLE (range), or BOTTOM (recent lows)?\n3. Did price recently BREAK any major trendlines or levels?" },
+ const parts: any[] = [
+    { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}
+
+MANDATORY CHART ANALYSIS PROTOCOL:
+For EACH chart, you must answer ALL these questions:
+
+1. Overall trend (look at full visible range, left to right):
+   - Higher highs + higher lows? = UPTREND
+   - Lower highs + lower lows? = DOWNTREND
+   
+2. Last 5-10 candles ONLY - Break of Structure check:
+   - Did the most recent candles break ABOVE the previous swing high? If YES → "Recent BOS UP"
+   - Did the most recent candles break BELOW the previous swing low? If YES → "Recent BOS DOWN"
+   - If neither → "No recent BOS"
+   
+3. Current price location: Top 25% / Middle / Bottom 25% of visible range
+
+You MUST state the BOS status explicitly for every timeframe.` },
+    { type: "text", text: "HTF 4H Chart - Answer all 3 questions above:" },
     { type: "image_url", image_url: { url: args.h4 } },
-    { type: "text", text: "Context 1H Chart - Same questions:" },
+    { type: "text", text: "Context 1H Chart - Answer all 3 questions above:" },
     { type: "image_url", image_url: { url: args.h1 } },
-    { type: "text", text: "Execution 15M Chart - Same questions:" },
+    { type: "text", text: "Execution 15M Chart - Answer all 3 questions above:" },
     { type: "image_url", image_url: { url: args.m15 } },
   ];
   if (args.m5) { parts.push({ type: "text", text: "Scalp 5M Chart" }); parts.push({ type: "image_url", image_url: { url: args.m5 } }); }
