@@ -1515,21 +1515,54 @@ function evaluateCalendarItems(items: any[], instrument: string) {
 
 
 if (calUrlOrig) {
-  const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch(() => null);
-  if (ocr && Array.isArray(ocr.items)) {
+  const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch((err) => {
+    console.error("[vision-plan] OCR failed:", err);
+    return null;
+  });
+  
+  if (ocr && Array.isArray(ocr.items) && ocr.items.length > 0) {
+    // OCR succeeded - evaluate the calendar data
     const result = evaluateCalendarItems(ocr.items, instrument);
     calendarProvider = "image-ocr";
     calendarStatus = "image-ocr";
-    calendarText = result.bias;
+    calendarText = result.reasoning[0] || result.bias; // Use first reasoning line as main text
     calendarEvidence = result.evidence;
     biasNote = result.reasoning.join("; ");
+    advisoryText = result.details || null;
     calDataUrlForPrompt = calUrlOrig;
+    
+    // Check for high-impact events within 60 minutes
+    const nowMs = Date.now();
+    for (const it of ocr.items) {
+      if (it?.impact === "High" && it?.timeISO) {
+        const eventTime = Date.parse(it.timeISO);
+        if (isFinite(eventTime) && eventTime >= nowMs) {
+          const minsAway = Math.floor((eventTime - nowMs) / 60000);
+          if (minsAway <= 60) {
+            warningMinutes = warningMinutes == null ? minsAway : Math.min(warningMinutes, minsAway);
+          }
+        }
+      }
+    }
+    
+    if (debugOCR) {
+      debugRows = ocr.items.slice(0, 3).map(r => ({
+        timeISO: r.timeISO || null,
+        title: r.title || null,
+        currency: r.currency || null,
+        impact: r.impact || null,
+        actual: r.actual ?? null,
+        forecast: r.forecast ?? null,
+        previous: r.previous ?? null,
+      }));
+    }
   } else {
-    // Fallback to API if OCR is present but unusable
+    // OCR failed or returned no items - fallback to API
+    console.log("[vision-plan] OCR returned no items, falling back to API");
     const calAdv = await fetchCalendarForAdvisory(req, instrument);
     calendarProvider = calAdv.provider;
     calendarStatus = calAdv.status;
-    calendarText = calAdv.text || "Calendar unavailable.";
+    calendarText = calAdv.text || "Calendar: OCR found no data, API also unavailable.";
     calendarEvidence = calAdv.evidence || [];
     biasNote = calAdv.biasNote || null;
     advisoryText = calAdv.advisoryText || null;
@@ -1537,10 +1570,11 @@ if (calUrlOrig) {
     calDataUrlForPrompt = null;
   }
 } else {
+  // No calendar image provided - try API
   const calAdv = await fetchCalendarForAdvisory(req, instrument);
   calendarProvider = calAdv.provider;
   calendarStatus = calAdv.status;
-  calendarText = calAdv.text || "Calendar unavailable.";
+  calendarText = calAdv.text || "Calendar: No image provided, API unavailable.";
   calendarEvidence = calAdv.evidence || [];
   biasNote = calAdv.biasNote || null;
   advisoryText = calAdv.advisoryText || null;
