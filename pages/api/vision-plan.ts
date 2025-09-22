@@ -679,39 +679,7 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
   };
 }
 
-// Helpers to determine instrument-relevant currencies for OCR usability checks
-const CURRENCIES = new Set(G8);
-function relevantCurrenciesFromInstrument(instr: string): string[] {
-  const U = (instr || "").toUpperCase();
-  const found = [...CURRENCIES].filter(c => U.includes(c));
-  
-  if (found.length >= 2) {
-    // For FX pairs, use BOTH currencies in the pair
-    return found.slice(0, 2);
-  } else if (found.length === 1) {
-    // Single currency found (e.g., XAUUSD) - use it plus correlations
-    const base = found[0];
-    if (base === "USD") return ["USD", "EUR", "GBP", "JPY", "CAD"]; // USD correlations
-    if (base === "EUR") return ["EUR", "USD", "GBP"]; // EUR correlations
-    return [base, "USD"]; // Default to base + USD
-  }
-  
-  // Non-FX instruments
-  if (/(XAUUSD|BTCUSD)/.test(U)) return ["USD", "EUR", "JPY"]; // Gold/Crypto affects multiple
-  if (/(US500|SPX|SP500|S&P)/.test(U)) return ["USD"];
-  if (U.endsWith("USD") || U.startsWith("USD")) return ["USD"];
-  
-  // Default: all G8 (professional traders look at ALL major currencies for risk sentiment)
-  return ["USD", "EUR", "GBP", "JPY", "CAD", "AUD", "CHF", "NZD"];
-}
-function hasUsableFields(r: OcrCalendarRow): boolean {
-  // ACCEPT:
-  //  (1) actual present and (forecast or previous), OR
-  //  (2) forecast and previous (pre-release expectation)
-  const hasActualSet = r != null && r.actual != null && (r.forecast != null || r.previous != null);
-  const hasPreRelease = r != null && r.actual == null && r.forecast != null && r.previous != null;
-  return !!(hasActualSet || hasPreRelease);
-}
+//
 
 // ---------- API calendar fallback ----------
 async function fetchCalendarRaw(req: NextApiRequest, instrument: string): Promise<any | null> {
@@ -1445,164 +1413,201 @@ let preReleaseOnly = false;
 
 let calDataUrlForPrompt: string | null = calUrlOrig;
 
-function evaluateCalendarItems(items: any[], instrument: string) {
-  const relCurs = new Set(relevantCurrenciesFromInstrument(instrument));
-  const usable = items.filter(r => relCurs.has(String(r?.currency || "")) && hasUsableFields(r));
+// Professional calendar analysis - reads ALL G8 currencies, applies cross-pair risk correlations
+function analyzeCalendarProfessional(ocrItems: OcrCalendarRow[], instrument: string): {
+  bias: string;
+  reasoning: string[];
+  evidence: string[];
+  details: string;
+} {
+  const base = instrument.slice(0, 3);
+  const quote = instrument.slice(3, 6);
+  
+  // Filter to last 72 hours with actual data
+  const nowMs = Date.now();
+  const h72ago = nowMs - 72 * 3600 * 1000;
+  
+  const validEvents = ocrItems.filter(r => {
+    if (!r?.currency) return false;
+    const a = parseNumberLoose(r.actual);
+    if (a == null) return false; // Must have actual
+    const f = parseNumberLoose(r.forecast);
+    const p = parseNumberLoose(r.previous);
+    if (f == null && p == null) return false; // Must have forecast or previous
+    
+    // Check timestamp if available
+    if (r.timeISO) {
+      const t = Date.parse(r.timeISO);
+      if (isFinite(t) && (t < h72ago || t > nowMs)) return false;
+    }
+    return true;
+  });
 
-  if (usable.length === 0) {
+  if (validEvents.length === 0) {
     return {
       bias: "neutral",
-      reasoning: [`Calendar: No relevant economic data for ${instrument} currencies in last 72h.`],
+      reasoning: [`Calendar: Analyzed ${ocrItems.length} events but found no usable data (actual + forecast/previous) for any G8 currency in last 72h`],
       evidence: [],
-      details: "OCR detected calendar but found no usable Actual/Forecast/Previous values for this pair's currencies."
+      details: `OCR extracted ${ocrItems.length} total rows, but none had complete A/F/P data within 72h window`
     };
   }
 
-  // Professional trader bias calculation
-  const base = instrument.slice(0, 3);
-  const quote = instrument.slice(3, 6);
-  let baseScore = 0;
-  let quoteScore = 0;
+  // Score each currency
+  const currencyScores: Record<string, number> = {};
   const reasoning: string[] = [];
   const evidence: string[] = [];
 
-  for (const ev of usable) {
-    const { currency, actual, forecast, previous, title, impact } = ev;
-    const a = parseNumberLoose(actual);
-    const f = parseNumberLoose(forecast);
-    const p = parseNumberLoose(previous);
+  for (const ev of validEvents) {
+    const cur = String(ev.currency).toUpperCase();
+    const title = String(ev.title || "Event");
+    const impact = ev.impact || "Medium";
     
-    if (a == null) continue;
-
-    // Determine if higher is better for this indicator
-    const higherIsBetter = goodIfHigher(String(title || ""));
+    const a = parseNumberLoose(ev.actual)!;
+    const f = parseNumberLoose(ev.forecast);
+    const p = parseNumberLoose(ev.previous);
     
-    // Calculate surprise vs forecast
-    const vsForecost = f != null ? a - f : 0;
-    const vsPrevious = p != null ? a - p : 0;
+    const higherIsBetter = goodIfHigher(title);
     
-    // Magnitude of surprise (% terms)
-    const surprisePct = f != null && f !== 0 ? (vsForecost / Math.abs(f)) * 100 : 0;
-    const changePct = p != null && p !== 0 ? (vsPrevious / Math.abs(p)) * 100 : 0;
-    
-    // Impact weighting
-    const impactWeight = impact === "High" ? 3 : impact === "Medium" ? 2 : 1;
-    
-    // Calculate directional score
-    let eventScore = 0;
-    if (higherIsBetter === true) {
-      // Higher = good for currency
-      if (f != null) eventScore += (vsForecost > 0 ? 1 : -1) * Math.min(Math.abs(surprisePct), 5) * impactWeight;
-      if (p != null) eventScore += (vsPrevious > 0 ? 0.5 : -0.5) * Math.min(Math.abs(changePct), 3) * impactWeight;
-    } else if (higherIsBetter === false) {
-      // Lower = good for currency
-      if (f != null) eventScore += (vsForecost < 0 ? 1 : -1) * Math.min(Math.abs(surprisePct), 5) * impactWeight;
-      if (p != null) eventScore += (vsPrevious < 0 ? 0.5 : -0.5) * Math.min(Math.abs(changePct), 3) * impactWeight;
-    }
-    
-    // Apply to correct currency
-    if (currency === base) baseScore += eventScore;
-    if (currency === quote) quoteScore += eventScore;
-    
-    // Build reasoning
-    const direction = eventScore > 0 ? "bullish" : eventScore < 0 ? "bearish" : "neutral";
-    const fStr = f != null ? `F:${f}` : "";
-    const pStr = p != null ? `P:${p}` : "";
-    reasoning.push(`${currency} ${title}: A:${a} ${fStr} ${pStr} → ${direction} ${currency} (impact: ${impact || "?"})`);
-    evidence.push(`${currency} ${title || ""}: ${a}/${f ?? "?"}/${p ?? "?"}`);
-  }
-
-  // Net bias for instrument (base - quote logic)
-  const netScore = baseScore - quoteScore;
-  const finalBias = netScore > 1 ? "bullish" : netScore < -1 ? "bearish" : "neutral";
-  
-  const summary = `Calendar: ${base}:${baseScore.toFixed(1)} vs ${quote}:${quoteScore.toFixed(1)} = ${finalBias} ${instrument} (Net:${netScore.toFixed(1)})`;
-  
-  return { 
-    bias: finalBias, 
-    reasoning: [summary, ...reasoning], 
-    evidence,
-    details: `Analyzed ${usable.length} events. Base currency (${base}) scored ${baseScore.toFixed(1)}, quote currency (${quote}) scored ${quoteScore.toFixed(1)}.`
-  };
-}
-
-
-if (calUrlOrig) {
-  const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch((err) => {
-    console.error("[vision-plan] OCR failed:", err);
-    return null;
-  });
-  
-  // DIAGNOSTIC LOGGING
-  console.log("[DIAGNOSTIC] OCR items count:", ocr?.items?.length || 0);
-  if (ocr?.items) {
-    console.log("[DIAGNOSTIC] First 3 OCR items:", JSON.stringify(ocr.items.slice(0, 3), null, 2));
-  }
-  console.log("[DIAGNOSTIC] Instrument:", instrument);
-  console.log("[DIAGNOSTIC] Relevant currencies:", relevantCurrenciesFromInstrument(instrument));
-  
-  if (ocr && Array.isArray(ocr.items) && ocr.items.length > 0) {
-    // OCR succeeded - evaluate the calendar data
-    const result = evaluateCalendarItems(ocr.items, instrument);
-    calendarProvider = "image-ocr";
-    calendarStatus = "image-ocr";
-    calendarText = result.reasoning[0] || result.bias; // Use first reasoning line as main text
-    calendarEvidence = result.evidence;
-    biasNote = result.reasoning.join("; ");
-    advisoryText = result.details || null;
-    calDataUrlForPrompt = calUrlOrig;
-    
-    // Check for high-impact events within 60 minutes
-    const nowMs = Date.now();
-    for (const it of ocr.items) {
-      if (it?.impact === "High" && it?.timeISO) {
-        const eventTime = Date.parse(it.timeISO);
-        if (isFinite(eventTime) && eventTime >= nowMs) {
-          const minsAway = Math.floor((eventTime - nowMs) / 60000);
-          if (minsAway <= 60) {
-            warningMinutes = warningMinutes == null ? minsAway : Math.min(warningMinutes, minsAway);
-          }
-        }
+    // Compare actual vs forecast (primary)
+    let score = 0;
+    if (f != null) {
+      const surprise = a - f;
+      const surprisePct = f !== 0 ? (surprise / Math.abs(f)) * 100 : 0;
+      
+      if (higherIsBetter === true) {
+        score += surprise > 0 ? Math.min(surprisePct, 10) : Math.max(surprisePct, -10);
+      } else if (higherIsBetter === false) {
+        score += surprise < 0 ? Math.min(Math.abs(surprisePct), 10) : -Math.min(Math.abs(surprisePct), 10);
       }
     }
     
-    if (debugOCR) {
-      debugRows = ocr.items.slice(0, 3).map(r => ({
-        timeISO: r.timeISO || null,
-        title: r.title || null,
-        currency: r.currency || null,
-        impact: r.impact || null,
-        actual: r.actual ?? null,
-        forecast: r.forecast ?? null,
-        previous: r.previous ?? null,
-      }));
+    // Compare actual vs previous (secondary)
+    if (p != null) {
+      const change = a - p;
+      const changePct = p !== 0 ? (change / Math.abs(p)) * 100 : 0;
+      
+      if (higherIsBetter === true) {
+        score += (change > 0 ? 0.5 : -0.5) * Math.min(Math.abs(changePct), 5);
+      } else if (higherIsBetter === false) {
+        score += (change < 0 ? 0.5 : -0.5) * Math.min(Math.abs(changePct), 5);
+      }
+    }
+    
+    // Impact multiplier
+    const impactMult = impact === "High" ? 1.5 : impact === "Medium" ? 1.0 : 0.5;
+    score *= impactMult;
+    
+    currencyScores[cur] = (currencyScores[cur] || 0) + score;
+    
+    const dir = score > 0 ? "bullish" : score < 0 ? "bearish" : "neutral";
+    reasoning.push(`${cur} ${title}: ${a} vs F:${f ?? "?"}/P:${p ?? "?"} = ${dir} (${score.toFixed(1)} pts, ${impact})`);
+    evidence.push(`${cur} ${title}: ${a}/${f ?? "?"}/${p ?? "?"}`);
+  }
+
+  // Calculate instrument bias (base - quote)
+  const baseScore = currencyScores[base] || 0;
+  const quoteScore = currencyScores[quote] || 0;
+  const netScore = baseScore - quoteScore;
+  
+  // Risk correlations: if major currencies show unified direction, apply correlation
+  const allCurrencies = Object.keys(currencyScores);
+  const avgScore = allCurrencies.reduce((sum, c) => sum + currencyScores[c], 0) / allCurrencies.length;
+  
+  // If overall risk-on/off bias exists, apply to USD
+  if (Math.abs(avgScore) > 2 && quote === "USD") {
+    // Risk-on = bad for USD, risk-off = good for USD
+    const riskBias = avgScore > 0 ? -2 : 2; // Inverse for USD
+    currencyScores["USD"] = (currencyScores["USD"] || 0) + riskBias;
+    reasoning.push(`Risk sentiment adjustment: Overall ${avgScore > 0 ? "risk-on" : "risk-off"} → ${avgScore > 0 ? "bearish" : "bullish"} USD`);
+  }
+
+  const finalBias = netScore > 2 ? "bullish" : netScore < -2 ? "bearish" : "neutral";
+  const summary = `Calendar: ${base} ${baseScore.toFixed(1)} vs ${quote} ${quoteScore.toFixed(1)} = ${finalBias} ${instrument} (net ${netScore.toFixed(1)})`;
+
+  return {
+    bias: finalBias,
+    reasoning: [summary, ...reasoning],
+    evidence,
+    details: `Analyzed ${validEvents.length} events across ${allCurrencies.length} currencies. ${base}:${baseScore.toFixed(1)}, ${quote}:${quoteScore.toFixed(1)}.`
+  };
+}
+
+// Calendar OCR + Processing
+if (calUrlOrig) {
+  const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch((err) => {
+    console.error("[vision-plan] Calendar OCR error:", err?.message || err);
+    return null;
+  });
+  
+  if (ocr && Array.isArray(ocr.items)) {
+    console.log(`[vision-plan] OCR extracted ${ocr.items.length} calendar rows`);
+    
+    if (ocr.items.length > 0) {
+      const analysis = analyzeCalendarProfessional(ocr.items, instrument);
+      calendarProvider = "image-ocr";
+      calendarStatus = "image-ocr";
+      calendarText = analysis.reasoning[0];
+      calendarEvidence = analysis.evidence;
+      biasNote = analysis.reasoning.join("; ");
+      advisoryText = analysis.details;
+      calDataUrlForPrompt = calUrlOrig;
+      
+      // High-impact warning detection
+      const nowMs = Date.now();
+      for (const it of ocr.items) {
+        if (it?.impact === "High" && it?.timeISO) {
+          const t = Date.parse(it.timeISO);
+          if (isFinite(t) && t >= nowMs) {
+            const mins = Math.floor((t - nowMs) / 60000);
+            if (mins <= 60) warningMinutes = warningMinutes == null ? mins : Math.min(warningMinutes, mins);
+          }
+        }
+      }
+      
+      if (debugOCR || debugQuery || debugField) {
+        debugRows = ocr.items.slice(0, 5).map(r => ({
+          timeISO: r.timeISO || null,
+          title: r.title || null,
+          currency: r.currency || null,
+          impact: r.impact || null,
+          actual: r.actual ?? null,
+          forecast: r.forecast ?? null,
+          previous: r.previous ?? null,
+        }));
+      }
+    } else {
+      calendarProvider = "image-ocr";
+      calendarStatus = "image-ocr";
+      calendarText = "Calendar: OCR returned 0 events (image may be empty or unreadable)";
+      calendarEvidence = [];
+      biasNote = null;
+      advisoryText = null;
+      calDataUrlForPrompt = calUrlOrig;
     }
   } else {
-    // OCR failed or returned no items - fallback to API
-    console.log("[vision-plan] OCR returned no items, falling back to API");
+    console.log("[vision-plan] OCR failed, attempting API fallback");
     const calAdv = await fetchCalendarForAdvisory(req, instrument);
     calendarProvider = calAdv.provider;
     calendarStatus = calAdv.status;
-    calendarText = calAdv.text || "Calendar: OCR found no data, API also unavailable.";
+    calendarText = calAdv.text || "Calendar: OCR failed, API unavailable";
     calendarEvidence = calAdv.evidence || [];
-    biasNote = calAdv.biasNote || null;
-    advisoryText = calAdv.advisoryText || null;
+    biasNote = calAdv.biasNote;
+    advisoryText = calAdv.advisoryText;
     warningMinutes = calAdv.warningMinutes ?? null;
     calDataUrlForPrompt = null;
   }
 } else {
-  // No calendar image provided - try API
+  console.log("[vision-plan] No calendar image provided");
   const calAdv = await fetchCalendarForAdvisory(req, instrument);
   calendarProvider = calAdv.provider;
   calendarStatus = calAdv.status;
-  calendarText = calAdv.text || "Calendar: No image provided, API unavailable.";
+  calendarText = calAdv.text || "Calendar: No image provided";
   calendarEvidence = calAdv.evidence || [];
-  biasNote = calAdv.biasNote || null;
-  advisoryText = calAdv.advisoryText || null;
+  biasNote = calAdv.biasNote;
+  advisoryText = calAdv.advisoryText;
   warningMinutes = calAdv.warningMinutes ?? null;
   calDataUrlForPrompt = null;
-}
-
+}  
 
 // ---------- Strategy Tournament + Conviction ----------
 function scoreStrategies(features: any, fundamentals: any) {
