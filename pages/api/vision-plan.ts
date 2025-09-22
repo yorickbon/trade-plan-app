@@ -11,6 +11,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
 import sharp from "sharp";
+import { getBOSStatus } from './bos-webhook';
 
 // ---------- config ----------
 export const config = { api: { bodyParser: false, sizeLimit: "25mb" } };
@@ -973,8 +974,18 @@ function buildUserPartsBase(args: {
   calendarEvidence?: string[] | null;
   debugOCRRows?: { timeISO: string | null; title: string | null; currency: string | null; impact: any; actual: any; forecast: any; previous: any }[] | null;
 }) {
- const parts: any[] = [
-    { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}
+  // Get BOS data from TradingView webhook cache
+  const bos4H = getBOSStatus(args.instrument, "240");
+  const bos1H = getBOSStatus(args.instrument, "60");
+  const bos15M = getBOSStatus(args.instrument, "15");
+  const bos5M = getBOSStatus(args.instrument, "5");
+  
+  const bosContext = (bos4H !== "NONE" || bos1H !== "NONE" || bos15M !== "NONE" || bos5M !== "NONE")
+    ? `\n\nRECENT STRUCTURE BREAKS (from TradingView indicator):\n- 4H: ${bos4H === "NONE" ? "No recent BOS" : "BOS " + bos4H}\n- 1H: ${bos1H === "NONE" ? "No recent BOS" : "BOS " + bos1H}\n- 15M: ${bos15M === "NONE" ? "No recent BOS" : "BOS " + bos15M}\n- 5M: ${bos5M === "NONE" ? "No recent BOS" : "BOS " + bos5M}\n`
+    : "\n\nRECENT STRUCTURE BREAKS: No BOS data from TradingView (check if alerts are active)\n";
+
+  const parts: any[] = [
+    { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}${bosContext}
 
 MANDATORY CHART ANALYSIS PROTOCOL:
 For EACH chart, you must answer ALL these questions:
