@@ -934,7 +934,9 @@ function systemCore(
     "- Near red news ±30m: do not initiate new market orders; consider only pre-planned limit orders with structure protection.",
     "- Management suggestions may include: partial at 1R, BE after 1R, time-stop within ~20 min if no follow-through.",
     "",
-    "ai_meta (append fields for downstream tools): include {'mode':'scalping', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'max_attempts': 3} in the existing ai_meta JSON."
+ "ai_meta (append fields for downstream tools): include {'mode':'scalping', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'max_attempts': 3} in the existing ai_meta JSON.",
+    "",
+    "CRITICAL: ai_meta MUST include 'currentPrice' field with the exact current market price from the hint provided. This is used for validation."
   ];
 
   return [...baseLines, ...scalpingLines].join("\n");
@@ -1709,10 +1711,30 @@ if (calUrlOrig) {
       });
       if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
 
-      let text = await callOpenAI(MODEL, messages);
+    let text = await callOpenAI(MODEL, messages);
       let aiMeta = extractAiMeta(text) || {};
 
-
+      // CRITICAL: Validate model acknowledged current price correctly
+      if (livePrice) {
+        const modelPrice = Number(aiMeta?.currentPrice);
+        
+        if (!isFinite(modelPrice) || modelPrice <= 0) {
+          console.error(`[VISION-PLAN] Model failed to report currentPrice in ai_meta`);
+          return res.status(400).json({ 
+            ok: false, 
+            reason: `Model did not report current price. This usually means chart y-axis is unreadable. Please use clearer chart images with visible price labels.` 
+          });
+        }
+        
+        const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
+        if (priceDiff > 0.02) { // More than 2% difference
+          console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(1)}%`);
+          return res.status(400).json({ 
+            ok: false, 
+            reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is ${livePrice} (${(priceDiff*100).toFixed(1)}% difference). Chart y-axis may be misread - please use clearer images.` 
+          });
+        }
+      }
 
       if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
 
@@ -1822,7 +1844,27 @@ text = await enforceOption1(MODEL, instrument, text);
     let textFull = await callOpenAI(MODEL, messages);
     let aiMetaFull = extractAiMeta(textFull) || {};
 
-
+    // CRITICAL: Validate model acknowledged current price correctly
+    if (livePrice) {
+      const modelPrice = Number(aiMetaFull?.currentPrice);
+      
+      if (!isFinite(modelPrice) || modelPrice <= 0) {
+        console.error(`[VISION-PLAN] Model failed to report currentPrice in ai_meta`);
+        return res.status(400).json({ 
+          ok: false, 
+          reason: `Model did not report current price. This usually means chart y-axis is unreadable. Please use clearer chart images with visible price labels.` 
+        });
+      }
+      
+      const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
+      if (priceDiff > 0.02) { // More than 2% difference
+        console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(1)}%`);
+        return res.status(400).json({ 
+          ok: false, 
+          reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is ${livePrice} (${(priceDiff*100).toFixed(1)}% difference). Chart y-axis may be misread - please use clearer images.` 
+        });
+      }
+    }
 
     if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
