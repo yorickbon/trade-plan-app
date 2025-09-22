@@ -1723,8 +1723,9 @@ if (calUrlOrig) {
           console.warn(`[VISION-PLAN] Model failed to report currentPrice, injecting live price ${livePrice}`);
           aiMeta.currentPrice = livePrice;
         } else {
-          const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
-          if (priceDiff > 0.05) { // More than 5% difference
+      const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
+          const maxDiff = 0.002; // 0.2% max (very tight - about 7.5 points for Gold at 3750)
+          if (priceDiff > maxDiff) {
             console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(1)}%`);
             return res.status(400).json({ 
               ok: false, 
@@ -1846,8 +1847,9 @@ if (calUrlOrig) {
         console.warn(`[VISION-PLAN] Model failed to report currentPrice, injecting live price ${livePrice}`);
         aiMetaFull.currentPrice = livePrice;
       } else {
-        const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
-        if (priceDiff > 0.05) { // More than 5% difference
+   const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
+          const maxDiff = 0.002; // 0.2% max (very tight - about 7.5 points for Gold at 3750)
+          if (priceDiff > maxDiff) {
           console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(1)}%`);
           return res.status(400).json({ 
             ok: false, 
