@@ -505,8 +505,10 @@ type OcrCalendar = { items: OcrCalendarRow[] };
 async function ocrCalendarFromImage(model: string, calendarDataUrl: string): Promise<OcrCalendar | null> {
   const sys = [
     "You are extracting ECONOMIC CALENDAR rows via image OCR.",
-    "Return STRICT JSON only. DO NOT GUESS values. If unreadable/absent, use null.",
-    "Fields per row: timeISO (ISO8601 if visible, else null), title, currency (e.g., USD, EUR), impact (Low|Medium|High), actual, forecast, previous."
+    "Return STRICT JSON only. CRITICAL: Extract ALL numbers including grey/muted text - these are valid data points.",
+    "Fields per row: timeISO (ISO8601 if visible, else null), title, currency (e.g., USD, EUR), impact (Low|Medium|High), actual, forecast, previous.",
+    "For numbers: extract percentage values (0.5%), rates (<0.50%), and regular numbers. Grey/muted numbers are valid - do not skip them.",
+    "If a cell appears empty or truly unreadable, use null. But if you see any number (colored or grey), extract it."
   ].join("\n");
   const user = [
     { type: "text", text: "Extract rows as specified. JSON only. Schema: { items: OcrCalendarRow[] }" },
@@ -1431,43 +1433,84 @@ let preReleaseOnly = false;
 let calDataUrlForPrompt: string | null = calUrlOrig;
 
 function evaluateCalendarItems(items: any[], instrument: string) {
-
   const relCurs = new Set(relevantCurrenciesFromInstrument(instrument));
   const usable = items.filter(r => relCurs.has(String(r?.currency || "")) && hasUsableFields(r));
 
   if (usable.length === 0) {
     return {
       bias: "neutral",
-      reasoning: [`Calendar provided, but no relevant info for ${instrument}.`],
-      evidence: []
+      reasoning: [`Calendar: No relevant economic data for ${instrument} currencies in last 72h.`],
+      evidence: [],
+      details: "OCR detected calendar but found no usable Actual/Forecast/Previous values for this pair's currencies."
     };
   }
 
-  let score = 0;
+  // Professional trader bias calculation
+  const base = instrument.slice(0, 3);
+  const quote = instrument.slice(3, 6);
+  let baseScore = 0;
+  let quoteScore = 0;
   const reasoning: string[] = [];
+  const evidence: string[] = [];
+
   for (const ev of usable) {
-    const { currency, actual, forecast, previous, title } = ev;
-    if (actual == null || forecast == null) continue;
+    const { currency, actual, forecast, previous, title, impact } = ev;
+    const a = parseNumberLoose(actual);
+    const f = parseNumberLoose(forecast);
+    const p = parseNumberLoose(previous);
+    
+    if (a == null) continue;
 
-    const surprise = actual - forecast;
-    const deltaPrev = forecast - previous;
-    let localBias = 0;
-
-    if (Math.abs(surprise) > Math.abs(deltaPrev)) {
-      localBias = surprise > 0 ? 1 : -1;
-    } else {
-      localBias = surprise >= 0 ? 0.5 : -0.5;
+    // Determine if higher is better for this indicator
+    const higherIsBetter = goodIfHigher(String(title || ""));
+    
+    // Calculate surprise vs forecast
+    const vsForecost = f != null ? a - f : 0;
+    const vsPrevious = p != null ? a - p : 0;
+    
+    // Magnitude of surprise (% terms)
+    const surprisePct = f != null && f !== 0 ? (vsForecost / Math.abs(f)) * 100 : 0;
+    const changePct = p != null && p !== 0 ? (vsPrevious / Math.abs(p)) * 100 : 0;
+    
+    // Impact weighting
+    const impactWeight = impact === "High" ? 3 : impact === "Medium" ? 2 : 1;
+    
+    // Calculate directional score
+    let eventScore = 0;
+    if (higherIsBetter === true) {
+      // Higher = good for currency
+      if (f != null) eventScore += (vsForecost > 0 ? 1 : -1) * Math.min(Math.abs(surprisePct), 5) * impactWeight;
+      if (p != null) eventScore += (vsPrevious > 0 ? 0.5 : -0.5) * Math.min(Math.abs(changePct), 3) * impactWeight;
+    } else if (higherIsBetter === false) {
+      // Lower = good for currency
+      if (f != null) eventScore += (vsForecost < 0 ? 1 : -1) * Math.min(Math.abs(surprisePct), 5) * impactWeight;
+      if (p != null) eventScore += (vsPrevious < 0 ? 0.5 : -0.5) * Math.min(Math.abs(changePct), 3) * impactWeight;
     }
-
-    if (currency === "USD") localBias *= -1;
-    if (currency === "EUR") localBias *= 1;
-
-    score += localBias;
-    reasoning.push(`${currency} ${title || ""}: ${actual}/${forecast}/${previous} → ${localBias > 0 ? "bullish" : "bearish"}`);
+    
+    // Apply to correct currency
+    if (currency === base) baseScore += eventScore;
+    if (currency === quote) quoteScore += eventScore;
+    
+    // Build reasoning
+    const direction = eventScore > 0 ? "bullish" : eventScore < 0 ? "bearish" : "neutral";
+    const fStr = f != null ? `F:${f}` : "";
+    const pStr = p != null ? `P:${p}` : "";
+    reasoning.push(`${currency} ${title}: A:${a} ${fStr} ${pStr} → ${direction} ${currency} (impact: ${impact || "?"})`);
+    evidence.push(`${currency} ${title || ""}: ${a}/${f ?? "?"}/${p ?? "?"}`);
   }
 
-  const finalBias = score > 0 ? "bullish" : score < 0 ? "bearish" : "neutral";
-  return { bias: finalBias, reasoning, evidence: usable.map(u => `${u.currency} ${u.title || ""}: ${u.actual}/${u.forecast}/${u.previous}`) };
+  // Net bias for instrument (base - quote logic)
+  const netScore = baseScore - quoteScore;
+  const finalBias = netScore > 1 ? "bullish" : netScore < -1 ? "bearish" : "neutral";
+  
+  const summary = `Calendar: ${base}:${baseScore.toFixed(1)} vs ${quote}:${quoteScore.toFixed(1)} = ${finalBias} ${instrument} (Net:${netScore.toFixed(1)})`;
+  
+  return { 
+    bias: finalBias, 
+    reasoning: [summary, ...reasoning], 
+    evidence,
+    details: `Analyzed ${usable.length} events. Base currency (${base}) scored ${baseScore.toFixed(1)}, quote currency (${quote}) scored ${quoteScore.toFixed(1)}.`
+  };
 }
 
 
