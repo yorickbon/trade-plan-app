@@ -1253,52 +1253,92 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const c = getCache(cacheKey);
       if (!c) return res.status(400).json({ ok: false, reason: "Expand failed: cache expired or not found." });
 
+      // Guard against stale-cache instrument mismatches
+      const qInstrument = String((req.query.instrument || "")).toUpperCase().replace(/\s+/g, "");
+      if (qInstrument && qInstrument !== c.instrument) {
+        return res.status(400).json({
+          ok: false,
+          reason: `Expand rejected: instrument mismatch (cache=${c.instrument}, query=${qInstrument}). Start a new run.`,
+        });
+      }
+
       const dateStr = new Date().toISOString().slice(0, 10);
       const calAdv = await fetchCalendarForAdvisory(req, c.instrument);
-      const provHint = { headlines_present: !!c.headlinesText, calendar_status: c.calendar ? "image-ocr" : (calAdv.status || "unavailable") };
+
+      // --------- Re-fetch fundamentals FRESH (no stale cache) ---------
+      // Headlines (server-side, instrument-scoped)
+      let headlineItems: AnyHeadline[] = [];
+      let headlinesText: string | null = null;
+      let headlinesProvider: string = "unknown";
+      try {
+        const viaServer = await fetchedHeadlinesViaServer(req, c.instrument);
+        headlineItems = viaServer.items;
+        headlinesText = viaServer.promptText;
+        headlinesProvider = viaServer.provider || "unknown";
+      } catch {}
+
+      // Bias from headlines
+      const hBias = computeHeadlinesBias(headlineItems);
+
+      // CSM (fresh snapshot; 15-min cache inside getCSM)
+      let csm: CsmSnapshot;
+      try { csm = await getCSM(); }
+      catch (e: any) {
+        return res.status(503).json({ ok: false, reason: `CSM unavailable: ${e?.message || "fetch failed"}.` });
+      }
+
+      // Optional COT cue from headlines
+      const cotCue = detectCotCueFromHeadlines(headlineItems);
+      const { text: sentimentText } = sentimentSummary(csm, cotCue, hBias);
+
+      // Provenance hint for the LLM (do NOT say unavailable if we have an image/API status)
+      const provHint = {
+        headlines_present: !!headlinesText,
+        calendar_status: c.calendar ? "image-ocr" : (calAdv?.status || "unavailable"),
+      };
 
       const messages = messagesFull({
-        instrument: c.instrument, dateStr,
+        instrument: c.instrument,
+        dateStr,
         m15: c.m15, h1: c.h1, h4: c.h4, m5: c.m5 || null,
         calendarDataUrl: c.calendar || undefined,
-        headlinesText: c.headlinesText || undefined,
-        sentimentText: c.sentimentText || undefined,
-        calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText, evidence: calAdv.evidence || [] },
+        // Use the fresh fundamentals we just fetched (never the cache)
+        headlinesText: headlinesText || undefined,
+        sentimentText: sentimentText || undefined,
+        calendarAdvisory: {
+          warningMinutes: calAdv.warningMinutes ?? null,
+          biasNote: calAdv.biasNote || null,
+          advisoryText: calAdv.advisoryText || null,
+          evidence: calAdv.evidence || [],
+        },
         provenance: provHint,
       });
 
       let text = await callOpenAI(modelExpand, messages);
       text = await enforceQuickPlan(modelExpand, c.instrument, text);
-      text = await enforceOption1(modelExpand, c.instrument, text);
-      text = await enforceOption2(modelExpand, c.instrument, text);
-
-      // Visibility and stamping
-      text = ensureCalendarVisibilityInQuickPlan(text, { instrument: c.instrument, preReleaseOnly: false, biasLine: calAdv.text || null });
-      const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
-      text = stampM5Used(text, usedM5);
-
-      const footer = buildServerProvenanceFooter({
-        headlines_provider: "expand-uses-stage1",
-        calendar_status: c.calendar ? "image-ocr" : (calAdv?.status || "unavailable"),
-        calendar_provider: c.calendar ? "image-ocr" : calAdv?.provider || null,
-        csm_time: null,
-        extras: { vp_version: VP_VERSION, model: modelExpand, mode: "expand" },
-      });
-      text = `${text}\n${footer}`;
-
-      res.setHeader("Cache-Control", "no-store");
-      return res.status(200).json({ ok: true, text, meta: { instrument: c.instrument, cacheKey, model: modelExpand, vp_version: VP_VERSION } });
-    }
 
     // ---------- multipart ----------
     if (!isMultipart(req)) {
-      return res.status(400).json({ ok: false, reason: "Use multipart/form-data with files: m15, h1, h4 and optional 'calendar'/'m5'. Or pass m15Url/h1Url/h4Url and optional 'calendarUrl'/'m5Url'. Include 'instrument'." });
+      return res.status(400).json({
+        ok: false,
+        reason: "Use multipart form with m15/h1/h4 (TV links or files), optional m5 and calendarUrl (Gyazo). 'instrument' is required.",
+      });
     }
 
     const { fields, files } = await parseMultipart(req);
 
     const MODEL = pickModelFromFields(req, fields);
-    const instrument = String(fields.instrument || fields.code || "EURUSD").toUpperCase().replace(/\s+/g, "");
+
+    // ---------- Instrument: NO DEFAULTS ----------
+    const instrumentRaw = String(fields.instrument || fields.code || "").toUpperCase().replace(/\s+/g, "");
+    if (!instrumentRaw) {
+      return res.status(400).json({
+        ok: false,
+        reason: "Instrument is required. Provide 'instrument' (e.g., AUDUSD). No default is used.",
+      });
+    }
+    const instrument = instrumentRaw;
+
     const requestedMode = String(fields.mode || "").toLowerCase();
     if (requestedMode === "fast") mode = "fast";
 
