@@ -1851,7 +1851,7 @@ if (calUrlOrig) {
           console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(1)}%`);
           return res.status(400).json({ 
             ok: false, 
-            reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is ${livePrice} (${(pctDiff*100).toFixed(1)}% difference). Chart y-axis may be misread - please use clearer images.` 
+reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is ${livePrice} (${(priceDiff*100).toFixed(1)}% difference). Chart y-axis may be misread - please use clearer images.` 
           });
         }
       }
