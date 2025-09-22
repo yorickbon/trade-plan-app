@@ -232,7 +232,7 @@ function computeHeadlinesBias(items: AnyHeadline[]): HeadlineBias {
   const scores = items.map(h => typeof h?.sentiment?.score === "number" ? Number(h.sentiment!.score) : null).filter(v => Number.isFinite(v)) as number[];
   if (scores.length === 0) return { label: "unavailable", avg: null, count: 0 };
   const avg = scores.reduce((a, b) => a + b, 0) / (scores.length || 1);
-  const label = avg > 0.05 ? "bullish" : avg < -0.05 ? "bearish" : "neutral";
+  const label = avg > 0.01 ? "bullish" : avg < -0.01 ? "bearish" : "neutral";
   return { label, avg, count: scores.length };
 }
 
