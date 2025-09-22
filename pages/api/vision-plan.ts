@@ -962,11 +962,11 @@ function buildUserPartsBase(args: {
 }) {
   const parts: any[] = [
     { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}` },
-    { type: "text", text: "HTF 4H Chart:" },
+    { type: "text", text: "STEP 1: ANALYZE CHARTS OBJECTIVELY (no fundamentals yet)\n\nHTF 4H Chart - Answer these:\n1. Is price making HIGHER HIGHS and HIGHER LOWS (uptrend) or LOWER HIGHS and LOWER LOWS (downtrend)?\n2. Where is price NOW relative to the last 50 candles - at the TOP (recent highs), MIDDLE (range), or BOTTOM (recent lows)?\n3. Did price recently BREAK any major trendlines or levels?" },
     { type: "image_url", image_url: { url: args.h4 } },
-    { type: "text", text: "Context 1H Chart:" },
+    { type: "text", text: "Context 1H Chart - Same questions:" },
     { type: "image_url", image_url: { url: args.h1 } },
-    { type: "text", text: "Execution 15M Chart:" },
+    { type: "text", text: "Execution 15M Chart - Same questions:" },
     { type: "image_url", image_url: { url: args.m15 } },
   ];
   if (args.m5) { parts.push({ type: "text", text: "Scalp 5M Chart" }); parts.push({ type: "image_url", image_url: { url: args.m5 } }); }
