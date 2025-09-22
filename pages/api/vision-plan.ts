@@ -1467,16 +1467,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           mode,
           vp_version: VP_VERSION,
           model: modelExpand,
-          sources: {
+                    sources: {
             headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
             headlines_instrument: c.instrument,
             headlines_provider: headlinesProvider || "unknown",
-            calendar_used: (calAdv?.status || "unavailable") !== "unavailable",
-            calendar_status: calAdv?.status || "unavailable",
-            calendar_provider: calAdv?.provider || null,
+            calendar_used: !!calAdv && (calAdv.status === "api" || calAdv.status === "image-ocr"),
+            calendar_status: calAdv?.status ?? "unavailable",
+            calendar_provider: calAdv?.provider ?? null,
             csm_used: true,
             csm_time: csm.tsISO,
           },
+
           aiMeta: extractAiMeta(text) || {},
         },
       });
