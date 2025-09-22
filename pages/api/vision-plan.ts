@@ -1719,19 +1719,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         ok: true,
         text,
         meta: {
-          instrument, mode, cacheKey, vp_version: VP_VERSION, model: MODEL,
-          sources: {
-            headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
-            headlines_instrument: instrument,
-            headlines_provider: headlinesProvider || "unknown",
-            calendar_used: calendarStatus !== "unavailable",
-            calendar_status: calendarStatus,
-            calendar_provider: calendarProvider,
-            csm_used: true,
-            csm_time: csm.tsISO,
-          },
-          aiMeta,
-        },
+        meta: {
+  instrument, mode, cacheKey, vp_version: VP_VERSION, model: MODEL,
+  sources: {
+    headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
+    headlines_instrument: instrument,
+    headlines_provider: headlinesProvider || "unknown",
+    calendar_used: calendarStatus === "api" || calendarStatus === "image-ocr",
+    calendar_status: calendarStatus,
+    calendar_provider: calendarProvider,
+    csm_used: true,
+    csm_time: csm.tsISO,
+  },
+  aiMeta,
+},
+
       });
     }
 
@@ -1813,23 +1815,24 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     return res.status(200).json({
       ok: true,
       text: textFull,
-      meta: {
-        instrument,
-        mode,
-        vp_version: VP_VERSION,
-        model: MODEL,
-        sources: {
-          headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
-          headlines_instrument: instrument,
-          headlines_provider: headlinesProvider || "unknown",
-          calendar_used: calendarStatus !== "unavailable",
-          calendar_status: calendarStatus,
-          calendar_provider: calendarProvider,
-          csm_used: true,
-          csm_time: csm.tsISO,
-        },
-        aiMeta: aiMetaFull,
-      },
+    meta: {
+  instrument,
+  mode,
+  vp_version: VP_VERSION,
+  model: MODEL,
+  sources: {
+    headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
+    headlines_instrument: instrument,
+    headlines_provider: headlinesProvider || "unknown",
+    calendar_used: calendarStatus === "api" || calendarStatus === "image-ocr",
+    calendar_status: calendarStatus,
+    calendar_provider: calendarProvider,
+    csm_used: true,
+    csm_time: csm.tsISO,
+  },
+  aiMeta: aiMetaFull,
+},
+
     });
   } catch (err: any) {
     return res.status(500).json({
