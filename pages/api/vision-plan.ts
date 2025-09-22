@@ -886,6 +886,8 @@ function systemCore(
     "- Score each candidate T_candidate = clamp( 0.5*HTF_fit(4H) + 0.3*Context_fit(1H) + 0.2*Trigger_fit(15m & optional 5m), 0, 100 ).",
     "- Penalize conflicts with HTF (-15 to -30). Reward multi-signal confluence (+10 to +20) and clean invalidation/asymmetric R:R (+5 to +15).",
     "- Pick TOP 1 as 'Option 1 (Primary)' and a DISTINCT runner-up for 'Option 2 (Alternative)'.",
+    "- Each option must report its own Conviction %, computed per the rule above (no shared caps).",
+
     "- Provide a compact tournament table (name — score — reason).",
     "",
     "Fundamentals Scoring (0–100, no hard caps):",
@@ -900,12 +902,12 @@ function systemCore(
     "- If a high-impact event is within ≤60 min, reduce by 25%: F = clamp( RawF * (1 - 0.25*proximityFlag), 0, 100 ), where proximityFlag=1 if warning ≤60 min else 0.",
     "- Unavailable components fall back to 50 (except calendar sign, which may be neutral).",
     "",
-    "Conviction (0–100) from TECH & FUND alignment:",
-    "- Compute T as the best tournament score (0–100).",
-    "- Use the fundamentals F above (0–100).",
-    "- Determine direction sign from technical primary vs fundamentals net sign; alignment bonus: +8 if same sign, else -8.",
-    "- If a high-impact event is within ≤60 min, apply final scaling 15%: Conv = clamp( (0.55*T + 0.45*F + align) * (1 - 0.15*proximityFlag), 0, 100 ).",
-    "- Do not apply any other caps.",
+   "Conviction (0–100) — per option (independent):",
+"- For **each** trade option, compute Conv using that option’s own tournament score T_option (0–100) and the same Fundamentals F (0–100).",
+"- Alignment: if the option’s technical direction matches the fundamentals net sign → +8; if it conflicts → -8.",
+"- If a high-impact event is within ≤60 min, apply a final scaling of 15%: Conv_option = clamp( (0.55*T_option + 0.45*F + align) * (1 - 0.15*proximityFlag), 0, 100 ).",
+"- Output **distinct Conviction** for Option 1 and Option 2. Quick Plan uses Option 1’s Conviction.",
+"- Do not apply any other caps.",
     "",
     "Consistency rule:",
     "- If Calendar/Headlines/CSM align, do not say 'contradicting'; say 'aligning'.",
@@ -1333,7 +1335,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const { fields, files } = await parseMultipart(req);
 
     const MODEL = pickModelFromFields(req, fields);
-    const instrument = String(fields.instrument || fields.code || "EURUSD").toUpperCase().replace(/\s+/g, "");
+    const rawInstr = String(fields.instrument || fields.code || "").trim().toUpperCase().replace(/\s+/g, "");
+if (!rawInstr) {
+  return res.status(400).json({ ok: false, reason: "Missing 'instrument'. Provide instrument code (e.g., EURUSD)." });
+}
+const instrument = rawInstr;
+
     const requestedMode = String(fields.mode || "").toLowerCase();
     if (requestedMode === "fast") mode = "fast";
 
