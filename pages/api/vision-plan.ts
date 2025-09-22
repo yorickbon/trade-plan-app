@@ -1,4 +1,3 @@
-
 // /pages/api/vision-plan.ts
 /**
  * OCR-first calendar (image priority) — improved acceptance of pre-release rows
@@ -6,7 +5,6 @@
  * - Only shows "Calendar provided, but no relevant info for <INSTRUMENT>." when OCR has zero rows for the pair’s currencies.
  * - Keeps API calendar fallback, but OCR should satisfy most cases now.
  * - Preserves section enforcement, consistency guard, conviction (0–100, no hard caps), caching, and provenance.
- * - Adds scalping mode (query/body field `scalping=true|1|on|yes`) and optional 1m chart.
  */
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -16,28 +14,10 @@ import sharp from "sharp";
 // ---------- config ----------
 export const config = { api: { bodyParser: false, sizeLimit: "25mb" } };
 
-// ---------- response types (unified & forward-compatible) ----------
-type QaSummary = { total: number; passed: number; failed: number };
+type Ok = { ok: true; text: string; meta?: any };
+type Err = { ok: false; reason: string };
 
-type ApiResponse =
-  | {
-      ok: true;
-      text?: string;            // normal path
-      meta?: any;
-      // optional QA payload (only when running the QA routine)
-      qa_summary?: QaSummary;
-      results?: any[];          // array because code uses results.length
-    }
-  | {
-      ok: false;
-      reason: string;           // error path
-      // allow QA keys even on error to avoid TS friction during QA runs
-      qa_summary?: QaSummary;
-      results?: any[];
-    };
-
-
-const VP_VERSION = "2025-09-18-vp-AtoL-rc1";
+const VP_VERSION = "2025-09-11-ocrv10-fund0to100+tournament+no-mixed";
 
 // ---------- OpenAI / Model pick ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
@@ -72,50 +52,22 @@ function dataUrlSizeBytes(s: string | null | undefined): number {
   const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
   return Math.floor((b64.length * 3) / 4) - padding;
 }
-// tolerant numeric parser for %, K/M/B, commas, Unicode minus, and OCR suffixes like "m/m", "y/y", "mom", "yoy"
+// tolerant numeric parser for %, K/M/B, commas, Unicode minus
 function parseNumberLoose(v: any): number | null {
   if (v == null) return null;
   if (typeof v === "number" && Number.isFinite(v)) return v;
-
   let s = String(v).trim().toLowerCase();
   if (!s || s === "n/a" || s === "na" || s === "-" || s === "—") return null;
-
-  // Normalize unicode and strip common noise the OCR calendar produces
-  s = s.replace(/\u2212/g, "-");      // Unicode minus → hyphen
-  s = s.replace(/[()\u00A0]/g, "");   // parentheses & non-breaking spaces
-  s = s.replace(/,/g, "");            // thousands separators
-  s = s.replace(/\s+/g, "");          // all spaces
-
-  // Drop common econ qualifiers that trail numbers (do not change the value):
-  // e.g. "0.4%m/m", "1.2%y/y", "0.2mom", "0.2yoy", "q/q", "sa", "nsa"
-  s = s.replace(/(m\/m|y\/y|q\/q|mom|yoy|qoq|sa|nsa)$/i, "");
-  s = s.replace(/(m\/m|y\/y|q\/q|mom|yoy|qoq|sa|nsa)(?=%|$)/ig, "");
-
-  // Allow leading "+" and trailing percent
+  s = s.replace(/,/g, "").replace(/\s+/g, "");
+  s = s.replace(/\u2212/g, "-"); // Unicode minus
   let mult = 1;
   if (s.endsWith("%")) { s = s.slice(0, -1); }
-
-  // Suffix multipliers
   if (s.endsWith("k")) { mult = 1_000; s = s.slice(0, -1); }
   else if (s.endsWith("m")) { mult = 1_000_000; s = s.slice(0, -1); }
   else if (s.endsWith("b")) { mult = 1_000_000_000; s = s.slice(0, -1); }
-
-  // If there's still trailing non-numeric junk (e.g., "0.4pp"), strip it safely
-  s = s.replace(/[^0-9eE+.\-]+$/g, "");
-
   const n = parseFloat(s);
   return Number.isFinite(n) ? n * mult : null;
 }
-
-
-// --- keep label and sign consistent for fundamentals ---
-function signFromLabel(label?: string): -1 | 0 | 1 {
-  const s = (label || "").toLowerCase();
-  if (s === "bullish") return 1;
-  if (s === "bearish") return -1;
-  return 0; // neutral / unknown
-}
-
 
 // ---------- in-memory image cache ----------
 type CacheEntry = {
@@ -161,16 +113,8 @@ function pickFirst<T = any>(x: T | T[] | undefined | null): T | null { if (!x) r
 
 // ---------- image processing ----------
 async function toJpeg(buf: Buffer, width: number, quality: number): Promise<Buffer> {
-  // Mild sharpening + normalize improves text/line clarity on uploaded charts without bloating size
-  return sharp(buf)
-    .rotate()
-    .resize({ width, withoutEnlargement: true })
-    .normalize()             // expands contrast range; helps tiny markings/labels
-    .sharpen(0.6)            // gentle sharpening; avoids halos
-    .jpeg({ quality, progressive: true, mozjpeg: true })
-    .toBuffer();
+  return sharp(buf).rotate().resize({ width, withoutEnlargement: true }).jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
 }
-
 async function processAdaptiveToDataUrl(buf: Buffer): Promise<string> {
   let width = BASE_W, quality = 74;
   let out = await toJpeg(buf, width, quality);
@@ -281,64 +225,25 @@ function headlinesToPromptLines(items: AnyHeadline[], limit = 6): string | null 
   return lines.join("\n");
 }
 
-// Cache for headline parsing to avoid reprocessing identical text
-const HEADLINE_CACHE = new Map<string, HeadlineBias>();
-
 function computeHeadlinesBias(items: AnyHeadline[]): HeadlineBias {
-  if (!Array.isArray(items) || items.length === 0) {
-    return { label: "unavailable", avg: null, count: 0 };
-  }
-
-  // Use concatenated text as cache key
-  const rawKey = items.map(h => h?.title || "").join("|");
-  if (HEADLINE_CACHE.has(rawKey)) {
-    return HEADLINE_CACHE.get(rawKey)!;
-  }
-
-  const scores = items
-    .map(h => (typeof h?.sentiment?.score === "number" ? Number(h.sentiment!.score) : null))
-    .filter(v => Number.isFinite(v)) as number[];
-
-  if (scores.length === 0) {
-    const out: HeadlineBias = { label: "unavailable", avg: null, count: 0 };
-    HEADLINE_CACHE.set(rawKey, out);
-    return out;
-  }
-
-  const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
-  let label: "bullish" | "bearish" | "neutral";
-  // Slightly widened thresholds to reduce flip-flop
-  if (avg > 0.1) label = "bullish";
-  else if (avg < -0.1) label = "bearish";
-  else label = "neutral";
-
-  const out: HeadlineBias = { label, avg, count: scores.length };
-  HEADLINE_CACHE.set(rawKey, out);
-  return out;
+  if (!Array.isArray(items) || items.length === 0) return { label: "unavailable", avg: null, count: 0 };
+  const scores = items.map(h => typeof h?.sentiment?.score === "number" ? Number(h.sentiment!.score) : null).filter(v => Number.isFinite(v)) as number[];
+  if (scores.length === 0) return { label: "unavailable", avg: null, count: 0 };
+  const avg = scores.reduce((a, b) => a + b, 0) / (scores.length || 1);
+  const label = avg > 0.05 ? "bullish" : avg < -0.05 ? "bearish" : "neutral";
+  return { label, avg, count: scores.length };
 }
 
-async function fetchedHeadlinesViaServer(
-  req: NextApiRequest,
-  instrument: string
-): Promise<{ items: AnyHeadline[]; promptText: string | null; provider: string }> {
+async function fetchedHeadlinesViaServer(req: NextApiRequest, instrument: string): Promise<{ items: AnyHeadline[]; promptText: string | null; provider: string }> {
   try {
     const base = originFromReq(req);
     const url = `${base}/api/news?instrument=${encodeURIComponent(instrument)}&hours=48&max=12&_t=${Date.now()}`;
-
-    // Parallelize fetch + json parse
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(2500) });
-    if (!r.ok) throw new Error(`Headlines fetch failed: ${r.status}`);
-    const j: any = await r.json().catch(() => ({}));
-
+    const r = await fetch(url, { cache: "no-store" });
+    const j = await r.json().catch(() => ({}));
     const items: AnyHeadline[] = Array.isArray(j?.items) ? j.items : [];
     const provider = String(j?.provider || "unknown");
-
-    // Deduplicate & sanitize items
-    const deduped = Array.from(new Map(items.map(i => [i.title, i])).values());
-
-    return { items: deduped, promptText: headlinesToPromptLines(deduped, 6), provider };
-  } catch (err) {
-    console.error("fetchedHeadlinesViaServer error", err);
+    return { items, promptText: headlinesToPromptLines(items, 6), provider };
+  } catch {
     return { items: [], promptText: null, provider: "unknown" };
   }
 }
@@ -351,45 +256,19 @@ function extractAiMeta(text: string) {
   return null;
 }
 function invalidOrderRelativeToPrice(aiMeta: any): string | null {
-  // Backward-compatible: read order type from either 'orderType' or legacy 'entryOrder'
-  const oRaw = String(aiMeta?.orderType || aiMeta?.entryOrder || "").toLowerCase();
+  const o = String(aiMeta?.entryOrder || "").toLowerCase();
   const dir = String(aiMeta?.direction || "").toLowerCase();
   const z = aiMeta?.zone || {};
   const p = Number(aiMeta?.currentPrice);
   const zmin = Number(z?.min);
   const zmax = Number(z?.max);
-
-  if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax) || !oRaw) return null;
-
-  // Normalize zone bounds
-  const lo = Math.min(zmin, zmax);
-  const hi = Math.max(zmin, zmax);
-
-  // Limit order sanity:
-  // - Long + Buy Limit should be BELOW price (tap/retest). If zone entirely ABOVE price → invalid.
-  // - Short + Sell Limit should be ABOVE price. If zone entirely BELOW price → invalid.
-  if (oRaw === "buy limit" && dir === "long") {
-    if (lo >= p) return "buy-limit-above-price";
-  }
-  if (oRaw === "sell limit" && dir === "short") {
-    if (hi <= p) return "sell-limit-below-price";
-  }
-
-  // Stop order sanity (breakout/BOS semantics):
-  // - Long + Buy Stop should be ABOVE price. If zone entirely BELOW price → invalid.
-  // - Short + Sell Stop should be BELOW price. If zone entirely ABOVE price → invalid.
-  if (oRaw === "buy stop" && dir === "long") {
-    if (hi <= p) return "buy-stop-below-price";
-  }
-  if (oRaw === "sell stop" && dir === "short") {
-    if (lo >= p) return "sell-stop-above-price";
-  }
-
+  if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return null;
+  if (o === "sell limit" && dir === "short") { if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price"; }
+  if (o === "buy limit" && dir === "long") { if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price"; }
   return null;
 }
 
-
-// ---------- CSM (intraday, patched for speed + correctness) ----------
+// ---------- CSM (intraday) ----------
 const G8 = ["USD", "EUR", "JPY", "GBP", "CHF", "CAD", "AUD", "NZD"];
 const USD_PAIRS = ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDJPY", "USDCHF", "USDCAD"];
 type Series = { t: number[]; c: number[] };
@@ -401,8 +280,6 @@ function kbarReturn(closes: number[], k: number): number | null {
   if (!(a > 0) || !(b > 0)) return null;
   return Math.log(a / b);
 }
-
-// ------------------ Providers ------------------
 async function tdSeries15(pair: string): Promise<Series | null> {
   if (!TD_KEY) return null;
   try {
@@ -419,7 +296,6 @@ async function tdSeries15(pair: string): Promise<Series | null> {
     return { t, c };
   } catch { return null; }
 }
-
 async function fhSeries15(pair: string): Promise<Series | null> {
   if (!FH_KEY) return null;
   try {
@@ -437,7 +313,6 @@ async function fhSeries15(pair: string): Promise<Series | null> {
     return { t, c };
   } catch { return null; }
 }
-
 async function polySeries15(pair: string): Promise<Series | null> {
   if (!POLY_KEY) return null;
   try {
@@ -456,82 +331,40 @@ async function polySeries15(pair: string): Promise<Series | null> {
     return { t, c };
   } catch { return null; }
 }
-
-// ------------------ Parallel Fetch ------------------
 async function fetchSeries15(pair: string): Promise<Series | null> {
-  const [td, fh, pg] = await Promise.allSettled([
-    tdSeries15(pair),
-    fhSeries15(pair),
-    polySeries15(pair)
-  ]);
-
-  const results = [td, fh, pg]
-    .map(r => (r.status === "fulfilled" ? r.value : null))
-    .filter(Boolean) as Series[];
-
-  return results.length > 0 ? results[0] : null;
+  const td = await tdSeries15(pair); if (td) return td;
+  const fh = await fhSeries15(pair); if (fh) return fh;
+  const pg = await polySeries15(pair); if (pg) return pg;
+  return null;
 }
-
 function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnapshot | null {
   const weights = { r60: 0.6, r240: 0.4 };
   const curScore: Record<string, number> = Object.fromEntries(G8.map((c) => [c, 0]));
-
   for (const pair of USD_PAIRS) {
     const S = seriesMap[pair];
     if (!S || !Array.isArray(S.c) || S.c.length < 17) continue;
-
-    // 60m ≈ 4 bars of 15m, 240m ≈ 16 bars
     const r60 = kbarReturn(S.c, 4) ?? 0;
     const r240 = kbarReturn(S.c, 16) ?? 0;
     const r = r60 * weights.r60 + r240 * weights.r240;
-
     const base = pair.slice(0, 3);
     const quote = pair.slice(3);
     curScore[base] += r;
     curScore[quote] -= r;
   }
-
   const vals = G8.map((c) => curScore[c]);
-  if (!vals.every((v) => Number.isFinite(v))) return null;
-
   const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
   const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length) || 1;
-
   const z: Record<string, number> = {};
   for (const c of G8) z[c] = (curScore[c] - mean) / sd;
-
   const ranks = [...G8].sort((a, b) => z[b] - z[a]);
-
-  return {
-    tsISO: new Date().toISOString(),
-    ranks,
-    scores: z,
-    ttl: Date.now() + 15 * 60 * 1000,
-  };
+  return { tsISO: new Date().toISOString(), ranks, scores: z, ttl: Date.now() + 15 * 60 * 1000 };
 }
-
 async function getCSM(): Promise<CsmSnapshot> {
-  // Use cache only if snapshot is still fresh
-  if (CSM_CACHE && Date.now() < CSM_CACHE.ttl) {
-    return CSM_CACHE;
-  }
-
-  // Fetch all pairs in parallel for speed
-  const entries = await Promise.all(
-    USD_PAIRS.map(async (p) => [p, await fetchSeries15(p)] as [string, Series | null])
-  );
-  const seriesMap: Record<string, Series | null> = Object.fromEntries(entries);
-
+  if (CSM_CACHE && Date.now() < CSM_CACHE.ttl) return CSM_CACHE;
+  const seriesMap: Record<string, Series | null> = {};
+  await Promise.all(USD_PAIRS.map(async (p) => { seriesMap[p] = await fetchSeries15(p); }));
   const snap = computeCSMFromPairs(seriesMap);
-
-  if (!snap) {
-    // Fallback to last cached snapshot if available
-    if (CSM_CACHE && Date.now() < CSM_CACHE.ttl) {
-      return CSM_CACHE;
-    }
-    throw new Error("CSM unavailable (fetch failed and no valid cache).");
-  }
-
+  if (!snap) { if (CSM_CACHE) return CSM_CACHE; throw new Error("CSM unavailable (fetch failed and no cache)."); }
   CSM_CACHE = snap;
   return snap;
 }
@@ -590,50 +423,49 @@ function sentimentSummary(csm: CsmSnapshot, cotCue: CotCue | null, headlineBias:
 }
 
 // ---------- Calendar helpers (OCR + API fallback) ----------
-
-/** OPTIONAL (PLUMBING ONLY, default OFF): explicit indicator polarity overrides.
- * Not used for sign unless you later flip a flag to enable it.
- * Kept here for future realism without touching core logic now. */
-const INDICATOR_POLARITY_MAP: Array<{ re: RegExp; higherGood: boolean }> = [
-  { re: /\b(core\s+)?cpi|ppi|inflation\b/i, higherGood: true },
-  { re: /\b(gdp|industrial\s+production|manufacturing\s+production|durable\s+goods|retail\s+sales)\b/i, higherGood: true },
-  { re: /\b(pmi|ism|confidence|sentiment|zew)\b/i, higherGood: true },
-  { re: /\b(unemployment|jobless|initial\s+claims|continuing\s+claims)\b/i, higherGood: false },
-  { re: /\b(nonfarm|nfp|employment\s+change|payrolls|jobs)\b/i, higherGood: true },
-  { re: /\b(trade\s+balance|current\s+account)\b/i, higherGood: true },
-  { re: /\b(interest\s+rate|rate\s+decision|refi\s+rate|deposit\s+facility|bank\s+rate|cash\s+rate|ocr)\b/i, higherGood: true },
-];
-
-/** INTERNAL: if we ever enable metric-aware polarity, this helper provides the mapping.
- * For now, we DO NOT use it for calendar sign; sign comes ONLY from actual vs forecast. */
-function polarityHigherIsGood(title: string | null | undefined): boolean | null {
-  const t = String(title || "").toLowerCase();
-  for (const m of INDICATOR_POLARITY_MAP) if (m.re.test(t)) return m.higherGood;
+function goodIfHigher(title: string): boolean | null {
+  const t = title.toLowerCase();
+  if (/(cpi|core cpi|ppi|inflation)/.test(t)) return true;
+  if (/(gdp|retail sales|industrial production|manufacturing production|consumer credit|housing starts|building permits|durable goods)/.test(t)) return true;
+  if (/(pmi|ism|confidence|sentiment)/.test(t)) return true;
+  if (/unemployment|jobless|initial claims|continuing claims/.test(t)) return false;
+  if (/(nonfarm|nfp|employment change|payrolls|jobs)/.test(t)) return true;
+  if (/trade balance|current account/.test(t)) return true;
+  if (/interest rate|rate decision|refi rate|deposit facility|bank rate|cash rate|ocr/.test(t)) return true;
   return null;
 }
 
-/** Evidence line — transparent comparisons; verdict strictly from actual vs forecast (if forecast present). */
+// (A) Evidence line — verdict strictly bullish/bearish/neutral (never "mixed")
 function evidenceLine(it: any, cur: string): string | null {
   const a = parseNumberLoose(it.actual);
   const f = parseNumberLoose(it.forecast);
   const p = parseNumberLoose(it.previous);
   if (a == null || (f == null && p == null)) return null;
-
-  // Comparisons for transparency only
-  const comp: string[] = [];
+  const dir = goodIfHigher(String(it.title || ""));
+  let comp: string[] = [];
   if (f != null) comp.push(a < f ? "< forecast" : a > f ? "> forecast" : "= forecast");
   if (p != null) comp.push(a < p ? "< previous" : a > p ? "> previous" : "= previous");
-
-  // Verdict: STRICT actual vs forecast rule
   let verdict: "bullish" | "bearish" | "neutral" = "neutral";
-  if (f != null) verdict = a > f ? "bullish" : a < f ? "bearish" : "neutral";
-
+  if (dir === true) {
+    const gtRef = (f != null && a > f) || (p != null && a > p);
+    const ltBoth = (f != null ? a < f : true) && (p != null ? a < p : true);
+    const gtBoth = (f != null ? a > f : true) && (p != null ? a > p : true);
+    verdict = gtBoth ? "bullish" : ltBoth ? "bearish" : "neutral";
+  } else if (dir === false) {
+    const ltRef = (f != null && a < f) || (p != null && a < p);
+    const gtBoth = (f != null ? a > f : true) && (p != null ? a > p : true);
+    const ltBoth = (f != null ? a < f : true) && (p != null ? a < p : true);
+    verdict = ltBoth ? "bullish" : gtBoth ? "bearish" : "neutral";
+  } else {
+    verdict = "neutral";
+  }
   const comps = comp.join(" and ");
-  return `${cur} — ${it.title}: actual ${a}${comps ? " " + comps : ""} → ${verdict} ${cur}`;
+  return `${cur} — ${it.title}: actual ${a}${f!=null||p!=null ? ` ${comps}` : ""} → ${verdict} ${cur}`;
 }
 
 // ---------- OpenAI core ----------
 async function callOpenAI(model: string, messages: any[]) {
+  // GPT-5 rejects non-default temperature. Keep temp=0 for 4o; omit for GPT-5.
   const body: any = { model, messages };
   if (!/^gpt-5/i.test(model)) {
     body.temperature = 0;
@@ -673,6 +505,7 @@ type OcrCalendarRow = {
 type OcrCalendar = { items: OcrCalendarRow[] };
 
 async function ocrCalendarFromImage(model: string, calendarDataUrl: string): Promise<OcrCalendar | null> {
+  // Two-pass: strict JSON; retry w/ emphasized "JSON ONLY" if first parse fails.
   const sys = [
     "You are extracting ECONOMIC CALENDAR rows via image OCR.",
     "Return STRICT JSON only. DO NOT GUESS values. If unreadable/absent, use null.",
@@ -730,8 +563,6 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
 
   const lines: string[] = [];
   const postRows: OcrCalendarRow[] = [];
-  let hasActualOnlyRecent = false;
-
   const rowsForDebug = (ocr.items || []).slice(0, 3).map(r => ({
     timeISO: r.timeISO || null,
     title: r.title || null,
@@ -761,23 +592,20 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     const f = parseNumberLoose(it.forecast);
     const p = parseNumberLoose(it.previous);
 
-    // Only consider rows within last 72h when time is known; if time missing, allow but don't score far history
+    // Only include rows with actuals in the last 72h
     const ts = it.timeISO ? Date.parse(it.timeISO) : NaN;
     const isWithin72h = isFinite(ts) ? ts <= nowMs && nowMs - ts <= H72 : true;
-    if (!isWithin72h) continue;
 
-    // Classification for post-release evidence & scoring
-    if (a != null && (f != null || p != null)) {
+    if (a != null && (f != null || p != null) && isWithin72h) {
       postRows.push({ ...it, actual: a, forecast: f, previous: p });
-    } else if (a != null && f == null && p == null) {
-      hasActualOnlyRecent = true;
     }
   }
 
-  // If no post-result rows, STRICT pre-release behavior
+  // If no post-result rows → pre-release only
   if (postRows.length === 0) {
-    // Waiting state, do not compute expectation from forecast/previous
-    const preLine = `Waiting for results (pre-release)${warn != null ? ` — high-impact event in ~${warn} min` : ""}.`;
+    const preLine = `Calendar: ${
+      warn != null ? `High-impact events scheduled (≤${warn} min). ` : ""
+    }Pre-release only, no confirmed bias until data is out.`;
     return {
       biasLine: preLine,
       biasNote: null,
@@ -788,7 +616,7 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
     };
   }
 
-  // --- Scoring setup for post-result rows ---
+  // --- Scoring setup ---
   const scoreByCur: Record<string, number> = {};
   const impactW: Record<string, number> = { Low: 0.5, Medium: 0.8, High: 1.0 };
   function add(cur: string, v: number) {
@@ -797,33 +625,35 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
 
   for (const it of postRows) {
     const cur = (it.currency || "").toUpperCase();
+    const dir = goodIfHigher(String(it.title || "")); // true=higher good; false=lower good
+    if (dir == null) continue;
 
-    // Strict sign: actual vs forecast only. If no forecast for this row, skip scoring (still produce evidence).
-    const fNum = it.forecast != null ? Number(it.forecast) : null;
+    const ref = (it.forecast ?? it.previous) as number | null;
+    if (ref == null) continue;
+
     const aNum = Number(it.actual);
-    const pNum = it.previous != null ? Number(it.previous) : null;
-
-    // Evidence line (transparent)
-    const ev = evidenceLine(it, cur);
-    if (ev) lines.push(ev);
-
-    if (fNum == null || !isFinite(aNum) || !isFinite(fNum)) continue;
-
-    // Magnitude from percent surprise (capped), weighted by impact; previous can add a tiny modulation but never flips sign.
-    const raw = (aNum - fNum) / Math.max(Math.abs(fNum), 1e-9);
+    const raw = (aNum - ref) / Math.max(Math.abs(ref), 1e-9);
     const clamped = Math.max(-0.25, Math.min(0.25, raw)); // limit ±25%
+
+    // Score 0–10 scaled, impact-weighted
     const unsigned0to10 = Math.round((Math.abs(clamped) / 0.25) * 10);
     const w = impactW[it.impact as keyof typeof impactW] ?? 1.0;
+    const lineScore = Math.round(unsigned0to10 * w);
 
-    // Optional tiny modulation from previous, purely as strength seasoning (never sign):
-    let mod = 1.0;
-    if (pNum != null && isFinite(pNum)) {
-      const cont = (aNum - pNum) / Math.max(Math.abs(pNum), 1e-9);
-      if (Math.sign(cont) === Math.sign(clamped)) mod += 0.1; // continuity bump
-    }
+    // Signed score (goodIfHigher flips)
+    const signed = (dir ? Math.sign(clamped) : -Math.sign(clamped)) * lineScore;
 
-    const lineScore = Math.round(unsigned0to10 * w * mod);
-    const signed = Math.sign(aNum - fNum) * lineScore; // sign ONLY from a-f
+    // Evidence line (never "mixed")
+    const fNum = it.forecast != null ? Number(it.forecast) : null;
+    const pNum = it.previous != null ? Number(it.previous) : null;
+    let comp: string[] = [];
+    if (fNum != null) comp.push(aNum < fNum ? "< forecast" : aNum > fNum ? "> forecast" : "= forecast");
+    if (pNum != null) comp.push(aNum < pNum ? "< previous" : aNum > pNum ? "> previous" : "= previous");
+    const comps = comp.join(" & ");
+
+    const impactTag = it.impact ? ` (${it.impact})` : "";
+    const signWord: "bullish" | "bearish" | "neutral" = signed > 0 ? "bullish" : signed < 0 ? "bearish" : "neutral";
+    lines.push(`${cur} — ${it.title}: ${aNum}${comps ? " " + comps : ""} → ${signWord} ${cur} (${signed >= 0 ? "+" : ""}${signed}/10${impactTag})`);
 
     add(cur, signed);
   }
@@ -994,367 +824,104 @@ function computeCompositeBias(args: {
   instrument: string;
   calendarBiasNote: string | null;
   headlinesBias: HeadlineBias;
-  csm: CsmSnapshot | null;
+  csm: CsmSnapshot;
   warningMinutes: number | null;
 }) {
   const calSign = parseInstrumentBiasFromNote(args.calendarBiasNote);
   const hSign = computeHeadlinesSign(args.headlinesBias);
+  const { sign: csmSign, zdiff } = computeCSMInstrumentSign(args.csm, args.instrument);
 
-  // Guard against null or expired CSM
-  const { sign: csmSign, zdiff } =
-    args.csm && Date.now() < args.csm.ttl
-      ? computeCSMInstrumentSign(args.csm, args.instrument)
-      : { sign: 0, zdiff: null };
-
-  // Build composite parts
   const parts = [calSign !== 0 ? (calSign > 0 ? 1 : -1) : 0, hSign, csmSign];
-  const pos = parts.filter((s) => s > 0).length;
-  const neg = parts.filter((s) => s < 0).length;
+  const pos = parts.some(s => s > 0);
+  const neg = parts.some(s => s < 0);
+  const align = (pos && !neg) || (neg && !pos);
+  const conflict = pos && neg;
 
-  const align = (pos > 0 && neg === 0) || (neg > 0 && pos === 0);
-  const conflict = pos > 0 && neg > 0;
-
-  // Enforced sign if clear alignment
-  let enforcedSign = 0;
-  if (align) enforcedSign = pos > 0 ? 1 : -1;
-
-  // Conviction cap for conflict / proximity to events
+  // Retained only for provenance/debug (no conviction caps applied anymore)
   let cap = 70;
   if (conflict) cap = 35;
   if (args.warningMinutes != null) cap = Math.min(cap, 35);
 
-  return {
-    calendarSign: calSign,
-    headlinesSign: hSign,
-    csmSign,
-    csmZDiff: zdiff,
-    align,
-    conflict,
-    enforcedSign,
-    cap,
-  };
+  return { calendarSign: calSign, headlinesSign: hSign, csmSign, csmZDiff: zdiff, align, conflict, cap };
 }
-
-
-/** Derive COT instrument sign from headline cues (independent component).
- * Uses cotCue.net per-currency signals: +1 net long, -1 net short. Maps to pair via baseMinusQuote. */
-function computeCOTInstrumentSign(cot: CotCue | null, instr: string): { sign: number; detail: string } {
-  if (!cot || !cot.net) return { sign: 0, detail: "unavailable" };
-  const { base, quote } = splitFXPair(instr);
-  if (!base || !quote) return { sign: 0, detail: "non-fx or unavailable" };
-  const b = typeof cot.net[base] === "number" ? cot.net[base] : 0;
-  const q = typeof cot.net[quote] === "number" ? cot.net[quote] : 0;
-  const diff = b - q; // >0 ⇒ bullish instrument; <0 ⇒ bearish
-  const sign = diff > 0 ? 1 : diff < 0 ? -1 : 0;
-  const toWord = (s: number) => (s > 0 ? "bullish" : s < 0 ? "bearish" : "neutral");
-  return { sign, detail: `COT ${toWord(b)} ${base} vs ${toWord(q)} ${quote} ⇒ ${toWord(sign)} ${instr}` };
-}
-
-/** Compute independent fundamentals components + final Fundamental Bias score/label (0–100).
- * Calendar, Headlines, CSM, COT are independent inputs. */
-function computeIndependentFundamentals(args: {
-  instrument: string;
-  calendarSign: number;      // -1 / 0 / +1 (instrument-mapped)
-  headlinesBias: HeadlineBias;
-  csm: CsmSnapshot;
-  cotCue: CotCue | null;
-  warningMinutes: number | null;
-}) {
-  // Calendar component (independent)
-  const S_cal = 50 + 50 * (args.calendarSign || 0);
-
-  // Headlines component (independent)
-  const S_head =
-    args.headlinesBias.label === "bullish" ? 75 :
-    args.headlinesBias.label === "bearish" ? 25 :
-    args.headlinesBias.label === "neutral" ? 50 : 50;
-
-  // CSM component (independent)
-  const { base, quote } = splitFXPair(args.instrument);
-  let S_csm = 50;
-  let csmDiff: number | null = null;
-  if (base && quote) {
-    const zb = args.csm.scores[base];
-    const zq = args.csm.scores[quote];
-    if (typeof zb === "number" && typeof zq === "number") {
-      csmDiff = zb - zq; // >0 ⇒ bullish instrument
-      const clamped = Math.max(-2, Math.min(2, csmDiff));
-      S_csm = 50 + 25 * (clamped / 2);
-    }
-  }
-
-  // COT component (independent) as alignment bump around a neutral 50 anchor
-  const { sign: cotSign, detail: cotDetail } = computeCOTInstrumentSign(args.cotCue, args.instrument);
-  const cotBump = cotSign === 0 ? 0 : (cotSign > 0 ? +5 : -5);
-  const S_cot = 50 + cotBump;
-
-  // Weights (independent aggregation)
-  const w_cal = 0.45, w_head = 0.20, w_csm = 0.30, w_cot = 0.05;
-  const RawF = w_cal * S_cal + w_head * S_head + w_csm * S_csm + w_cot * S_cot;
-
-  const proximityFlag = args.warningMinutes != null ? 1 : 0;
-  const F = Math.max(0, Math.min(100, RawF * (1 - 0.25 * proximityFlag)));
-
-  // Final label (keep sign logic consistent with majority direction)
-  const compSigns = [
-    args.calendarSign,
-    computeHeadlinesSign(args.headlinesBias),
-    computeCSMInstrumentSign(args.csm, args.instrument).sign,
-    cotSign,
-  ].filter((s) => s !== 0);
-
-  let signNet = 0;
-  if (compSigns.length) {
-    const sum = compSigns.reduce((a, b) => a + b, 0);
-    signNet = sum > 0 ? 1 : sum < 0 ? -1 : 0;
-  }
-  const label = signNet > 0 ? "bullish" : signNet < 0 ? "bearish" : (F > 55 ? "bullish" : F < 45 ? "bearish" : "neutral");
-
-  // --- NEW: ensure internal sign matches the printed label when label is non-neutral ---
-  let finalSign = signNet;
-  if (finalSign === 0 && label !== "neutral") {
-    finalSign = label === "bullish" ? 1 : -1;
-  }
-
-  return {
-    components: {
-      calendar: { sign: args.calendarSign, score: S_cal },
-      headlines: { label: args.headlinesBias.label, score: S_head },
-      csm: { diff: csmDiff, score: S_csm },
-      cot: { sign: cotSign, detail: cotDetail, score: S_cot },
-      proximity_penalty_applied: proximityFlag === 1
-    },
-    final: { score: F, label, sign: finalSign }
-  };
-}
-
-/** Ensure a standardized “Fundamental Bias Snapshot” block appears under Full Breakdown.
- * Injects independent components (Calendar, Headlines, CSM, COT) + Final Fundamental Bias. */
-function ensureFundamentalsSnapshot(
-  text: string,
-  args: {
-    instrument: string;
-    snapshot: {
-      components: {
-        calendar: { sign: number; score: number };
-        headlines: { label: string; score: number };
-        csm: { diff: number | null; score: number };
-        cot: { sign: number; detail: string; score: number };
-        proximity_penalty_applied: boolean;
-      };
-      final: { score: number; label: string; sign: number };
-    };
-    preReleaseOnly: boolean;
-    calendarLine: string | null; // may be "Calendar bias for <PAIR>: ...", "Calendar unavailable.", etc.
-  }
-) {
-  if (!text) return text;
-
-  const hasFull = /Full\s*Breakdown/i.test(text);
-  const hasSnapshot = /Fundamental\s*Bias\s*Snapshot/i.test(text);
-  if (hasFull && hasSnapshot) return text;
-
-  // Normalize Calendar line to always start with "Calendar:"
-  let calLineNorm: string;
-   if (args.preReleaseOnly) {
-    calLineNorm = "Calendar: Pre-release only, no confirmed bias until data is out.";
-  } else if (typeof args.calendarLine === "string" && args.calendarLine.trim()) {
-    const raw = args.calendarLine.trim();
-    if (/unavailable/i.test(raw)) {
-      calLineNorm = "Calendar: unavailable.";
-    } else if (/^Calendar\s*:/i.test(raw)) {
-      // Already a "Calendar:" style line
-      calLineNorm = raw.replace(/\.$/, "");
-    } else if (/^Calendar\s*bias\s*for/i.test(raw)) {
-      // Wrap instrument-level line
-      calLineNorm = `Calendar: ${raw.replace(/\.$/, "")}`;
-    } else {
-      // Fallback to explicit wrapper
-      calLineNorm = `Calendar: ${raw.replace(/\.$/, "")}`;
-    }
-  } else {
-    calLineNorm = "Calendar: unavailable.";
-  }
-
-
-  const cotSignWord = args.snapshot.components.cot.sign > 0 ? "bullish"
-                     : args.snapshot.components.cot.sign < 0 ? "bearish" : "neutral";
-  const proxNote = args.snapshot.components.proximity_penalty_applied ? " (proximity penalty applied)" : "";
-
-  const block =
-`\nFundamental Bias Snapshot:
-• ${calLineNorm}
-• Headlines bias (48h): ${args.snapshot.components.headlines.label} (score ~${Math.round(args.snapshot.components.headlines.score)})
-• CSM z-diff ${args.snapshot.components.csm.diff == null ? "(n/a)" : args.snapshot.components.csm.diff.toFixed(2)} ⇒ CSM score ~${Math.round(args.snapshot.components.csm.score)}
-• COT: ${cotSignWord}; ${args.snapshot.components.cot.detail} (score ~${Math.round(args.snapshot.components.cot.score)})
-• Final Fundamental Bias: ${args.snapshot.final.label} (score ~${Math.round(args.snapshot.final.score)})${proxNote}
-`;
-
-  if (hasFull) {
-    return text.replace(/(Full\s*Breakdown[^\n]*\n)/i, `$1${block}`);
-  }
-  return `${text}\n${block}`;
-}
-
 
 // ---------- prompts (Updated per ALLOWED CHANGES A–E) ----------
-function systemCore(
-  instrument: string,
-  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null },
-  scalping?: boolean,
-  scalpingHard?: boolean
-) {
+function systemCore(instrument: string, calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null }) {
   const warn = (calendarAdvisory?.warningMinutes ?? null) != null ? calendarAdvisory!.warningMinutes : null;
   const bias = calendarAdvisory?.biasNote || null;
 
-  const baseLines = [
+  return [
     "You are a professional discretionary trader.",
-
-    // === VISION-FIRST CHART READING (STRICT) ===
-    "VISION-FIRST CHART RULES (must read the images exactly; no guessing):",
-    "- Always extract facts from the uploaded charts first. If text and chart conflict, the **chart wins**.",
-    "- For **each timeframe provided (4H, 1H, 15m, 5m, 1m)**, explicitly derive:",
-    "  • Swing structure: HH/HL (uptrend) vs LH/LL (downtrend) vs range",
-    "  • Most recent BOS/CHOCH and direction",
-    "  • Obvious supply/demand (OB/FVG) zones, prior day/week H/L if visible, major TL/channel, and notable sweeps/wicks",
-    "- HTF Truth Table (hard guard):",
-    "  • If 4H = HH/HL or recent 4H BOS up ⇒ **never** describe 4H as downtrend; wording must say 'Uptrend (HH/HL)' or 'Bullish structure'.",
-    "  • If 4H = LH/LL or recent 4H BOS down ⇒ wording must say 'Downtrend (LH/LL)' or 'Bearish structure'.",
-    "  • If 4H = range ⇒ wording must say 'Range / consolidation'.",
-    "- 1H inherits HTF bias as context, but may be counter-trend. Note counter-trend explicitly if it conflicts.",
-    "- 15m is for execution map (zones/levels). 5m/1m are for timing only; **they cannot override 4H/1H bias**.",
-    "- When you state trend lines under Technical View and X-ray, they must match the chart-derived swing logic above.",
-    "- If an uploaded timeframe is missing, write 'not provided' for that TF and do not infer unseen structure.",
-
     "STRICT NO-GUESS RULES:",
     "- Only mention **Calendar** if calendar_status === 'api' or calendar_status === 'image-ocr'.",
     "- Only mention **Headlines** if a headlines snapshot is provided.",
     "- Do not invent events, figures, or quotes. If something is missing, write 'unavailable'.",
-    "- Treat **Calendar**, **Headlines/Articles**, **CSM**, and **COT** as **independent** fundamental components.",
+    "- Use the Sentiment snapshot exactly as given (CSM + Headlines bias + optional COT cue).",
     "- Never use the word 'mixed' for calendar verdicts — use bullish/bearish/neutral only.",
-
     "",
     "Execution clarity:",
     "- Prefer **Entry zones (min–max)** for OB/FVG/SR confluence; use a **single price** for tight breakout/trigger.",
     "- SL behind structure; TP1/TP2 with R multiples; BE rules; invalidation.",
-
     "",
     "Multi-timeframe roles (fixed):",
     "- 4H = HTF bias & key zones (trend, SD zones, macro S/R, structure).",
     "- 1H = context & setup construction (refine zones, structure state, trigger conditions).",
     "- 15m = execution map (exact entry zone or trigger level, invalidation, TP structure).",
-    "- 5m (optional) = entry timing/confirmation only; do not let 5m/1m override HTF bias.",
-
+    "- 5m (optional) = entry timing/confirmation only; do not let 5m override HTF bias.",
     "",
-    "Strategy Tournament (broad library & scoring) — UNCHANGED LOGIC:",
+    "Strategy Tournament (broad library & scoring):",
     "- Evaluate these candidates by fit to visible charts (do not invent):",
     "  • Market Structure (BOS/CHOCH; continuation vs reversal)",
-    "  • Order Blocks (OB) demand/supply; mitigations; breaker blocks",
+    "  • Order Blocks (OB) demand/supply; mitigations",
     "  • Fair Value Gaps (FVG)/Imbalance; gap fills",
-    "  • Support/Resistance (HTF + intraday), Round/Quarter levels, psych levels",
+    "  • Breakers/Breaker blocks",
+    "  • Support/Resistance (HTF + intraday), Round numbers/psych levels",
     "  • Trendline breaks + retests; channels; wedges; triangles",
-    "  • Liquidity mechanics (sweeps/raids/stop hunts; equal highs/lows; session liquidity, kill zones)",
-    "  • Pullbacks to OB/FVG/MA; Fib 0.382/0.5/0.618/0.786; EQ of range",
-    "  • Moving averages (EMA21/50 regime/cross); momentum ignition/breakout",
-    "  • RSI (regular/hidden divergence), MACD impulse, Bollinger squeeze/expansion",
-    "  • Mean reversion / range rotations (prior day/week H/L, session opens)",
-    "  • VWAP / Anchored VWAP (optional)",
-    "- **MANDATES**:",
-    "  • Consider **at least 5 candidates** on every run.",
-    "  • Ensure **≥3 candidates are NOT liquidity-sweep/BOS** plays (e.g., OB/FVG pullback, TL break+retest, range rotation, mean reversion, MA momentum, VWAP, etc.).",
-    "  • TRIGGERS MUST BE STRATEGY-SPECIFIC AND TIMEFRAME-SPECIFIC. Examples:",
-    "    - OB/FVG confluence: 'Tap of 15m demand OB + 15m FVG fill → 5m CHOCH; entry on 5m retest of FVG midpoint.'",
-    "    - Trendline break: 'Break of 1H descending TL → 15m retest + 5m BOS; entry on 5m break/retest of prior LH.'",
-    "    - Range rotation: 'Reject 1H range high with 15m bearish engulfing; 5m sweep of minor high then BOS; sell stop below 5m BOS.'",
-    "    - Momentum breakout: '1H squeeze resolves down; 15m base → 5m ignition; sell stop below ignition low after micro pullback.'",
-    "    - VWAP: 'Failing above session VWAP; 5m sweep above VWAP then 1m BOS; entry on 1m retest; SL beyond sweep high.'",
+    "  • Liquidity sweeps/stop hunts; equal highs/lows raids; session liquidity (London/NY)",
+    "  • Pullbacks (to MA/OB/FVG); 50%/61.8% fib retracements",
+    "  • Moving average regime/cross; momentum ignition/breakout",
+    "  • RSI divergence (regular/hidden); MACD impulse; Bollinger squeeze/expansion",
+    "  • Mean reversion/range rotations; range high/low plays; session “kill zones” confluence",
     "- Score each candidate T_candidate = clamp( 0.5*HTF_fit(4H) + 0.3*Context_fit(1H) + 0.2*Trigger_fit(15m & optional 5m), 0, 100 ).",
     "- Penalize conflicts with HTF (-15 to -30). Reward multi-signal confluence (+10 to +20) and clean invalidation/asymmetric R:R (+5 to +15).",
-    "- Pick TOP 1 as 'Option 1 (Primary)' and a DISTINCT runner-up for 'Option 2 (Alternative)'. Provide a compact tournament table (name — score — reason).",
-
+    "- Pick TOP 1 as 'Option 1 (Primary)' and a DISTINCT runner-up for 'Option 2 (Alternative)'.",
+    "- Provide a compact tournament table (name — score — reason).",
     "",
-    "Fundamentals Scoring (independent components; 0–100, no hard caps):",
-    "- Compute independently:",
-    "  • Calendar (instrument sign: bearish:-1 / neutral:0 / bullish:+1) ⇒ S_cal = 50 + 50*sign",
-    "  • Headlines (48h) ⇒ S_head = 25 (bearish) / 50 (neutral/unavailable) / 75 (bullish)",
-    "  • CSM diff = z(base) - z(quote) ⇒ S_csm = 50 + 25 * clamp(diff, -2, +2)/2",
-    "  • COT cue (if present) ⇒ S_cot = 50 ± 5 (align:+5 / conflict:-5 / none:0)",
+    "Fundamentals Scoring (0–100, no hard caps):",
+    "- Determine calendar instrument sign from the calendar bias (bearish:-1, neutral:0, bullish:+1).",
+    "- Compute:",
+    "  • S_cal = 50 + 50*sign",
+    "  • Headlines (48h): S_head = 25 (bearish) / 50 (neutral) / 75 (bullish); if unavailable, use 50",
+    "  • CSM diff = z(base) - z(quote); S_csm = 50 + 25 * clamp(diff, -2, +2)/2",
+    "  • COT (if cues detected): bump +5 if aligns with calendar sign, -5 if conflicts, 0 if none",
     "- Weights: w_cal=0.45, w_head=0.20, w_csm=0.30, w_cot=0.05",
-    "- RawF = w_cal*S_cal + w_head*S_head + w_csm*S_csm + w_cot*S_cot",
-    "- Proximity (≤60m high-impact) penalty: F = clamp(RawF * 0.75, 0, 100) when active.",
-
+    "- RawF = w_cal*S_cal + w_head*S_head + w_csm*S_csm + w_cot*(50+cotBump)",
+    "- If a high-impact event is within ≤60 min, reduce by 25%: F = clamp( RawF * (1 - 0.25*proximityFlag), 0, 100 ), where proximityFlag=1 if warning ≤60 min else 0.",
+    "- Unavailable components fall back to 50 (except calendar sign, which may be neutral).",
     "",
     "Conviction (0–100) from TECH & FUND alignment:",
     "- Compute T as the best tournament score (0–100).",
     "- Use the fundamentals F above (0–100).",
-    "- Alignment bonus: +8 if technical primary direction matches the fundamentals net sign; else -8.",
+    "- Determine direction sign from technical primary vs fundamentals net sign; alignment bonus: +8 if same sign, else -8.",
     "- If a high-impact event is within ≤60 min, apply final scaling 15%: Conv = clamp( (0.55*T + 0.45*F + align) * (1 - 0.15*proximityFlag), 0, 100 ).",
-
+    "- Do not apply any other caps.",
     "",
     "Consistency rule:",
-    "- If Calendar/Headlines/CSM align, say 'aligning'.",
+    "- If Calendar/Headlines/CSM align, do not say 'contradicting'; say 'aligning'.",
     "- 'Tech vs Fundy Alignment' must be Match when aligned, Mismatch when conflicted.",
-    "- IMPORTANT: The **Direction** lines in Quick Plan / Option 1 / Option 2 must not contradict the extracted 4H/1H bias unless explicitly labeled as counter-trend.",
-
     "",
     `Keep instrument alignment with ${instrument}.`,
     warn !== null ? `\nCALENDAR WARNING: High-impact event within ~${warn} min. Avoid impulsive market entries right before release.` : "",
     bias ? `\nPOST-RESULT ALIGNMENT: ${bias}.` : "",
-
     "",
     "Calendar verdict rules:",
     "- Per event: compute verdict using domain direction (goodIfHigher); output only bullish/bearish/neutral.",
     "- Final calendar bias uses baseMinusQuote: net = baseSum - quoteSum; net>0 → bullish instrument; net<0 → bearish; only when BOTH currency sums are exactly 0 → neutral.",
-    "- Mapping reminder (examples):",
-    "  • USD bearish ⇒ XAUUSD bullish, EURUSD/GBPUSD bullish.",
-    "  • USD bearish ⇒ USDJPY/USDCHF/USDCAD bearish.",
-    "  • USD bullish ⇒ XAUUSD/EURUSD/GBPUSD bearish; USDJPY/USDCHF/USDCAD bullish.",
-    "- Always state the instrument-level calendar line (e.g., 'Calendar bias for XAUUSD: bullish').",
     "- If no actuals in the last 72h for the pair’s currencies: 'Pre-release only, no confirmed bias until data is out.'",
-
     "",
-    "Under **Fundamental View**, present **independent** lines:",
-    "- Calendar: <instrument-level line or 'unavailable' / pre-release rule>",
-    "- Headlines bias (48h): bullish/bearish/neutral (or 'unavailable')",
-    "- CSM: z(base)-z(quote) diff value and interpretation",
-    "- COT: bullish/bearish/neutral (or 'unavailable')",
-    "- Then state: **Final Fundamental Bias: <label> (score ~X)**",
-  ];
-
-  const scalpingLines = !scalping ? [] : [
-    "",
-    "SCALPING MODE (guardrails only; sections unchanged):",
-    "- Treat 4H/1H as guardrails; build setups on 15m, confirm timing on 5m (and 1m if provided). 1m must not override HTF bias.",
-    "- Adjust candidate scoring weights: T_candidate = clamp( 0.35*HTF_fit(1H/4H) + 0.40*Context_fit(15m) + 0.25*Trigger_fit(5m & optional 1m), 0, 100 ).",
-    "- Prefer session confluence (London/NY kill zones), OR prior day H/L, Asia range. Reward +10 for session confluence and clean invalidation (≤0.35× ATR15) with ≥1.8R potential.",
-    "- Near red news ±30m: do not initiate new market orders; consider only pre-planned limit orders with structure protection.",
-    "- Management suggestions may include: partial at 1R, BE after 1R, time-stop within ~20 min if no follow-through.",
-    "- EMA 21/50 may be referenced; optional only.",
-    "- VWAP may be referenced; if referenced, include vwap_used=true in ai_meta.",
-    "- TIMEFRAME ATTRIBUTION FOR WORDING: Attribute sweeps to **5m**; CHOCH/BOS to **1m** when detected there.",
-    "- TRIGGER WORDING RULE: 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)'.",
-    "",
-    "ai_meta (append fields for downstream tools): include {'mode':'scalping', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'max_attempts': 3}.",
-  ];
-
-  const scalpingHardLines = !scalpingHard ? [] : [
-    "",
-    "SCALPING HARD (enforced micro-structure entries):",
-    "- Only produce a **scalping** trade or explicitly 'Stay Flat' if no compliant scalp exists.",
-    "- Entry must be built from 15m structure with **5m confirmation**; if a 1m chart is provided, use 1m for timing confirmation.",
-    "- Mandatory micro-structure: liquidity sweep or FVG/OB tap + immediate shift (CHOCH/BOS).",
-    "- TIMEFRAME ATTRIBUTION FOR WORDING (MANDATORY): Sweeps credited to **5m**; CHOCH/BOS credited to **1m** if detected there (else 5m).",
-    "- TRIGGER WORDING RULE (MANDATORY): 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)'.",
-    "- SL tight: behind the 1m/5m swing; typical 0.15×–0.40× ATR15.",
-    "- Time-stop: 15 minutes; state explicitly.",
-    "- Max attempts: 2; state explicitly.",
-    "- Near red news ±20m: 'Stay Flat' unless a protected limit is resting.",
-    "- EMA/VWAP optional only.",
-    "",
-    "ai_meta (override/add): set {'mode':'scalping-hard', 'time_stop_minutes': 15, 'max_attempts': 2} and include 'vwap_used' if VWAP is referenced."
-  ];
-
-  return [...baseLines, ...scalpingLines, ...scalpingHardLines].join("\n");
+    "Under **Fundamental View**, if Calendar is unavailable, write exactly 'Calendar: unavailable'.",
+    "If Calendar is pre-release only, write exactly 'Pre-release only, no confirmed bias until data is out.' and do NOT claim a bullish/bearish/neutral calendar bias.",
+  ].join("\n");
 }
 
 function buildUserPartsBase(args: {
@@ -1362,7 +929,6 @@ function buildUserPartsBase(args: {
   dateStr: string;
   m15: string; h1: string; h4: string;
   m5?: string | null;
-  m1?: string | null;
   calendarDataUrl?: string | null;
   calendarText?: string | null;
   headlinesText?: string | null;
@@ -1381,7 +947,6 @@ function buildUserPartsBase(args: {
     { type: "image_url", image_url: { url: args.m15 } },
   ];
   if (args.m5) { parts.push({ type: "text", text: "Scalp 5M Chart" }); parts.push({ type: "image_url", image_url: { url: args.m5 } }); }
-  if (args.m1) { parts.push({ type: "text", text: "Timing 1M Chart" }); parts.push({ type: "image_url", image_url: { url: args.m1 } }); }
   if (args.calendarDataUrl) { parts.push({ type: "text", text: "Economic Calendar Image:" }); parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } }); }
   if (!args.calendarDataUrl && args.calendarText) { parts.push({ type: "text", text: `Calendar snapshot:\n${args.calendarText}` }); }
   if (args.calendarAdvisoryText) { parts.push({ type: "text", text: `Calendar advisory:\n${args.calendarAdvisoryText}` }); }
@@ -1397,110 +962,67 @@ function buildUserPartsBase(args: {
 
 // ---------- Message builders ----------
 function messagesFull(args: {
-  instrument: string; dateStr: string; m15: string; h1: string; h4: string; m5?: string | null; m1?: string | null;
+  instrument: string; dateStr: string; m15: string; h1: string; h4: string; m5?: string | null;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null;
   calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null; debugRows?: any[] | null; preReleaseOnly?: boolean | null };
   provenance?: any;
-  scalping?: boolean;
-  scalpingHard?: boolean;
 }) {
-
- const system = [
-  systemCore(
-    args.instrument,
-    args.calendarAdvisory,
-    args.scalping,
-    args.scalpingHard
-  ),
-  "",
+  const system = [
+    systemCore(args.instrument, args.calendarAdvisory), "",
     "OUTPUT format (in this exact order):",
-  "RAW SWING MAP (first)",
-  "4H: swings=<comma-separated HH/HL/LH/LL sequence>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "1H: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "15m: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "5m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "1m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "",
-  "Quick Plan (Actionable)",
-
-  "• Direction: Long | Short | Stay Flat",
-  "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-  "• Trigger: (state timeframes explicitly, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)')",
-  "• Entry (zone or single):",
-  "• Stop Loss:",
-  "• Take Profit(s): TP1 / TP2 (approx R multiples)",
-  "• Conviction: <0–100>%",
-  "• Setup:",
-  "• Short Reasoning:",
-  "",
-  "Option 1 (Primary)",
-  "• Direction: ...",
-  "• Order Type: ...",
-  "• Trigger:",
-  "• Entry (zone or single):",
-  "• Stop Loss:",
-  "• Take Profit(s): TP1 / TP2",
-  "• Conviction: <0–100>%",
-  "• Why this is primary:",
-  "",
-  "Option 2 (Alternative)",
-  "• Direction: ...",
-  "• Order Type: ...",
-  "• Trigger:",
-  "• Entry (zone or single):",
-  "• Stop Loss:",
-  "• Take Profit(s): TP1 / TP2",
-  "• Conviction: <0–100>%",
-  "• Why this alternative:",
-  "",
+    "Quick Plan (Actionable)",
+    "• Direction: Long | Short | Stay Flat",
+    "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
+    "• Trigger:",
+    "• Entry (zone or single):",
+    "• Stop Loss:",
+    "• Take Profit(s): TP1 / TP2 (approx R multiples)",
+    "• Conviction: <0–100>%",
+    "• Setup:",
+    "• Short Reasoning:",
+    "",
+    "Option 1 (Primary)",
+    "• Direction: ...",
+    "• Order Type: ...",
+    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
+    "• Conviction: <0–100>%", "• Why this is primary:",
+    "",
+    "Option 2 (Alternative)",
+    "• Direction: ...",
+    "• Order Type: ...",
+    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
+    "• Conviction: <0–100>%", "• Why this alternative:",
+    "",
     "Full Breakdown",
-  "• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m/1m if used)",
-  "• Fundamental View:",
-  "   - Calendar: explicit instrument-level calendar line (or 'Calendar: unavailable'). If pre-release, write exactly: 'Pre-release only, no confirmed bias until data is out.'",
-  "   - Headlines bias (48h): bullish/bearish/neutral (or 'unavailable')",
-  "   - CSM: z(base)-z(quote) diff and interpretation",
-  "   - COT: bullish/bearish/neutral (or 'unavailable')",
-  "   - Final Fundamental Bias: <label> (score ~X)",
-  "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
-  "• Conditional Scenarios:",
-  "• Surprise Risk:",
-  "• Invalidation:",
-  "• One-liner Summary:",
-
-  "",
+    "• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m if used)",
+    "• Fundamental View (Calendar + Sentiment + Headlines) — include explicit Calendar bias for <PAIR> when available; if pre-release, say: 'Pre-release only, no confirmed bias until data is out.'",
+    "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
+    "• Conditional Scenarios:",
+    "• Surprise Risk:",
+    "• Invalidation:",
+    "• One-liner Summary:",
+    "",
     "Detected Structures (X-ray):",
-  "• 4H: Classify as Uptrend only if clear HH/HL are present. Classify as Downtrend only if LH/LL are confirmed. Do not mark Downtrend when higher highs are visible.",
-  "• 1H: Apply same HH/HL vs LH/LL rules as 4H. If mixed signals are present, label as Range/Neutral.",
-  "• 15m: Confirm BOS/CHOCH strictly. Use HH/HL vs LH/LL for classification. If unclear, default to Neutral instead of forcing a bias.",
-  "• 5m (if used): Use only for execution timing. Must still follow HH/HL vs LH/LL rules to avoid false bias calls.",
-  "• 1m (if used): Execution timing only — never overrides higher timeframe structure.",
-  "",
-  "Candidate Scores (tournament):",
-  "- All strategy scores must be consistent with the detected structures above.",
-  "- Trend-Following: Score higher only if two or more HTFs (4H, 1H, 15m) show HH/HL (uptrend) or LH/LL (downtrend).",
-  "- BOS Strategy: Score only when BOS/CHOCH confirmed across at least two timeframes.",
-  "- Liquidity-Sweep: Score only if explicit sweep wicks are detected (esp. on 5m/15m).",
-  "- Breakout Strategy: Score only on clean breakout beyond HTF key levels, aligned with structure.",
-  "- Mean Reversion: Score only if repeated rejection at OB/FVG with opposite HTF bias, not randomly.",
-  "",
-  "Final Table Summary:",
-
-
-  `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |`,
-  `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
-  "",
-  "Append a fenced JSON block labeled ai_meta at the very end.",
-  "",
-  "provenance_hint:",
-  JSON.stringify(args.provenance || {}, null, 2),
-].join("\n");
-
+    "• 4H:", "• 1H:", "• 15m:", "• 5m (if used):",
+    "",
+    "Candidate Scores (tournament):",
+    "- name — score — reason",
+    "",
+    "Final Table Summary:",
+    `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |`,
+    `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
+    "",
+    "Append a fenced JSON block labeled ai_meta at the very end.",
+    "",
+    "provenance_hint:",
+    JSON.stringify(args.provenance || {}, null, 2),
+  ].join("\n");
 
   return [
     { role: "system", content: system },
     { role: "user", content: buildUserPartsBase({
-      instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4, m5: args.m5 || null, m1: args.m1 || null,
+      instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4, m5: args.m5 || null,
       calendarDataUrl: args.calendarDataUrl, calendarText: args.calendarText,
       headlinesText: args.headlinesText, sentimentText: args.sentimentText,
       calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null,
@@ -1511,97 +1033,43 @@ function messagesFull(args: {
 }
 
 function messagesFastStage1(args: {
-  instrument: string; dateStr: string; m15: string; h1: string; h4: string; m5?: string | null; m1?: string | null;
+  instrument: string; dateStr: string; m15: string; h1: string; h4: string; m5?: string | null;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null;
   calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null; debugRows?: any[] | null; preReleaseOnly?: boolean | null };
   provenance?: any;
-  scalping?: boolean;
-  scalpingHard?: boolean;
 }) {
-
- const system = [
-  systemCore(
-    args.instrument,
-    args.calendarAdvisory,
-    args.scalping,
-    args.scalpingHard
-  ),
-  "",
-   "OUTPUT ONLY:",
-  "RAW SWING MAP (first)",
-  "4H: swings=<comma-separated HH/HL/LH/LL sequence>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "1H: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "15m: swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "5m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "1m (if provided): swings=<...>; last_BOS=<up|down|none>; verdict=<Uptrend|Downtrend|Range>",
-  "",
-  "Quick Plan (Actionable)",
-
-  "• Direction: Long | Short | Stay Flat",
-  "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
-  "• Trigger: (state timeframes explicitly, e.g., 'Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)')",
-  "• Entry (zone or single):",
-  "• Stop Loss:",
-  "• Take Profit(s): TP1 / TP2",
-  "• Conviction: <0–100>%",
-  "• Setup:",
-  "• Short Reasoning:",
-  "",
-  "Option 1 (Primary)",
-  "• Direction: ...",
-  "• Order Type: ...",
-  "• Trigger:",
-  "• Entry (zone or single):",
-  "• Stop Loss:",
-  "• Take Profit(s): TP1 / TP2",
-  "• Conviction: <0–100>%",
-  "• Why this is primary:",
-  "",
-  "Option 2 (Alternative)",
-  "• Direction: ...",
-  "• Order Type: ...",
-  "• Trigger:",
-  "• Entry (zone or single):",
-  "• Stop Loss:",
-  "• Take Profit(s): TP1 / TP2",
-  "• Conviction: <0–100>%",
-  "• Why this alternative:",
-   "",
-  "Management: Partials at ~1R; move to BE at 1R; time-stop 20m (scalping) / 15m (scalping-hard) / 15–20m default; max attempts 3 (scalping) / 2 (hard).",
-  "",
-  "Under Full Breakdown, include 'Fundamental Bias Snapshot' with Calendar, Headlines, CSM, COT, and the Final Fundamental Bias (score + label).",
-  "",
-
-  "Detected Structures (X-ray):",
-"• 4H: Classify as Uptrend only if clear HH/HL are present. Classify as Downtrend only if LH/LL are confirmed. Do not mark Downtrend when higher highs are visible.",
-"• 1H: Apply same HH/HL vs LH/LL rules as 4H. If mixed signals are present, label as Range/Neutral.",
-"• 15m: Confirm BOS/CHOCH strictly. Use HH/HL vs LH/LL for classification. If unclear, default to Neutral instead of forcing a bias.",
-"• 5m (if used): Use only for execution timing. Must still follow HH/HL vs LH/LL rules to avoid false bias calls.",
-"• 1m (if used): Execution timing only — never overrides higher timeframe structure.",
-"",
-"Candidate Scores (tournament):",
-"- All strategy scores must be consistent with the detected structures above.",
-"- Trend-Following: Score higher only if two or more HTFs (4H, 1H, 15m) show HH/HL (uptrend) or LH/LL (downtrend).",
-"- BOS Strategy: Score only when BOS/CHOCH confirmed across at least two timeframes.",
-"- Liquidity-Sweep: Score only if explicit sweep wicks are detected (esp. on 5m/15m).",
-"- Breakout Strategy: Score only on clean breakout beyond HTF key levels, aligned with structure.",
-"- Mean Reversion: Score only if repeated rejection at OB/FVG with opposite HTF bias, not randomly.",
-"",
-"Final Table Summary:",
-
-  `| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |`,
-  `| ${args.instrument} | ... | ... | ... | ... | ... | ... |`,
-  "",
-  "Append ONLY a fenced JSON block labeled ai_meta.",
-  "",
-  "provenance_hint:",
-  JSON.stringify(args.provenance || {}, null, 2),
-].join("\n");
-
+  const system = [
+    systemCore(args.instrument, args.calendarAdvisory), "",
+    "OUTPUT ONLY:",
+    "Quick Plan (Actionable)",
+    "• Direction: Long | Short | Stay Flat",
+    "• Order Type: Buy Limit | Sell Limit | Buy Stop | Sell Stop | Market",
+    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
+    "• Conviction: <0–100>%", "• Setup:", "• Short Reasoning:",
+    "",
+    "Option 1 (Primary)",
+    "• Direction: ...",
+    "• Order Type: ...",
+    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
+    "• Conviction: <0–100>%", "• Why this is primary:",
+    "",
+    "Option 2 (Alternative)",
+    "• Direction: ...",
+    "• Order Type: ...",
+    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
+    "• Conviction: <0–100>%", "• Why this alternative:",
+    "",
+    "Management: Brief actionable playbook.",
+    "",
+    "Append ONLY a fenced JSON block labeled ai_meta.",
+    "",
+    "provenance_hint:",
+    JSON.stringify(args.provenance || {}, null, 2),
+  ].join("\n");
 
   const parts = buildUserPartsBase({
-    instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4, m5: args.m5 || null, m1: args.m1 || null,
+    instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4, m5: args.m5 || null,
     calendarDataUrl: args.calendarDataUrl,
     calendarText: !args.calendarDataUrl && args.calendarText ? args.calendarText : undefined,
     headlinesText: args.headlinesText || undefined,
@@ -1614,36 +1082,13 @@ function messagesFastStage1(args: {
   return [{ role: "system", content: system }, { role: "user", content: parts }];
 }
 
-// ---------- Enforcement helpers (UPDATED) ----------
-
-/** Utility: tolerant sign extractor for Direction lines. */
-function _dirSignFromBlock(block: string): -1 | 0 | 1 {
-  const m = block.match(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Direction\s*:\s*(Long|Short|Stay\s*Flat)/im);
-  if (!m) return 0;
-  const v = m[1].toLowerCase();
-  if (v.startsWith("long")) return 1;
-  if (v.startsWith("short")) return -1;
-  return 0;
-}
-
-/** Utility: get core plan blocks. */
-function _pickBlocks(doc: string) {
-  const RE_QP = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
-  const RE_O1 = /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
-  const RE_O2 = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
-  const qp = doc.match(RE_QP)?.[0] || "";
-  const o1 = doc.match(RE_O1)?.[0] || "";
-  const o2 = doc.match(RE_O2)?.[0] || "";
-  return { qp, o1, o2, RE_QP, RE_O1, RE_O2 };
-}
-
+// ---------- Enforcement helpers ----------
 function hasCompliantOption2(text: string): boolean {
   if (!/Option\s*2/i.test(text || "")) return false;
   const block = (text.match(/Option\s*2[\s\S]{0,800}/i)?.[0] || "").toLowerCase();
   const must = ["direction", "order type", "trigger", "entry", "stop", "tp", "conviction"];
   return must.every((k) => block.includes(k));
 }
-
 async function enforceOption2(model: string, instrument: string, text: string) {
   if (hasCompliantOption2(text)) return text;
   const messages = [
@@ -1652,181 +1097,16 @@ async function enforceOption2(model: string, instrument: string, text: string) {
   ];
   return callOpenAI(model, messages);
 }
-
-function hasOption1(text: string): boolean {
-  if (!text) return false;
-  const re =
-    /(^|\n)\s{0,3}#{0,6}\s*[>\s]*[*\-•]?\s*(?:\*\*|__|_)?\s*Option[ \t\u00A0\u202F]*1(?!\d)\s*(?:\(\s*Primary\s*\))?(?:\s*[:\-–—])?(?:\s*(?:\*\*|__|_))?/im;
-  return re.test(text);
-}
-
-// Inject tournament strategies + scoring (deterministic, no placeholders)
-function enforceTournamentStrategies(text: string, instrument: string): string {
-  if (!text) return text;
-
-  // Capture ANY existing tournament sections (with/without ###, with/without colon)
-  const SECT_G =
-    /(#+\s*)?Candidate\s*Scores\s*\(tournament\)\s*:?\s*[\s\S]*?(?=\n\s*(?:Final\s*Table\s*Summary|Detected\s*Structures|\*\*Detected\s*Structures|Full\s*Breakdown|Option\s*1|Option\s*2)\b|$)/gi;
-
-  // Gather scored bullets (— <number> —) from existing sections
-  const matches = [...(text.matchAll(SECT_G) || [])].map(m => m[0]);
-  const bullets: string[] = [];
-  for (const sect of matches) {
-    const lines = sect.match(/^\s*[-•]\s+.+$/gmi) || [];
-    for (const ln of lines) {
-      if (/—\s*\d{1,3}\s*—/.test(ln)) bullets.push(ln.trim());
-    }
-  }
-
-  // Dedupe by strategy name (left of first em-dash)
-  const deduped: string[] = [];
-  const seen = new Set<string>();
-  for (const ln of bullets) {
-    const name = (ln.split("—")[0] || ln).replace(/^[-•]\s*/, "").trim().toLowerCase();
-    if (!seen.has(name)) { seen.add(name); deduped.push(ln); }
-  }
-
-  // Compliance: ≥5 total, ≥3 non-sweep/BOS, each bullet cites TFs
-  const nonSweep = deduped.filter(l => !/(sweep|liquidity|stop\s*hunt|bos\b|choch\b)/i.test(l));
-  const hasTFs = deduped.every(l => /\b(4H|1H|15m|5m|1m)\b/i.test(l));
-
-  let section: string;
-  if (deduped.length >= 5 && nonSweep.length >= 3 && hasTFs) {
-    section = `Candidate Scores (tournament):\n${deduped.join("\n")}\n`;
-  } else {
-    // Deterministic, TF-aware stub (no placeholders)
-    const stub = [
-      "- OB+FVG pullback — 70 — 4H/1H aligned; 15m anchor; 5m confirmation",
-      "- TL break + retest — 66 — 1H break; 15m retest; 5m BOS for entry",
-      "- Range rotation — 64 — 1H range bounds; 15m EQ; 5m rejection then shift",
-      "- Momentum breakout — 62 — 1H squeeze resolves; 15m base; 5m ignition",
-      "- VWAP fade — 60 — session VWAP confluence; 15m structure; 5m sweep then shift",
-    ].join("\n");
-    section = `Candidate Scores (tournament):\n${stub}\n`;
-  }
-
-  // Remove all existing tournament sections
-  let out = text.replace(SECT_G, "");
-
-  // Insert before Final Table Summary:, else after X-ray, else append
-  if (/Final\s*Table\s*Summary\s*:/.test(out)) {
-    out = out.replace(/(\n\s*Final\s*Table\s*Summary\s*:)/i, `\n${section}\n$1`);
-  } else if (/Detected\s*Structures\s*\(X-ray\)/i.test(out)) {
-    out = out.replace(
-      /(Detected\s*Structures\s*\(X-ray\)[\s\S]*?)(?=\n\s*(?:Final\s*Table\s*Summary|Full\s*Breakdown|$))/i,
-      (m) => `${m}\n${section}\n`
-    );
-  } else {
-    out = `${out}\n\n${section}`;
-  }
-
-  return out;
-}
-
-
-/** Deterministically build & insert "Option 1 (Primary)" if missing.
- * Also avoids duplicate regex const names elsewhere by keeping all regexes local to this function. */
-async function enforceOption1(_model: string, instrument: string, text: string) {
-  if (!text) return text;
-
-  // Dedupe extra Option 1 blocks if any
-  const RE_O1_BLOCK_G = /(Option\s*1(?!\d)[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/gi;
-  let o1Count = 0;
-  const deduped = text.replace(RE_O1_BLOCK_G, (m) => (++o1Count === 1 ? m : ""));
-  if (o1Count > 1) text = deduped;
-
+function hasOption1(text: string): boolean { return /Option\s*1\s*\(?(Primary)?\)?/i.test(text || ""); }
+async function enforceOption1(model: string, instrument: string, text: string) {
   if (hasOption1(text)) return text;
-
-  // Local-only regex (do not collide with other helpers)
-  const RE_QP_BLOCK_LOCAL = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
-  const RE_O2_BLOCK_LOCAL = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
-  const RE_FULL_LOCAL     = /(\n\s*Full\s*Breakdown)/i;
-
-  const qpBlock = text.match(RE_QP_BLOCK_LOCAL)?.[0] || "";
-  const o2Block = text.match(RE_O2_BLOCK_LOCAL)?.[0] || "";
-
-  function detectBulletChar(block: string): string {
-    if (/^\s*•\s/m.test(block)) return "• ";
-    if (/^\s*-\s/m.test(block)) return "- ";
-    return "• ";
-  }
-  function blockUsesBoldLabels(block: string): boolean {
-    return /\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:\s*\*\*/i.test(block)
-        || /(?:^|\n)\s*(?:[-•]\s*)?\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:/i.test(block);
-  }
-  function pick(re: RegExp, src: string): string | null {
-    const m = src.match(re);
-    return m ? String(m[1]).trim() : null;
-  }
-  function parseFields(src: string) {
-    return {
-      direction: pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Direction\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
-      orderType: pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Order\s*Type\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
-      trigger:   pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Trigger\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
-      entry:     pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Entry\s*\(zone\s*or\s*single\)\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src)
-              || pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Entry\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
-      stop:      pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Stop\s*Loss\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
-      tps:       pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Take\s*Profit\(s\)\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src)
-              || pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*TPs?\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
-      conv:      pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Conviction\s*:\s*(?:\*\*)?\s*(\d{1,3})\s*%/mi, src),
-      setup:     pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Setup\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src),
-      shortWhy:  pick(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Short\s*Reasoning\s*:\s*(?:\*\*)?\s*([^\n]+)/mi, src)
-    };
-  }
-
-  const qp = parseFields(qpBlock);
-  const o2 = parseFields(o2Block);
-  const choose = (a?: string | null, b?: string | null, ph = "...") =>
-    (a && a.trim()) || (b && b.trim()) || ph;
-
-  const bullet = detectBulletChar(qpBlock || o2Block || text);
-  const bold = blockUsesBoldLabels(qpBlock || o2Block || "");
-  const L = (label: string) => (bold ? `**${label}:**` : `${label}:`);
-
-  const fields = {
-    direction: choose(qp.direction, o2.direction, "Long"),
-    orderType: choose(qp.orderType, o2.orderType, "Market"),
-    trigger:   choose(qp.trigger,   o2.trigger,   "Liquidity sweep on 5m; BOS on 1m (trigger on break/retest)"),
-    entry:     choose(qp.entry,     o2.entry,     "zone ..."),
-    stop:      choose(qp.stop,      o2.stop,      "behind recent swing"),
-    tps:       choose(qp.tps,       o2.tps,       "TP1 1.0R / TP2 2.0R"),
-    conv:      choose(qp.conv,      o2.conv,      "60"),
-    why:       choose(qp.shortWhy,  qp.setup,     "Primary due to HTF alignment, clean invalidation, and superior R:R.")
-  };
-
-  const option1Block =
-`Option 1 (Primary)
-${bullet}${L("Direction")} ${fields.direction}
-${bullet}${L("Order Type")} ${fields.orderType}
-${bullet}${L("Trigger")} ${fields.trigger}
-${bullet}${L("Entry (zone or single)")} ${fields.entry}
-${bullet}${L("Stop Loss")} ${fields.stop}
-${bullet}${L("Take Profit(s)")} ${fields.tps}
-${bullet}${L("Conviction")} ${fields.conv}%
-${bullet}${L("Why this is primary")} ${fields.why}
-`;
-
-  let out = text;
-
-  if (RE_O2_BLOCK_LOCAL.test(out)) {
-    out = out.replace(RE_O2_BLOCK_LOCAL, `${option1Block}\n$&`);
-    return out;
-  }
-  if (RE_QP_BLOCK_LOCAL.test(out)) {
-    out = out.replace(RE_QP_BLOCK_LOCAL, (m) => `${m}\n${option1Block}\n`);
-    return out;
-  }
-  if (RE_FULL_LOCAL.test(out)) {
-    out = out.replace(RE_FULL_LOCAL, `\n${option1Block}\n$1`);
-  } else {
-    out = `${out}\n\n${option1Block}\n`;
-  }
-  return out;
+  const messages = [
+    { role: "system", content: "Insert a labeled 'Option 1 (Primary)' block BEFORE 'Option 2'. Use the primary trade details already present. Include Direction, Order Type, Trigger, Entry (zone or single), SL, TP1/TP2, Conviction %. Keep other content unchanged." },
+    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd/normalize 'Option 1 (Primary)' as specified.` },
+  ];
+  return callOpenAI(model, messages);
 }
-
-
 function hasQuickPlan(text: string): boolean { return /Quick\s*Plan\s*\(Actionable\)/i.test(text || ""); }
-
 async function enforceQuickPlan(model: string, instrument: string, text: string) {
   if (hasQuickPlan(text)) return text;
   const messages = [
@@ -1836,99 +1116,7 @@ async function enforceQuickPlan(model: string, instrument: string, text: string)
   return callOpenAI(model, messages);
 }
 
-/** SCALPING guards (unchanged logic, wording improved where needed) */
-function enforceScalpHardStopLossLines(text: string, scalpingHard: boolean) {
-  if (!scalpingHard || !text) return text;
-
-  const blocks = [
-    { name: "Quick Plan (Actionable)", re: /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
-    { name: "Option 1", re: /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
-    { name: "Option 2", re: /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i },
-  ];
-
-  const lineRe = /(^\s*•\s*Stop\s*Loss:\s*)(.*)$/mi;
-  const needsRewrite = (s: string) => {
-    const l = (s || "").toLowerCase();
-    const mentions15m = /\b(15m|15\s*min|15\s*minute)\b/i.test(l);
-    const hasMicroTF = /\b(1m|5m)\b/i.test(l);
-    const hasSpec = /(swing|choch|bos|atr)/i.test(l);
-    return mentions15m || !hasMicroTF || !hasSpec;
-  };
-
-  function rewriteBlock(block: string): string {
-    const m = block.match(lineRe);
-    if (!m) return block;
-    const current = m[2] || "";
-    if (!needsRewrite(current)) return block;
-    const newLine = "• Stop Loss: beyond 1m/5m swing of the entry leg (tight), typical 0.15×–0.40× ATR15; if 1m prints opposite CHOCH/BOS, exit (time-stop 15m).";
-    return block.replace(lineRe, (_full, p1) => `${p1}${newLine.replace(/^•\s*Stop\s*Loss:\s*/i, "")}`);
-  }
-
-  let out = text;
-  for (const b of blocks) {
-    const m = out.match(b.re);
-    if (!m) continue;
-    const patched = rewriteBlock(m[0]);
-    out = out.replace(m[0], patched);
-  }
-  return out;
-}
-
-function enforceScalpRiskLines(text: string, scalping: boolean, scalpingHard: boolean) {
-  if (!text || (!scalping && !scalpingHard)) return text;
-  const timeStop = scalpingHard ? 15 : 20;
-  const attempts = scalpingHard ? 2 : 3;
-
-  const blocks = [
-    { name: "Quick Plan (Actionable)", re: /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
-    { name: "Option 1", re: /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
-    { name: "Option 2", re: /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i },
-  ];
-
-  function injectLines(block: string): string {
-    let out = block;
-    const anchorRe = /(^\s*•\s*Conviction\s*:\s*.*$)/mi;
-    const hasTimeStop = /•\s*Time-?Stop\s*:/i.test(out);
-    const hasAttempts = /•\s*Max\s*Attempts\s*:/i.test(out);
-    const addTimeStop = `• Time-Stop: ${timeStop} minutes if no follow-through or opposite micro-shift (CHOCH/BOS).`;
-    const addAttempts = `• Max Attempts: ${attempts}.`;
-
-    if (!hasTimeStop || !hasAttempts) {
-      if (anchorRe.test(out)) {
-        out = out.replace(anchorRe, (m) => {
-          const insert = `${!hasTimeStop ? addTimeStop + "\n" : ""}${!hasAttempts ? addAttempts + "\n" : ""}`;
-          return `${insert}${m}`;
-        });
-      } else {
-        out = out.replace(/$/, `\n${!hasTimeStop ? addTimeStop + "\n" : ""}${!hasAttempts ? addAttempts + "\n" : ""}`);
-      }
-    }
-    return out;
-  }
-
-  let out = text;
-  for (const b of blocks) {
-    const m = out.match(b.re);
-    if (!m) continue;
-    const patched = injectLines(m[0]);
-    out = out.replace(m[0], patched);
-  }
-  return out;
-}
-
-function ensureNewsProximityNote(text: string, warnMins: number | null, instrument: string) {
-  if (!text || warnMins == null) return text;
-  const qpRe = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
-  const m = text.match(qpRe);
-  if (!m) return text;
-  let block = m[0];
-  if (/News\s*Proximity\s*:/i.test(block)) return text;
-
-  const note = `• News Proximity: High-impact event in ~${warnMins} min — prefer protected limit orders; consider staying flat until after release.`;
-  block = block.replace(/(Quick\s*Plan\s*\(Actionable\)[^\n]*\n)/i, `$1${note}\n`);
-  return text.replace(m[0], block);
-}
-
+// ---------- Consistency + visibility guards ----------
 function ensureCalendarVisibilityInQuickPlan(text: string, args: { instrument: string; preReleaseOnly: boolean; biasLine: string | null }) {
   if (!text) return text;
   const hasQP = /Quick\s*Plan\s*\(Actionable\)/i.test(text);
@@ -1936,21 +1124,11 @@ function ensureCalendarVisibilityInQuickPlan(text: string, args: { instrument: s
 
   const qpBlock = text.match(/Quick\s*Plan\s*\(Actionable\)[\s\S]*?(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i)?.[0] || "";
   const hasCalendarMention = /Calendar\s*:/i.test(qpBlock) || /Calendar\s*bias\s*for\s*/i.test(qpBlock);
-  if (hasCalendarMention) return text;
+  if (hasCalendarMention) return text; // already present
 
-  let inject = "";
-  if (args.preReleaseOnly) {
-    inject = `\n• Note: Pre-release only, no confirmed bias until data is out.`;
-   } else if (args.biasLine) {
-    if (/unavailable/i.test(args.biasLine)) {
-      inject = `\n• Calendar: unavailable.`;
-    } else {
-      const trimmed = args.biasLine.replace(/^Calendar\s*:\s*/i, "").replace(/\.$/, "");
-      const normalized = /^Calendar\s*bias\s*for/i.test(trimmed) ? trimmed : `Calendar bias for ${args.instrument}: ${trimmed}`;
-      const finalLine = normalized.replace(new RegExp(`^Calendar\\s*bias\\s*for\\s*${args.instrument}\\s*:\\s*`, "i"), `Calendar bias for ${args.instrument}: `);
-      inject = `\n• ${finalLine}`;
-    }
-  }
+  const inject = args.preReleaseOnly
+    ? `\n• Note: Pre-release only, no confirmed bias until data is out.`
+    : (args.biasLine ? `\n• Calendar bias for ${args.instrument}: ${args.biasLine.replace(/^Calendar bias for\s*[^:]+:\s*/i, "")}` : "");
 
   if (!inject) return text;
   return text.replace(/(Quick\s*Plan\s*\(Actionable\)[^\n]*\n)/i, `$1${inject}\n`);
@@ -1960,11 +1138,13 @@ function stampM5Used(text: string, used: boolean) {
   if (!used) return text;
   const stamp = "• Used Chart: 5M execution";
   let out = text;
+  // Add to Quick Plan
   if (/Quick\s*Plan\s*\(Actionable\)/i.test(out) && !/Used\s*Chart:\s*5M/i.test(out)) {
     out = out.replace(/(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(\n\s*Option\s*1)/i, (m, a, b) => {
       return /•\s*Used\s*Chart:\s*5M/i.test(a) ? m : `${a}\n${stamp}\n${b}`;
     });
   }
+  // Add to Option 1
   if (/Option\s*1\s*\(?(Primary)?\)?/i.test(out) && !/Used\s*Chart:\s*5M/i.test(out)) {
     out = out.replace(/(Option\s*1[\s\S]*?)(\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i, (m, a, b) => {
       return /•\s*Used\s*Chart:\s*5M/i.test(a) ? m : `${a}\n${stamp}\n${b}`;
@@ -1973,1288 +1153,23 @@ function stampM5Used(text: string, used: boolean) {
   return out;
 }
 
-function stampM1Used(text: string, used: boolean) {
-  if (!used) return text;
-  const stamp = "• Used Chart: 1M timing";
-  let out = text;
-  if (/Quick\s*Plan\s*\(Actionable\)/i.test(out) && !/Used\s*Chart:\s*1M/i.test(out)) {
-    out = out.replace(/(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(\n\s*Option\s*1)/i, (m, a, b) => {
-      return /•\s*Used\s*Chart:\s*1M/i.test(a) ? m : `${a}\n${stamp}\n${b}`;
-    });
-  }
-  if (/Option\s*1\s*\(?(Primary)?\)?/i.test(out) && !/Used\s*Chart:\s*1M/i.test(out)) {
-    out = out.replace(/(Option\s*1[\s\S]*?)(\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i, (m, a, b) => {
-      return /•\s*Used\s*Chart:\s*1M/i.test(a) ? m : `${a}\n${stamp}\n${b}`;
-    });
-  }
-  return out;
-}
-
-/** Deterministic alignment wording using *final* fundamentals sign + actual plan direction.
- * If fundamentals are neutral, force "Match (Fundamentals neutral — trade managed by technicals)". */
-function applyConsistencyGuards(
-  text: string,
-  args: { fundamentalsSign: -1 | 0 | 1 }
-) {
+function applyConsistencyGuards(text: string, args: { instrument: string; headlinesSign: number; csmSign: number; calendarSign: number; }) {
   let out = text || "";
-  const { qp, o1 } = _pickBlocks(out);
+  const signs = [args.headlinesSign, args.csmSign, args.calendarSign].filter((s) => s !== 0);
+  const hasPos = signs.some((s) => s > 0);
+  const hasNeg = signs.some((s) => s < 0);
+  const aligned = signs.length > 0 && ((hasPos && !hasNeg) || (hasNeg && !hasPos));
+  const mismatch = hasPos && hasNeg;
 
-  // Technical sign preference: Option 1 first, then Quick Plan
-  let techSign: -1 | 0 | 1 = _dirSignFromBlock(o1);
-  if (techSign === 0) techSign = _dirSignFromBlock(qp);
-
-  const reTF = /(Tech\s*vs\s*Fundy\s*Alignment:\s*)(Match|Mismatch)([^\n]*)/i;
-  const isNeutralFinal = args.fundamentalsSign === 0;
-
-  const desired =
-    isNeutralFinal
-      ? "Match (Fundamentals neutral — trade managed by technicals)"
-      : (techSign !== 0 && techSign === args.fundamentalsSign)
-        ? "Match"
-        : (techSign !== 0 && args.fundamentalsSign !== 0)
-          ? "Mismatch"
-          : "Match";
-
+  if (aligned) out = out.replace(/contradict(?:ion|ing|s)?/gi, "aligning");
+  const reTF = /(Tech\s*vs\s*Fundy\s*Alignment:\s*)(Match|Mismatch)/i;
   if (reTF.test(out)) {
-    out = out.replace(reTF, (_m, p1) => `${p1}${desired}`);
-  } else {
-    // Inject under Full Breakdown > Fundamental View if missing
-    out = out.replace(
-      /(Full\s*Breakdown[\s\S]*?Fundamental\s*View:[\s\S]*?)(\n\s*•\s*Tech\s*vs\s*Fundy\s*Alignment:|$)/i,
-      (m, a) => `${a}\n• Tech vs Fundy Alignment: ${desired}\n`
-    );
+    out = out.replace(reTF, (_, p1) => `${p1}${aligned ? "Match" : mismatch ? "Mismatch" : "Match"}`);
   }
   return out;
-}
-
-
-/** Tournament size & non-sweep diversity (unchanged behavior). */
-async function enforceTournamentDiversity(model: string, instrument: string, text: string) {
-  // 1) Collect ALL tournament sections (handles duplicates, header variants, stray colons)
-  const SECT_G = /(Candidate\s*Scores\s*\(tournament\)\s*:?\s*[\s\S]*?)(?=\n\s*(?:Final\s*Table\s*Summary|Detected\s*Structures|\*\*Detected\s*Structures|Full\s*Breakdown|Option\s*1|Option\s*2)\b|$)/gi;
-  const matches = [...(text.matchAll(SECT_G) || [])].map(m => m[0]);
-
-  // 2) Gather bullets from all found sections
-  const gathered: string[] = [];
-  for (const sect of matches) {
-    const bullets = sect.match(/^\s*[-•]\s+.+$/gmi) || [];
-    gathered.push(...bullets);
-  }
-
-  // If nothing gathered, we still create the section via LLM rewrite below
-  // 3) De-duplicate by strategy name (left of first em-dash), keep first occurrence
-  const deduped: string[] = [];
-  const seen = new Set<string>();
-  for (const line of gathered) {
-    const m = line.match(/^\s*[-•]\s*([^—\n]+?)\s*—\s*(\d{1,3})\s*—\s*(.+)$/i);
-    const key = (m ? m[1] : line).trim().toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(line.trim());
-  }
-
-  // 4) Compliance checks: ≥5 bullets, ≥3 non-sweep/BOS, every bullet cites timeframes
-  const nonSweep = deduped.filter(l => !/(sweep|liquidity|stop\s*hunt|bos\b|choch\b)/i.test(l));
-  const hasTFs = deduped.every(l => /\b(4H|1H|15m|5m|1m)\b/i.test(l));
-
-  let section: string | null = null;
-
-  if (deduped.length >= 5 && nonSweep.length >= 3 && hasTFs) {
-    // Build a clean single section
-    section = `Candidate Scores (tournament):\n${deduped.join("\n")}\n`;
-  } else {
-    // 5) Ask model to output ONLY a corrected section (header + bullets), keep rest untouched
-    const original = matches.join("\n\n") || "(section missing)";
-    const prompt = [
-      "Fix ONLY the 'Candidate Scores (tournament)' section to satisfy ALL of the following:",
-      "1) Include at least 5 candidates total.",
-      "2) Include at least 3 candidates that are NOT liquidity-sweep/BOS strategies.",
-      "3) Each bullet MUST cite explicit timeframe(s) (e.g., 4H/1H/15m/5m/1m) in the reason.",
-      "",
-      "Keep every other part of the document unchanged. Return only the corrected section content (header + bullet lines).",
-      "Each line format: '- name — score — reason' and reasons must reference visible structure/timeframes.",
-      `Instrument: ${instrument}`,
-      original
-    ].join("\n\n");
-
-    const out = await callOpenAI(model, [
-      { role: "system", content: "Output ONLY the corrected 'Candidate Scores (tournament)' section (header + bullet lines). Do not include anything else." },
-      { role: "user", content: prompt }
-    ]);
-
-    const clean = (out || "").trim();
-    if (!clean) {
-      // Failsafe minimal stub so we don't crash the pipeline
-      section = "Candidate Scores (tournament):\n- OB+FVG pullback — 70 — 4H/1H aligned; 15m anchor; 5m timing\n- TL break + retest — 66 — 1H break; 15m retest; 5m trigger\n- Range rotation — 64 — 1H range bounds; 15m EQ; 5m rejection\n- Momentum breakout — 62 — 1H squeeze; 15m base; 5m ignition\n- VWAP fade — 60 — session VWAP; 15m structure; 5m sweep then shift\n";
-    } else {
-      section = /^Candidate\s*Scores/i.test(clean) ? `${clean}\n` : `Candidate Scores (tournament):\n${clean}\n`;
-    }
-  }
-
-  // 6) Remove ALL existing tournament sections
-  let cleaned = text.replace(SECT_G, "");
-
-  // 7) Insert the single clean section before Final Table Summary if present; else after X-ray; else append
-  if (/Final\s*Table\s*Summary/i.test(cleaned)) {
-    cleaned = cleaned.replace(/(\n\s*Final\s*Table\s*Summary\s*:)/i, `\n${section}\n$1`);
-  } else if (/Detected\s*Structures/i.test(cleaned)) {
-    cleaned = cleaned.replace(
-      /(Detected\s*Structures\s*\(X-ray\)\s*[\s\S]*?)(?=\n\s*(?:Final\s*Table\s*Summary|Full\s*Breakdown|$))/i,
-      (m) => `${m}\n${section}\n`
-    );
-  } else {
-    cleaned = `${cleaned}\n\n${section}`;
-  }
-
-  return cleaned;
-}
-
-
-/** Remove duplicate "Candidate Scores (tournament)" sections; keep the strongest (most bullets). */
-function dedupeTournamentSections(text: string): string {
-  if (!text) return text;
-  const re = /Candidate\s*Scores\s*\(tournament\):[\s\S]*?(?=\n\s*Final\s*Table\s*Summary:|\n\s*Detected\s*Structures|\n\s*Full\s*Breakdown|$)/gi;
-  const matches = [...text.matchAll(re)];
-  if (matches.length <= 1) return text;
-
-  // keep the block with most bullet lines
-  let best = matches[0];
-  let bestScore = (matches[0][0].match(/^- .+/gmi) || []).length;
-  for (const m of matches.slice(1)) {
-    const s = (m[0].match(/^- .+/gmi) || []).length;
-    if (s > bestScore) { best = m; bestScore = s; }
-  }
-
-  // remove all and insert best before Final Table
-  let out = text.replace(re, "");
-  if (/Final\s*Table\s*Summary:/i.test(out)) {
-    out = out.replace(/(\n\s*Final\s*Table\s*Summary:)/i, `\n${best[0].trim()}\n$1`);
-  } else if (/Full\s*Breakdown/i.test(out)) {
-    out = out.replace(/(\n\s*Full\s*Breakdown)/i, `\n${best[0].trim()}\n$1`);
-  } else {
-    out = `${out}\n${best[0].trim()}\n`;
-  }
-  return out;
-}
-
-/** Trigger specificity (unchanged behavior). */
-async function enforceTriggerSpecificity(model: string, instrument: string, text: string) {
-  const blockSpecs = [
-    { name: "Quick Plan (Actionable)", re: /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
-    { name: "Option 1", re: /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i },
-    { name: "Option 2", re: /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i },
-  ];
-
-  let out = text;
-  for (const spec of blockSpecs) {
-    const m = out.match(spec.re);
-    if (!m) continue;
-    const block = m[0];
-    const trigMatch = block.match(/^\s*•\s*Trigger:\s*(.+)$/mi);
-    if (!trigMatch) continue;
-    const trig = trigMatch[1].trim();
-
-    const hasTF = /(1m|5m|15m|1h|4h)/i.test(trig);
-    const hasStrat = /(ob|order\s*block|fvg|fair\s*value|trendline|range|vwap|sweep|bos|choch|divergence|squeeze|pullback|fib|breaker|momentum|breakout)/i.test(trig);
-    const isGeneric = !(hasTF && hasStrat) || /\b(price\s+breaks|break\s+(above|below)|crosses)\b/i.test(trig);
-
-    if (!isGeneric) continue;
-
-    const sys = "Rewrite only the Trigger line to be strategy-specific and timeframe-specific using the strategy implied in the block. Keep all other lines unchanged.";
-    const usr = `Instrument: ${instrument}\n\nBLOCK:\n${block}\n\nRules:\n- Explicit timeframes (e.g., '5m sweep; 1m BOS').\n- Use a concrete trigger matching the strategy (OB/FVG, TL break+retest, range rotation, momentum breakout, VWAP, etc.).\n- Keep everything else intact. Return ONLY the rewritten Trigger line, starting with '• Trigger:'`;
-
-    const newLine = await callOpenAI(model, [{ role: "system", content: sys }, { role: "user", content: usr }]);
-    if (newLine && /^(\s*•\s*Trigger:)/i.test(newLine.trim())) {
-      const updatedBlock = block.replace(/^\s*•\s*Trigger:\s*.+$/mi, newLine.trim());
-      out = out.replace(block, updatedBlock);
-    }
-  }
-  return out;
-}
-
-/** Ensure Full Breakdown skeleton exists. */
-async function enforceFullBreakdownSkeleton(model: string, instrument: string, text: string) {
-  const hasFB = /Full\s*Breakdown/i.test(text);
-  const need = [
-    /Technical\s*View/i, /Fundamental\s*View/i, /Tech\s*vs\s*Fundy\s*Alignment/i,
-    /Conditional\s*Scenarios/i, /Surprise\s*Risk/i, /Invalidation/i, /One-liner\s*Summary/i
-  ];
-  const ok = hasFB && need.every(re => re.test(text));
-  if (ok) return text;
-
-  if (!hasFB) {
-    return `${text}\n\nFull Breakdown\n• Technical View (HTF + Intraday): ...\n• Fundamental View: ...\n• Tech vs Fundy Alignment: ...\n• Conditional Scenarios: ...\n• Surprise Risk: ...\n• Invalidation: ...\n• One-liner Summary: ...\n`;
-  }
-
-  const prompt = `Add any missing Full Breakdown subsection labels (exact labels) without altering existing content. Instrument: ${instrument}\n\n${text}`;
-  const patched = await callOpenAI(model, [
-    { role: "system", content: "Ensure required Full Breakdown subsection labels exist. Do not modify existing content; only insert missing labeled lines under the Full Breakdown section." },
-    { role: "user", content: prompt }
-  ]);
-  return patched && patched.trim().length > 10 ? patched : text;
-}
-
-function enforceFinalTableSummary(text: string, instrument: string) {
-  if (/Final\s*Table\s*Summary/i.test(text)) return text;
-  const stub =
-`\nFinal Table Summary:
-| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |
-| ${instrument} | ... | ... | ... | ... | ... | ... |\n`;
-  return `${text}\n${stub}`;
-}
-
-/** Conviction calculation & injection (independent per-plan + hard-gated Option2 distinct + scaffold enforcement). */
-function computeAndInjectConviction(
-  text: string,
-  args: { fundamentals: { final: { score: number; sign: number } }, proximityFlag?: boolean }
-) {
-  if (!text) return text;
-
-  // ---- Tournament scores (map Top1→QP, Top2→O1, Top3→O2) ----
-  const tSect = text.match(
-    /Candidate\s*Scores\s*\(tournament\):[\s\S]*?(?=\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i
-  )?.[0] || "";
-
-  const tMatches = [...tSect.matchAll(/—\s*(\d{1,3})\s*—/g)];
-  const uniqSorted = [...new Set(
-    tMatches
-      .map((m) => Number(m[1]))
-      .filter((n) => Number.isFinite(n))
-      .map((n) => Math.max(0, Math.min(100, n)))
-  )].sort((a, b) => b - a);
-
-  const T1 = uniqSorted[0] ?? 0;
-  const T2 = uniqSorted[1] ?? Math.max(0, T1 - 8);
-  const T3 = uniqSorted[2] ?? Math.max(0, T2 - 8);
-
-  // ---- Fundamentals snapshot ----
-  const Fraw = Number(args.fundamentals?.final?.score) || 0;
-  const F = Math.max(0, Math.min(100, Fraw));
-  const fSign = (Number(args.fundamentals?.final?.sign) || 0) as -1 | 0 | 1;
-  const prox = !!args.proximityFlag;
-
-  // ---- Plan blocks ----
-  const RE_QP_BLOCK = /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
-  const RE_O1_BLOCK = /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i;
-  const RE_O2_BLOCK = /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i;
-
-  function dirSign(block: string): -1 | 0 | 1 { return _dirSignFromBlock(block); }
-  function hasText(s: string, re: RegExp) { return re.test((s || "").toLowerCase()); }
-  function pickBlock(src: string, re: RegExp): string { const m = src.match(re); return m ? m[0] : ""; }
-
-  let qpBlock = pickBlock(text, RE_QP_BLOCK);
-  let o1Block = pickBlock(text, RE_O1_BLOCK);
-  let o2Block = pickBlock(text, RE_O2_BLOCK);
-
-  // ---- Scaffold enforcement (ensure all three exist) ----
-  function ensureScaffold(block: string, label: string): string {
-    if (!block || block.trim() === "") {
-      return `${label}\n• Direction: ...\n• Order Type: ...\n• Trigger: ...\n• Entry (zone or single): ...\n• Stop Loss: ...\n• Take Profit(s): ...\n• Conviction: ...\n`;
-    }
-    return block;
-  }
-  qpBlock = ensureScaffold(qpBlock, "Quick Plan (Actionable)");
-  o1Block = ensureScaffold(o1Block, "Option 1 (Primary)");
-  o2Block = ensureScaffold(o2Block, "Option 2 (Alternative)");
-
-  let dQP = dirSign(qpBlock);
-  const dO1 = dirSign(o1Block);
-  const dO2 = dirSign(o2Block);
-  if (dQP === 0) dQP = dO1;
-
-  // Independent alignment bonuses/penalties
-  const alignQP = (fSign !== 0 && dQP !== 0) ? (fSign === dQP ? 8 : -8) : 0;
-  const alignO1 = (fSign !== 0 && dO1 !== 0) ? (fSign === dO1 ? 8 : -8) : 0;
-  const alignO2 = (fSign !== 0 && dO2 !== 0) ? (fSign === dO2 ? 8 : -8) : 0;
-
-  // Quality & reliability heuristics
-  function qualityFactor(block: string): number {
-    let q = 1.0;
-    if (hasText(block, /(htf\s+alignment|clean\s+invalidation|confluence|ob\s*\+?\s*fvg|rr\s*[:x]?\s*2(\.?\d+)?|\bR\s*[:x]\s*2)/i)) q += 0.05;
-    if (hasText(block, /(clear\s+(bos|choch)|trendline\s+break|range\s+rotation|vwap)/i)) q += 0.05;
-    if (hasText(block, /(chop|unclear|messy|low\s+confidence)/i)) q -= 0.1;
-    return Math.max(0.8, Math.min(1.1, q));
-  }
-  function reliabilityFactor(textAll: string): number {
-    let r = 1.0;
-    if (hasText(textAll, /pre-release\s+only|waiting\s+for\s+results|calendar:\s*unavailable/i)) r -= 0.1;
-    if (hasText(textAll, /\bMismatch\b/i)) r -= 0.05;
-    return Math.max(0.8, Math.min(1.05, r));
-  }
-
-  const Q_qp = qualityFactor(qpBlock || o1Block || "");
-  const Q_o1 = qualityFactor(o1Block);
-  const Q_o2 = qualityFactor(o2Block);
-  const R_f  = reliabilityFactor(text);
-
-  const prox_pen = prox ? 6 : 0;
-  const liq_pen  = hasText(text, /\b(asia\s+session|illiquid|thin\s+liquidity)\b/i) ? 2 : 0;
-
-  // ---- Independent technical baselines per plan ----
-  const Tq_qp = Math.max(0, Math.min(100, Math.round(T1 * Q_qp)));
-  const Tq_o1 = Math.max(0, Math.min(100, Math.round(T2 * Q_o1)));
-  const Tq_o2 = Math.max(0, Math.min(100, Math.round(T3 * Q_o2)));
-  const Fr    = Math.max(0, Math.min(100, Math.round(F * R_f)));
-
-  // Final convictions (0–100), per plan
-  const convQP = Math.max(0, Math.min(100, Math.round(0.60 * Tq_qp + 0.40 * Fr + alignQP - (prox_pen + liq_pen))));
-  const convO1 = Math.max(0, Math.min(100, Math.round(0.60 * Tq_o1 + 0.40 * Fr + alignO1 - (prox_pen + liq_pen))));
-  const convO2 = Math.max(0, Math.min(100, Math.round(0.60 * Tq_o2 + 0.40 * Fr + alignO2 - (prox_pen + liq_pen))));
-
-  // ---- Write back into each block ----
-  function detectBullet(block: string): string {
-    if (/^\s*•\s/m.test(block)) return "• ";
-    if (/^\s*-\s/m.test(block)) return "- ";
-    return "• ";
-  }
-  function usesBoldLabels(block: string): boolean {
-    return /\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:\s*\*\*/i.test(block)
-        || /(?:^|\n)\s*(?:[-•]\s*)?\*\*\s*(Direction|Order\s*Type|Trigger|Entry|Stop\s*Loss|Take\s*Profit\(s\))\s*:/i.test(block);
-  }
-  function writeConv(src: string, blockRe: RegExp, pct: number) {
-    const m = src.match(blockRe);
-    if (!m) return src;
-    const block = m[0];
-
-    const bullet = detectBullet(block);
-    const bold = usesBoldLabels(block);
-    const label = bold ? "**Conviction:**" : "Conviction:";
-
-    const stripped = block.replace(/^\s*(?:[-•]\s*)?(?:\*\*)?\s*Conviction\s*:[^\n]*\n?/gmi, "");
-    const reTP = /(^\s*(?:[-•]\s*)?(?:\*\*)?\s*Take\s*Profit\(s\)\s*:[^\n]*\n)/mi;
-    const reSL = /(^\s*(?:[-•]\s*)?(?:\*\*)?\s*Stop\s*Loss\s*:[^\n]*\n)/mi;
-    const insertion = `${bullet}${label} ${pct}%\n`;
-
-    let updated = stripped;
-    if (reTP.test(stripped)) updated = stripped.replace(reTP, (m) => m + insertion);
-    else if (reSL.test(stripped)) updated = stripped.replace(reSL, (m) => m + insertion);
-    else updated = stripped.replace(/$/, `\n${insertion}`);
-
-    return src.replace(block, updated);
-  }
-
-  let out = text;
-  out = writeConv(out, RE_QP_BLOCK, convQP);
-  out = writeConv(out, RE_O1_BLOCK, convO1);
-  out = writeConv(out, RE_O2_BLOCK, convO2);
-
-  // ---- Hard-gate Option2 distinctness (sync) ----
-  out = enforceOption2DistinctHardSync("EURUSD", out);
-
-  return out;
-}
-
-/** Ensures Option 2 is distinct from Option 1 without async */
-function enforceOption2DistinctHardSync(instrument: string, text: string): string {
-  if (!text) return text;
-
-  const o1 = text.match(/Option\s*1[\s\S]*?(?=\n\s*Option\s*2|$)/i)?.[0] || "";
-  const o2 = text.match(/Option\s*2[\s\S]*?(?=\n\s*Full\s*Breakdown|$)/i)?.[0] || "";
-
-  if (!o1 || !o2) return text;
-
-  const stratKeywords = ["bos", "break of structure", "liquidity", "sweep", "breakout", "retest", "mean reversion"];
-  const findBucket = (block: string) =>
-    stratKeywords.find((k) => block.toLowerCase().includes(k)) || "other";
-
-  const bucketO1 = findBucket(o1);
-  const bucketO2 = findBucket(o2);
-
-  if (bucketO1 === bucketO2) {
-    const fixedO2 = o2.replace(/(Trigger:\s*)(.*)/i, `$1Alternative setup based on different structure (e.g. liquidity sweep if O1 was BOS, or BOS if O1 was sweep). Distinct from Option 1.`);
-    return text.replace(o2, fixedO2);
-  }
-
-  return text;
-}
-
-/** Final table row filler (with entry zone enforcement, fixed thousands parsing). */
-function fillFinalTableSummaryRow(text: string, instrument: string) {
-  if (!text) return text;
-
-  const ai = extractAiMeta(text) || {};
-
-  // thousands-aware tokenization (preserve formatting from QP lines)
-  const TOKEN_RE = /(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?/g;
-  const stripMd = (s: string) =>
-    String(s || "")
-      .replace(/[*_`~]/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
-  const fmtThousands = (s: string) => {
-    if (!s) return s;
-    if (/,/.test(s)) return s;
-    const [i, d] = s.split(".");
-    const ii = i.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-    return d ? `${ii}.${d}` : ii;
-  };
-  const numFromToken = (tok: string) => Number(tok.replace(/,/g, ""));
-
-  const grab = (re: RegExp): string | null => {
-    const m = text.match(re);
-    return m ? stripMd(m[1]) : null;
-  };
-
-  // Bias & Conviction from Quick Plan
-  const bias = grab(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(?:\*\*)?\s*(Long|Short|Stay\s*Flat)/i) || "...";
-  const slLine = grab(/Quick\s*Plan[\s\S]*?Stop\s*Loss\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "...";
-  const tpsLine =
-    grab(/Quick\s*Plan[\s\S]*?Take\s*Profit\(s\)\s*:\s*(?:\*\*)?\s*([^\n]+)/i) ||
-    grab(/Quick\s*Plan[\s\S]*?TPs?\s*:\s*(?:\*\*)?\s*([^\n]+)/i) ||
-    "";
-  const conv = grab(/Quick\s*Plan[\s\S]*?Conviction\s*:\s*(?:\*\*)?\s*(\d{1,3})\s*%/i) || "...";
-
-  // Entry zone: prefer ai_meta.zone; else reuse QP tokens (preserving commas)
-  let entryZone = "...";
-  if (ai?.zone && Number.isFinite(+ai.zone.min) && Number.isFinite(+ai.zone.max)) {
-    const lo = Math.min(Number(ai.zone.min), Number(ai.zone.max));
-    const hi = Math.max(Number(ai.zone.min), Number(ai.zone.max));
-    const sLo = fmtThousands(String(lo));
-    const sHi = fmtThousands(String(hi));
-    entryZone = `${sLo} – ${sHi}`;
-  } else {
-    const rawEntry = grab(/Quick\s*Plan[\s\S]*?Entry\s*(?:\(zone\s*or\s*single\))?\s*:\s*(?:\*\*)?\s*([^\n]+)/i) || "";
-    const toks = (rawEntry.match(TOKEN_RE) || []).map(String);
-    if (toks.length >= 2) {
-      entryZone = `${fmtThousands(toks[0])} – ${fmtThousands(toks[1])}`;
-    } else if (toks.length === 1) {
-      const t = toks[0];
-      const decs = (t.split(".")[1] || "").length || 4;
-      const entry = numFromToken(t);
-      const pip = Math.pow(10, -decs);
-      const w = 10 * pip;
-      const lo = (entry - w).toFixed(decs);
-      const hi = (entry + w).toFixed(decs);
-      entryZone = `${fmtThousands(lo)} – ${fmtThousands(hi)}`;
-    }
-  }
-
-  // SL from QP tokens (preserve commas)
-  let sl = slLine;
-  const slTok = (slLine.match(TOKEN_RE) || [])[0];
-  if (slTok) sl = slLine.replace(TOKEN_RE, fmtThousands(slTok));
-
-  // TP1/TP2 from QP tokens (preserve commas)
-  let tp1 = "...", tp2 = "...";
-  if (tpsLine) {
-    const mm1 = tpsLine.match(/TP1[:\s]*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)/i);
-    const mm2 = tpsLine.match(/TP2[:\s]*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)/i);
-    if (mm1) tp1 = fmtThousands(mm1[1]);
-    if (mm2) tp2 = fmtThousands(mm2[1]);
-    if (tp1 === "..." || tp2 === "...") {
-      const toks = (tpsLine.match(TOKEN_RE) || []).map(fmtThousands);
-      if (tp1 === "..." && toks[0]) tp1 = toks[0];
-      if (tp2 === "..." && toks[1]) tp2 = toks[1];
-    }
-  }
-
-  const headerRe = /Final\s*Table\s*Summary:\s*\n\|\s*Instrument\s*\|\s*Bias\s*\|\s*Entry Zone\s*\|\s*SL\s*\|\s*TP1\s*\|\s*TP2\s*\|\s*Conviction %\s*\|\n/i;
-  const rowRe = new RegExp(`^\\|\\s*${instrument.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\s*\\|[^\\n]*$`, "im");
-  const newRow = `| ${instrument} | ${bias} | ${entryZone} | ${sl} | ${tp1} | ${tp2} | ${conv} |`;
-
-  if (!headerRe.test(text)) {
-    const block =
-`\nFinal Table Summary:
-| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |
-${newRow}\n`;
-    return `${text}\n${block}`;
-  }
-  if (rowRe.test(text)) return text.replace(rowRe, newRow);
-  return text.replace(headerRe, (m) => m + newRow + "\n");
-}
-
-function ensureAiMetaBlock(text: string, patch: Record<string, any>) {
-  // Final polish pass BEFORE emitting ai_meta (normalizes 'mixed' → 'neutral' on calendar lines, etc.)
-  const polished = _finalPolish(text || "");
-
-  // Merge existing ai_meta (if any) with the provided patch
-  const meta = extractAiMeta(polished) || {};
-  const merged = { ...meta, ...patch };
-  const json = JSON.stringify(merged, null, 2);
-
-  // Always emit a fenced JSON block:
-  // ai_meta
-  // ```json
-  // { ... }
-  // ```
-  const fenced = `\nai_meta\n\`\`\`json\n${json}\n\`\`\`\n`;
-
-  // Hard-deduplicate: remove ANY existing ai_meta blocks (fenced or legacy) before appending one clean block.
-  let out = polished.replace(/\nai_meta\s*```json[\s\S]*?```\s*/gi, "");
-  out = out.replace(/\nai_meta\s*{[\s\S]*?}\s*/gi, "");
-
-  // Ensure there is a trailing newline separation to avoid gluing to previous content
-  const needsNL = !/\n$/.test(out);
-  if (needsNL) out += "\n";
-
-  return `${out}${fenced}`;
-}
-/** Normalize Order Type (existing behavior kept) if ai_meta has price & zone. */
-
-function normalizeOrderTypeLines(text: string, aiMeta: any) {
-  const dir = String(aiMeta?.direction || "").toLowerCase();
-  const p = Number(aiMeta?.currentPrice);
-  const zmin = Number(aiMeta?.zone?.min);
-  const zmax = Number(aiMeta?.zone?.max);
-  if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return text;
-
-  function wantOrder(): string | null {
-    if (dir === "long") {
-      if (Math.max(zmin, zmax) < p) return "Buy Limit";
-      if (Math.min(zmin, zmax) > p) return "Buy Stop";
-      return "Market";
-    } else if (dir === "short") {
-      if (Math.min(zmin, zmax) > p) return "Sell Limit";
-      if (Math.max(zmin, zmax) < p) return "Sell Stop";
-      return "Market";
-    }
-    return null;
-  }
-
-  const desired = wantOrder();
-  if (!desired) return text;
-
-  function setOrderInBlock(src: string, blockRe: RegExp) {
-    const m = src.match(blockRe);
-    if (!m) return src;
-    const block = m[0];
-    const updated = block.replace(/(^\s*•\s*Order\s*Type:\s*)(.+)$/mi, `$1${desired}`);
-    return src.replace(block, updated);
-  }
-
-  let out = text;
-  out = setOrderInBlock(out, /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
-  out = setOrderInBlock(out, /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
-  return out;
-}
-
-/** NEW: If trigger says BOS/breakout/close-below, prefer Stop orders; fix Limit/Stop mismatch. */
-function _normalizeOrderTypeByTrigger(text: string): string {
-  const { qp, o1, o2, RE_QP, RE_O1, RE_O2 } = _pickBlocks(text);
-
-  function desiredOrder(type: "long" | "short", triggerLine: string): "Market" | "Buy Stop" | "Sell Stop" | "Buy Limit" | "Sell Limit" {
-    const trig = triggerLine.toLowerCase();
-    const isBreak = /(bos|break\s+of\s+structure|close\s+(above|below)|break(out)?|breach)/i.test(trig);
-    if (isBreak) {
-      return type === "long" ? "Buy Stop" : "Sell Stop";
-    }
-    // pullback/tap style
-    const isTap = /(tap|retest|pullback|mitigation|fvg|order\s*block|ob|supply|demand)/i.test(trig);
-    if (isTap) {
-      return type === "long" ? "Buy Limit" : "Sell Limit";
-    }
-    return type === "long" ? "Market" : "Market";
-  }
-
-  function fixInBlock(src: string, block: string) {
-    const dirM = block.match(/^\s*•\s*Direction:\s*(Long|Short)/mi);
-    const trigM = block.match(/^\s*•\s*Trigger:\s*([^\n]+)/mi);
-    const ordM  = block.match(/^\s*•\s*Order\s*Type:\s*([^\n]+)/mi);
-    if (!dirM || !trigM || !ordM) return src;
-
-    const want = desiredOrder(dirM[1].toLowerCase() === "long" ? "long" : "short", trigM[1]);
-    const cur  = ordM[1].trim();
-
-    if (cur.toLowerCase() !== want.toLowerCase()) {
-      const patched = block.replace(/(^\s*•\s*Order\s*Type:\s*)([^\n]+)/mi, `$1${want}`);
-      src = src.replace(block, patched);
-    }
-    return src;
-  }
-
-  let out = text;
-  if (qp) out = fixInBlock(out, qp);
-  if (o1) out = fixInBlock(out, o1);
-  if (o2) out = fixInBlock(out, o2);
-  return out;
-}
-
-/* =========================
-   MEGA PATCH 1 (AtoL-Ω)
-   - Drop-in monolithic post-processing layer
-   - Replaces/extends earlier helpers with stricter, deterministic logic
-   ========================= */
-
-/* -------------------------
-   0) Safe object utils
-   ------------------------- */
-function _clamp(n: number, lo: number, hi: number) {
-  return Math.max(lo, Math.min(hi, n));
-}
-function _defined<T>(v: T | null | undefined): v is T {
-  return v !== null && v !== undefined;
-}
-function _toNum(s: string | number | null | undefined): number | null {
-  if (s == null) return null;
-  const n = Number(String(s).replace(/,/g, ""));
-  return Number.isFinite(n) ? n : null;
-}
-
-/* -------------------------
-   1) Trigger → Order-Type (REPLACE)
-   - Stop for BOS/breakout/ignition/close-through
-   - Limit for retest/tap/mitigation/OB/FVG/range rotation
-   ------------------------- */
-function desiredOrder(
-  type: "long" | "short",
-  triggerLine: string
-): "Market" | "Buy Stop" | "Sell Stop" | "Buy Limit" | "Sell Limit" {
-  const s = (triggerLine || "").toLowerCase();
-
-  const impliesBreak =
-    /(bos|break\s*of\s*structure|close\s*(above|below)|break\s*out|breakout|breach|ignite|ignition|momentum|impulse|squeeze|close\-through)/i.test(
-      s
-    );
-  // NOTE: if both appear (“break → retest”), treat as STOP (confirmation first).
-  const impliesRetest =
-    /(tap|retest|pullback|mitigation|mitigate|rebalance|fill|fvg|fair\s*value|order\s*block|\bob\b|supply|demand|breaker|range\s*(high|low)|eq\s*of\s*range|rotation)/i.test(
-      s
-    );
-
-  if (impliesBreak) return type === "long" ? "Buy Stop" : "Sell Stop";
-  if (impliesRetest) return type === "long" ? "Buy Limit" : "Sell Limit";
-  return "Market";
-}
-
-/* -------------------------
-   2) Normalize Trigger spacing (REPLACE)
-   ------------------------- */
-function normalizeTriggerSpacing(text: string): string {
-  if (!text) return text;
-  // fix "Trigger:Alternative" or multiple spaces
-  let out = text.replace(/^\s*•\s*Trigger\s*:?(\s*)/gmi, "• Trigger: ");
-  // collapse multiple spaces after "•" bullet labels generally
-  out = out.replace(/(^\s*•\s*[A-Za-z][A-Za-z ()/]*:)\s+/gmi, (_m, p1) => `${p1} `);
-  return out;
-}
-
-/* -------------------------
-   3) Clarify BOS wording (KEEP, stricter)
-   ------------------------- */
-function _clarifyBOSWording(text: string): string {
-  return text
-    .replace(/5m:\s*Awaiting\s*BOS\s*for\s*confirmation/gi, "5m: Awaiting 5m BOS (decisive break/close below latest 5m swing low) for confirmation")
-    .replace(/BOS\s*needed\s*for\s*confirmation/gi, "BOS needed for confirmation (break/close of recent swing)")
-    .replace(/(awaiting|need[s]?|requires?)\s*bos\b/gi, "awaiting BOS (decisive close through the swing)");
-}
-
-/* -------------------------
-   4) Final vocabulary guard (REPLACE)
-   - “mixed” → “neutral” on Calendar lines ONLY (including “Calendar bias for <INSTRUMENT>”)
-   ------------------------- */
-function _finalPolish(text: string): string {
-  if (!text) return text;
-  let out = text;
-
-  // Calendar: ... mixed -> neutral
-  out = out.replace(
-    /(^|\n)(\s*•\s*)?Calendar\s*:\s*([^\n]*?)\bmixed\b([^\n]*)/gi,
-    (_m, pfx, bullet, before, after) => {
-      const replaced = (before + after).replace(/\bmixed\b/gi, "neutral");
-      return `${pfx || "\n"}${bullet || ""}Calendar: ${replaced}`;
-    }
-  );
-
-  // Calendar bias for <INSTRUMENT>: ... mixed -> neutral (preserve instrument)
-  out = out.replace(
-    /(^|\n)(\s*•\s*)?Calendar\s*bias\s*for\s+([A-Z0-9:_\-]+?)\s*:\s*([^\n]*?)\bmixed\b([^\n]*)/gi,
-    (_m, pfx, bullet, instr, before, after) => {
-      const replaced = (before + after).replace(/\bmixed\b/gi, "neutral");
-      return `${pfx || "\n"}${bullet || ""}Calendar bias for ${instr}: ${replaced}`;
-    }
-  );
-
-  // repair stray “Trigger:Alternative …” bugs
-  out = out.replace(/(^\s*•\s*Trigger:\s*)Alternative\s*/gmi, "$1");
-
-  return out;
-}
-
-/* -------------------------
-   5) Entry zone enforcement (REPLACE, trigger-aware)
-   - Produces min–max zone
-   - BOS ⇢ synth tight zone around level
-   - Retest/tap ⇢ preserve two-number zone or synth around single
-   ------------------------- */
-function enforceEntryZoneUsage(text: string, instrument: string): string {
-  if (!text) return text;
-  const ai = extractAiMeta(text) || {};
-  const NUM_RE = /(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?/g;
-  const toNum = (s: string) => Number(String(s).replace(/,/g, ""));
-
-  function fmtZone(min: number, max: number): string {
-    const lo = Math.min(min, max);
-    const hi = Math.max(min, max);
-    const dec = Math.max((String(lo).split(".")[1] || "").length, (String(hi).split(".")[1] || "").length, 2);
-    return `${lo.toFixed(dec)} – ${hi.toFixed(dec)}`;
-  }
-  function widthAround(px: number) {
-    // Use ~0.18% span, floor by a “tick-like” epsilon
-    const span = Math.max(Math.abs(px) * 0.0018, Math.max(0.5, Math.abs(px) * 1e-5));
-    return { lo: px - span / 2, hi: px + span / 2 };
-  }
-  function deriveZone(triggerLine: string, entryLine: string, stopLine: string): string | null {
-    const trig = (triggerLine || "").toLowerCase();
-    const entryNums = (entryLine.match(NUM_RE) || []).map(toNum).filter(Number.isFinite);
-    const stopNums = (stopLine.match(NUM_RE) || []).map(toNum).filter(Number.isFinite);
-
-    const isBreak = /(bos|break\s*of\s*structure|close\s*(above|below)|breakout|breach|ignite|ignition|momentum|impulse|squeeze|close\-through)/i.test(trig);
-    const isRetest = /(tap|retest|pullback|mitigation|mitigate|rebalance|fill|fvg|fair\s*value|order\s*block|\bob\b|supply|demand|breaker|range\s*(high|low)|eq\s*of\s*range|rotation)/i.test(trig);
-
-    // BOS-anchor: use the first numeric from entry or trigger, widen slightly
-    if (isBreak) {
-      const px = entryNums[0] ?? ((triggerLine.match(NUM_RE) || []).map(toNum)[0]);
-      if (Number.isFinite(px)) {
-        const { lo, hi } = widthAround(px!);
-        return fmtZone(lo, hi);
-      }
-    }
-
-    // Retest anchor: if entry has two numbers already, respect them
-    if (isRetest && entryNums.length >= 2) return fmtZone(entryNums[0], entryNums[1]);
-
-    // If single number only, synth zone
-    const single = entryNums[0] ?? ((triggerLine.match(NUM_RE) || []).map(toNum)[0]);
-    if (Number.isFinite(single)) {
-      const { lo, hi } = widthAround(single!);
-      return fmtZone(lo, hi);
-    }
-
-    // Hail-mary: if nothing, synth near SL
-    if (stopNums.length) {
-      const px = stopNums[0]!;
-      const { lo, hi } = widthAround(px);
-      return fmtZone(lo, hi);
-    }
-    return null;
-  }
-
-  function rewriteBlock(src: string, reBlock: RegExp) {
-    const m = src.match(reBlock);
-    if (!m) return src;
-    let block = m[0];
-
-    const reTrig  = /(^\s*•\s*Trigger\s*:\s*)([^\n]+)$/mi;
-    const reEntry = /(^\s*•\s*Entry\s*\(zone\s*or\s*single\)\s*:\s*)([^\n]+)$/mi;
-    const reEntryAlt = /(^\s*•\s*Entry\s*:\s*)([^\n]+)$/mi;
-    const reStop  = /(^\s*•\s*Stop\s*Loss\s*:\s*)([^\n]+)$/mi;
-
-    const trigLine  = (block.match(reTrig)?.[2] || "").trim();
-    const entryLine = (block.match(reEntry)?.[2] || block.match(reEntryAlt)?.[2] || "").trim();
-    const stopLine  = (block.match(reStop)?.[2] || "").trim();
-
-    // Priority 1: ai_meta zone (when present)
-    let zoneText: string | null = null;
-    if (ai?.zone && Number.isFinite(+ai.zone.min) && Number.isFinite(+ai.zone.max)) {
-      const lo = Number(ai.zone.min), hi = Number(ai.zone.max);
-      zoneText = fmtZone(lo, hi);
-    } else {
-      zoneText = deriveZone(trigLine, entryLine, stopLine);
-    }
-
-    if (!zoneText) return src;
-
-    if (reEntry.test(block)) block = block.replace(reEntry, (_f, p1) => `${p1}${zoneText}`);
-    else if (reEntryAlt.test(block)) block = block.replace(reEntryAlt, (_f, p1) => `${p1}${zoneText}`);
-    else block = `${block}\n• Entry (zone or single): ${zoneText}`;
-
-    return src.replace(m[0], block);
-  }
-
-  let out = text;
-  out = rewriteBlock(out, /(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
-  out = rewriteBlock(out, /(Option\s*1[\s\S]*?)(?=\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
-  out = rewriteBlock(out, /(Option\s*2[\s\S]*?)(?=\n\s*Full\s*Breakdown|$)/i);
-  return out;
-}
-
-/* -------------------------
-   6) RAW SWING MAP enforcer (REPLACE)
-   - Accepts bullets or plain lines
-   - Syncs X-ray + Technical View
-   - 1H/15m can be counter-trend but may not override 4H wording
-   - Bullet normalization in X-ray
-   ------------------------- */
-function _applyRawSwingMap(text: string): string {
-  if (!text) return text;
-
-  const mapRe = /(RAW\s*SWING\s*MAP(?:\s*\(first\))?[\s\S]*?)(?=\n\s*Quick\s*Plan\s*\(Actionable\)|\n\s*Option\s*1|\n\s*Full\s*Breakdown|$)/i;
-  const m = text.match(mapRe);
-  if (!m) return text;
-
-  const block = m[1];
-  type Verdict = 'Uptrend'|'Downtrend'|'Range';
-  type TF = '4H'|'1H'|'15m'|'5m'|'1m';
-  const lines: Partial<Record<TF, { swings:string; bos:string; verdict:Verdict }>> = {};
-
-  function take(tf: TF) {
-    const tfEsc = tf.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
-    const re = new RegExp(
-      `^\\s*(?:[-•]\\s*)?(?:\\*\\*)?${tfEsc}(?:\\*\\*)?\\s*:\\s*` +
-      `(?:Swings|swings)?\\s*=?\\s*([^;\\n]+)?;?\\s*` +
-      `(?:last_?BOS|last\\s*BOS)?\\s*=\\s*([^;\\n]+)?;?\\s*` +
-      `verdict\\s*=\\s*(Uptrend|Downtrend|Range)\\s*$`,
-      'im'
-    );
-    const mm = block.match(re);
-    if (!mm) return;
-    lines[tf] = {
-      swings: (mm[1] || '').trim(),
-      bos: (mm[2] || '').trim().toLowerCase(),
-      verdict: (mm[3] as Verdict)
-    };
-  }
-  (['4H','1H','15m','5m','1m'] as TF[]).forEach(take);
-
-  if (!lines['4H'] || !lines['1H'] || !lines['15m']) return text;
-
-  const v4 = lines['4H']!.verdict;
-  const v1 = lines['1H']!.verdict;
-  const v15 = lines['15m']!.verdict;
-
-  const ct15 = (v4 !== 'Range' && v15 !== 'Range' && v15 !== v4);
-
-  const tail4 =
-    v4 === 'Uptrend'   ? '— bullish structure (HH/HL confirmed)'
-  : v4 === 'Downtrend' ? '— bearish structure (LH/LL confirmed)'
-                       : '— consolidation / range';
-
-  const ctx1 = '— at support/demand; monitor continuation vs pullback';
-
-  const line4 = `Trend: ${v4} ${tail4}`;
-  const line1 = `Trend: ${v1} ${ctx1}`;
-  const line15 = `Trend: ${v15} — Execution anchors refined from 1H${ct15 ? ' (counter-trend)' : ''}`;
-
-  // Micro TFs
-  const micro = (v?: Verdict) => v === 'Uptrend' ? 'Micro up' : v === 'Downtrend' ? 'Micro down' : 'Micro range';
-  const line5  = `Trend: ${micro(lines['5m']?.verdict)} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`;
-  const line1m = lines['1m'] ? `Trend: ${micro(lines['1m']!.verdict)} — timing only; CHOCH/BOS micro-shift for entry` : 'not used';
-
-  const newX =
-`Detected Structures (X-ray)
-• 4H: ${line4}
-• 1H: ${line1}
-• 15m: ${line15}
-• 5m: ${line5}
-• 1m: ${line1m}
-`;
-
-  const xrayRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
-  let out = text;
-  if (xrayRe.test(out)) out = out.replace(xrayRe, (_m)=>newX);
-  else out = out.replace(/(\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown)/i, `\n${newX}\n$1`);
-
-  // Sync Technical View lines
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line4}`);
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line1}`);
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m,p1)=> `${p1}${line15}`);
-
-  return out;
-}
-
-/* -------------------------
-   7) Heuristic reconciliation when RAW SWING MAP missing (REPLACE)
-   - Keep old behavior but normalize output to match the new X-ray bullets
-   ------------------------- */
-function _reconcileHTFTrendFromText(text: string): string {
-  if (!text) return text;
-
-  // If a RAW SWING MAP exists, skip (truth source)
-  const hasRawMap = /(RAW\s*SWING\s*MAP[\s\S]*?)(?=\n\s*Quick\s*Plan|\n\s*Option\s*1|\n\s*Full\s*Breakdown|$)/i.test(text);
-  if (hasRawMap) return text;
-
-  const raw = text;
-  const lower = raw.toLowerCase();
-  function readTF(tf: '4H'|'1H'|'15m'|'5m'|'1m'): string {
-    const tfEsc = tf.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
-    const reX  = new RegExp(`^\\s*[-•]\\s*${tfEsc}\\s*(?:\\(if\\s*used\\))?\\s*:\\s*([^\\n]*)`, 'mi');
-    const reTV = new RegExp(`(Technical\\s*View[\\s\\S]{0,800}?${tfEsc}:\\s*)([^\\n]*)`, 'i');
-    const mX = raw.match(reX);
-    if (mX) return (mX[1] || '').trim();
-    const mT = raw.match(reTV);
-    if (mT) return (mT[2] || '').trim();
-    return '';
-  }
-  type Dir = 'up'|'down'|'range'|'';
-  function classify(desc: string): Dir {
-    const s = (desc || '').toLowerCase();
-    if (!s) return '';
-    const hasHHHL = /\bhh\/hl|higher\s*highs?\b.*\bhigher\s*lows?\b/i.test(s);
-    const hasLHLL = /\blh\/ll|lower\s*highs?\b.*\blower\s*lows?\b/i.test(s);
-    const saysUp  = /\b(uptrend|bullish)\b/.test(s);
-    const saysDn  = /\b(downtrend|bearish)\b/.test(s);
-    const saysRg  = /\b(range|sideways|consolidation|chop)\b/.test(s);
-    if ((hasHHHL && hasLHLL) || (saysUp && saysDn)) return 'range';
-    if (hasHHHL) return 'up';
-    if (hasLHLL) return 'down';
-    if (saysRg)  return 'range';
-    if (saysUp)  return 'up';
-    if (saysDn)  return 'down';
-    return '';
-  }
-  function planDirSign(): -1|0|1 {
-    const mQP = raw.match(/Quick\s*Plan[\s\S]*?Direction\s*:\s*(Long|Short)/i);
-    const mO1 = raw.match(/Option\s*1[\s\S]*?Direction\s*:\s*(Long|Short)/i);
-    const d = (mQP?.[1] || mO1?.[1] || '').toLowerCase();
-    return d === 'long' ? 1 : d === 'short' ? -1 : 0;
-  }
-
-  const prior4  = readTF('4H');
-  const prior1  = readTF('1H');
-  const prior15 = readTF('15m');
-  const prior5  = readTF('5m');
-  const prior1m = readTF('1m');
-
-  let d4: Dir  = classify(prior4);
-  let d1: Dir  = classify(prior1);
-  let d15: Dir = classify(prior15);
-
-  if (!d4) {
-    const sign = planDirSign();
-    d4 = sign === 1 ? 'up' : sign === -1 ? 'down' : 'range';
-  }
-  if (!d1) d1 = d4;
-  if (!d15) d15 = d1;
-
-  const word = (d: Dir) => d === 'up' ? 'Uptrend' : d === 'down' ? 'Downtrend' : 'Range';
-  const microWord = (d: Dir) => d === 'up' ? 'Micro up' : d === 'down' ? 'Micro down' : 'Micro range';
-
-  const tail4 =
-      d4 === 'up'   ? '— bullish structure (HH/HL confirmed)'
-    : d4 === 'down' ? '— bearish structure (LH/LL confirmed)'
-                    : '— consolidation / range';
-  const line4 = `Trend: ${word(d4)} ${tail4}`;
-
-  const supCount = (lower.match(/\b(support|demand)\b/gi) || []).length;
-  const resCount = (lower.match(/\b(resistance|supply)\b/gi) || []).length;
-  const ctx1 = resCount > supCount
-    ? '— at resistance/supply; monitor rejection vs break'
-    : '— at support/demand; monitor continuation vs pullback';
-  const line1 = `Trend: ${word(d1)} ${ctx1}`;
-
-  const ctNote = (d4 && d15 && d15 !== d4 && d15 !== d1) ? ' (counter-trend)' : '';
-  const anchor15 = (prior15 || 'Execution anchors refined from 1H').trim();
-  const line15 = `Trend: ${word(d15)} — ${anchor15}${ctNote}`;
-
-  const d5  : Dir = classify(prior5)  || 'range';
-  const d1m : Dir = classify(prior1m) || 'range';
-  const line5  = `Trend: ${microWord(d5)} — timing only; awaiting 5m BOS (decisive break/close of latest 5m swing)`;
-  const mentions1m = /\b1m\b/i.test(raw) || /Used\s*Chart:\s*1M/i.test(raw);
-  const line1m = mentions1m ? `Trend: ${microWord(d1m)} — timing only; CHOCH/BOS micro-shift for entry` : 'not used';
-
-  const newX =
-`Detected Structures (X-ray)
-• 4H: ${line4}
-• 1H: ${line1}
-• 15m: ${line15}
-• 5m: ${line5}
-• 1m: ${line1m}
-`;
-
-  const xraySectRe = /(Detected\s*Structures\s*\(X-ray\):[\s\S]*?)(?=\n\s*Candidate\s*Scores|\n\s*Final\s*Table\s*Summary:|\n\s*Full\s*Breakdown|$)/i;
-  let out = raw;
-  if (xraySectRe.test(out)) out = out.replace(xraySectRe, (_m) => newX);
-  else if (/Final\s*Table\s*Summary:/i.test(out)) out = out.replace(/(\n\s*Final\s*Table\s*Summary:)/i, `\n${newX}\n$1`);
-  else if (/Full\s*Breakdown/i.test(out)) out = out.replace(/(\n\s*Full\s*Breakdown)/i, `\n${newX}\n$1`);
-  else out = `${out}\n\n${newX}`;
-
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?4H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line4}`);
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?1H:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line1}`);
-  out = out.replace(/(Technical\s*View[\s\S]{0,800}?15m:\s*)([^\n]*)/i, (_m, p1) => `${p1}${line15}`);
-
-  return out;
-}
-
-/* -------------------------
-   8) Option order alignment & swapping by fundamentals (REPLACE)
-   - Fix order types first
-   - If O1 misaligned and O2 aligned, swap
-   - Prefer confirmation-based option when O1 uses Limit but needs BOS
-   ------------------------- */
-function enforceOptionOrderByBias(text: string, fundamentalsSign: number): string {
-  if (!text) return text;
-
-  const { qp, o1, o2, RE_O1, RE_O2 } = _pickBlocks(text);
-  if (!o1 || !o2) return _normalizeOrderTypeByTrigger(text);
-
-  const trigImpliesBOS = (s: string) => /(bos|break\s+of\s+structure|close\s+(below|above)|breakout|breach|ignite|ignition|momentum|impulse|squeeze)/i.test(s);
-
-  // Normalize first
-  let out = _normalizeOrderTypeByTrigger(text);
-
-  // Re-pick post-normalization
-  const B = _pickBlocks(out);
-  const O1 = B.o1!, O2 = B.o2!;
-
-  const O1_trig = (O1.match(/^\s*•\s*Trigger:\s*([^\n]+)/mi)?.[1] || "").toLowerCase();
-  const O2_trig = (O2.match(/^\s*•\s*Trigger:\s*([^\n]+)/mi)?.[1] || "").toLowerCase();
-
-  const O1_dir  = _dirSignFromBlock(O1);
-  const O2_dir  = _dirSignFromBlock(O2);
-
-  const o1Aligned = fundamentalsSign !== 0 && O1_dir !== 0 && Math.sign(fundamentalsSign) === Math.sign(O1_dir);
-  const o2Aligned = fundamentalsSign !== 0 && O2_dir !== 0 && Math.sign(fundamentalsSign) === Math.sign(O2_dir);
-
-  const o1NeedsBOS = trigImpliesBOS(O1_trig);
-  const o2NeedsBOS = trigImpliesBOS(O2_trig);
-
-  const preferO2BecauseConfirmation =
-    (o1NeedsBOS && /limit/i.test(O1)) ||
-    (o2NeedsBOS && !o1NeedsBOS);
-
-  if ((!o1Aligned && o2Aligned) || preferO2BecauseConfirmation) {
-    let swapped = out.replace(RE_O2, "__O2_SWAP_MARKER__");
-    swapped = swapped.replace(RE_O1, O2);
-    swapped = swapped.replace("__O2_SWAP_MARKER__", O1);
-    return swapped;
-  }
-  return out;
-}
-
-/* -------------------------
-   9) Hard distinct Option 2 (REPLACE)
-   - Distinct strategy bucket
-   - If still overlapping and 1H shows counter-trend context, flip O2 direction
-   - Normalize order type afterwards
-   ------------------------- */
-async function enforceOption2DistinctHard(_model: string, instrument: string, text: string) {
-  if (!text) return text;
-
-  const { o1, o2, RE_O2 } = _pickBlocks(text);
-  if (!o1 || !o2) return text;
-
-  const dirOf = (s: string) => (s.match(/^\s*•\s*Direction\s*:\s*(Long|Short)/mi)?.[1] || "").toLowerCase();
-  const dir1 = dirOf(o1), dir2 = dirOf(o2);
-
-  const trigOf = (s: string) => (s.match(/^\s*•\s*Trigger\s*:\s*(.+)$/mi)?.[1] || "").toLowerCase().replace(/\s+/g, " ").trim();
-  const t1 = trigOf(o1), t2 = trigOf(o2);
-
-  const buckets: Record<string, RegExp> = {
-    sweep: /(sweep|liquidity|raid|stop\s*hunt|bos\b|choch\b)/i,
-    ob_fvg: /(order\s*block|\bob\b|fvg|fair\s*value|breaker)/i,
-    tl_break: /(trendline|channel|wedge|triangle)/i,
-    range: /(range\s*rotation|range\b|mean\s*reversion|eq\s*of\s*range)/i,
-    vwap: /\bvwap\b/i,
-    momentum: /(ignition|breakout|squeeze|bollinger|macd|divergence|momentum|impulse)/i,
-  };
-  const bucketOf = (s: string) => {
-    for (const [k, re] of Object.entries(buckets)) if (re.test(s)) return k;
-    return "other";
-  };
-
-  const b1 = bucketOf(t1);
-  const b2 = bucketOf(t2);
-  const sameBucket = !!t1 && !!t2 && (b1 === b2 || t1 === t2);
-  const sameDir = dir1 && dir2 && dir1 === dir2;
-
-  let needRewrite = sameBucket || sameDir;
-
-  if (!needRewrite) {
-    return ensureAiMetaBlock(text, {
-      compliance: { ...(extractAiMeta(text)?.compliance || {}), option2Distinct: true }
-    });
-  }
-
-  const altByPrimary: Record<string, string> = {
-    sweep: "tl_break",
-    tl_break: "range",
-    range: "ob_fvg",
-    ob_fvg: "momentum",
-    momentum: "vwap",
-    vwap: "ob_fvg",
-    other: "tl_break"
-  };
-  const alt = altByPrimary[b1] || "tl_break";
-
-  function altTrigger(bucket: string): string {
-    switch (bucket) {
-      case "tl_break": return "15m trendline break → 15m/5m retest; confirm 5m BOS";
-      case "range":    return "15m range EQ rotation; act at range high/low; 5m shift/BOS confirmation";
-      case "ob_fvg":   return "15m OB + FVG pullback; 5m mitigation + BOS continuation";
-      case "momentum": return "15m momentum breakout; 5m close-through + hold, then 5m BOS";
-      case "vwap":     return "Session VWAP dev fade; 5m rejection + micro shift/BOS";
-      default:         return "15m structural break; 5m retest; 5m BOS";
-    }
-  }
-
-  let newO2 = o2;
-
-  // If same direction and the 1H text indicates a counter-trend context, flip O2’s direction
-  const tv1H = (text.match(/Technical\s*View[\s\S]{0,800}?1H:\s*([^\n]+)/i)?.[1] || "").toLowerCase();
-  const hintCT = /\bcounter\-trend\b/.test(tv1H);
-  if (sameDir && hintCT) {
-    const flipped = dir1 === "long" ? "Short" : "Long";
-    if (/^\s*•\s*Direction\s*:/mi.test(newO2)) {
-      newO2 = newO2.replace(/(^\s*•\s*Direction\s*:\s*)(Long|Short)/mi, `$1${flipped}`);
-    } else {
-      newO2 = newO2.replace(/^(Option\s*2[^\n]*\n)/i, `$1• Direction: ${flipped}\n`);
-    }
-  }
-
-  // Replace or inject Trigger
-  const newTrig = `• Trigger: ${altTrigger(alt)}`;
-  if (/^\s*•\s*Trigger\s*:/mi.test(newO2)) newO2 = newO2.replace(/^\s*•\s*Trigger\s*:.+$/mi, newTrig);
-  else newO2 = newO2.replace(/^(Option\s*2[^\n]*\n)/i, `$1${newTrig}\n`);
-
-  // Why line tweak
-  const whyLine = `• Why this alternative: Different playbook (${alt.replace("_", "/")}) to avoid overlap with Option 1; explicit 15m/5m confirmation.`;
-  if (/^\s*•\s*Why\s+this\s+alternative\s*:/mi.test(newO2)) {
-    newO2 = newO2.replace(/^\s*•\s*Why\s+this\s+alternative\s*:[^\n]*$/mi, whyLine);
-  } else {
-    newO2 += `\n${whyLine}\n`;
-  }
-
-  let out = text.replace(RE_O2, newO2);
-
-  // Normalize order type to match new trigger
-  out = _normalizeOrderTypeByTrigger(out);
-
-  // Mark compliance flag
-  out = ensureAiMetaBlock(out, {
-    compliance: { ...(extractAiMeta(out)?.compliance || {}), option2Distinct: true }
-  });
-
-  return out;
-}
-
-/* -------------------------
-   10) Calendar line normalization (ADD)
-   - Guarantee Full Breakdown snapshot emits a "Calendar:" line and never “mixed”
-   ------------------------- */
-function _normalizeCalendarSnapshotLines(text: string): string {
-  if (!text) return text;
-  let out = text;
-
-  // ensure there is a Calendar: line inside "Fundamental Bias Snapshot"
-  const hasSnapshot = /Fundamental\s*Bias\s*Snapshot/i.test(out);
-  if (hasSnapshot && !/Fundamental\s*Bias\s*Snapshot[\s\S]*?\n•\s*Calendar\s*:/i.test(out)) {
-    out = out.replace(/(Fundamental\s*Bias\s*Snapshot:\s*\n)/i, `$1• Calendar: unavailable.\n`);
-  }
-
-  // never “mixed”
-  out = _finalPolish(out);
-  return out;
-}
-
-/* -------------------------
-   11) Final Table Summary: show both options (ADD)
-   - Builds two rows when Option 2 exists
-   - Uses found numbers; if missing, leaves “—”
-   ------------------------- */
-function _expandFinalTableToTwoRows(text: string, instrument: string): string {
-  if (!text) return text;
-
-  const pick = (block: string, label: string) =>
-    (block.match(new RegExp(`^\\s*•\\s*${label}\\s*:\\s*([^\\n]+)`, "mi"))?.[1] || "").trim();
-
-  const { o1, o2 } = _pickBlocks(text);
-  if (!o1) return text;
-
-  const rowFrom = (name: string, blk: string) => {
-    const dir = pick(blk, "Direction") || "—";
-    const entry = pick(blk, "Entry\\s*\\(zone\\s*or\\s*single\\)") || pick(blk, "Entry") || "—";
-    const sl = pick(blk, "Stop\\s*Loss") || "—";
-    const tps = pick(blk, "Take\\s*Profit\\(s\\)|TPs?") || "—";
-    const tp1 = (tps.match(/TP1:\s*([^\s/]+)/i)?.[1] || "—");
-    const tp2 = (tps.match(/TP2:\s*([^\s/]+)/i)?.[1] || "—");
-    const conv = (pick(blk, "Conviction").match(/\d{1,3}/)?.[0] || "—");
-    return `| ${instrument} | ${dir} | ${entry} | ${sl} | ${tp1} | ${tp2} | ${conv} |`;
-  };
-
-  const row1 = rowFrom("Option 1", o1);
-  const row2 = o2 ? `\n${rowFrom("Option 2", o2)}` : "";
-
-  if (/Final\s*Table\s*Summary\s*:/i.test(text)) {
-    return text.replace(
-      /(Final\s*Table\s*Summary\s*:\s*\n\|[^\n]+\n\|[^\n]+\n)([\s\S]*?)(?:\n{0,2}(?:ai_meta|$))/i,
-      (_m, head) => `${head}${row1}${row2}\n`
-    );
-  }
-
-  // Inject a new table if missing
-  const header =
-`Final Table Summary:
-| Instrument | Bias | Entry Zone | SL | TP1 | TP2 | Conviction % |
-|---|---|---|---|---|---|---|
-${row1}${row2}
-`;
-  return `${text}\n\n${header}`;
-}
-
-/* -------------------------
-   12) Repair stray “Trigger:Alternative …” in all blocks (ADD)
-   ------------------------- */
-function _repairAltTriggerTypos(text: string): string {
-  if (!text) return text;
-  return text.replace(/(^\s*•\s*Trigger:\s*)Alternative(?:\s+setup)?\s*/gmi, "$1");
-}
-
-/* -------------------------
-   13) Price/order sanity: if ai_meta shows invalid, fix order-type only (ADD)
-   ------------------------- */
-function _fixOrderAgainstPriceIfNeeded(text: string): string {
-  const ai = extractAiMeta(text);
-  if (!ai) return text;
-  const bad = invalidOrderRelativeToPrice(ai);
-  if (!bad) return text;
-  return normalizeOrderTypeLines(text, ai); // function exists in your file
-}
-
-/* -------------------------
-   14) Orchestrator: apply full chain in one call (ADD)
-   - Use this in both “expand” and “full” flows right before provenance
-   ------------------------- */
-async function _applyMegaPostGenChain(args: {
-  text: string;
-  instrument: string;
-  fundamentalsSign: number;
-  scalping?: boolean;
-  scalpingHard?: boolean;
-}): Promise<string> {
-  let out = args.text;
-
-  // 1) BOS wording + trigger spacing + typo repairs
-  out = _clarifyBOSWording(out);
-  out = normalizeTriggerSpacing(out);
-  out = _repairAltTriggerTypos(out);
-
-  // 2) Structure reconciliation (first heuristic, then RAW MAP truth in case it appears)
-  out = _reconcileHTFTrendFromText(out);
-  out = _applyRawSwingMap(out);
-
-  // 3) Trigger specificity is already elsewhere; ensure order type parity + option ordering
-  out = _normalizeOrderTypeByTrigger(out);
-  out = enforceOptionOrderByBias(out, args.fundamentalsSign);
-
-  // 4) Option 2 distinctness (post-normalization)
-  out = await enforceOption2DistinctHard("n/a", args.instrument, out);
-  out = _normalizeOrderTypeByTrigger(out);
-
-  // 5) Entry zone normalization (trigger-aware) + price sanity
-  out = enforceEntryZoneUsage(out, args.instrument);
-  out = _fixOrderAgainstPriceIfNeeded(out);
-
-  // 6) Calendar wording guard + BOS again (idempotent) + final polish
-  out = _normalizeCalendarSnapshotLines(out);
-  out = _clarifyBOSWording(out);
-  out = _finalPolish(out);
-
-  // 7) Final table: ensure both options row coverage
-  out = _expandFinalTableToTwoRows(out, args.instrument);
-
-  return out;
-}
-
-/* =========================
-   END MEGA PATCH 1
-   ========================= */
-
-async function hardGateOption2Distinctness(model: string, instrument: string, text: string) {
-  return enforceOption2DistinctHard(model, instrument, text);
 }
 
 // ---------- Live price ----------
-
 async function fetchLivePrice(pair: string): Promise<number | null> {
   if (TD_KEY) {
     try {
@@ -3300,360 +1215,6 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
   } catch {}
   return null;
 }
-/* =========================================================================
-   PIXEL-BASED CHART SWING EXTRACTOR (drop-in)
-   Purpose:
-     - Extract candlestick OHLC approximation directly from chart images
-       (black/white TradingView-like charts), detect swings and produce a
-       RAW SWING MAP block that the rest of the pipeline consumes.
-     - Insert BEFORE provenance footer section in the file.
-   Notes:
-     - Heuristics only: works best with simple black-on-white candlesticks.
-     - Falls back (returns null) if confidence is low; does not override existing
-       text-based logic if detection fails.
-   ========================================================================= */
-
-// soft-import jimp so builds don't fail if it isn't installed
-let Jimp: any = null;
-try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  Jimp = require("jimp");
-} catch {
-  Jimp = null; // pixel extractor will auto-skip if null
-}
-
-/** Convert a data-url (image) to Jimp image. */
-async function loadJimpFromDataUrl(dataUrl: string): Promise<any | null> {
-  if (!dataUrl || !Jimp) return null;
-  try {
-    const comma = dataUrl.indexOf(",");
-    const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
-    const buf = Buffer.from(b64, "base64");
-    const img = await Jimp.read(buf);
-    return img;
-  } catch {
-    return null;
-  }
-}
-
-/** Basic grayscale / brightness helper. */
-function brightnessAtPixel(img: any, x: number, y: number): number {
-  const idx = img.getPixelColor(x, y);
-  const { r, g, b } = Jimp.intToRGBA(idx);
-  return 0.299 * r + 0.587 * g + 0.114 * b;
-}
-
-/**
- * Estimate OHLC per column by scanning vertical pixels for dark clusters.
- * Returns an array of { o,h,l,c } sampled across width.
- */
-function estimateOHLCFromImage(img: any, columnsToSample = 200) {
-  const w = img.bitmap.width;
-  const h = img.bitmap.height;
-  const step = Math.max(1, Math.floor(w / columnsToSample));
-  const result: { o: number; h: number; l: number; c: number }[] = [];
-
-  // compute global brightness stats to adapt to black/white charts
-  let sum = 0, cnt = 0;
-  for (let y = 0; y < h; y += Math.max(2, Math.floor(h / 50))) {
-    for (let x = 0; x < w; x += Math.max(2, Math.floor(w / 50))) {
-      sum += brightnessAtPixel(img, x, y);
-      cnt++;
-    }
-  }
-  const avg = sum / Math.max(1, cnt);
-  // darker pixels than threshold are considered "ink"
-  const inkThreshold = Math.max(15, Math.min(240, avg - 30)); // adaptive
-
-  for (let x = 0; x < w; x += step) {
-    let topInk = -1, bottomInk = -1;
-    const inkRows: number[] = [];
-
-    for (let y = 0; y < h; y++) {
-      const b = brightnessAtPixel(img, x, y);
-      if (b < inkThreshold) {
-        inkRows.push(y);
-        if (topInk === -1) topInk = y;
-        bottomInk = y;
-      }
-    }
-
-    if (inkRows.length === 0) {
-      if (result.length) {
-        const last = result[result.length - 1];
-        result.push({ ...last });
-      } else {
-        const mid = Math.floor(h / 2);
-        result.push({ o: mid, h: mid, l: mid, c: mid } as any);
-      }
-      continue;
-    }
-
-    const high = topInk;
-    const low = bottomInk;
-
-    // Estimate body region: find longest contiguous run in inkRows
-    let bestStart = inkRows[0], bestEnd = inkRows[0], curStart = inkRows[0], curPrev = inkRows[0];
-    for (let i = 1; i < inkRows.length; i++) {
-      const r = inkRows[i];
-      if (r === curPrev + 1) curPrev = r;
-      else {
-        if ((curPrev - curStart) > (bestEnd - bestStart)) {
-          bestStart = curStart; bestEnd = curPrev;
-        }
-        curStart = r; curPrev = r;
-      }
-    }
-    if ((curPrev - curStart) > (bestEnd - bestStart)) {
-      bestStart = curStart; bestEnd = curPrev;
-    }
-
-    // body center -> estimate open/close orientation via left/right darkness
-    const bodyMid = Math.round((bestStart + bestEnd) / 2);
-    let leftDark = 0, rightDark = 0;
-    for (let dx = -2; dx <= 2; dx++) {
-      const xx = Math.min(w - 1, Math.max(0, x + dx));
-      const bm = brightnessAtPixel(img, xx, bodyMid);
-      if (bm < inkThreshold) { if (dx <= 0) leftDark++; else rightDark++; }
-    }
-
-    const toPrice = (rowY: number) => 1 - rowY / (h - 1); // 1 = top, 0 = bottom
-    const openRow = leftDark > rightDark ? bestStart : bestEnd;
-    const closeRow = leftDark > rightDark ? bestEnd : bestStart;
-
-    const o = toPrice(openRow);
-    const c = toPrice(closeRow);
-    const hh = toPrice(high);
-    const ll = toPrice(low);
-
-    result.push({ o, h: hh, l: ll, c });
-  }
-
-  return result;
-}
-
-/** Close series for swing detection */
-function seriesFromOHLC(ohlc: { o: number; h: number; l: number; c: number }[]) {
-  return ohlc.map((d) => d.c);
-}
-
-/** Peak/trough detector */
-function detectSwings(prices: number[], windowSize = 6) {
-  const swings: { idx: number; type: "H" | "L"; value: number }[] = [];
-  const n = prices.length;
-  for (let i = windowSize; i < n - windowSize; i++) {
-    const v = prices[i];
-    let isHigh = true, isLow = true;
-    for (let j = i - windowSize; j <= i + windowSize; j++) {
-      if (prices[j] > v + 1e-9) isHigh = false;
-      if (prices[j] < v - 1e-9) isLow = false;
-      if (!isHigh && !isLow) break;
-    }
-    if (isHigh) swings.push({ idx: i, type: "H", value: v });
-    else if (isLow) swings.push({ idx: i, type: "L", value: v });
-  }
-  return swings;
-}
-
-/** Swings → verdict */
-function swingsToVerdict(swings: { idx: number; type: "H" | "L"; value: number }[]) {
-  if (!swings || swings.length < 2) return { swingsText: "insufficient", verdict: "Range / consolidation" };
-  let up = 0, down = 0;
-  for (let i = 1; i < swings.length; i++) {
-    const prev = swings[i - 1], cur = swings[i];
-    if (prev.type === "H" && cur.type === "H") { if (cur.value > prev.value) up++; else down++; }
-    else if (prev.type === "L" && cur.type === "L") { if (cur.value > prev.value) up++; else down++; }
-  }
-  const swingsSeq = swings.map(s => s.type === "H" ? "HH/HL?" : "LH/LL?").join(", ");
-  let verdict = "Range / consolidation";
-  if (up > down && up >= 1) verdict = "Uptrend (HH/HL)";
-  else if (down > up && down >= 1) verdict = "Downtrend (LH/LL)";
-  return { swingsText: swingsSeq || "mixed", verdict };
-}
-
-/** local type for return */
-type SwingResult = {
-  rawSwingMap: string | null;
-  confidence: number; // 0..1
-  details?: any;
-};
-
-/** Build RAW SWING MAP block for a TF from its image data URL */
-async function buildRawSwingForTF(dataUrl: string | null, timeLabel: string): Promise<{ block: string | null; confidence: number }> {
-  if (!dataUrl) return { block: null, confidence: 0 };
-  const img = await loadJimpFromDataUrl(dataUrl);
-  if (!img) return { block: null, confidence: 0 };
-
-  const MAX_W = 1200;
-  if (img.bitmap.width > MAX_W) img.resize(MAX_W, Jimp.AUTO);
-
-  const sampleCount = Math.max(80, Math.min(240, Math.floor(img.bitmap.width / 3)));
-  const ohlc = estimateOHLCFromImage(img, sampleCount);
-  const series = seriesFromOHLC(ohlc);
-
-  const swings = detectSwings(series, Math.max(3, Math.floor(sampleCount / 30)));
-  const detectConfidence = Math.min(1, Math.max(0, swings.length / 6)); // heuristic
-
-  const { swingsText, verdict } = swingsToVerdict(swings);
-
-  const block =
-`**${timeLabel}:**  
-- Swings: ${swingsText}  
-- Last BOS: ${detectConfidence > 0.5 ? (verdict.startsWith("Uptrend") ? "Up" : (verdict.startsWith("Downtrend") ? "Down" : "Neutral")) : "Unknown"}  
-- Verdict: ${verdict}`;
-
-  return { block, confidence: detectConfidence };
-}
-
-/** Images (4H/1H/15m/5m/1m) → RAW SWING MAP */
-export async function generateRawSwingMapFromImages(images: {
-  h4?: string | null;
-  h1?: string | null;
-  m15?: string | null;
-  m5?: string | null;
-  m1?: string | null;
-}): Promise<SwingResult> {
-  try {
-    const tasks = await Promise.all([
-      buildRawSwingForTF(images.h4 ?? null, "4H"),
-      buildRawSwingForTF(images.h1 ?? null, "1H"),
-      buildRawSwingForTF(images.m15 ?? null, "15m"),
-      buildRawSwingForTF(images.m5 ?? null, "5m"),
-      buildRawSwingForTF(images.m1 ?? null, "1m"),
-    ]);
-
-    const [r4, r1, r15, r5, r1m] = tasks;
-    const confidences = [r4.confidence, r1.confidence, r15.confidence, r5.confidence, r1m.confidence].filter(c => c != null) as number[];
-    const aggConfidence = confidences.length ? (confidences.reduce((a, b) => a + b, 0) / confidences.length) : 0;
-
-    if (aggConfidence < 0.35) {
-      return { rawSwingMap: null, confidence: aggConfidence, details: { r4, r1, r15, r5, r1m } };
-    }
-
-    const lines: string[] = [];
-    lines.push("## RAW SWING MAP\n");
-    if (r4.block)  lines.push(r4.block + "\n");
-    if (r1.block)  lines.push(r1.block + "\n");
-    if (r15.block) lines.push(r15.block + "\n");
-    if (r5.block)  lines.push(r5.block + "\n");
-    if (r1m.block && !r5.block) lines.push(r1m.block + "\n"); // include 1m if no 5m
-
-    const rawSwingMap = lines.join("\n");
-    return { rawSwingMap, confidence: aggConfidence, details: { r4, r1, r15, r5, r1m } };
-  } catch (e) {
-    return { rawSwingMap: null, confidence: 0, details: { error: String(e) } };
-  }
-}
-
-/** Helper: inject the RAW SWING MAP (if detected) at the top of textFull */
-export async function tryInjectRawSwingMapIntoText(
-  textFull: string,
-  imgs: { h4?: string | null; h1?: string | null; m15?: string | null; m5?: string | null; m1?: string | null; }
-) {
-  const res = await generateRawSwingMapFromImages(imgs);
-  if (res.rawSwingMap) {
-    return { text: `${res.rawSwingMap}\n---\n${textFull}`, confidence: res.confidence, details: res.details };
-  }
-  return { text: textFull, confidence: res.confidence, details: res.details };
-}
-
-/* -------------------------------
-   CHART VERDICT GUARD
-   Sync RAW SWING MAP verdicts with Detected Structures (X-ray)
-   and Technical View lines.
--------------------------------- */
-function _fixChartVerdictsBlock(src: string): string {
-  if (!src) return src;
-
-  // 1) Find RAW SWING MAP block
-  const mapRe = /(##\s*RAW\s*SWING\s*MAP[\s\S]*?)(?:\n-{3,}|\n##|\nFull\s*Breakdown|\n$)/i;
-  const m = src.match(mapRe);
-  if (!m) return src;
-  let block = m[1];
-
-  const tfs = ["4H", "1H", "15m", "5m"] as const;
-  const rows: Record<string, { swings: string; bos: string; verdict: string }> = {
-    "4H": { swings: "", bos: "", verdict: "" },
-    "1H": { swings: "", bos: "", verdict: "" },
-    "15m": { swings: "", bos: "", verdict: "" },
-    "5m": { swings: "", bos: "", verdict: "" },
-  };
-
-  function swingVerdictFrom(swings: string, lastBOS: string): string {
-    const s = String(swings || "").toUpperCase();
-    const bos = String(lastBOS || "").toLowerCase();
-    const hasHHHL = /\bHH\b.*\bHL\b|\bHL\b.*\bHH\b/.test(s);
-    const hasLHLL = /\bLH\b.*\bLL\b|\bLL\b.*\bLH\b/.test(s);
-    if (hasHHHL && !hasLHLL) return "Uptrend (HH/HL)";
-    if (hasLHLL && !hasHHHL) return "Downtrend (LH/LL)";
-    if (/up/.test(bos)) return "Uptrend (HH/HL)";
-    if (/down/.test(bos)) return "Downtrend (LH/LL)";
-    return "Range / consolidation";
-  }
-
-  function grab(tf: string) {
-    const sectRe = new RegExp(`\\*\\*${tf}\\*\\*:\\s*[\\r\\n]+([\\s\\S]*?)(?:\\n\\*\\*|\\n-{3,}|\\n##|\\n$)`, "i");
-    const s = block.match(sectRe)?.[1] || "";
-    const swings = s.match(/Swings:\s*([^\n]+)/i)?.[1]?.trim() || "";
-    const bos    = s.match(/Last\s*BOS:\s*([^\n]+)/i)?.[1]?.trim() || "";
-    const verdict= s.match(/Verdict:\s*([^\n]+)/i)?.[1]?.trim() || "";
-    rows[tf] = { swings, bos, verdict };
-  }
-  tfs.forEach(grab);
-
-  const v4  = swingVerdictFrom(rows["4H"].swings, rows["4H"].bos);
-  const v1  = swingVerdictFrom(rows["1H"].swings, rows["1H"].bos);
-  const v15 = swingVerdictFrom(rows["15m"].swings, rows["15m"].bos);
-  const v5  = swingVerdictFrom(rows["5m"].swings, rows["5m"].bos);
-
-  const counter1H =
-    (v4.startsWith("Uptrend") && v1.startsWith("Downtrend")) ||
-    (v4.startsWith("Downtrend") && v1.startsWith("Uptrend"));
-
-  const vFix: Record<string, string> = { "4H": v4, "1H": v1, "15m": v15, "5m": v5 };
-
-  // 2) Rewrite RAW SWING MAP verdict lines to normalized wording
-  function setVerdict(tf: string, verdictText: string) {
-    const sectRe = new RegExp(`(\\*\\*${tf}\\*\\*:[\\s\\S]*?\\n)(-\\s*Verdict:\\s*)([^\\n]+)`, "i");
-    block = block.replace(sectRe, (_m, head, vlabel) => `${head}${vlabel}${verdictText}`);
-  }
-  tfs.forEach(tf => setVerdict(tf, vFix[tf]));
-
-  if (counter1H) {
-    const oneHRe = /(\*\*1H\*\*:[\s\S]*?)(\n-\s*Verdict:\s*[^\n]+)/i;
-    block = block.replace(oneHRe, (_m, head, verdictLine) => `${head}${verdictLine} — counter-trend vs 4H`);
-  }
-
-  // put RAW SWING MAP back
-  let out = src.replace(m[1], block);
-
-  // 3) Sync **Technical View** lines to match the normalized verdicts
-  const tvRe = /(\*\*Technical\s*View[^\n]*\*\*:[\s\S]*?)(?:\n\*\*Fundamental|\nFundamental\s*Bias\s*Snapshot|\n##|\n$)/i;
-  const tvBlock = out.match(tvRe)?.[1];
-  if (!tvBlock) return out;
-  let tv = tvBlock;
-
-  function replaceTV(tf: string, verdictText: string) {
-    const lineRe = new RegExp(`(-\\s*\\*\\*${tf}\\*\\*:\\s*)([^\\n]+)`, "i");
-    if (lineRe.test(tv)) {
-      tv = tv.replace(lineRe, (_m, pre) => `${pre}${verdictText}`);
-    } else {
-      tv = tv.trimEnd() + `\n- **${tf}:** ${verdictText}`;
-    }
-  }
-  replaceTV("4H",  vFix["4H"]);
-  replaceTV("1H",  vFix["1H"] + (counter1H ? " — counter-trend vs 4H" : ""));
-  replaceTV("15m", vFix["15m"]);
-  replaceTV("5m",  vFix["5m"]);
-
-  out = out.replace(tvBlock, tv);
-  return out;
-}
-/* =========================================================================
-   END PIXEL-BASED CHART SWING EXTRACTOR
-   ========================================================================= */
-
-
 
 // ---------- Provenance footer ----------
 function buildServerProvenanceFooter(args: {
@@ -3676,294 +1237,94 @@ function buildServerProvenanceFooter(args: {
 }
 
 // ---------- Handler ----------
-export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiResponse>) {
+export default async function handler(req: NextApiRequest, res: NextApiResponse<Ok | Err>) {
   try {
     if (req.method !== "POST") return res.status(405).json({ ok: false, reason: "Method not allowed" });
     if (!OPENAI_API_KEY) return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
 
-    // --- Perf helpers inlined here ---
-    const withTimeout = <T>(p: Promise<T>, ms: number, label: string): Promise<T> =>
-      new Promise((resolve, reject) => {
-        const id = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
-        p.then((v) => { clearTimeout(id); resolve(v); })
-         .catch((err) => { clearTimeout(id); reject(err); });
-      });
-
-    async function retry<T>(fn: () => Promise<T>, retries = 2, label = "task"): Promise<T> {
-      let lastErr: any;
-      for (let i = 0; i <= retries; i++) {
-        try { return await fn(); } catch (e) { lastErr = e; }
-      }
-      throw new Error(`${label} failed after ${retries + 1} attempts: ${lastErr?.message || lastErr}`);
-    }
-
-    async function parallelFetch<T>(tasks: { label: string; fn: () => Promise<T> }[]): Promise<Record<string, T | null>> {
-      const results: Record<string, T | null> = {};
-      await Promise.all(tasks.map(async (t) => {
-        try { results[t.label] = await retry(() => withTimeout(t.fn(), 5000, t.label), 1, t.label); }
-        catch { results[t.label] = null; }
-      }));
-      return results;
-    }
-
-    const latency: Record<string, number> = {};
-    const markStart = (k: string) => (latency[k] = Date.now());
-    const markEnd = (k: string) => { latency[k] = Date.now() - latency[k]; };
-
-       // --- Mode selection ---
     const urlMode = String((req.query.mode as string) || "").toLowerCase();
     let mode: "full" | "fast" | "expand" = urlMode === "fast" ? "fast" : urlMode === "expand" ? "expand" : "full";
     const debugQuery = String(req.query.debug || "").trim() === "1";
 
-    // --- QA harness (golden self-tests) ---
-    // Enabled only when explicitly requested via ?qa=1 OR ?mode=selftest
-    const qaMode = String(req.query.qa || "").trim() === "1" || urlMode === "selftest";
+    // ---------- expand ----------
+    if (mode === "expand") {
+      const modelExpand = pickModelFromFields(req);
+      const cacheKey = String(req.query.cache || "").trim();
+      const c = getCache(cacheKey);
+      if (!c) return res.status(400).json({ ok: false, reason: "Expand failed: cache expired or not found." });
 
-    if (qaMode) {
-      type QaResult = { name: string; pass: boolean; detail?: string };
-      const results: QaResult[] = [];
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const calAdv = await fetchCalendarForAdvisory(req, c.instrument);
+      const provHint = { headlines_present: !!c.headlinesText, calendar_status: c.calendar ? "image-ocr" : (calAdv.status || "unavailable") };
 
-      // Utility: add a test result
-      const T = (name: string, cond: boolean, detail = "") =>
-        results.push({ name, pass: !!cond, detail: cond ? undefined : detail });
+      const messages = messagesFull({
+        instrument: c.instrument, dateStr,
+        m15: c.m15, h1: c.h1, h4: c.h4, m5: c.m5 || null,
+        calendarDataUrl: c.calendar || undefined,
+        headlinesText: c.headlinesText || undefined,
+        sentimentText: c.sentimentText || undefined,
+        calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText, evidence: calAdv.evidence || [] },
+        provenance: provHint,
+      });
 
-      try {
-        // 1) RAW SWING MAP → X-ray/TV sync
-        const sampleDoc1 =
-`RAW SWING MAP (first)
-4H: swings=LH, LL, LH, LL; last_BOS=down; verdict=Downtrend
-1H: swings=LH, LL, LH, LL; last_BOS=down; verdict=Downtrend
-15m: swings=LH, LL; last_BOS=down; verdict=Downtrend
+      let text = await callOpenAI(modelExpand, messages);
+      text = await enforceQuickPlan(modelExpand, c.instrument, text);
+      text = await enforceOption1(modelExpand, c.instrument, text);
+      text = await enforceOption2(modelExpand, c.instrument, text);
 
-Quick Plan (Actionable)
-• Direction: Short
-• Order Type: Sell Limit
-• Trigger:Alternative wording that needs spacing fix
-• Entry (zone or single): 115950 - 116000
-• Stop Loss: 116200
-• Take Profit(s): TP1: 115500 / TP2: 115000
-• Conviction: 18%
+      // Visibility and stamping
+      text = ensureCalendarVisibilityInQuickPlan(text, { instrument: c.instrument, preReleaseOnly: false, biasLine: calAdv.text || null });
+      const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
+      text = stampM5Used(text, usedM5);
 
-Full Breakdown
-• Technical View (HTF + Intraday): 4H: ... 1H: ... 15m: ...
-`;
+      const footer = buildServerProvenanceFooter({
+        headlines_provider: "expand-uses-stage1",
+        calendar_status: c.calendar ? "image-ocr" : (calAdv?.status || "unavailable"),
+        calendar_provider: c.calendar ? "image-ocr" : calAdv?.provider || null,
+        csm_time: null,
+        extras: { vp_version: VP_VERSION, model: modelExpand, mode: "expand" },
+      });
+      text = `${text}\n${footer}`;
 
-        const afterMap = _applyRawSwingMap(sampleDoc1);
-        T("RAW SWING MAP → X-ray includes 4H Downtrend",
-          /Detected Structures \(X-ray\)[\s\S]*4H: Trend:\s*Downtrend/i.test(afterMap),
-          "Expected 4H Downtrend line in X-ray.");
-
-        // 2) Trigger spacing normalization
-        const afterTrigSpacing = normalizeTriggerSpacing(afterMap);
-        T("Normalize '• Trigger:' spacing",
-          /• Trigger: Alternative wording that needs spacing fix/i.test(afterTrigSpacing),
-          "Expected exactly one space after colon in Trigger line.");
-
-        // 3) Entry zone enforcement (thousands-aware)
-        const afterZone = enforceEntryZoneUsage(afterTrigSpacing, "BTCUSD");
-        T("Entry rendered as zone with thousands separators",
-          /Entry \(zone or single\):\s*115,950\s*–\s*116,000/i.test(afterZone),
-          "Expected '115,950 – 116,000' as enforced zone.");
-
-        // 4) Final polish converts 'mixed' → 'neutral' only on Calendar lines
-        const sampleDoc2 =
-`Full Breakdown
-• Fundamental View:
-   - Calendar: mixed ahead of release
-   - Headlines bias (48h): neutral
-   - CSM: z(base)-z(quote) diff and interpretation
-   - COT: unavailable
-   - Final Fundamental Bias: neutral (score ~50)
-`;
-        const afterPolish = _finalPolish(sampleDoc2);
-        T("Final polish maps Calendar 'mixed' → 'neutral'",
-          /Calendar:\s*neutral ahead of release/i.test(afterPolish),
-          "Expected Calendar line to replace 'mixed' with 'neutral'.");
-
-        // 5) ai_meta block always present & deduped
-        const withMeta = ensureAiMetaBlock(afterZone, {
-          version: "vp-AtoL-1",
-          instrument: "BTCUSD",
-          mode: "full",
-          vwap_used: false,
-          fundamentals: {
-            final: { score: 50, label: "neutral", sign: 0 }
-          },
-          proximity: { highImpactMins: null },
-          vp_version: "2025-09-18-vp-AtoL-rc1"
-        });
-        T("ai_meta fenced block appended",
-          /\nai_meta\s*```json[\s\S]*?```/i.test(withMeta),
-          "Expected fenced JSON ai_meta at the end.");
-
-        // Summary + counts
-        const passed = results.filter(r => r.pass).length;
-        const failed = results.length - passed;
-
-               if (failed === 0) {
-          // Conform to Ok: put the QA report in 'text'
-          const reportLines = [
-            "# QA Report",
-            `Total: ${results.length} | Passed: ${passed} | Failed: ${failed}`,
-            "",
-            ...results.map(r => `- ${r.pass ? "✅" : "❌"} ${r.name}${r.pass ? "" : (r.detail ? ` — ${r.detail}` : "")}`)
-          ];
-          return res.status(200).json({
-            ok: true,
-            text: reportLines.join("\n")
-          });
-        } else {
-          // Conform to Err: summarize failures in 'reason'
-          const fails = results
-            .filter(r => !r.pass)
-            .map(r => `${r.name}${r.detail ? ` (${r.detail})` : ""}`)
-            .join("; ");
-          return res.status(500).json({
-            ok: false,
-            reason: `QA failed: ${failed}/${results.length} checks failed — ${fails}`
-          });
-        }
-      } catch (e: any) {
-        return res.status(500).json({
-          ok: false,
-          reason: `QA harness error: ${e?.message || String(e)}`
-        });
-      }
-
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).json({ ok: true, text, meta: { instrument: c.instrument, cacheKey, model: modelExpand, vp_version: VP_VERSION } });
     }
-
-
- // ---------- expand ----------
-if (mode === "expand") {
-  const modelExpand = pickModelFromFields(req);
-  const cacheKey = String(req.query.cache || "").trim();
-  const c = getCache(cacheKey);
-  if (!c) return res.status(400).json({ ok: false, reason: "Expand failed: cache expired or not found." });
-
-  const dateStr = new Date().toISOString().slice(0, 10);
-  const calAdv = await fetchCalendarForAdvisory(req, c.instrument);
-  const provHint = {
-    headlines_present: !!c.headlinesText,
-    calendar_status: c.calendar ? "image-ocr" : (calAdv.status || "unavailable")
-  };
-
-  const messages = messagesFull({
-    instrument: c.instrument, dateStr,
-    m15: c.m15, h1: c.h1, h4: c.h4, m5: c.m5 || null, m1: null,
-    calendarDataUrl: c.calendar || undefined,
-    headlinesText: c.headlinesText || undefined,
-    sentimentText: c.sentimentText || undefined,
-    calendarAdvisory: {
-      warningMinutes: calAdv.warningMinutes,
-      biasNote: calAdv.biasNote,
-      advisoryText: calAdv.advisoryText,
-      evidence: calAdv.evidence || []
-    },
-    provenance: provHint,
-    scalping: false,
-    scalpingHard: false
-  });
-
-  let text = await callOpenAI(modelExpand, messages);
-// pixel-based RAW SWING MAP injection (images → map)
-const _injExp = await tryInjectRawSwingMapIntoText(text, { h4: c.h4, h1: c.h1, m15: c.m15, m5: c.m5 || null, m1: null });
-text = _injExp.text;
-
-   // Minimum scaffold & options
-  text = await enforceQuickPlan(modelExpand, c.instrument, text);
-  text = await enforceOption1(modelExpand, c.instrument, text);
-  text = await enforceOption2(modelExpand, c.instrument, text);
-
-  // Enforce structure directly from RAW SWING MAP (truth source)
-  text = _applyRawSwingMap(text);
-
-  // Replace placeholder tournament injection...
-  text = await enforceTournamentDiversity(modelExpand, c.instrument, text);
-  text = dedupeTournamentSections(text); // keep only the best tournament block before Final Table
-
-  // Calendar visibility + stamps
-  text = ensureCalendarVisibilityInQuickPlan(text, { instrument: c.instrument, preReleaseOnly: false, biasLine: calAdv.text || null });
-  const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
-  text = stampM5Used(text, usedM5);
-
-    // Polish & structure guards (spacing + BOS wording + HTF reconciliation + trigger specificity)
-  text = _clarifyBOSWording(text);
-  text = normalizeTriggerSpacing(text); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
-  text = _reconcileHTFTrendFromText(text);
-  // NEW: enforce HTF/LTF structure from RAW SWING MAP (map has final authority over X-ray/TV lines)
-  text = _applyRawSwingMap(text);
-  text = await enforceTriggerSpecificity(modelExpand, c.instrument, text);
-
-
-
-  // Ensure breakdown skeleton + final table heading, then normalize entry zone rendering
-  text = await enforceFullBreakdownSkeleton(modelExpand, c.instrument, text);
-  text = enforceFinalTableSummary(text, c.instrument);
-  text = enforceEntryZoneUsage(text, c.instrument);
-
-
-  // Provenance footer
-  const footer = buildServerProvenanceFooter({
-    headlines_provider: "expand-uses-stage1",
-    calendar_status: c.calendar ? "image-ocr" : (calAdv?.status || "unavailable"),
-    calendar_provider: c.calendar ? "image-ocr" : calAdv?.provider || null,
-    csm_time: null,
-    extras: { vp_version: VP_VERSION, model: modelExpand, mode: "expand" }
-  });
-  text = `${text}\n${footer}`;
-
-  res.setHeader("Cache-Control", "no-store");
-  return res.status(200).json({
-    ok: true,
-    text,
-    meta: { instrument: c.instrument, cacheKey, model: modelExpand, vp_version: VP_VERSION }
-  });
-}
 
     // ---------- multipart ----------
     if (!isMultipart(req)) {
-      return res.status(400).json({ ok: false, reason: "Use multipart/form-data with files: m15, h1, h4 and optional 'calendar'/'m5'/'m1'. Or pass m15Url/h1Url/h4Url and optional 'calendarUrl'/'m5Url'/'m1Url'. Include 'instrument'." });
+      return res.status(400).json({ ok: false, reason: "Use multipart/form-data with files: m15, h1, h4 and optional 'calendar'/'m5'. Or pass m15Url/h1Url/h4Url and optional 'calendarUrl'/'m5Url'. Include 'instrument'." });
     }
 
     const { fields, files } = await parseMultipart(req);
+
     const MODEL = pickModelFromFields(req, fields);
     const instrument = String(fields.instrument || fields.code || "EURUSD").toUpperCase().replace(/\s+/g, "");
     const requestedMode = String(fields.mode || "").toLowerCase();
     if (requestedMode === "fast") mode = "fast";
 
-    // --- scalping toggles ---
-    const scalpingRaw = String(pickFirst(fields.scalping) || "").trim().toLowerCase();
-    const scalping = ["1", "true", "on", "yes"].includes(scalpingRaw);
-    const scalpingHardRaw = String(pickFirst(fields.scalping_hard) || "").trim().toLowerCase();
-    const scalpingHard = ["1", "true", "on", "yes"].includes(scalpingHardRaw);
-
-    // --- debug ---
+    // debug toggle
     const debugField = String(pickFirst(fields.debug) || "").trim() === "1";
     const debugOCR = debugQuery || debugField;
 
-    // --- Files + URLs ---
-    const m1f = pickFirst(files.m1);
+    // files + urls
     const m5f = pickFirst(files.m5);
     const m15f = pickFirst(files.m15);
     const h1f = pickFirst(files.h1);
     const h4f = pickFirst(files.h4);
     const calF = pickFirst(files.calendar);
 
-    const m1Url = String(pickFirst(fields.m1Url) || "").trim();
     const m5Url = String(pickFirst(fields.m5Url) || "").trim();
     const m15Url = String(pickFirst(fields.m15Url) || "").trim();
     const h1Url = String(pickFirst(fields.h1Url) || "").trim();
     const h4Url = String(pickFirst(fields.h4Url) || "").trim();
     const calendarUrlField = String(pickFirst(fields.calendarUrl) || "").trim();
 
-    const [m1FromFile, m5FromFile, m15FromFile, h1FromFile, h4FromFile, calFromFile] = await Promise.all([
-      m1f ? fileToDataUrl(m1f) : Promise.resolve(null),
+    const [m5FromFile, m15FromFile, h1FromFile, h4FromFile, calFromFile] = await Promise.all([
       m5f ? fileToDataUrl(m5f) : Promise.resolve(null),
       fileToDataUrl(m15f), fileToDataUrl(h1f), fileToDataUrl(h4f),
       calF ? fileToDataUrl(calF) : Promise.resolve(null),
     ]);
-    const [m1FromUrl, m5FromUrl, m15FromUrl, h1FromUrl, h4FromUrl, calFromUrl] = await Promise.all([
-      m1FromFile ? Promise.resolve(null) : linkToDataUrl(m1Url),
+    const [m5FromUrl, m15FromUrl, h1FromUrl, h4FromUrl, calFromUrl] = await Promise.all([
       m5FromFile ? Promise.resolve(null) : linkToDataUrl(m5Url),
       m15FromFile ? Promise.resolve(null) : linkToDataUrl(m15Url),
       h1FromFile ? Promise.resolve(null) : linkToDataUrl(h1Url),
@@ -3971,7 +1332,6 @@ text = _injExp.text;
       calFromFile ? Promise.resolve(null) : linkToDataUrl(calendarUrlField),
     ]);
 
-    const m1 = m1FromFile || m1FromUrl || null;
     const m5 = m5FromFile || m5FromUrl || null;
     const m15 = m15FromFile || m15FromUrl;
     const h1 = h1FromFile || h1FromUrl;
@@ -3979,14 +1339,10 @@ text = _injExp.text;
     const calUrlOrig = calFromFile || calFromUrl || null;
 
     if (!m15 || !h1 || !h4) {
-      return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either files or TV/Gyazo image links. (5m/1m optional)" });
+      return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either files or TV/Gyazo image links. (5m optional)" });
     }
 
-    if (scalpingHard && (!m5 || !m1)) {
-      return res.status(400).json({ ok: false, reason: "Hard scalping requires BOTH 5m and 1m charts. Please upload 5m + 1m along with 15m/1H/4H." });
-    }
-
-    // ---------- Headlines ----------
+    // Headlines
     let headlineItems: AnyHeadline[] = [];
     let headlinesText: string | null = null;
     let headlinesProvider: string = "unknown";
@@ -4009,7 +1365,7 @@ text = _injExp.text;
     }
     const hBias = computeHeadlinesBias(headlineItems);
 
-    // ---------- Calendar ----------
+    // Calendar (OCR-first STRICT pre-release handling, fallback to API)
     let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
     let calendarProvider: string | null = null;
     let calendarText: string | null = null;
@@ -4019,7 +1375,9 @@ text = _injExp.text;
     let advisoryText: string | null = null;
     let debugRows: any[] | null = null;
     let preReleaseOnly = false;
+
     let calDataUrlForPrompt: string | null = calUrlOrig;
+
     if (calUrlOrig) {
       const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch(() => null);
       if (ocr && Array.isArray(ocr.items)) {
@@ -4029,14 +1387,16 @@ text = _injExp.text;
         calendarProvider = "image-ocr";
         if (usableForInstr) {
           const analyzed = analyzeCalendarOCR(ocr, instrument);
-          calendarText = analyzed.biasLine;
-          calendarEvidence = analyzed.evidenceLines;
+          calendarText = analyzed.biasLine;                    // pre-release line or bias line
+          calendarEvidence = analyzed.evidenceLines;           // only post-result rows (≤72h)
           warningMinutes = analyzed.warningMinutes;
-          biasNote = analyzed.preReleaseOnly ? null : analyzed.biasNote;
+          biasNote = analyzed.preReleaseOnly ? null : analyzed.biasNote; // no biasNote if pre-release
           preReleaseOnly = analyzed.preReleaseOnly;
           debugRows = analyzed.rowsForDebug || null;
-          calDataUrlForPrompt = calUrlOrig;
-          if (preReleaseOnly) advisoryText = calendarText;
+          calDataUrlForPrompt = calUrlOrig; // keep image in prompt
+          if (preReleaseOnly) {
+            advisoryText = calendarText; // surface pre-release line in prompt too
+          }
         } else {
           calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
           calDataUrlForPrompt = null;
@@ -4063,21 +1423,16 @@ text = _injExp.text;
       calDataUrlForPrompt = null;
     }
 
-   // ---------- Sentiment + Price ----------
+    // Sentiment + price
     let csm: CsmSnapshot;
     try { csm = await getCSM(); }
     catch (e: any) { return res.status(503).json({ ok: false, reason: `CSM unavailable: ${e?.message || "fetch failed"}.` }); }
-
     const cotCue = detectCotCueFromHeadlines(headlineItems);
     const { text: sentimentText } = sentimentSummary(csm, cotCue, hBias);
-
-    // Live price hint (guarded): used ONLY for order-type sanity (normalizeOrderTypeLines + invalidOrderRelativeToPrice).
-    // Not used to rewrite Entry/SL/TP or to influence structure/bias.
-    const livePrice = await fetchLivePrice(instrument).catch(() => null);
-
+    const livePrice = await fetchLivePrice(instrument);
     const dateStr = new Date().toISOString().slice(0, 10);
 
-    // Composite bias
+    // Composite bias (provenance only)
     const composite = computeCompositeBias({
       instrument,
       calendarBiasNote: biasNote,
@@ -4090,174 +1445,131 @@ text = _injExp.text;
       headlines_present: !!headlinesText,
       calendar_status: calendarStatus,
       composite,
+      // Fundamentals hint inputs for LLM scoring per B-D:
       fundamentals_hint: {
         calendar_sign: parseInstrumentBiasFromNote(biasNote),
         headlines_label: hBias.label,
         csm_diff: computeCSMInstrumentSign(csm, instrument).zdiff,
         cot_cue_present: !!cotCue
       },
-      proximity_flag: warningMinutes != null ? 1 : 0,
-      scalping_mode: !!scalping,
-      scalping_hard_mode: !!scalpingHard
+      proximity_flag: warningMinutes != null ? 1 : 0
     };
+
+    // ---------- Stage-1 (fast) ----------
+    if (mode === "fast") {
+      const messages = messagesFastStage1({
+        instrument, dateStr, m15, h1, h4, m5,
+        calendarDataUrl: calDataUrlForPrompt || undefined,
+        calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
+        headlinesText: headlinesText || undefined,
+        sentimentText: sentimentText,
+        calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
+        provenance: provForModel,
+      });
+      if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
+
+      let text = await callOpenAI(MODEL, messages);
+      let aiMeta = extractAiMeta(text) || {};
+      if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
+
+      const bad = invalidOrderRelativeToPrice(aiMeta);
+      if (bad) {
+        text = await enforceOption1(MODEL, instrument, text);
+        text = await enforceOption2(MODEL, instrument, text);
+        aiMeta = extractAiMeta(text) || aiMeta;
+      }
+
+      text = await enforceQuickPlan(MODEL, instrument, text);
+      text = await enforceOption1(MODEL, instrument, text);
+      text = await enforceOption2(MODEL, instrument, text);
+
+      // Ensure calendar visibility in Quick Plan
+      text = ensureCalendarVisibilityInQuickPlan(text, { instrument, preReleaseOnly, biasLine: calendarText });
+
+      // Stamp 5M execution if used
+      const usedM5 = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
+      text = stampM5Used(text, usedM5);
+
+      text = applyConsistencyGuards(text, {
+        instrument,
+        headlinesSign: computeHeadlinesSign(hBias),
+        csmSign: computeCSMInstrumentSign(csm, instrument).sign,
+        calendarSign: parseInstrumentBiasFromNote(biasNote)
+      });
+
+      const cacheKey = setCache({ instrument, m5: m5 || null, m15, h1, h4, calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
+
+      const footer = buildServerProvenanceFooter({
+        headlines_provider: headlinesProvider || "unknown",
+        calendar_status: calendarStatus,
+        calendar_provider: calendarProvider,
+        csm_time: csm.tsISO,
+        extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR },
+      });
+      text = `${text}\n${footer}`;
+
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).json({
+        ok: true,
+        text,
+        meta: {
+          instrument, mode, cacheKey, vp_version: VP_VERSION, model: MODEL,
+          sources: {
+            headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
+            headlines_instrument: instrument,
+            headlines_provider: headlinesProvider || "unknown",
+            calendar_used: calendarStatus !== "unavailable",
+            calendar_status: calendarStatus,
+            calendar_provider: calendarProvider,
+            csm_used: true,
+            csm_time: csm.tsISO,
+          },
+          aiMeta,
+        },
+      });
+    }
 
     // ---------- FULL ----------
     const messages = messagesFull({
-      instrument, dateStr, m15, h1, h4, m5, m1,
+      instrument, dateStr, m15, h1, h4, m5,
       calendarDataUrl: calDataUrlForPrompt || undefined,
       calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
       headlinesText: headlinesText || undefined,
       sentimentText,
       calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
       provenance: provForModel,
-      scalping,
-      scalpingHard
     });
+    if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
 
     let textFull = await callOpenAI(MODEL, messages);
-    // pixel-based RAW SWING MAP injection (images → map)
-const _injFull = await tryInjectRawSwingMapIntoText(textFull, { h4, h1, m15, m5, m1 });
-textFull = _injFull.text;
-
     let aiMetaFull = extractAiMeta(textFull) || {};
 
-    // === Post-processing enforcement ===
+    if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
+
     textFull = await enforceQuickPlan(MODEL, instrument, textFull);
-        textFull = await enforceOption1(MODEL, instrument, textFull);
-
-    // Deterministic fallback: if Option 1 is still missing, copy from Quick Plan
-    if (!/Option\s*1\s*\(?(Primary)?\)?/i.test(textFull)) {
-      const qpMatch = textFull.match(/(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(?=\n\s*Option\s*1|\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i);
-      const qpBlock = qpMatch ? qpMatch[0] : "";
-
-      const pick = (labelRe: string) => {
-        const m = qpBlock.match(new RegExp(`^\\s*•\\s*${labelRe}\\s*:\\s*([^\\n]+)`, "mi"));
-        return m ? m[1].trim() : "...";
-      };
-
-      const dir = pick("(?:\\*\\*)?Direction(?:\\*\\*)?");
-      const ord = pick("(?:\\*\\*)?Order\\s*Type(?:\\*\\*)?");
-      const trg = pick("(?:\\*\\*)?Trigger(?:\\*\\*)?");
-      const ent = pick("(?:\\*\\*)?Entry(?:\\s*\\(zone\\s*or\\s*single\\))?(?:\\*\\*)?");
-      const sl  = pick("(?:\\*\\*)?Stop\\s*Loss(?:\\*\\*)?");
-      const tps = pick("(?:\\*\\*)?(?:Take\\s*Profit\\(s\\)|TPs?)(?:\\*\\*)?");
-      const cv  = pick("(?:\\*\\*)?Conviction(?:\\*\\*)?");
-
-      const option1Synth =
-`Option 1 (Primary)
-• Direction: ${dir}
-• Order Type: ${ord}
-• Trigger: ${trg}
-• Entry (zone or single): ${ent}
-• Stop Loss: ${sl}
-• Take Profit(s): ${tps}
-• Conviction: ${/^\d{1,3}\s*%$/.test(cv) ? cv : (cv ? `${cv}` : "...")}
-• Why this is primary: Primary derived from Quick Plan details (HTF guardrails, clean invalidation).`;
-
-      if (qpBlock) {
-        textFull = textFull.replace(qpBlock, `${qpBlock}\n${option1Synth}\n`);
-      }
-    }
-
+    textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
 
-        // Enforce structure directly from RAW SWING MAP (truth source)
-    textFull = _applyRawSwingMap(textFull);
-
-    // Replace placeholder tournament injection with deterministic diversity/scoring
-    textFull = await enforceTournamentDiversity(MODEL, instrument, textFull);
-    textFull = dedupeTournamentSections(textFull); // keep only the best tournament block before Final Table
-
-       // Polish & structure guards
+    // Ensure calendar visibility in Quick Plan
     textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
-    textFull = _clarifyBOSWording(textFull);
-    textFull = normalizeTriggerSpacing(textFull); // fixes 'Trigger:Alternative' → 'Trigger: Alternative'
-    textFull = _reconcileHTFTrendFromText(textFull);
-    // NEW: enforce HTF/LTF structure from RAW SWING MAP (map has final authority over X-ray/TV lines)
-    textFull = _applyRawSwingMap(textFull);
-    textFull = await enforceTriggerSpecificity(MODEL, instrument, textFull);
 
+    // Stamp 5M execution if used
+    const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
+    textFull = stampM5Used(textFull, usedM5Full);
 
-
-    // Execution & risk guards
-    textFull = enforceEntryZoneUsage(textFull, instrument);
-    textFull = enforceScalpHardStopLossLines(textFull, scalpingHard);
-    textFull = enforceScalpRiskLines(textFull, scalping, scalpingHard);
-    textFull = ensureNewsProximityNote(textFull, warningMinutes, instrument);
-
-    // Ensure full breakdown scaffold + final table heading placement
-    textFull = await enforceFullBreakdownSkeleton(MODEL, instrument, textFull);
-    textFull = enforceFinalTableSummary(textFull, instrument);
-
-    // Fundamentals snapshot + alignment copy
-    const fundamentalsSnapshotFull = computeIndependentFundamentals({
+    textFull = applyConsistencyGuards(textFull, {
       instrument,
-      calendarSign: parseInstrumentBiasFromNote(biasNote),
-      headlinesBias: hBias,
-      csm,
-      cotCue,
-      warningMinutes
+      headlinesSign: computeHeadlinesSign(hBias),
+      csmSign: computeCSMInstrumentSign(csm, instrument).sign,
+      calendarSign: parseInstrumentBiasFromNote(biasNote)
     });
-    textFull = ensureFundamentalsSnapshot(textFull, { instrument, snapshot: fundamentalsSnapshotFull, preReleaseOnly, calendarLine: calendarText || null });
-    textFull = applyConsistencyGuards(textFull, { fundamentalsSign: fundamentalsSnapshotFull.final.sign as -1 | 0 | 1 });
-    textFull = enforceOptionOrderByBias(textFull, fundamentalsSnapshotFull.final.sign);
 
-    // Conviction + final table values (fill → enforce order to keep parity and avoid truncation)
-    textFull = computeAndInjectConviction(textFull, { fundamentals: fundamentalsSnapshotFull, proximityFlag: warningMinutes != null });
-    textFull = fillFinalTableSummaryRow(textFull, instrument);
-    textFull = enforceEntryZoneUsage(textFull, instrument);
-
-    // Determine if VWAP is truly used (ignore candidate list; look only at actionable parts)
-    const _txtNoCand = textFull.replace(/Candidate\s*Scores[\s\S]*?Final\s*Table\s*Summary/i, "Final Table Summary");
-    const vwap_used_flag =
-      /\bVWAP\b/i.test(_txtNoCand) &&
-      /\b(Setup|Trigger|Order\s*Type|Option\s*1|Option\s*2|Quick\s*Plan)\b/i.test(_txtNoCand);
-
-    // ai_meta patch — keep live price hint, but never modify user numbers with it
-    const aiPatchFull = {
-      version: "vp-AtoL-1",
-      instrument,
-      mode,
-      vwap_used: vwap_used_flag,
-      time_stop_minutes: scalpingHard ? 15 : (scalping ? 20 : undefined),
-      max_attempts: scalpingHard ? 2 : (scalping ? 3 : undefined),
-      currentPrice: livePrice ?? null, // HINT ONLY
-      scalping: !!scalping,
-      scalping_hard: !!scalpingHard,
-      fundamentals: {
-        calendar: { sign: fundamentalsSnapshotFull.components.calendar.sign, line: calendarText || null },
-        headlines: { label: fundamentalsSnapshotFull.components.headlines.label, avg: hBias.avg ?? null },
-        csm: { diff: fundamentalsSnapshotFull.components.csm.diff },
-        cot: { sign: fundamentalsSnapshotFull.components.cot.sign, detail: fundamentalsSnapshotFull.components.cot.detail },
-        final: { score: Math.round(fundamentalsSnapshotFull.final.score), label: fundamentalsSnapshotFull.final.label, sign: fundamentalsSnapshotFull.final.sign },
-        reliability: preReleaseOnly ? "low" : "normal"
-      },
-      proximity: { highImpactMins: warningMinutes ?? null },
-      vp_version: VP_VERSION
-    };
-    textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
-
-    // If the ai_meta + trigger semantics produced an order-type/price mismatch, fix order type ONLY.
-    let aiMetaFullNow = extractAiMeta(textFull) || {};
-    if (aiMetaFullNow && invalidOrderRelativeToPrice(aiMetaFullNow)) {
-      textFull = normalizeOrderTypeLines(textFull, aiMetaFullNow);
-    }
-
-    // Hard-gate: Option 2 must be a distinct playbook, then re-normalize entry zone & ai_meta footer once more
-    textFull = await enforceOption2DistinctHard(MODEL, instrument, textFull);
-    textFull = enforceEntryZoneUsage(textFull, instrument);
-    textFull = ensureAiMetaBlock(textFull, Object.fromEntries(Object.entries(aiPatchFull).filter(([,v]) => v !== undefined)));
-
-// >>> enforce HTF truth-table & sync Technical View to RAW SWING MAP
-    textFull = _fixChartVerdictsBlock(textFull);
-    
-    // Provenance footer
     const footer = buildServerProvenanceFooter({
       headlines_provider: headlinesProvider || "unknown",
       calendar_status: calendarStatus,
       calendar_provider: calendarProvider,
       csm_time: csm.tsISO,
-      extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping, scalping_hard_mode: scalpingHard, latency },
+      extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR },
     });
     textFull = `${textFull}\n${footer}`;
 
@@ -4280,9 +1592,6 @@ textFull = _injFull.text;
         aiMeta: aiMetaFull,
       },
     });
-
-// --- END CHART VERDICT GUARD ---
-
   } catch (err: any) {
     return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
   }
