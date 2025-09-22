@@ -1711,39 +1711,32 @@ if (calUrlOrig) {
       });
       if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
 
-    let text = await callOpenAI(MODEL, messages);
+   let text = await callOpenAI(MODEL, messages);
       let aiMeta = extractAiMeta(text) || {};
 
       // CRITICAL: Validate model acknowledged current price correctly
       if (livePrice) {
         const modelPrice = Number(aiMeta?.currentPrice);
         
+        // If model didn't report price, inject it but warn
         if (!isFinite(modelPrice) || modelPrice <= 0) {
-          console.error(`[VISION-PLAN] Model failed to report currentPrice in ai_meta`);
-          return res.status(400).json({ 
-            ok: false, 
-            reason: `Model did not report current price. This usually means chart y-axis is unreadable. Please use clearer chart images with visible price labels.` 
-          });
-        }
-        
-       const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
-      if (priceDiff > 0.05) { // More than 5% difference
-          console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(1)}%`);
-          return res.status(400).json({ 
-            ok: false, 
-            reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is ${livePrice} (${(priceDiff*100).toFixed(1)}% difference). Chart y-axis may be misread - please use clearer images.` 
-          });
+          console.warn(`[VISION-PLAN] Model failed to report currentPrice, injecting live price ${livePrice}`);
+          aiMeta.currentPrice = livePrice;
+        } else {
+          const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
+          if (priceDiff > 0.05) { // More than 5% difference
+            console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(1)}%`);
+            return res.status(400).json({ 
+              ok: false, 
+              reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is ${livePrice} (${(priceDiff*100).toFixed(1)}% difference). Chart y-axis may be misread - please use clearer images.` 
+            });
+          }
         }
       }
 
       if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
 
-    text = await enforceOption1(MODEL, instrument, text);
-      text = await enforceOption2(MODEL, instrument, text);
-      
-      // CRITICAL: Validate entry prices...
-
-text = await enforceOption1(MODEL, instrument, text);
+      text = await enforceOption1(MODEL, instrument, text);
       text = await enforceOption2(MODEL, instrument, text);
 
       // CRITICAL: Validate entry prices are reasonable relative to current market price
@@ -1841,38 +1834,35 @@ text = await enforceOption1(MODEL, instrument, text);
     });
     if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
 
-    let textFull = await callOpenAI(MODEL, messages);
+ let textFull = await callOpenAI(MODEL, messages);
     let aiMetaFull = extractAiMeta(textFull) || {};
 
     // CRITICAL: Validate model acknowledged current price correctly
     if (livePrice) {
       const modelPrice = Number(aiMetaFull?.currentPrice);
       
+      // If model didn't report price, inject it but warn
       if (!isFinite(modelPrice) || modelPrice <= 0) {
-        console.error(`[VISION-PLAN] Model failed to report currentPrice in ai_meta`);
-        return res.status(400).json({ 
-          ok: false, 
-          reason: `Model did not report current price. This usually means chart y-axis is unreadable. Please use clearer chart images with visible price labels.` 
-        });
-      }
-      
-     const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
-      if (priceDiff > 0.05) { // More than 5% difference
-        console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(1)}%`);
-        return res.status(400).json({ 
-          ok: false, 
-          reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is ${livePrice} (${(priceDiff*100).toFixed(1)}% difference). Chart y-axis may be misread - please use clearer images.` 
-        });
+        console.warn(`[VISION-PLAN] Model failed to report currentPrice, injecting live price ${livePrice}`);
+        aiMetaFull.currentPrice = livePrice;
+      } else {
+        const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
+        if (priceDiff > 0.05) { // More than 5% difference
+          console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(1)}%`);
+          return res.status(400).json({ 
+            ok: false, 
+            reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is ${livePrice} (${(pctDiff*100).toFixed(1)}% difference). Chart y-axis may be misread - please use clearer images.` 
+          });
+        }
       }
     }
 
     if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
-textFull = await enforceOption1(MODEL, instrument, textFull);
+    textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
 
-       
-      // CRITICAL: Validate entry prices are reasonable relative to current market price
+    // CRITICAL: Validate entry prices are reasonable relative to current market price
       if (livePrice && aiMetaFull) {
         const entries: number[] = [];
         const entryMatch = textFull.match(/Entry.*?:.*?([\d.]+)/i);
