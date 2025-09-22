@@ -1410,63 +1410,123 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
     const hBias = computeHeadlinesBias(headlineItems);
 
-    // Calendar (OCR-first STRICT pre-release handling, fallback to API)
-    let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
-    let calendarProvider: string | null = null;
-    let calendarText: string | null = null;
-    let calendarEvidence: string[] = [];
-    let warningMinutes: number | null = null;
-    let biasNote: string | null = null;
-    let advisoryText: string | null = null;
-    let debugRows: any[] | null = null;
-    let preReleaseOnly = false;
+   // ---------- Calendar Handling (Improved) ----------
+let calendarStatus: "image-ocr" | "api" | "parsed" = "parsed";
+let calendarProvider: string | null = null;
+let calendarText: string | null = null;
+let calendarEvidence: string[] = [];
+let warningMinutes: number | null = null;
+let biasNote: string | null = null;
+let advisoryText: string | null = null;
+let debugRows: any[] | null = null;
+let preReleaseOnly = false;
 
-    let calDataUrlForPrompt: string | null = calUrlOrig;
+let calDataUrlForPrompt: string | null = calUrlOrig;
 
-    if (calUrlOrig) {
-      const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch(() => null);
-      if (ocr && Array.isArray(ocr.items)) {
-        const relCurs = new Set(relevantCurrenciesFromInstrument(instrument));
-        const usableForInstr = (ocr.items || []).some((r) => relCurs.has(String(r?.currency || "")) && hasUsableFields(r));
-        calendarStatus = "image-ocr";
-        calendarProvider = "image-ocr";
-        if (usableForInstr) {
-          const analyzed = analyzeCalendarOCR(ocr, instrument);
-          calendarText = analyzed.biasLine;                    // pre-release line or bias line
-          calendarEvidence = analyzed.evidenceLines;           // only post-result rows (≤72h)
-          warningMinutes = analyzed.warningMinutes;
-          biasNote = analyzed.preReleaseOnly ? null : analyzed.biasNote; // no biasNote if pre-release
-          preReleaseOnly = analyzed.preReleaseOnly;
-          debugRows = analyzed.rowsForDebug || null;
-          calDataUrlForPrompt = calUrlOrig; // keep image in prompt
-          if (preReleaseOnly) {
-            advisoryText = calendarText; // surface pre-release line in prompt too
-          }
-        } else {
-          calendarText = `Calendar provided, but no relevant info for ${instrument}.`;
-          calDataUrlForPrompt = null;
-        }
-      } else {
-        const calAdv = await fetchCalendarForAdvisory(req, instrument);
-        calendarStatus = calAdv.status;
-        calendarProvider = calAdv.provider;
-        calendarText = calAdv.text;
-        advisoryText = calAdv.advisoryText || null;
-        calendarEvidence = calAdv.evidence || [];
-        warningMinutes = calAdv.warningMinutes;
-        biasNote = calAdv.biasNote;
-        calDataUrlForPrompt = null;
-      }
+function evaluateCalendarItems(items: any[], instrument: string) {
+  const relCurs = new Set(relevantCurrenciesFromInstrument(instrument));
+  const usable = items.filter(r => relCurs.has(String(r?.currency || "")) && hasUsableFields(r));
+
+  if (usable.length === 0) {
+    return {
+      bias: "neutral",
+      reasoning: [`Calendar provided, but no relevant info for ${instrument}.`],
+      evidence: []
+    };
+  }
+
+  let score = 0;
+  const reasoning: string[] = [];
+  for (const ev of usable) {
+    const { currency, actual, forecast, previous, name } = ev;
+    if (actual == null || forecast == null) continue;
+
+    const surprise = actual - forecast;
+    const deltaPrev = forecast - previous;
+    let localBias = 0;
+
+    if (Math.abs(surprise) > Math.abs(deltaPrev)) {
+      localBias = surprise > 0 ? 1 : -1;
     } else {
-      const calAdv = await fetchCalendarForAdvisory(req, instrument);
-      calendarStatus = calAdv.status;
-      calendarProvider = calAdv.provider;
-      calendarText = calAdv.text;
-      calendarEvidence = calAdv.evidence || [];
-      warningMinutes = calAdv.warningMinutes;
-      biasNote = calAdv.biasNote;
-      calDataUrlForPrompt = null;
+      localBias = surprise >= 0 ? 0.5 : -0.5;
     }
+
+    if (currency === "USD") localBias *= -1;
+    if (currency === "EUR") localBias *= 1;
+
+    score += localBias;
+    reasoning.push(`${currency} ${name}: ${actual}/${forecast}/${previous} → ${localBias > 0 ? "bullish" : "bearish"}`);
+  }
+
+  const finalBias = score > 0 ? "bullish" : score < 0 ? "bearish" : "neutral";
+  return { bias: finalBias, reasoning, evidence: usable.map(u => `${u.currency} ${u.name}: ${u.actual}/${u.forecast}/${u.previous}`) };
+}
+
+if (calUrlOrig) {
+  const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch(() => null);
+  if (ocr && Array.isArray(ocr.items)) {
+    const result = evaluateCalendarItems(ocr.items, instrument);
+    calendarProvider = "image-ocr";
+    calendarText = result.bias;
+    calendarEvidence = result.evidence;
+    biasNote = result.reasoning.join("; ");
+    calDataUrlForPrompt = calUrlOrig;
+  }
+} else {
+  const calAdv = await fetchCalendarForAdvisory(req, instrument);
+  calendarProvider = calAdv.provider;
+  calendarText = calAdv.text || "neutral";
+  calendarEvidence = calAdv.evidence || [];
+  biasNote = calAdv.biasNote || "Calendar parsed via API fallback.";
+  calDataUrlForPrompt = null;
+}
+
+// ---------- Strategy Tournament + Conviction ----------
+function scoreStrategies(features: any, fundamentals: any) {
+  const scores: { [k: string]: number } = {};
+
+  scores["trendPullback"] = (features.emaSlope > 0 ? 60 : 40) + (fundamentals.calendar === "bullish" ? 10 : 0);
+  scores["breakout"] = features.volatility > features.atrAvg ? 70 : 50;
+  scores["liquiditySweep"] = features.sweepDetected ? 80 : 50;
+  scores["momentum"] = features.rsi > 55 && features.macdHist > 0 ? 75 : 55;
+  scores["rangeFade"] = features.rangeBound ? 65 : 40;
+  scores["meanReversion"] = features.distanceFromVWAP > features.atr ? 70 : 45;
+
+  return scores;
+}
+
+function computeConviction(strategyScore: number, fundamentals: any): number {
+  let base = strategyScore;
+  if (fundamentals.calendar === "bullish" && base > 50) base += 5;
+  if (fundamentals.calendar === "bearish" && base < 50) base += 5;
+  return Math.min(100, Math.max(0, base));
+}
+
+const strategyScores = scoreStrategies(techFeatures, { calendar: calendarText, sentiment: headlinesBias, csm: csmBias });
+const ranked = Object.entries(strategyScores).sort((a, b) => b[1] - a[1]);
+
+const option1Strategy = ranked[0];
+const option2Strategy = ranked[1];
+
+const option1 = {
+  strategy: option1Strategy[0],
+  conviction: computeConviction(option1Strategy[1], { calendar: calendarText }),
+  direction: option1Strategy[0] === "liquiditySweep" ? "short" : "long",
+  entry: "see trade card",
+  sl: "see trade card",
+  tp1: "see trade card",
+  tp2: "see trade card",
+};
+
+const option2 = {
+  strategy: option2Strategy[0],
+  conviction: computeConviction(option2Strategy[1], { calendar: calendarText }),
+  direction: option2Strategy[0] === "liquiditySweep" ? "short" : "long",
+  entry: "see trade card",
+  sl: "see trade card",
+  tp1: "see trade card",
+  tp2: "see trade card",
+};
 
     // Sentiment + price
     let csm: CsmSnapshot;
