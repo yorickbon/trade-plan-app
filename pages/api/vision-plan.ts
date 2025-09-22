@@ -1354,7 +1354,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let mode: "full" | "fast" | "expand" = urlMode === "fast" ? "fast" : urlMode === "expand" ? "expand" : "full";
     const debugQuery = String(req.query.debug || "").trim() === "1";
 
-    // ---------- expand ----------
+       // ---------- expand ----------
     if (mode === "expand") {
       const modelExpand = pickModelFromFields(req);
       const cacheKey = String(req.query.cache || "").trim();
@@ -1423,7 +1423,64 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       });
 
       let text = await callOpenAI(modelExpand, messages);
+      // Normalize sections
       text = await enforceQuickPlan(modelExpand, c.instrument, text);
+      text = await enforceOption1(modelExpand, c.instrument, text);
+      text = await enforceOption2(modelExpand, c.instrument, text);
+
+      // Ensure calendar visibility in Quick Plan
+      text = ensureCalendarVisibilityInQuickPlan(text, {
+        instrument: c.instrument,
+        preReleaseOnly: !(calAdv?.biasNote),
+        biasLine: calAdv?.text || null
+      });
+
+      // Stamp 5M execution if used
+      const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
+      text = stampM5Used(text, usedM5);
+
+      // Consistency guard
+      text = applyConsistencyGuards(text, {
+        instrument: c.instrument,
+        headlinesSign: computeHeadlinesSign(hBias),
+        csmSign: computeCSMInstrumentSign(csm, c.instrument).sign,
+        calendarSign: parseInstrumentBiasFromNote(calAdv?.biasNote || null)
+      });
+
+      // Provenance footer
+      const footer = buildServerProvenanceFooter({
+        headlines_provider: headlinesProvider || "unknown",
+        calendar_status: calAdv?.status || "unavailable",
+        calendar_provider: calAdv?.provider || null,
+        csm_time: csm.tsISO,
+        extras: { vp_version: VP_VERSION, model: modelExpand, mode }
+      });
+      text = `${text}\n${footer}`;
+
+      // Return expand response
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).json({
+        ok: true,
+        text,
+        meta: {
+          instrument: c.instrument,
+          mode,
+          vp_version: VP_VERSION,
+          model: modelExpand,
+          sources: {
+            headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
+            headlines_instrument: c.instrument,
+            headlines_provider: headlinesProvider || "unknown",
+            calendar_used: (calAdv?.status || "unavailable") !== "unavailable",
+            calendar_status: calAdv?.status || "unavailable",
+            calendar_provider: calAdv?.provider || null,
+            csm_used: true,
+            csm_time: csm.tsISO,
+          },
+          aiMeta: extractAiMeta(text) || {},
+        },
+      });
+    }
 
     // ---------- multipart ----------
     if (!isMultipart(req)) {
