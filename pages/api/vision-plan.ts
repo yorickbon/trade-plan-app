@@ -1509,7 +1509,14 @@ function computeConviction(strategyScore: number, fundamentals: any): number {
   return Math.min(100, Math.max(0, base));
 }
 
-const strategyScores = scoreStrategies(techFeatures, { calendar: calendarText, sentiment: headlinesBias, csm: csmBias });
+// Normalize calendar to a strict label for scoring/conviction
+const calendarLabel = (() => {
+  const s = parseInstrumentBiasFromNote(biasNote); // -1 | 0 | +1
+  return s > 0 ? "bullish" : s < 0 ? "bearish" : "neutral";
+})();
+
+// Use detected features from the parsed structures (already built above)
+const strategyScores = scoreStrategies(features, { calendar: calendarLabel });
 const ranked = Object.entries(strategyScores).sort((a, b) => b[1] - a[1]);
 
 const option1Strategy = ranked[0];
@@ -1517,7 +1524,7 @@ const option2Strategy = ranked[1];
 
 const option1 = {
   strategy: option1Strategy[0],
-  conviction: computeConviction(option1Strategy[1], { calendar: calendarText }),
+  conviction: computeConviction(option1Strategy[1], { calendar: calendarLabel }), // conviction per option
   direction: option1Strategy[0] === "liquiditySweep" ? "short" : "long",
   entry: "see trade card",
   sl: "see trade card",
@@ -1527,13 +1534,14 @@ const option1 = {
 
 const option2 = {
   strategy: option2Strategy[0],
-  conviction: computeConviction(option2Strategy[1], { calendar: calendarText }),
+  conviction: computeConviction(option2Strategy[1], { calendar: calendarLabel }), // conviction per option
   direction: option2Strategy[0] === "liquiditySweep" ? "short" : "long",
   entry: "see trade card",
   sl: "see trade card",
   tp1: "see trade card",
   tp2: "see trade card",
 };
+
 
     // Sentiment + price
     let csm: CsmSnapshot;
