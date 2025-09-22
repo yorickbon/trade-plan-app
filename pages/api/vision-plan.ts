@@ -1418,7 +1418,7 @@ const instrument = rawInstr;
     const hBias = computeHeadlinesBias(headlineItems);
 
    // ---------- Calendar Handling (Improved) ----------
-let calendarStatus: "image-ocr" | "api" | "parsed" = "parsed";
+let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
 let calendarProvider: string | null = null;
 let calendarText: string | null = null;
 let calendarEvidence: string[] = [];
@@ -1430,7 +1430,7 @@ let preReleaseOnly = false;
 
 let calDataUrlForPrompt: string | null = calUrlOrig;
 
-function evaluateCalendarItems(items: any[], instrument: string) {
+ffunction evaluateCalendarItems(items: any[], instrument: string) {
   const relCurs = new Set(relevantCurrenciesFromInstrument(instrument));
   const usable = items.filter(r => relCurs.has(String(r?.currency || "")) && hasUsableFields(r));
 
@@ -1445,7 +1445,7 @@ function evaluateCalendarItems(items: any[], instrument: string) {
   let score = 0;
   const reasoning: string[] = [];
   for (const ev of usable) {
-    const { currency, actual, forecast, previous, name } = ev;
+    const { currency, actual, forecast, previous, title } = ev;
     if (actual == null || forecast == null) continue;
 
     const surprise = actual - forecast;
@@ -1462,31 +1462,48 @@ function evaluateCalendarItems(items: any[], instrument: string) {
     if (currency === "EUR") localBias *= 1;
 
     score += localBias;
-    reasoning.push(`${currency} ${name}: ${actual}/${forecast}/${previous} → ${localBias > 0 ? "bullish" : "bearish"}`);
+    reasoning.push(`${currency} ${title || ""}: ${actual}/${forecast}/${previous} → ${localBias > 0 ? "bullish" : "bearish"}`);
   }
 
   const finalBias = score > 0 ? "bullish" : score < 0 ? "bearish" : "neutral";
-  return { bias: finalBias, reasoning, evidence: usable.map(u => `${u.currency} ${u.name}: ${u.actual}/${u.forecast}/${u.previous}`) };
+  return { bias: finalBias, reasoning, evidence: usable.map(u => `${u.currency} ${u.title || ""}: ${u.actual}/${u.forecast}/${u.previous}`) };
 }
+
 
 if (calUrlOrig) {
   const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch(() => null);
   if (ocr && Array.isArray(ocr.items)) {
     const result = evaluateCalendarItems(ocr.items, instrument);
     calendarProvider = "image-ocr";
+    calendarStatus = "image-ocr";
     calendarText = result.bias;
     calendarEvidence = result.evidence;
     biasNote = result.reasoning.join("; ");
     calDataUrlForPrompt = calUrlOrig;
+  } else {
+    // Fallback to API if OCR is present but unusable
+    const calAdv = await fetchCalendarForAdvisory(req, instrument);
+    calendarProvider = calAdv.provider;
+    calendarStatus = calAdv.status;
+    calendarText = calAdv.text || "Calendar unavailable.";
+    calendarEvidence = calAdv.evidence || [];
+    biasNote = calAdv.biasNote || null;
+    advisoryText = calAdv.advisoryText || null;
+    warningMinutes = calAdv.warningMinutes ?? null;
+    calDataUrlForPrompt = null;
   }
 } else {
   const calAdv = await fetchCalendarForAdvisory(req, instrument);
   calendarProvider = calAdv.provider;
-  calendarText = calAdv.text || "neutral";
+  calendarStatus = calAdv.status;
+  calendarText = calAdv.text || "Calendar unavailable.";
   calendarEvidence = calAdv.evidence || [];
-  biasNote = calAdv.biasNote || "Calendar parsed via API fallback.";
+  biasNote = calAdv.biasNote || null;
+  advisoryText = calAdv.advisoryText || null;
+  warningMinutes = calAdv.warningMinutes ?? null;
   calDataUrlForPrompt = null;
 }
+
 
 // ---------- Strategy Tournament + Conviction ----------
 function scoreStrategies(features: any, fundamentals: any) {
