@@ -701,19 +701,16 @@ function hasUsableFields(r: OcrCalendarRow): boolean {
   return !!(hasActualSet || hasPreRelease);
 }
 
-// ---------- API calendar (OCR-first, 72h, never "unavailable") ----------
+// ---------- API calendar fallback ----------
 async function fetchCalendarRaw(req: NextApiRequest, instrument: string): Promise<any | null> {
   try {
     const base = originFromReq(req);
-    // 72h strict window; rely on server OCR to include grey numbers as numeric fields
-    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=72&_t=${Date.now()}`;
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(6000) });
+    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=120&_t=${Date.now()}`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(5000) });
     const j: any = await r.json().catch(() => ({}));
     return j?.ok ? j : null;
   } catch { return null; }
 }
-
-// Lightweight label builder retained for UI summaries
 function calendarShortText(resp: any, pair: string): string | null {
   if (!resp?.ok) return null;
   const instrBias = resp?.bias?.instrument;
@@ -727,7 +724,6 @@ function calendarShortText(resp: any, pair: string): string | null {
   if (!parts.length) parts.push("No strong calendar bias.");
   return `Calendar bias for ${pair}: ${parts.join("; ")}`;
 }
-
 function nearestHighImpactWithin(resp: any, minutes: number): number | null {
   if (!resp?.ok || !Array.isArray(resp?.items)) return null;
   const nowMs = Date.now(); let best: number | null = null;
@@ -741,78 +737,17 @@ function nearestHighImpactWithin(resp: any, minutes: number): number | null {
   }
   return best;
 }
-
-// --- Calendar bias computation v2 (deterministic) ---
-type CalEvent = { time: string; currency: string; name?: string; actual?: number|null; forecast?: number|null; previous?: number|null; impact?: string; };
-function _isHigherBetter(name: string): number {
-  const n = (name || "").toLowerCase();
-  // Lower is better
-  if (/\bunemployment\b|\bjobless\b|\bclaims\b|\bjobless claims\b|\binitial claims\b|\bcontinuing claims\b|\binflation rate\b.*(target)?\b/.test(n)) return -1;
-  // Higher is better
-  if (/\bcpi\b|\bcore cpi\b|\bpce\b|\bcore pce\b|\bgdp\b|\bretail sales\b|\bpmi\b|\bism\b|\bservices\b|\bmanufacturing\b|\bnew orders\b|\bconfidence\b|\bbuilding\b|\bhousing\b/.test(n)) return +1;
-  // Default neutral → treat higher as better
-  return +1;
-}
-function _impactWeight(impact?: string): number {
-  const s = String(impact || "").toLowerCase();
-  if (s === "high") return 1.0;
-  if (s === "medium" || s === "med") return 0.6;
-  if (s === "low") return 0.3;
-  return 0.5;
-}
-function _surprise(it: CalEvent): number {
-  // Use Actual vs Forecast if Actual exists, else expected lean from Forecast vs Previous
-  const hasActual = it.actual != null && !Number.isNaN(it.actual as any);
-  const ref = (hasActual ? (it.forecast ?? it.previous) : (it.previous ?? null));
-  const base = (hasActual ? it.actual : it.forecast);
-  if (base == null || ref == null) return 0;
-  const denom = Math.max(Math.abs(Number(ref)), 1e-9);
-  return Number((Number(base) - Number(ref)) / denom);
-}
-function _scoreEvent(it: CalEvent): number {
-  const dir = _isHigherBetter(it.name || "");
-  const s = _surprise(it);
-  return dir * s * _impactWeight(it.impact);
-}
-function _aggregateBias(resp: any, pair: string) {
-  const base = pair.slice(0,3), quote = pair.slice(3);
-  const nowMs = Date.now(), lo = nowMs - 72*3600*1000;
-  const items: CalEvent[] = Array.isArray(resp?.items) ? resp.items : [];
-  const rel = items.filter((it: any) => {
-    const t = new Date(it?.time || 0).getTime();
-    return t <= nowMs && t >= lo && it?.currency && (it.currency === base || it.currency === quote);
-  });
-  let per: Record<string, number> = {};
-  for (const it of rel) {
-    const c = it.currency;
-    per[c] = (per[c] || 0) + _scoreEvent(it);
-  }
-  const b = per[base] || 0, q = per[quote] || 0;
-  const net = b - q; // pair bias (base - quote)
-  function label(x: number): "bullish"|"bearish"|"neutral" {
-    if (x > +0.05) return "bullish";
-    if (x < -0.05) return "bearish";
-    return "neutral";
-  }
-  const perCurrency = {
-    [base]: { score: +b.toFixed(3), label: label(b) },
-    [quote]: { score: +q.toFixed(3), label: label(q) }
-  };
-  const instrument = { pair, score: +net.toFixed(3), label: label(net) };
-  return { perCurrency, instrument };
-}
-
 function postResultBiasNote(resp: any, pair: string): string | null {
   if (!resp?.ok) return null;
-  const agg = _aggregateBias(resp, pair);
   const base = pair.slice(0,3), quote = pair.slice(3);
-  const b = agg.perCurrency[base]?.label || "neutral";
-  const q = agg.perCurrency[quote]?.label || "neutral";
-  const instr = agg.instrument?.label || "neutral";
-  const scores = `(score ${agg.instrument?.score ?? 0})`;
-  return `Per-currency: ${base} ${b} vs ${quote} ${q}; Instrument bias: ${instr} ${scores}`;
+  const per = resp?.bias?.perCurrency || {};
+  const b = per[base]?.label || "neutral";
+  const q = per[quote]?.label || "neutral";
+  const instr = resp?.bias?.instrument?.label || null;
+  const scores = resp?.bias?.instrument ? `(score ${resp.bias.instrument.score})` : "";
+  const line = `Per-currency: ${base} ${b} vs ${quote} ${q}${instr ? `; Instrument bias: ${instr} ${scores}` : ""}`;
+  return line;
 }
-
 function buildCalendarEvidence(resp: any, pair: string): string[] {
   if (!resp?.ok || !Array.isArray(resp?.items)) return [];
   const base = pair.slice(0,3), quote = pair.slice(3);
@@ -827,78 +762,35 @@ function buildCalendarEvidence(resp: any, pair: string): string[] {
   }
   return lines;
 }
-
 async function fetchCalendarForAdvisory(req: NextApiRequest, instrument: string): Promise<{
-  text: string | null, status: "image-ocr" | "api", provider: string | null,
+  text: string | null, status: "api" | "unavailable", provider: string | null,
   warningMinutes: number | null, advisoryText: string | null, biasNote: string | null,
   raw?: any | null, evidence?: string[] | null
 }> {
   try {
-    // 1) Fetch OCR/API result for last 72h, including grey numbers
-    const raw = await fetchCalendarRaw(req, instrument);
-
-    // If we couldn't fetch anything, still return an explicit reason (never "unavailable")
-    if (!raw?.ok || !Array.isArray(raw.items) || raw.items.length === 0) {
-      return {
-        text: `Calendar provided, but no instrument-relevant events for ${instrument} in the last 72h.`,
-        status: "image-ocr",
-        provider: String(raw?.provider || "image-ocr"),
-        warningMinutes: null,
-        advisoryText: "No AUD/USD-relevant rows with Actual/Forecast/Previous in the 72h window.",
-        biasNote: "Neutral — insufficient post-result data.",
-        raw: raw || null,
-        evidence: []
-      };
+    const base = originFromReq(req);
+    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=48&_t=${Date.now()}`
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(4000) });
+    const j: any = await r.json().catch(() => ({}));
+    if (j?.ok) {
+      const t = calendarShortText(j, instrument) || `Calendar bias for ${instrument}: (no strong signal)`;
+      const warn = nearestHighImpactWithin(j, 60);
+      const bias = postResultBiasNote(j, instrument);
+      const advisory = [
+        warn != null ? `⚠️ High-impact event in ~${warn} min.` : null,
+        bias ? `Recent result alignment: ${bias}.` : null
+      ].filter(Boolean).join("\n");
+      const rawFull = await fetchCalendarRaw(req, instrument);
+      const evidence = rawFull ? buildCalendarEvidence(rawFull, instrument) : buildCalendarEvidence(j, instrument);
+      return { text: t, status: "api", provider: String(j?.provider || "mixed"), warningMinutes: warn ?? null, advisoryText: advisory || null, biasNote: bias || null, raw: j, evidence };
     }
-
-    // 2) Build explicit bias (deterministic)
-    const bias = _aggregateBias(raw, instrument);
-    const short = calendarShortText({ ok: true, bias }, instrument)
-              || `Calendar bias for ${instrument}: ${bias.instrument.label} (${bias.instrument.score})`;
-
-    // 3) Warn if a high-impact event is within 60 minutes
-    const warn = nearestHighImpactWithin(raw, 60);
-
-    // 4) Compose advisory and evidence
-    const biasLine = postResultBiasNote({ ok: true, bias }, instrument) || null;
-    const evidence = buildCalendarEvidence(raw, instrument);
-
-    // 5) If we only have pre-release (Forecast/Previous but no Actuals) in last 72h,
-    // still return a reasoned "pre-release" note rather than "unavailable"
-    const hasActual = raw.items.some((it: any) => it.actual != null);
-    const advisory = [
-      warn != null ? `⚠️ High-impact event in ~${warn} min.` : null,
-      !hasActual ? "Pre-release window: results not out yet; computed lean from Forecast vs Previous." : null,
-      biasLine ? `Recent result alignment: ${biasLine}.` : null
-    ].filter(Boolean).join("\n");
-
-    return {
-      text: short,
-      status: String(raw?.provider || "image-ocr") === "api" ? "api" : "image-ocr",
-      provider: String(raw?.provider || "image-ocr"),
-      warningMinutes: warn ?? null,
-      advisoryText: advisory || null,
-      biasNote: biasLine || null,
-      raw,
-      evidence
-    };
-  } catch (e: any) {
-    // Explicit, actionable failure message (never "unavailable")
-    return {
-      text: `Calendar parsing failed for ${instrument}: ${e?.message || "unexpected error"}.`,
-      status: "image-ocr",
-      provider: "image-ocr",
-      warningMinutes: null,
-      advisoryText: "OCR/API error or timeout. Try re-uploading the Gyazo calendar image.",
-      biasNote: "Neutral — failed to compute bias.",
-      raw: null,
-      evidence: []
-    };
+    return { text: "Calendar unavailable.", status: "unavailable", provider: null, warningMinutes: null, advisoryText: null, biasNote: null, raw: null, evidence: [] };
+  } catch {
+    return { text: "Calendar unavailable.", status: "unavailable", provider: null, warningMinutes: null, advisoryText: null, biasNote: null, raw: null, evidence: [] };
   }
 }
 
 // ---------- Composite bias (legacy for provenance only) ----------
-
 function splitFXPair(instr: string): { base: string|null; quote: string|null } {
   const U = (instr || "").toUpperCase();
   if (U.length >= 6) {
@@ -1354,157 +1246,59 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let mode: "full" | "fast" | "expand" = urlMode === "fast" ? "fast" : urlMode === "expand" ? "expand" : "full";
     const debugQuery = String(req.query.debug || "").trim() === "1";
 
-       // ---------- expand ----------
+    // ---------- expand ----------
     if (mode === "expand") {
       const modelExpand = pickModelFromFields(req);
       const cacheKey = String(req.query.cache || "").trim();
       const c = getCache(cacheKey);
       if (!c) return res.status(400).json({ ok: false, reason: "Expand failed: cache expired or not found." });
 
-      // Guard against stale-cache instrument mismatches
-      const qInstrument = String((req.query.instrument || "")).toUpperCase().replace(/\s+/g, "");
-      if (qInstrument && qInstrument !== c.instrument) {
-        return res.status(400).json({
-          ok: false,
-          reason: `Expand rejected: instrument mismatch (cache=${c.instrument}, query=${qInstrument}). Start a new run.`,
-        });
-      }
-
       const dateStr = new Date().toISOString().slice(0, 10);
       const calAdv = await fetchCalendarForAdvisory(req, c.instrument);
-
-      // --------- Re-fetch fundamentals FRESH (no stale cache) ---------
-      // Headlines (server-side, instrument-scoped)
-      let headlineItems: AnyHeadline[] = [];
-      let headlinesText: string | null = null;
-      let headlinesProvider: string = "unknown";
-      try {
-        const viaServer = await fetchedHeadlinesViaServer(req, c.instrument);
-        headlineItems = viaServer.items;
-        headlinesText = viaServer.promptText;
-        headlinesProvider = viaServer.provider || "unknown";
-      } catch {}
-
-      // Bias from headlines
-      const hBias = computeHeadlinesBias(headlineItems);
-
-      // CSM (fresh snapshot; 15-min cache inside getCSM)
-      let csm: CsmSnapshot;
-      try { csm = await getCSM(); }
-      catch (e: any) {
-        return res.status(503).json({ ok: false, reason: `CSM unavailable: ${e?.message || "fetch failed"}.` });
-      }
-
-      // Optional COT cue from headlines
-      const cotCue = detectCotCueFromHeadlines(headlineItems);
-      const { text: sentimentText } = sentimentSummary(csm, cotCue, hBias);
-
-      // Provenance hint for the LLM (do NOT say unavailable if we have an image/API status)
-      const provHint = {
-        headlines_present: !!headlinesText,
-        calendar_status: c.calendar ? "image-ocr" : (calAdv?.status || "unavailable"),
-      };
+      const provHint = { headlines_present: !!c.headlinesText, calendar_status: c.calendar ? "image-ocr" : (calAdv.status || "unavailable") };
 
       const messages = messagesFull({
-        instrument: c.instrument,
-        dateStr,
+        instrument: c.instrument, dateStr,
         m15: c.m15, h1: c.h1, h4: c.h4, m5: c.m5 || null,
         calendarDataUrl: c.calendar || undefined,
-        // Use the fresh fundamentals we just fetched (never the cache)
-        headlinesText: headlinesText || undefined,
-        sentimentText: sentimentText || undefined,
-        calendarAdvisory: {
-          warningMinutes: calAdv.warningMinutes ?? null,
-          biasNote: calAdv.biasNote || null,
-          advisoryText: calAdv.advisoryText || null,
-          evidence: calAdv.evidence || [],
-        },
+        headlinesText: c.headlinesText || undefined,
+        sentimentText: c.sentimentText || undefined,
+        calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText, evidence: calAdv.evidence || [] },
         provenance: provHint,
       });
 
       let text = await callOpenAI(modelExpand, messages);
-      // Normalize sections
       text = await enforceQuickPlan(modelExpand, c.instrument, text);
       text = await enforceOption1(modelExpand, c.instrument, text);
       text = await enforceOption2(modelExpand, c.instrument, text);
 
-      // Ensure calendar visibility in Quick Plan
-      text = ensureCalendarVisibilityInQuickPlan(text, {
-        instrument: c.instrument,
-        preReleaseOnly: !(calAdv?.biasNote),
-        biasLine: calAdv?.text || null
-      });
-
-      // Stamp 5M execution if used
+      // Visibility and stamping
+      text = ensureCalendarVisibilityInQuickPlan(text, { instrument: c.instrument, preReleaseOnly: false, biasLine: calAdv.text || null });
       const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
       text = stampM5Used(text, usedM5);
 
-      // Consistency guard
-      text = applyConsistencyGuards(text, {
-        instrument: c.instrument,
-        headlinesSign: computeHeadlinesSign(hBias),
-        csmSign: computeCSMInstrumentSign(csm, c.instrument).sign,
-        calendarSign: parseInstrumentBiasFromNote(calAdv?.biasNote || null)
-      });
-
-      // Provenance footer
       const footer = buildServerProvenanceFooter({
-        headlines_provider: headlinesProvider || "unknown",
-        calendar_status: calAdv?.status || "unavailable",
-        calendar_provider: calAdv?.provider || null,
-        csm_time: csm.tsISO,
-        extras: { vp_version: VP_VERSION, model: modelExpand, mode }
+        headlines_provider: "expand-uses-stage1",
+        calendar_status: c.calendar ? "image-ocr" : (calAdv?.status || "unavailable"),
+        calendar_provider: c.calendar ? "image-ocr" : calAdv?.provider || null,
+        csm_time: null,
+        extras: { vp_version: VP_VERSION, model: modelExpand, mode: "expand" },
       });
       text = `${text}\n${footer}`;
 
-      // Return expand response
       res.setHeader("Cache-Control", "no-store");
-      return res.status(200).json({
-        ok: true,
-        text,
-        meta: {
-          instrument: c.instrument,
-          mode,
-          vp_version: VP_VERSION,
-          model: modelExpand,
-                    sources: {
-            headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
-            headlines_instrument: c.instrument,
-            headlines_provider: headlinesProvider || "unknown",
-            calendar_used: !!calAdv && (calAdv.status === "api" || calAdv.status === "image-ocr"),
-            calendar_status: calAdv?.status ?? "unavailable",
-            calendar_provider: calAdv?.provider ?? null,
-            csm_used: true,
-            csm_time: csm.tsISO,
-          },
-
-          aiMeta: extractAiMeta(text) || {},
-        },
-      });
+      return res.status(200).json({ ok: true, text, meta: { instrument: c.instrument, cacheKey, model: modelExpand, vp_version: VP_VERSION } });
     }
 
     // ---------- multipart ----------
     if (!isMultipart(req)) {
-      return res.status(400).json({
-        ok: false,
-        reason: "Use multipart form with m15/h1/h4 (TV links or files), optional m5 and calendarUrl (Gyazo). 'instrument' is required.",
-      });
+      return res.status(400).json({ ok: false, reason: "Use multipart/form-data with files: m15, h1, h4 and optional 'calendar'/'m5'. Or pass m15Url/h1Url/h4Url and optional 'calendarUrl'/'m5Url'. Include 'instrument'." });
     }
 
     const { fields, files } = await parseMultipart(req);
 
     const MODEL = pickModelFromFields(req, fields);
-
-    // ---------- Instrument: NO DEFAULTS ----------
-    const instrumentRaw = String(fields.instrument || fields.code || "").toUpperCase().replace(/\s+/g, "");
-    if (!instrumentRaw) {
-      return res.status(400).json({
-        ok: false,
-        reason: "Instrument is required. Provide 'instrument' (e.g., AUDUSD). No default is used.",
-      });
-    }
-    const instrument = instrumentRaw;
-
+    const instrument = String(fields.instrument || fields.code || "EURUSD").toUpperCase().replace(/\s+/g, "");
     const requestedMode = String(fields.mode || "").toLowerCase();
     if (requestedMode === "fast") mode = "fast";
 
@@ -1719,21 +1513,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         ok: true,
         text,
         meta: {
-        meta: {
-  instrument, mode, cacheKey, vp_version: VP_VERSION, model: MODEL,
-  sources: {
-    headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
-    headlines_instrument: instrument,
-    headlines_provider: headlinesProvider || "unknown",
-    calendar_used: calendarStatus === "api" || calendarStatus === "image-ocr",
-    calendar_status: calendarStatus,
-    calendar_provider: calendarProvider,
-    csm_used: true,
-    csm_time: csm.tsISO,
-  },
-  aiMeta,
-},
-
+          instrument, mode, cacheKey, vp_version: VP_VERSION, model: MODEL,
+          sources: {
+            headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
+            headlines_instrument: instrument,
+            headlines_provider: headlinesProvider || "unknown",
+            calendar_used: calendarStatus !== "unavailable",
+            calendar_status: calendarStatus,
+            calendar_provider: calendarProvider,
+            csm_used: true,
+            csm_time: csm.tsISO,
+          },
+          aiMeta,
+        },
       });
     }
 
@@ -1744,46 +1536,27 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
       headlinesText: headlinesText || undefined,
       sentimentText,
-      calendarAdvisory: {
-        warningMinutes,
-        biasNote,
-        advisoryText,
-        evidence: calendarEvidence || [],
-        debugRows: debugOCR ? (debugRows || []) : [],
-        preReleaseOnly
-      },
+      calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
       provenance: provForModel,
     });
-
-    if (livePrice) {
-      (messages[0] as any).content =
-        (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`;
-    }
+    if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\nNote: Current price hint ~ ${livePrice};`; }
 
     let textFull = await callOpenAI(MODEL, messages);
     let aiMetaFull = extractAiMeta(textFull) || {};
 
-    if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) {
-      aiMetaFull.currentPrice = livePrice;
-    }
+    if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
-    // Enforce sections (we will remove Quick Plan in Patch 3)
     textFull = await enforceQuickPlan(MODEL, instrument, textFull);
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
 
-    // Ensure calendar visibility in Quick Plan (no-op after Patch 3)
-    textFull = ensureCalendarVisibilityInQuickPlan(textFull, {
-      instrument,
-      preReleaseOnly,
-      biasLine: calendarText
-    });
+    // Ensure calendar visibility in Quick Plan
+    textFull = ensureCalendarVisibilityInQuickPlan(textFull, { instrument, preReleaseOnly, biasLine: calendarText });
 
     // Stamp 5M execution if used
     const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
     textFull = stampM5Used(textFull, usedM5Full);
 
-    // Consistency guard
     textFull = applyConsistencyGuards(textFull, {
       instrument,
       headlinesSign: computeHeadlinesSign(hBias),
@@ -1791,54 +1564,35 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       calendarSign: parseInstrumentBiasFromNote(biasNote)
     });
 
-    // Provenance footer
     const footer = buildServerProvenanceFooter({
       headlines_provider: headlinesProvider || "unknown",
       calendar_status: calendarStatus,
       calendar_provider: calendarProvider,
       csm_time: csm.tsISO,
-      extras: {
-        vp_version: VP_VERSION,
-        model: MODEL,
-        mode,
-        composite_cap: composite.cap,
-        composite_align: composite.align,
-        composite_conflict: composite.conflict,
-        pre_release: preReleaseOnly,
-        debug_ocr: !!debugOCR
-      },
+      extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR },
     });
     textFull = `${textFull}\n${footer}`;
 
-    // Final response
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
       ok: true,
       text: textFull,
-    meta: {
-  instrument,
-  mode,
-  vp_version: VP_VERSION,
-  model: MODEL,
-  sources: {
-    headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
-    headlines_instrument: instrument,
-    headlines_provider: headlinesProvider || "unknown",
-    calendar_used: calendarStatus === "api" || calendarStatus === "image-ocr",
-    calendar_status: calendarStatus,
-    calendar_provider: calendarProvider,
-    csm_used: true,
-    csm_time: csm.tsISO,
-  },
-  aiMeta: aiMetaFull,
-},
-
+      meta: {
+        instrument, mode, vp_version: VP_VERSION, model: MODEL,
+        sources: {
+          headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
+          headlines_instrument: instrument,
+          headlines_provider: headlinesProvider || "unknown",
+          calendar_used: calendarStatus !== "unavailable",
+          calendar_status: calendarStatus,
+          calendar_provider: calendarProvider,
+          csm_used: true,
+          csm_time: csm.tsISO,
+        },
+        aiMeta: aiMetaFull,
+      },
     });
   } catch (err: any) {
-    return res.status(500).json({
-      ok: false,
-      reason: err?.message || "vision-plan failed"
-    });
+    return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
   }
 }
-
