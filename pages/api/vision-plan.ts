@@ -1515,33 +1515,7 @@ const calendarLabel = (() => {
   return s > 0 ? "bullish" : s < 0 ? "bearish" : "neutral";
 })();
 
-// Use detected features from the parsed structures (already built above)
-const strategyScores = scoreStrategies(features, { calendar: calendarLabel });
-const ranked = Object.entries(strategyScores).sort((a, b) => b[1] - a[1]);
-
-const option1Strategy = ranked[0];
-const option2Strategy = ranked[1];
-
-const option1 = {
-  strategy: option1Strategy[0],
-  conviction: computeConviction(option1Strategy[1], { calendar: calendarLabel }), // conviction per option
-  direction: option1Strategy[0] === "liquiditySweep" ? "short" : "long",
-  entry: "see trade card",
-  sl: "see trade card",
-  tp1: "see trade card",
-  tp2: "see trade card",
-};
-
-const option2 = {
-  strategy: option2Strategy[0],
-  conviction: computeConviction(option2Strategy[1], { calendar: calendarLabel }), // conviction per option
-  direction: option2Strategy[0] === "liquiditySweep" ? "short" : "long",
-  entry: "see trade card",
-  sl: "see trade card",
-  tp1: "see trade card",
-  tp2: "see trade card",
-};
-
+/* tournament-scoring moved into FAST/FULL branches after aiMeta extraction — no code here */
 
     // Sentiment + price
     let csm: CsmSnapshot;
@@ -1591,6 +1565,57 @@ const option2 = {
 
       let text = await callOpenAI(MODEL, messages);
       let aiMeta = extractAiMeta(text) || {};
+
+// ---- Strategy Tournament (FAST) — only if model returned features ----
+const calendarLabel = (() => {
+  const s = parseInstrumentBiasFromNote(biasNote); // -1 | 0 | +1
+  return s > 0 ? "bullish" : s < 0 ? "bearish" : "neutral";
+})();
+
+const featuresFromAi = (aiMeta && typeof (aiMeta as any).features === "object") ? (aiMeta as any).features : null;
+
+let tournamentFast: any = null;
+if (featuresFromAi) {
+  const strategyScores = scoreStrategies(featuresFromAi, { calendar: calendarLabel });
+  const ranked = Object.entries(strategyScores).sort((a, b) => b[1] - a[1]);
+
+  if (ranked.length >= 1) {
+    const option1Strategy = ranked[0];
+    const opt1 = {
+      strategy: option1Strategy[0],
+      conviction: computeConviction(option1Strategy[1], { calendar: calendarLabel }),
+      direction: option1Strategy[0] === "liquiditySweep" ? "short" : "long",
+      entry: "see trade card",
+      sl: "see trade card",
+      tp1: "see trade card",
+      tp2: "see trade card",
+    };
+
+    const opt2 = ranked.length >= 2 ? (() => {
+      const option2Strategy = ranked[1];
+      return {
+        strategy: option2Strategy[0],
+        conviction: computeConviction(option2Strategy[1], { calendar: calendarLabel }),
+        direction: option2Strategy[0] === "liquiditySweep" ? "short" : "long",
+        entry: "see trade card",
+        sl: "see trade card",
+        tp1: "see trade card",
+        tp2: "see trade card",
+      };
+    })() : null;
+
+    tournamentFast = {
+      ranked: ranked.map(([name, score]) => ({ name, score })),
+      option1: opt1,
+      option2: opt2,
+      calendar: calendarLabel,
+    };
+  }
+}
+
+// attach to aiMeta so downstream can use it; if null, nothing is invented
+(aiMeta as any).tournament = tournamentFast;
+
       if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
 
       const bad = invalidOrderRelativeToPrice(aiMeta);
@@ -1667,6 +1692,57 @@ const option2 = {
 
     let textFull = await callOpenAI(MODEL, messages);
     let aiMetaFull = extractAiMeta(textFull) || {};
+
+// ---- Strategy Tournament (FULL) — only if model returned features ----
+const calendarLabelFull = (() => {
+  const s = parseInstrumentBiasFromNote(biasNote); // -1 | 0 | +1
+  return s > 0 ? "bullish" : s < 0 ? "bearish" : "neutral";
+})();
+
+const featuresFromAiFull = (aiMetaFull && typeof (aiMetaFull as any).features === "object") ? (aiMetaFull as any).features : null;
+
+let tournamentFull: any = null;
+if (featuresFromAiFull) {
+  const strategyScores = scoreStrategies(featuresFromAiFull, { calendar: calendarLabelFull });
+  const ranked = Object.entries(strategyScores).sort((a, b) => b[1] - a[1]);
+
+  if (ranked.length >= 1) {
+    const option1Strategy = ranked[0];
+    const opt1 = {
+      strategy: option1Strategy[0],
+      conviction: computeConviction(option1Strategy[1], { calendar: calendarLabelFull }),
+      direction: option1Strategy[0] === "liquiditySweep" ? "short" : "long",
+      entry: "see trade card",
+      sl: "see trade card",
+      tp1: "see trade card",
+      tp2: "see trade card",
+    };
+
+    const opt2 = ranked.length >= 2 ? (() => {
+      const option2Strategy = ranked[1];
+      return {
+        strategy: option2Strategy[0],
+        conviction: computeConviction(option2Strategy[1], { calendar: calendarLabelFull }),
+        direction: option2Strategy[0] === "liquiditySweep" ? "short" : "long",
+        entry: "see trade card",
+        sl: "see trade card",
+        tp1: "see trade card",
+        tp2: "see trade card",
+      };
+    })() : null;
+
+    tournamentFull = {
+      ranked: ranked.map(([name, score]) => ({ name, score })),
+      option1: opt1,
+      option2: opt2,
+      calendar: calendarLabelFull,
+    };
+  }
+}
+
+// attach to aiMetaFull so downstream can use it; if null, nothing is invented
+(aiMetaFull as any).tournament = tournamentFull;
+
 
     if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
