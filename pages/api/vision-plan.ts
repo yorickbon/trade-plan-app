@@ -1941,32 +1941,7 @@ if (livePrice && scalpingMode === "hard") {
           reason: "Chart analysis incomplete: AI did not count swing patterns. Cannot determine trend validity without swing structure analysis." 
         });
       }
-     // 3. Validate BOS matches TradingView data
-      if (bos4H !== "NONE" || bos1H !== "NONE" || bos15M !== "NONE") {
-        const extractedBOS = {
-          h4: text.match(/4H.*?BOS\s+(UP|DOWN)/i)?.[1]?.toUpperCase() || "NONE",
-          h1: text.match(/1H.*?BOS\s+(UP|DOWN)/i)?.[1]?.toUpperCase() || "NONE",
-          m15: text.match(/15M.*?BOS\s+(UP|DOWN)/i)?.[1]?.toUpperCase() || "NONE"
-        };
-        
-        const mismatches: string[] = [];
-        if (bos4H !== "NONE" && extractedBOS.h4 !== bos4H && extractedBOS.h4 !== "NONE") {
-          mismatches.push(`4H: AI said ${extractedBOS.h4}, indicator shows ${bos4H}`);
-        }
-        if (bos1H !== "NONE" && extractedBOS.h1 !== bos1H && extractedBOS.h1 !== "NONE") {
-          mismatches.push(`1H: AI said ${extractedBOS.h1}, indicator shows ${bos1H}`);
-        }
-        if (bos15M !== "NONE" && extractedBOS.m15 !== bos15M && extractedBOS.m15 !== "NONE") {
-          mismatches.push(`15M: AI said ${extractedBOS.m15}, indicator shows ${bos15M}`);
-        }
-        
-        if (mismatches.length > 0) {
-          console.warn(`[VISION-PLAN] BOS mismatch: ${mismatches.join("; ")}`);
-          text = `⚠️ **STRUCTURE BREAK DISCREPANCY DETECTED**\n${mismatches.join("\n")}\n\n**TradingView indicator data is more reliable - use indicator values for trade decisions.**\n\n` + text;
-        }
-      }
-
-      // 3. Entry price validation (keep original numbering for clarity) 
+// 3. Entry price validation
             if (livePrice) {
         const entryValidation = validateEntryPrices(text, aiMeta, livePrice, scalpingMode);
         if (!entryValidation.valid) {
