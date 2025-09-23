@@ -1881,8 +1881,8 @@ if (calUrlOrig) {
         csm_diff: computeCSMInstrumentSign(csm, instrument).zdiff,
         cot_cue_present: !!cotCue
       },
-      proximity_flag: warningMinutes != null ? 1 : 0,
-      scalping_mode: !!scalping
+    proximity_flag: warningMinutes != null ? 1 : 0,
+      scalping_mode: scalpingMode
     };
 
     // ---------- Stage-1 (fast) ----------
