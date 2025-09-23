@@ -1020,14 +1020,14 @@ function buildUserPartsBase(args: {
   calendarEvidence?: string[] | null;
   debugOCRRows?: { timeISO: string | null; title: string | null; currency: string | null; impact: any; actual: any; forecast: any; previous: any }[] | null;
 }) {
-  // Get BOS data from TradingView webhook cache
-  const bos4H = getBOSStatus(args.instrument, "240");
-  const bos1H = getBOSStatus(args.instrument, "60");
-  const bos15M = getBOSStatus(args.instrument, "15");
-  const bos5M = getBOSStatus(args.instrument, "5");
+// Get BOS data from TradingView webhook cache
+  const bosH4 = getBOSStatus(args.instrument, "240");
+  const bosH1 = getBOSStatus(args.instrument, "60");
+  const bosM15 = getBOSStatus(args.instrument, "15");
+  const bosM5 = getBOSStatus(args.instrument, "5");
   
-const bosContext = (bos4H !== "NONE" || bos1H !== "NONE" || bos15M !== "NONE" || bos5M !== "NONE")
-    ? `\n\nRECENT STRUCTURE BREAKS (from TradingView indicator - USE THIS DATA):\n- 4H: ${bos4H === "NONE" ? "No recent BOS" : "BOS " + bos4H}\n- 1H: ${bos1H === "NONE" ? "No recent BOS" : "BOS " + bos1H}\n- 15M: ${bos15M === "NONE" ? "No recent BOS" : "BOS " + bos15M}\n- 5M: ${bos5M === "NONE" ? "No recent BOS" : "BOS " + bos5M}\n\n**MANDATORY: Your BOS analysis MUST match this TradingView data. If your visual analysis conflicts, trust the indicator and explain the discrepancy.**\n`
+const bosContext = (bosH4 !== "NONE" || bosH1 !== "NONE" || bosM15 !== "NONE" || bosM5 !== "NONE")
+    ? `\n\nRECENT STRUCTURE BREAKS (from TradingView indicator - USE THIS DATA):\n- 4H: ${bosH4 === "NONE" ? "No recent BOS" : "BOS " + bosH4}\n- 1H: ${bosH1 === "NONE" ? "No recent BOS" : "BOS " + bosH1}\n- 15M: ${bosM15 === "NONE" ? "No recent BOS" : "BOS " + bosM15}\n- 5M: ${bosM5 === "NONE" ? "No recent BOS" : "BOS " + bosM5}\n\n**MANDATORY: Your BOS analysis MUST match this TradingView data. If your visual analysis conflicts, trust the indicator and explain the discrepancy.**\n`
     : "\n\nRECENT STRUCTURE BREAKS: No BOS data from TradingView (check if alerts are active)\n";
 
   const parts: any[] = [
@@ -1498,7 +1498,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         calendar_status: c.calendar ? "image-ocr" : (calAdv?.status || "unavailable"),
         calendar_provider: c.calendar ? "image-ocr" : calAdv?.provider || null,
         csm_time: null,
-        extras: { vp_version: VP_VERSION, model: modelExpand, mode: "expand" },
+       extras: { vp_version: VP_VERSION, model: modelExpand, mode: "expand", scalping_mode: "off" },
       });
       text = `${text}\n${footer}`;
 
@@ -1527,11 +1527,10 @@ const instrument = rawInstr;
     const scalpingRaw = String(pickFirst(fields.scalping) || "").trim().toLowerCase();
     const scalpingHardRaw = String(pickFirst(fields.scalping_hard) || "").trim().toLowerCase();
     
-    const scalpingMode = 
+   const scalpingMode = 
       (scalpingHardRaw === "1" || scalpingHardRaw === "true" || scalpingHardRaw === "on") ? "hard" :
       (scalpingRaw === "1" || scalpingRaw === "true" || scalpingRaw === "on") ? "soft" :
       "off";
-    const scalping = scalpingMode !== "off";
 
     // debug toggle
     const debugField = String(pickFirst(fields.debug) || "").trim() === "1";
@@ -1675,10 +1674,13 @@ function analyzeCalendarProfessional(ocrItems: OcrCalendarRow[], instrument: str
     const f = parseNumberLoose(ev.forecast);
     const p = parseNumberLoose(ev.previous);
     
-    const higherIsBetter = goodIfHigher(title);
+  const higherIsBetter = goodIfHigher(title);
     
     // Compare actual vs forecast (primary)
     let score = 0;
+    const ref = f ?? p;
+    if (ref == null) continue; // Safety check: skip if no reference value
+    
     if (f != null) {
       const surprise = a - f;
       const surprisePct = f !== 0 ? (surprise / Math.abs(f)) * 100 : 0;
@@ -2106,7 +2108,11 @@ let textFull = await callOpenAI(MODEL, messages);
     }
 
     // Validate BOS matches TradingView data
-    if (bos4H !== "NONE" || bos1H !== "NONE" || bos15M !== "NONE") {
+    const bosH4 = getBOSStatus(instrument, "240");
+    const bosH1 = getBOSStatus(instrument, "60");
+    const bosM15 = getBOSStatus(instrument, "15");
+    
+    if (bosH4 !== "NONE" || bosH1 !== "NONE" || bosM15 !== "NONE") {
       const extractedBOS = {
         h4: textFull.match(/4H.*?BOS\s+(UP|DOWN)/i)?.[1]?.toUpperCase() || "NONE",
         h1: textFull.match(/1H.*?BOS\s+(UP|DOWN)/i)?.[1]?.toUpperCase() || "NONE",
@@ -2114,14 +2120,14 @@ let textFull = await callOpenAI(MODEL, messages);
       };
       
       const mismatches: string[] = [];
-      if (bos4H !== "NONE" && extractedBOS.h4 !== bos4H && extractedBOS.h4 !== "NONE") {
-        mismatches.push(`4H: AI said ${extractedBOS.h4}, indicator shows ${bos4H}`);
+      if (bosH4 !== "NONE" && extractedBOS.h4 !== bosH4 && extractedBOS.h4 !== "NONE") {
+        mismatches.push(`4H: AI said ${extractedBOS.h4}, indicator shows ${bosH4}`);
       }
-      if (bos1H !== "NONE" && extractedBOS.h1 !== bos1H && extractedBOS.h1 !== "NONE") {
-        mismatches.push(`1H: AI said ${extractedBOS.h1}, indicator shows ${bos1H}`);
+      if (bosH1 !== "NONE" && extractedBOS.h1 !== bosH1 && extractedBOS.h1 !== "NONE") {
+        mismatches.push(`1H: AI said ${extractedBOS.h1}, indicator shows ${bosH1}`);
       }
-      if (bos15M !== "NONE" && extractedBOS.m15 !== bos15M && extractedBOS.m15 !== "NONE") {
-        mismatches.push(`15M: AI said ${extractedBOS.m15}, indicator shows ${bos15M}`);
+      if (bosM15 !== "NONE" && extractedBOS.m15 !== bosM15 && extractedBOS.m15 !== "NONE") {
+        mismatches.push(`15M: AI said ${extractedBOS.m15}, indicator shows ${bosM15}`);
       }
       
       if (mismatches.length > 0) {
@@ -2229,12 +2235,6 @@ reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is
     textFull = stampM1Used(textFull, usedM1Full);
 
     textFull = applyConsistencyGuards(textFull, {
-      instrument,
-      headlinesSign: computeHeadlinesSign(hBias),
-      csmSign: computeCSMInstrumentSign(csm, instrument).sign,
-      calendarSign: parseInstrumentBiasFromNote(biasNote)
-    });
-  textFull = applyConsistencyGuards(textFull, {
       instrument,
       headlinesSign: computeHeadlinesSign(hBias),
       csmSign: computeCSMInstrumentSign(csm, instrument).sign,
