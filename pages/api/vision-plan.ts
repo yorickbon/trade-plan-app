@@ -1356,10 +1356,15 @@ const instrument = rawInstr;
     const requestedMode = String(fields.mode || "").toLowerCase();
     if (requestedMode === "fast") mode = "fast";
 
-    // NEW: scalping toggle (default off). Safe: when off, behavior is unchanged.
+  // Scalping mode detection from frontend checkboxes
     const scalpingRaw = String(pickFirst(fields.scalping) || "").trim().toLowerCase();
-    const scalping =
-      scalpingRaw === "1" || scalpingRaw === "true" || scalpingRaw === "on" || scalpingRaw === "yes";
+    const scalpingHardRaw = String(pickFirst(fields.scalping_hard) || "").trim().toLowerCase();
+    
+    const scalpingMode = 
+      (scalpingHardRaw === "1" || scalpingHardRaw === "true" || scalpingHardRaw === "on") ? "hard" :
+      (scalpingRaw === "1" || scalpingRaw === "true" || scalpingRaw === "on") ? "soft" :
+      "off";
+    const scalping = scalpingMode !== "off";
 
     // debug toggle
     const debugField = String(pickFirst(fields.debug) || "").trim() === "1";
