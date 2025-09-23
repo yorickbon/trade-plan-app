@@ -2048,8 +2048,7 @@ if (livePrice && scalpingMode === "hard") {
 `;
       text = verificationWarning + text;
 
-      const footer = buildServerProvenanceFooter({
-      const footer = buildServerProvenanceFooter({
+           const footer = buildServerProvenanceFooter({
         headlines_provider: headlinesProvider || "unknown",
         calendar_status: calendarStatus,
         calendar_provider: calendarProvider,
