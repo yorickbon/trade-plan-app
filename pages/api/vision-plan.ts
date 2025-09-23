@@ -1303,6 +1303,115 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
   } catch {}
   return null;
 }
+// ---------- Chart vs API price validation ----------
+function validatePriceConsistency(apiPrice: number, aiMetaPrice: number): {
+  valid: boolean;
+  error: string | null;
+  warning: string | null;
+} {
+  if (!apiPrice || apiPrice <= 0) {
+    return { valid: true, error: null, warning: "No API price available for validation" };
+  }
+  
+  // Check if AI reported price matches API (0.5% tolerance)
+  if (aiMetaPrice && isFinite(aiMetaPrice) && aiMetaPrice > 0) {
+    const diffPct = Math.abs((aiMetaPrice - apiPrice) / apiPrice);
+    if (diffPct > 0.005) {
+      return {
+        valid: false,
+        error: `AI misread current price: Reported ${aiMetaPrice} but actual is ${apiPrice} (${(diffPct*100).toFixed(2)}% difference). Charts may have wrong y-axis scale.`,
+        warning: null
+      };
+    }
+  }
+  
+  return { valid: true, error: null, warning: null };
+}
+
+// ---------- Entry price validation vs current market ----------
+function validateEntryPrices(text: string, aiMeta: any, livePrice: number, scalpingMode: string): {
+  valid: boolean;
+  errors: string[];
+} {
+  const errors: string[] = [];
+  
+  // Extract all entry prices mentioned in text
+  const entryMatches = text.matchAll(/Entry[^:]*:\s*(\d+\.\d+)/gi);
+  const entries = Array.from(entryMatches).map(m => Number(m[1]));
+  
+  // Add zone prices from ai_meta
+  if (aiMeta?.zone?.min) entries.push(Number(aiMeta.zone.min));
+  if (aiMeta?.zone?.max) entries.push(Number(aiMeta.zone.max));
+  
+  if (entries.length === 0) {
+    errors.push("No entry prices found in trade plan");
+    return { valid: false, errors };
+  }
+  
+  // Check each entry is reasonable distance from current price
+  const maxDriftPct = scalpingMode === "hard" ? 0.015 : scalpingMode === "soft" ? 0.03 : 0.05;
+  
+  for (const entry of entries) {
+    if (!isFinite(entry) || entry <= 0) continue;
+    const drift = Math.abs((entry - livePrice) / livePrice);
+    if (drift > maxDriftPct) {
+      errors.push(
+        `Entry ${entry} is ${(drift*100).toFixed(1)}% from current ${livePrice} (max allowed: ${(maxDriftPct*100).toFixed(1)}%)`
+      );
+    }
+  }
+  
+  // Validate order type logic
+  const dirMatch = text.match(/Direction:\s*(Long|Short)/i);
+  const orderMatch = text.match(/Order Type:\s*(Market|Limit|Stop)/i);
+  
+  if (dirMatch && orderMatch && entries.length > 0) {
+    const dir = dirMatch[1].toLowerCase();
+    const order = orderMatch[1].toLowerCase();
+    const avgEntry = entries.reduce((a, b) => a + b, 0) / entries.length;
+    
+    if (order === "limit") {
+      if (dir === "long" && avgEntry >= livePrice) {
+        errors.push(`LOGIC ERROR: Long Limit order must be BELOW current price ${livePrice}, not at ${avgEntry}`);
+      }
+      if (dir === "short" && avgEntry <= livePrice) {
+        errors.push(`LOGIC ERROR: Short Limit order must be ABOVE current price ${livePrice}, not at ${avgEntry}`);
+      }
+    }
+  }
+  
+  return { valid: errors.length === 0, errors };
+}
+
+// ---------- Risk management calculator ----------
+function calculateRiskMetrics(
+  instrument: string,
+  entry: number,
+  stopLoss: number,
+  takeProfit1: number
+): string {
+  const pipValue = instrument.includes("JPY") ? 0.01 : 0.0001;
+  const stopPips = Math.abs(entry - stopLoss) / pipValue;
+  const tp1Pips = Math.abs(takeProfit1 - entry) / pipValue;
+  const rr = tp1Pips / stopPips;
+  
+  const warnings: string[] = [];
+  if (stopPips < 15 && !instrument.startsWith("XAU")) {
+    warnings.push(`⚠️ Stop too tight: ${stopPips.toFixed(0)} pips (min 15 recommended)`);
+  }
+  if (stopPips > 100) {
+    warnings.push(`⚠️ Stop too wide: ${stopPips.toFixed(0)} pips (max 80 recommended)`);
+  }
+  if (rr < 1.5) {
+    warnings.push(`⚠️ Poor R:R: ${rr.toFixed(2)}:1 (minimum 1.5:1 recommended)`);
+  }
+  
+  return `\n**RISK METRICS**\n` +
+    `• Stop Loss: ${stopPips.toFixed(0)} pips\n` +
+    `• Take Profit 1: ${tp1Pips.toFixed(0)} pips\n` +
+    `• Risk:Reward: ${rr.toFixed(2)}:1\n` +
+    (warnings.length ? warnings.join('\n') + '\n' : '');
+}
 
 // ---------- Provenance footer ----------
 function buildServerProvenanceFooter(args: {
