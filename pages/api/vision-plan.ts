@@ -933,9 +933,9 @@ function systemCore(
     "- Entry: 15M order blocks, FVG, minor S/R within HTF structure.",
     "- Management: Partial at 1R, BE after 10-15 pips, time-stop after 2-4 hours.",
     "",
-    "ai_meta: include {'mode':'scalping_soft', 'time_stop_minutes': 180, 'currentPrice': <exact price from hint>}",
+   "ai_meta: include {'mode':'scalping_soft', 'time_stop_minutes': 180, 'currentPrice': EXACT_PRICE_FROM_HINT}",
   ] : [
-    "",
+     "",
     "SCALPING MODE - HARD (Micro Execution):",
     "- If 4H/1H provided: quick bias check only (30 seconds). If not provided: assume 15M trend = bias.",
     "- PRIMARY: 15M structure → 5M confirmation (MANDATORY) → 1M precision entry (if provided).",
@@ -948,7 +948,9 @@ function systemCore(
     "- Session-specific: London open (3-5am ET), NY open (9:30-11am ET), Asia range breakout. Note current time.",
     "- Management: partial at 1R, BE after 1R, time-stop within ~20 min if no follow-through.",
     "",
-    "ai_meta: include {'mode':'scalping_hard', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'currentPrice': <exact price from hint>}",
+    "ai_meta: include {'mode':'scalping_hard', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'currentPrice': EXACT_PRICE_FROM_HINT}",
+    "",
+    "CRITICAL: ai_meta MUST include 'currentPrice' field with the exact current market price from the hint provided. This is used for validation."
   ];
     "- CRITICAL: For market orders, entry MUST be current price (from hint). For limit orders, max 3-5 pips away from current.",
     "- 1M usage: Pin bar wicks, engulfing close, BOS candle. Entry at EXACT 1M wick level (e.g., 1.78536, not 1.7850).",
