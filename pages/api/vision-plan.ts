@@ -1493,32 +1493,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
       text = stampM5Used(text, usedM5);
 
-      // Add execution safety checklist
-    if (livePrice) {
-      const checklist = `
-
----
-
-## ⚠️ PRE-TRADE SAFETY CHECKLIST
-
-**Before placing this trade, verify ALL boxes:**
-
-☐ Current ${instrument} price confirmed: ${livePrice}
-☐ Entry order is logical (Limit below for long, above for short)
-☐ Stop loss protects against >2% account loss
-☐ No major news in next 30 minutes (check calendar)
-☐ Position size calculated (not overleveraged)
-☐ No correlated trades open (check other ${instrument.slice(0,3)}/${instrument.slice(3,6)} pairs)
-☐ Spread is normal (not widened)
-☐ Can emotionally accept the loss if stopped out
-
-**If ANY box unchecked: DO NOT TRADE**
-
----
-`;
-      textFull = textFull + checklist;
-    }
-
     const footer = buildServerProvenanceFooter({
         headlines_provider: "expand-uses-stage1",
         calendar_status: c.calendar ? "image-ocr" : (calAdv?.status || "unavailable"),
