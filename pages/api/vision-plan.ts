@@ -902,24 +902,59 @@ function systemCore(
     "",
     
     "",
-    "Fundamentals Scoring (0–100, no hard caps):",
-    "- Determine calendar instrument sign from the calendar bias (bearish:-1, neutral:0, bullish:+1).",
-    "- Compute:",
-    "  • S_cal = 50 + 50*sign",
-    "  • Headlines (48h): S_head = 25 (bearish) / 50 (neutral) / 75 (bullish); if unavailable, use 50",
-    "  • CSM diff = z(base) - z(quote); S_csm = 50 + 25 * clamp(diff, -2, +2)/2",
-    "  • COT (if cues detected): bump +5 if aligns with calendar sign, -5 if conflicts, 0 if none",
-    "- Weights: w_cal=0.45, w_head=0.20, w_csm=0.30, w_cot=0.05",
-    "- RawF = w_cal*S_cal + w_head*S_head + w_csm*S_csm + w_cot*(50+cotBump)",
-    "- If a high-impact event is within ≤60 min, reduce by 25%: F = clamp( RawF * (1 - 0.25*proximityFlag), 0, 100 ), where proximityFlag=1 if warning ≤60 min else 0.",
-    "- Unavailable components fall back to 50 (except calendar sign, which may be neutral).",
+   "FUNDAMENTALS SCORING SYSTEM (0-100, show your work):",
     "",
-   "Conviction (0–100) — per option (independent):",
-"- For **each** trade option, compute Conv using that option’s own tournament score T_option (0–100) and the same Fundamentals F (0–100).",
-"- Alignment: if the option’s technical direction matches the fundamentals net sign → +8; if it conflicts → -8.",
-"- If a high-impact event is within ≤60 min, apply a final scaling of 15%: Conv_option = clamp( (0.55*T_option + 0.45*F + align) * (1 - 0.15*proximityFlag), 0, 100 ).",
-"- Output **distinct Conviction** for Option 1 and Option 2. Quick Plan uses Option 1’s Conviction.",
-"- Do not apply any other caps.",
+    "Step 1: Component Scores",
+    "• Calendar (S_cal): Extract bias from calendar analysis",
+    "  - Bullish = +1 → S_cal = 100",
+    "  - Bearish = -1 → S_cal = 0", 
+    "  - Neutral = 0 → S_cal = 50",
+    "",
+    "• Headlines (S_head): 48h sentiment provided",
+    "  - Bullish → 75",
+    "  - Neutral → 50",
+    "  - Bearish → 25",
+    "  - Unavailable → 50 (default)",
+    "",
+    "• CSM (S_csm): Currency strength momentum (provided as z-scores)",
+    "  - diff = z(base) - z(quote)",
+    "  - S_csm = 50 + (25 × clamp(diff, -2, +2) / 2)",
+    "  - Example: diff = +1.2 → S_csm = 50 + (25 × 0.6) = 65",
+    "",
+    "• COT (S_cot): Commitment of Traders (if detected)",
+    "  - Base = 50",
+    "  - If aligns with calendar: +10",
+    "  - If conflicts with calendar: -10",
+    "",
+    "Step 2: Weighted Average",
+    "F = (0.40 × S_cal) + (0.25 × S_head) + (0.25 × S_csm) + (0.10 × S_cot)",
+    "",
+    "Step 3: Proximity Adjustment",
+    "If high-impact event within 60 min: F = F × 0.70 (reduce 30%)",
+    "",
+    "YOU MUST SHOW THIS CALCULATION:",
+    "Example: 'F = (0.40×100) + (0.25×25) + (0.25×65) + (0.10×50) = 67.5 → 68'",
+    "",
+  "CONVICTION CALCULATION (per option, 0-100):",
+    "",
+    "For Option 1 and Option 2 independently:",
+    "",
+    "1. Get Technical Score (T): From tournament scoring (0-100)",
+    "2. Get Fundamentals Score (F): From calculation above (0-100)",
+    "3. Calculate alignment bonus:",
+    "   - If option direction matches fundamental bias: +10",
+    "   - If opposite direction: -15",
+    "   - If fundamentals neutral: 0",
+    "4. Base conviction: Conv = (0.55 × T) + (0.45 × F) + alignment",
+    "5. Event proximity penalty: If high-impact event ≤60 min: Conv × 0.85",
+    "6. Final: Round to whole number, clamp between 0-100",
+    "",
+    "EXAMPLE:",
+    "Option 1 (Long): T=75, F=68, Alignment=+10 (fundies bullish)",
+    "Conv = (0.55×75) + (0.45×68) + 10 = 41.25 + 30.6 + 10 = 81.85 → 82%",
+    "",
+    "Option 2 (Short): T=60, F=68, Alignment=-15 (against fundies)", 
+    "Conv = (0.55×60) + (0.45×68) - 15 = 33 + 30.6 - 15 = 48.6 → 49%",
     "",
     "Consistency rule:",
     "- If Calendar/Headlines/CSM align, do not say 'contradicting'; say 'aligning'.",
@@ -1287,6 +1322,115 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
   } catch {}
   return null;
 }
+// ---------- Chart vs API price validation ----------
+function validatePriceConsistency(apiPrice: number, aiMetaPrice: number): {
+  valid: boolean;
+  error: string | null;
+  warning: string | null;
+} {
+  if (!apiPrice || apiPrice <= 0) {
+    return { valid: true, error: null, warning: "No API price available for validation" };
+  }
+  
+  // Check if AI reported price matches API (0.5% tolerance)
+  if (aiMetaPrice && isFinite(aiMetaPrice) && aiMetaPrice > 0) {
+    const diffPct = Math.abs((aiMetaPrice - apiPrice) / apiPrice);
+    if (diffPct > 0.005) {
+      return {
+        valid: false,
+        error: `AI misread current price: Reported ${aiMetaPrice} but actual is ${apiPrice} (${(diffPct*100).toFixed(2)}% difference). Charts may have wrong y-axis scale.`,
+        warning: null
+      };
+    }
+  }
+  
+  return { valid: true, error: null, warning: null };
+}
+
+// ---------- Entry price validation vs current market ----------
+function validateEntryPrices(text: string, aiMeta: any, livePrice: number, scalpingMode: string): {
+  valid: boolean;
+  errors: string[];
+} {
+  const errors: string[] = [];
+  
+  // Extract all entry prices mentioned in text
+  const entryMatches = text.matchAll(/Entry[^:]*:\s*(\d+\.\d+)/gi);
+  const entries = Array.from(entryMatches).map(m => Number(m[1]));
+  
+  // Add zone prices from ai_meta
+  if (aiMeta?.zone?.min) entries.push(Number(aiMeta.zone.min));
+  if (aiMeta?.zone?.max) entries.push(Number(aiMeta.zone.max));
+  
+  if (entries.length === 0) {
+    errors.push("No entry prices found in trade plan");
+    return { valid: false, errors };
+  }
+  
+  // Check each entry is reasonable distance from current price
+  const maxDriftPct = scalpingMode === "hard" ? 0.015 : scalpingMode === "soft" ? 0.03 : 0.05;
+  
+  for (const entry of entries) {
+    if (!isFinite(entry) || entry <= 0) continue;
+    const drift = Math.abs((entry - livePrice) / livePrice);
+    if (drift > maxDriftPct) {
+      errors.push(
+        `Entry ${entry} is ${(drift*100).toFixed(1)}% from current ${livePrice} (max allowed: ${(maxDriftPct*100).toFixed(1)}%)`
+      );
+    }
+  }
+  
+  // Validate order type logic
+  const dirMatch = text.match(/Direction:\s*(Long|Short)/i);
+  const orderMatch = text.match(/Order Type:\s*(Market|Limit|Stop)/i);
+  
+  if (dirMatch && orderMatch && entries.length > 0) {
+    const dir = dirMatch[1].toLowerCase();
+    const order = orderMatch[1].toLowerCase();
+    const avgEntry = entries.reduce((a, b) => a + b, 0) / entries.length;
+    
+    if (order === "limit") {
+      if (dir === "long" && avgEntry >= livePrice) {
+        errors.push(`LOGIC ERROR: Long Limit order must be BELOW current price ${livePrice}, not at ${avgEntry}`);
+      }
+      if (dir === "short" && avgEntry <= livePrice) {
+        errors.push(`LOGIC ERROR: Short Limit order must be ABOVE current price ${livePrice}, not at ${avgEntry}`);
+      }
+    }
+  }
+  
+  return { valid: errors.length === 0, errors };
+}
+
+// ---------- Risk management calculator ----------
+function calculateRiskMetrics(
+  instrument: string,
+  entry: number,
+  stopLoss: number,
+  takeProfit1: number
+): string {
+  const pipValue = instrument.includes("JPY") ? 0.01 : 0.0001;
+  const stopPips = Math.abs(entry - stopLoss) / pipValue;
+  const tp1Pips = Math.abs(takeProfit1 - entry) / pipValue;
+  const rr = tp1Pips / stopPips;
+  
+  const warnings: string[] = [];
+  if (stopPips < 15 && !instrument.startsWith("XAU")) {
+    warnings.push(`⚠️ Stop too tight: ${stopPips.toFixed(0)} pips (min 15 recommended)`);
+  }
+  if (stopPips > 100) {
+    warnings.push(`⚠️ Stop too wide: ${stopPips.toFixed(0)} pips (max 80 recommended)`);
+  }
+  if (rr < 1.5) {
+    warnings.push(`⚠️ Poor R:R: ${rr.toFixed(2)}:1 (minimum 1.5:1 recommended)`);
+  }
+  
+  return `\n**RISK METRICS**\n` +
+    `• Stop Loss: ${stopPips.toFixed(0)} pips\n` +
+    `• Take Profit 1: ${tp1Pips.toFixed(0)} pips\n` +
+    `• Risk:Reward: ${rr.toFixed(2)}:1\n` +
+    (warnings.length ? warnings.join('\n') + '\n' : '');
+}
 
 // ---------- Provenance footer ----------
 function buildServerProvenanceFooter(args: {
@@ -1349,7 +1493,33 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
       text = stampM5Used(text, usedM5);
 
-      const footer = buildServerProvenanceFooter({
+      // Add execution safety checklist
+    if (livePrice) {
+      const checklist = `
+
+---
+
+## ⚠️ PRE-TRADE SAFETY CHECKLIST
+
+**Before placing this trade, verify ALL boxes:**
+
+☐ Current ${instrument} price confirmed: ${livePrice}
+☐ Entry order is logical (Limit below for long, above for short)
+☐ Stop loss protects against >2% account loss
+☐ No major news in next 30 minutes (check calendar)
+☐ Position size calculated (not overleveraged)
+☐ No correlated trades open (check other ${instrument.slice(0,3)}/${instrument.slice(3,6)} pairs)
+☐ Spread is normal (not widened)
+☐ Can emotionally accept the loss if stopped out
+
+**If ANY box unchecked: DO NOT TRADE**
+
+---
+`;
+      textFull = textFull + checklist;
+    }
+
+    const footer = buildServerProvenanceFooter({
         headlines_provider: "expand-uses-stage1",
         calendar_status: c.calendar ? "image-ocr" : (calAdv?.status || "unavailable"),
         calendar_provider: c.calendar ? "image-ocr" : calAdv?.provider || null,
@@ -1761,72 +1931,67 @@ if (livePrice && scalpingMode === "hard") {
         (messages[0] as any).content = (messages[0] as any).content + `\n\n**CRITICAL PRICE CHECK**: Current ${instrument} price is EXACTLY ${livePrice}. You MUST report this exact price in ai_meta.currentPrice. All entry suggestions must be within 15 points (0.4%) of this level for immediate execution.`;
       }
 
-   let text = await callOpenAI(MODEL, messages);
+ let text = await callOpenAI(MODEL, messages);
       let aiMeta = extractAiMeta(text) || {};
 
-      // CRITICAL: Validate model acknowledged current price correctly
+      // ========== VALIDATION CHECKPOINT ==========
+      
+      // 1. Price consistency check
       if (livePrice) {
-        const modelPrice = Number(aiMeta?.currentPrice);
-        
-        // If model didn't report price, inject it but warn
-        if (!isFinite(modelPrice) || modelPrice <= 0) {
-          console.warn(`[VISION-PLAN] Model failed to report currentPrice, injecting live price ${livePrice}`);
-          aiMeta.currentPrice = livePrice;
-        } else {
-      const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
-          const maxDiff = 0.002; // 0.2% max (very tight - about 7.5 points for Gold at 3750)
-          if (priceDiff > maxDiff) {
-            console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(1)}%`);
-            return res.status(400).json({ 
-              ok: false, 
-              reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is ${livePrice} (${(priceDiff*100).toFixed(1)}% difference). Chart y-axis may be misread - please use clearer images.` 
-            });
-          }
+        const priceCheck = validatePriceConsistency(livePrice, Number(aiMeta?.currentPrice));
+        if (!priceCheck.valid && priceCheck.error) {
+          console.error(`[VISION-PLAN] ${priceCheck.error}`);
+          return res.status(400).json({ ok: false, reason: priceCheck.error });
+        }
+        if (priceCheck.warning) {
+          console.warn(`[VISION-PLAN] ${priceCheck.warning}`);
         }
       }
-
-      if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
-
-      text = await enforceOption1(MODEL, instrument, text);
-      text = await enforceOption2(MODEL, instrument, text);
-
-    // CRITICAL: Validate entry prices are reasonable relative to current market price
-      if (livePrice && aiMeta) {
-        const entries: number[] = [];
-        const entryMatch = text.match(/Entry.*?:.*?([\d.]+)/i);
-        if (entryMatch) entries.push(Number(entryMatch[1]));
-        if (aiMeta.zone?.min) entries.push(Number(aiMeta.zone.min));
-        if (aiMeta.zone?.max) entries.push(Number(aiMeta.zone.max));
-        
-        for (const entry of entries) {
-          if (isFinite(entry) && entry > 0) {
-            const pctDiff = Math.abs((entry - livePrice) / livePrice);
-            // Allow structure-based entries: 1% for hard scalping, 5% for normal/soft modes
-            const maxDiff = scalpingMode === "hard" ? 0.01 : 0.05;
-            if (pctDiff > maxDiff) {
-              console.error(`[VISION-PLAN] Price validation FAILED: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
-              return res.status(400).json({ ok: false, reason: `Entry too far from current price: ${entry} vs live ${livePrice} (${(pctDiff*100).toFixed(1)}% away). Max allowed: ${(maxDiff*100).toFixed(1)}% for ${scalpingMode} mode.` });
-            }
-          }
+      
+      // 2. Chart analysis verification
+      const hasDetailedAnalysis = /Swings?:\s*SH\d+=/i.test(text);
+      if (!hasDetailedAnalysis) {
+        console.warn("[VISION-PLAN] AI did not provide detailed swing analysis - response may be vague");
+        // Don't fail here, just log warning
+      }
+      
+      // 3. Entry price validation
+      if (livePrice) {
+        const entryValidation = validateEntryPrices(text, aiMeta, livePrice, scalpingMode);
+        if (!entryValidation.valid) {
+          console.error(`[VISION-PLAN] Entry validation failed: ${entryValidation.errors.join('; ')}`);
+          return res.status(400).json({ 
+            ok: false, 
+            reason: `Entry prices are invalid:\n${entryValidation.errors.join('\n')}` 
+          });
         }
+      }
+      
+      // 4. Add risk metrics
+      const entryMatch = text.match(/Entry[^:]*:\s*(\d+\.\d+)/i);
+      const slMatch = text.match(/Stop Loss[^:]*:\s*(\d+\.\d+)/i);
+      const tp1Match = text.match(/TP1[^:]*:\s*(\d+\.\d+)/i);
+      
+      if (entryMatch && slMatch && tp1Match) {
+        const riskMetrics = calculateRiskMetrics(
+          instrument,
+          Number(entryMatch[1]),
+          Number(slMatch[1]),
+          Number(tp1Match[1])
+        );
         
-        const dirMatch = text.match(/Direction:\s*(Long|Short)/i);
-        const orderMatch = text.match(/Order Type:\s*(Limit|Stop|Market)/i);
-        if (dirMatch && orderMatch && entries.length > 0) {
-          const direction = dirMatch[1].toLowerCase();
-          const orderType = orderMatch[1].toLowerCase();
-          const avgEntry = entries.reduce((a, b) => a + b, 0) / entries.length;
-          
-          if (direction === "long" && orderType === "limit" && avgEntry > livePrice) {
-            console.error(`[VISION-PLAN] Order logic FAILED: Long Limit at ${avgEntry} but price is ${livePrice}`);
-            return res.status(400).json({ ok: false, reason: `Order type error: Long Limit orders must be BELOW current price (${livePrice}), not above at ${avgEntry}. Model may have misread chart direction.` });
-          }
-          
-          if (direction === "short" && orderType === "limit" && avgEntry < livePrice) {
-            console.error(`[VISION-PLAN] Order logic FAILED: Short Limit at ${avgEntry} but price is ${livePrice}`);
-            return res.status(400).json({ ok: false, reason: `Order type error: Short Limit orders must be ABOVE current price (${livePrice}), not below at ${avgEntry}. Model may have misread chart direction.` });
-          }
-        }
+        // Insert before Management section
+        text = text.replace(
+          /(Trade Management|Management:)/i,
+          riskMetrics + '\n$1'
+        );
+      }
+      
+      // ========== END VALIDATION ==========
+      
+      // Continue with existing code...
+      if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) {
+        aiMeta.currentPrice = livePrice;
       }
 
       // Stamp 5M/1M execution if used
@@ -1895,14 +2060,58 @@ const messages = messagesFull({
         (messages[0] as any).content = (messages[0] as any).content + `\n\n**CRITICAL PRICE CHECK**: Current ${instrument} price is EXACTLY ${livePrice}. You MUST report this exact price in ai_meta.currentPrice. All entry suggestions must be within 15 points (0.4%) of this level for immediate execution.`;
       }
 
- let textFull = await callOpenAI(MODEL, messages);
+let textFull = await callOpenAI(MODEL, messages);
     let aiMetaFull = extractAiMeta(textFull) || {};
 
-    // CRITICAL: Validate model acknowledged current price correctly
+    // ========== VALIDATION CHECKPOINT ==========
+    
     if (livePrice) {
-      const modelPrice = Number(aiMetaFull?.currentPrice);
+      const priceCheck = validatePriceConsistency(livePrice, Number(aiMetaFull?.currentPrice));
+      if (!priceCheck.valid && priceCheck.error) {
+        console.error(`[VISION-PLAN] ${priceCheck.error}`);
+        return res.status(400).json({ ok: false, reason: priceCheck.error });
+      }
+    }
+    
+    const hasDetailedAnalysis = /Swings?:\s*SH\d+=/i.test(textFull);
+    if (!hasDetailedAnalysis) {
+      console.warn("[VISION-PLAN] AI did not provide detailed swing analysis");
+    }
+    
+    if (livePrice) {
+      const entryValidation = validateEntryPrices(textFull, aiMetaFull, livePrice, scalpingMode);
+      if (!entryValidation.valid) {
+        console.error(`[VISION-PLAN] Entry validation failed: ${entryValidation.errors.join('; ')}`);
+        return res.status(400).json({ 
+          ok: false, 
+          reason: `Entry prices are invalid:\n${entryValidation.errors.join('\n')}` 
+        });
+      }
+    }
+    
+    const entryMatch = textFull.match(/Entry[^:]*:\s*(\d+\.\d+)/i);
+    const slMatch = textFull.match(/Stop Loss[^:]*:\s*(\d+\.\d+)/i);
+    const tp1Match = textFull.match(/TP1[^:]*:\s*(\d+\.\d+)/i);
+    
+    if (entryMatch && slMatch && tp1Match) {
+      const riskMetrics = calculateRiskMetrics(
+        instrument,
+        Number(entryMatch[1]),
+        Number(slMatch[1]),
+        Number(tp1Match[1])
+      );
+      textFull = textFull.replace(/(Trade Management|Management:)/i, riskMetrics + '\n$1');
+    }
+    
+    // ========== END VALIDATION ==========
+    
+    if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) {
+      aiMetaFull.currentPrice = livePrice;
+    }
+     const modelPrice = Number(aiMetaFull?.currentPrice);
       
-      // If model didn't report price, inject it but warn
+      if (livePrice) {
+        // If model didn't report price, inject it but warn
       if (!isFinite(modelPrice) || modelPrice <= 0) {
         console.warn(`[VISION-PLAN] Model failed to report currentPrice, injecting live price ${livePrice}`);
         aiMetaFull.currentPrice = livePrice;
@@ -1919,8 +2128,7 @@ reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is
       }
     }
 
-    if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
-
+ 
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
 
@@ -1975,8 +2183,34 @@ reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is
       csmSign: computeCSMInstrumentSign(csm, instrument).sign,
       calendarSign: parseInstrumentBiasFromNote(biasNote)
     });
+  // Add execution safety checklist
+      if (livePrice) {
+        const checklist = `
 
-    const footer = buildServerProvenanceFooter({
+---
+
+## ⚠️ PRE-TRADE SAFETY CHECKLIST
+
+**Before placing this trade, verify ALL boxes:**
+
+☐ Current ${instrument} price confirmed: ${livePrice}
+☐ Entry order is logical (Limit below for long, above for short)
+☐ Stop loss protects against >2% account loss
+☐ No major news in next 30 minutes (check calendar)
+☐ Position size calculated (not overleveraged)
+☐ No correlated trades open (check other ${instrument.slice(0,3)}/${instrument.slice(3,6)} pairs)
+☐ Spread is normal (not widened)
+☐ Can emotionally accept the loss if stopped out
+
+**If ANY box unchecked: DO NOT TRADE**
+
+---
+`;
+       textFull = textFull + checklist;
+      }
+
+      const footer = buildServerProvenanceFooter({
+   
       headlines_provider: headlinesProvider || "unknown",
       calendar_status: calendarStatus,
       calendar_provider: calendarProvider,
