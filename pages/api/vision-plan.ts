@@ -830,7 +830,7 @@ function computeCompositeBias(args: {
 function systemCore(
   instrument: string,
   calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null },
-  scalping?: boolean
+  scalpingMode?: "soft" | "hard" | "off"
 ) {
   const warn = (calendarAdvisory?.warningMinutes ?? null) != null ? calendarAdvisory!.warningMinutes : null;
   const bias = calendarAdvisory?.biasNote || null;
@@ -1033,7 +1033,7 @@ function messagesFull(args: {
   headlinesText?: string | null; sentimentText?: string | null;
   calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null; debugRows?: any[] | null; preReleaseOnly?: boolean | null };
   provenance?: any;
-  scalping?: boolean;
+scalpingMode?: "soft" | "hard" | "off";
 }) {
   const system = [
     systemCore(args.instrument, args.calendarAdvisory, args.scalping), "",
@@ -1107,7 +1107,7 @@ function messagesFastStage1(args: {
   headlinesText?: string | null; sentimentText?: string | null;
   calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null; debugRows?: any[] | null; preReleaseOnly?: boolean | null };
   provenance?: any;
-  scalping?: boolean;
+ scalpingMode?: "soft" | "hard" | "off";
 }) {
   const system = [
     systemCore(args.instrument, args.calendarAdvisory, args.scalping), "",
