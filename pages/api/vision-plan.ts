@@ -232,7 +232,7 @@ function computeHeadlinesBias(items: AnyHeadline[]): HeadlineBias {
   const scores = items.map(h => typeof h?.sentiment?.score === "number" ? Number(h.sentiment!.score) : null).filter(v => Number.isFinite(v)) as number[];
   if (scores.length === 0) return { label: "unavailable", avg: null, count: 0 };
   const avg = scores.reduce((a, b) => a + b, 0) / (scores.length || 1);
-  const label = avg > 0.01 ? "bullish" : avg < -0.01 ? "bearish" : "neutral";
+ const label = avg > 0.02 ? "bullish" : avg < -0.02 ? "bearish" : "neutral";
   return { label, avg, count: scores.length };
 }
 
@@ -927,9 +927,15 @@ function systemCore(
 
   const scalpingLines = !scalping ? [] : [
     "",
-    "SCALPING MODE (guardrails only; sections unchanged):",
-    "- Treat 4H/1H as guardrails; build setups on 15m, confirm timing on 5m (and 1m if provided). 1m must not override HTF bias.",
-    "- Adjust candidate scoring weights: T_candidate = clamp( 0.35*HTF_fit(1H/4H) + 0.40*Context_fit(15m) + 0.25*Trigger_fit(5m & optional 1m), 0, 100 ).",
+    "SCALPING MODE - INTRADAY PRECISION:",
+    "- 4H/1H = bias only. Build setups on 15M. MANDATORY: Use 5M for structure confirmation AND 1M (if provided) for exact entry timing.",
+    "- 1M chart usage: Identify precise trigger candles (pin bars, engulfing, BOS), exact entry wick levels, micro stop placement (5-8 pips).",
+    "- If 1M shows conflicting momentum vs 15M setup, note this as execution risk but proceed with 15M plan (1M doesn't override HTF).",
+    "- Target: 5-15 pip moves (not 50+ pip swings). Entries at micro levels (order blocks, FVG, session opens).",
+    "- Session-specific: London open (3-5am ET), NY open (9:30-11am ET), Asia range breakout. Note current time.",
+   "- Scoring: T_candidate = clamp( 0.25*HTF_bias + 0.45*Structure(15M) + 0.20*Confirmation(5M) + 0.10*Precision(1M if provided), 0, 100 ).",
+    "- 1M adds 10 points for: clean trigger candle, precise entry wick, tight stop behind 1M structure.",
+    "- Prefer: Prior day high/low, session highs/lows, round numbers (00/50 levels), VWAP if visible.",
     "- Prefer session confluence (London/NY kill zones), OR high/low, prior day high/low, Asia range. Reward +10 for session confluence and clean invalidation (≤0.35× ATR15) with ≥1.8R potential.",
     "- Near red news ±30m: do not initiate new market orders; consider only pre-planned limit orders with structure protection.",
     "- Management suggestions may include: partial at 1R, BE after 1R, time-stop within ~20 min if no follow-through.",
