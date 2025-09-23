@@ -928,8 +928,11 @@ function systemCore(
   const scalpingLines = !scalping ? [] : [
     "",
     "SCALPING MODE - INTRADAY PRECISION:",
-    "- 4H/1H = bias only. Build setups on 15M. MANDATORY: Use 5M for structure confirmation AND 1M (if provided) for exact entry timing.",
-    "- 1M chart usage: Identify precise trigger candles (pin bars, engulfing, BOS), exact entry wick levels, micro stop placement (5-8 pips).",
+  "- 4H/1H = bias only. Build setups on 15M. MANDATORY: Use 5M for structure AND 1M for EXACT entry.",
+    "- CRITICAL: For market orders, entry MUST be current price (from hint). For limit orders, max 3-5 pips away from current.",
+    "- 1M usage: Pin bar wicks, engulfing close, BOS candle. Entry at EXACT 1M wick level (e.g., 1.78536, not 1.7850).",
+    "- Stop loss: 5-8 pips ONLY. Place behind 1M structure (pin bar low/high, engulfing body, BOS candle).",
+    "- Take profits: TP1 at 8-12 pips (1.5R min), TP2 at 12-18 pips (2R). DO NOT suggest 20+ pip targets.",
     "- If 1M shows conflicting momentum vs 15M setup, note this as execution risk but proceed with 15M plan (1M doesn't override HTF).",
     "- Target: 5-15 pip moves (not 50+ pip swings). Entries at micro levels (order blocks, FVG, session opens).",
     "- Session-specific: London open (3-5am ET), NY open (9:30-11am ET), Asia range breakout. Note current time.",
@@ -1720,7 +1723,11 @@ if (calUrlOrig) {
         provenance: provForModel,
         scalping,
       });
-    if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\n**CRITICAL PRICE CHECK**: Current ${instrument} price is EXACTLY ${livePrice}. You MUST report this exact price in ai_meta.currentPrice. All entry suggestions must be within 15 points (0.4%) of this level for immediate execution.`; }
+if (livePrice && scalpingMode === "hard") {
+        (messages[0] as any).content = (messages[0] as any).content + `\n\n**HARD SCALPING PRICE LOCK**: ${instrument} is EXACTLY at ${livePrice} RIGHT NOW. For market orders, entry = ${livePrice} (no rounding). For limit orders, max 5 pips away. SL must be 5-8 pips. TP1 = 8-12 pips, TP2 = 12-18 pips. DO NOT round to .7850 or .50 levels.`;
+      } else if (livePrice) {
+        (messages[0] as any).content = (messages[0] as any).content + `\n\n**CRITICAL PRICE CHECK**: Current ${instrument} price is EXACTLY ${livePrice}. You MUST report this exact price in ai_meta.currentPrice. All entry suggestions must be within 15 points (0.4%) of this level for immediate execution.`;
+      }
 
    let text = await callOpenAI(MODEL, messages);
       let aiMeta = extractAiMeta(text) || {};
@@ -1844,7 +1851,11 @@ if (calUrlOrig) {
       provenance: provForModel,
       scalping,
     });
-  if (livePrice) { (messages[0] as any).content = (messages[0] as any).content + `\n\n**CRITICAL PRICE CHECK**: Current ${instrument} price is EXACTLY ${livePrice}. You MUST report this exact price in ai_meta.currentPrice. All entry suggestions must be within 15 points (0.4%) of this level for immediate execution.`; }
+      if (livePrice && scalpingMode === "hard") {
+        (messages[0] as any).content = (messages[0] as any).content + `\n\n**HARD SCALPING PRICE LOCK**: ${instrument} is EXACTLY at ${livePrice} RIGHT NOW. For market orders, entry = ${livePrice} (no rounding). For limit orders, max 5 pips away. SL must be 5-8 pips. TP1 = 8-12 pips, TP2 = 12-18 pips. DO NOT round to .7850 or .50 levels.`;
+      } else if (livePrice) {
+        (messages[0] as any).content = (messages[0] as any).content + `\n\n**CRITICAL PRICE CHECK**: Current ${instrument} price is EXACTLY ${livePrice}. You MUST report this exact price in ai_meta.currentPrice. All entry suggestions must be within 15 points (0.4%) of this level for immediate execution.`;
+      }
 
  let textFull = await callOpenAI(MODEL, messages);
     let aiMetaFull = extractAiMeta(textFull) || {};
