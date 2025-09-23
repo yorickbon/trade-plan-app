@@ -1725,8 +1725,12 @@ if (calUrlOrig) {
 
     // ---------- Stage-1 (fast) ----------
     if (mode === "fast") {
-   const messages = messagesFastStage1({
-        instrument, dateStr, m15, h1, h4, m5, m1,
+  const messages = messagesFastStage1({
+        instrument, dateStr, 
+        m15: m15!, 
+        h1: h1 || "", 
+        h4: h4 || "", 
+        m5, m1,
         calendarDataUrl: calDataUrlForPrompt || undefined,
         calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
         headlinesText: headlinesText || undefined,
@@ -1853,8 +1857,12 @@ if (livePrice && scalpingMode === "hard") {
     }
 
     // ---------- FULL ----------
-  const messages = messagesFull({
-      instrument, dateStr, m15, h1, h4, m5, m1,
+const messages = messagesFull({
+      instrument, dateStr, 
+      m15: m15!, 
+      h1: h1 || "", 
+      h4: h4 || "", 
+      m5, m1,
       calendarDataUrl: calDataUrlForPrompt || undefined,
       calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
       headlinesText: headlinesText || undefined,
