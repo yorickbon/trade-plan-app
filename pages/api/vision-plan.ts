@@ -1824,7 +1824,7 @@ if (livePrice && scalpingMode === "hard") {
         calendarSign: parseInstrumentBiasFromNote(biasNote)
       });
 
-      const cacheKey = setCache({ instrument, m5: m5 || null, m15, h1, h4, calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
+    const cacheKey = setCache({ instrument, m5: m5 || null, m15: m15!, h1: h1 || "", h4: h4 || "", calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
 
       const footer = buildServerProvenanceFooter({
         headlines_provider: headlinesProvider || "unknown",
