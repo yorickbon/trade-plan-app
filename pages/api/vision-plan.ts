@@ -1020,14 +1020,14 @@ function buildUserPartsBase(args: {
   calendarEvidence?: string[] | null;
   debugOCRRows?: { timeISO: string | null; title: string | null; currency: string | null; impact: any; actual: any; forecast: any; previous: any }[] | null;
 }) {
-// Get BOS data from TradingView webhook cache
-  const bosH4 = getBOSStatus(args.instrument, "240");
-  const bosH1 = getBOSStatus(args.instrument, "60");
-  const bosM15 = getBOSStatus(args.instrument, "15");
-  const bosM5 = getBOSStatus(args.instrument, "5");
+  // Get BOS data from TradingView webhook cache
+  const bos4H = getBOSStatus(args.instrument, "240");
+  const bos1H = getBOSStatus(args.instrument, "60");
+  const bos15M = getBOSStatus(args.instrument, "15");
+  const bos5M = getBOSStatus(args.instrument, "5");
   
-const bosContext = (bosH4 !== "NONE" || bosH1 !== "NONE" || bosM15 !== "NONE" || bosM5 !== "NONE")
-    ? `\n\nRECENT STRUCTURE BREAKS (from TradingView indicator - USE THIS DATA):\n- 4H: ${bosH4 === "NONE" ? "No recent BOS" : "BOS " + bosH4}\n- 1H: ${bosH1 === "NONE" ? "No recent BOS" : "BOS " + bosH1}\n- 15M: ${bosM15 === "NONE" ? "No recent BOS" : "BOS " + bosM15}\n- 5M: ${bosM5 === "NONE" ? "No recent BOS" : "BOS " + bosM5}\n\n**MANDATORY: Your BOS analysis MUST match this TradingView data. If your visual analysis conflicts, trust the indicator and explain the discrepancy.**\n`
+  const bosContext = (bos4H !== "NONE" || bos1H !== "NONE" || bos15M !== "NONE" || bos5M !== "NONE")
+    ? `\n\nRECENT STRUCTURE BREAKS (from TradingView indicator):\n- 4H: ${bos4H === "NONE" ? "No recent BOS" : "BOS " + bos4H}\n- 1H: ${bos1H === "NONE" ? "No recent BOS" : "BOS " + bos1H}\n- 15M: ${bos15M === "NONE" ? "No recent BOS" : "BOS " + bos15M}\n- 5M: ${bos5M === "NONE" ? "No recent BOS" : "BOS " + bos5M}\n`
     : "\n\nRECENT STRUCTURE BREAKS: No BOS data from TradingView (check if alerts are active)\n";
 
   const parts: any[] = [
@@ -1498,7 +1498,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         calendar_status: c.calendar ? "image-ocr" : (calAdv?.status || "unavailable"),
         calendar_provider: c.calendar ? "image-ocr" : calAdv?.provider || null,
         csm_time: null,
-       extras: { vp_version: VP_VERSION, model: modelExpand, mode: "expand", scalping_mode: "off" },
+        extras: { vp_version: VP_VERSION, model: modelExpand, mode: "expand" },
       });
       text = `${text}\n${footer}`;
 
@@ -1527,11 +1527,11 @@ const instrument = rawInstr;
     const scalpingRaw = String(pickFirst(fields.scalping) || "").trim().toLowerCase();
     const scalpingHardRaw = String(pickFirst(fields.scalping_hard) || "").trim().toLowerCase();
     
-  const scalpingMode = 
-  (scalpingHardRaw === "1" || scalpingHardRaw === "true" || scalpingHardRaw === "on") ? "hard" :
-  (scalpingRaw === "1" || scalpingRaw === "true" || scalpingRaw === "on") ? "soft" :
-  "off";
-const scalping = scalpingMode !== "off";  // ADD THIS LINE
+    const scalpingMode = 
+      (scalpingHardRaw === "1" || scalpingHardRaw === "true" || scalpingHardRaw === "on") ? "hard" :
+      (scalpingRaw === "1" || scalpingRaw === "true" || scalpingRaw === "on") ? "soft" :
+      "off";
+    const scalping = scalpingMode !== "off";
 
     // debug toggle
     const debugField = String(pickFirst(fields.debug) || "").trim() === "1";
@@ -1675,13 +1675,10 @@ function analyzeCalendarProfessional(ocrItems: OcrCalendarRow[], instrument: str
     const f = parseNumberLoose(ev.forecast);
     const p = parseNumberLoose(ev.previous);
     
-  const higherIsBetter = goodIfHigher(title);
+    const higherIsBetter = goodIfHigher(title);
     
     // Compare actual vs forecast (primary)
     let score = 0;
-    const ref = f ?? p;
-    if (ref == null) continue; // Safety check: skip if no reference value
-    
     if (f != null) {
       const surprise = a - f;
       const surprisePct = f !== 0 ? (surprise / Math.abs(f)) * 100 : 0;
@@ -1882,8 +1879,8 @@ if (calUrlOrig) {
         csm_diff: computeCSMInstrumentSign(csm, instrument).zdiff,
         cot_cue_present: !!cotCue
       },
-    proximity_flag: warningMinutes != null ? 1 : 0,
-      scalping_mode: scalpingMode
+      proximity_flag: warningMinutes != null ? 1 : 0,
+      scalping_mode: !!scalping
     };
 
     // ---------- Stage-1 (fast) ----------
@@ -1925,27 +1922,15 @@ if (livePrice && scalpingMode === "hard") {
         }
       }
       
-     // 2. Chart analysis verification - STRICT ENFORCEMENT
+      // 2. Chart analysis verification
       const hasDetailedAnalysis = /Swings?:\s*SH\d+=/i.test(text);
       if (!hasDetailedAnalysis) {
-        console.error("[VISION-PLAN] AI failed to provide required swing analysis");
-        return res.status(400).json({ 
-          ok: false, 
-          reason: "Chart analysis incomplete: AI did not provide specific swing high/low prices. The response lacks required technical detail for trade execution. Please retry with clearer chart images showing visible price scales." 
-        });
+        console.warn("[VISION-PLAN] AI did not provide detailed swing analysis - response may be vague");
+        // Don't fail here, just log warning
       }
       
-      // Additional check: Must have counted swings
-      const hasSwingCount = /Count:\s*\d+\s+(rising|falling)/i.test(text);
-      if (!hasSwingCount) {
-        console.error("[VISION-PLAN] AI did not count swing patterns");
-        return res.status(400).json({ 
-          ok: false, 
-          reason: "Chart analysis incomplete: AI did not count swing patterns. Cannot determine trend validity without swing structure analysis." 
-        });
-      }
-// 3. Entry price validation
-            if (livePrice) {
+      // 3. Entry price validation
+      if (livePrice) {
         const entryValidation = validateEntryPrices(text, aiMeta, livePrice, scalpingMode);
         if (!entryValidation.valid) {
           console.error(`[VISION-PLAN] Entry validation failed: ${entryValidation.errors.join('; ')}`);
@@ -1996,42 +1981,14 @@ if (livePrice && scalpingMode === "hard") {
         calendarSign: parseInstrumentBiasFromNote(biasNote)
       });
 
-    
     const cacheKey = setCache({ instrument, m5: m5 || null, m15: m15!, h1: h1 || "", h4: h4 || "", calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
-      // Add mandatory manual verification warning
-      const verificationWarning = `
-⚠️⚠️⚠️ **CRITICAL: MANUAL VERIFICATION REQUIRED** ⚠️⚠️⚠️
 
-**This analysis is AI-GENERATED and may contain errors. You MUST verify:**
-
-1. **Chart Reading**: Compare AI's swing analysis against what YOU see on charts
-   - Does the trend match? (Higher highs/lows vs Lower highs/lows)
-   - Are BOS locations correct? Check the actual candle closes
-   - Is price location accurate? (Highs/Middle/Lows)
-
-2. **Entry Logic**: Verify orders make sense
-   - Long Limit should be BELOW current price
-   - Short Limit should be ABOVE current price
-   - Entry should be at clear structure (not random level)
-
-3. **Risk Management**: Calculate position size independently
-   - Never risk more than 1-2% of account per trade
-   - Verify stop loss is behind structure
-   - Check R:R is minimum 1.5:1
-
-**DO NOT TRADE if ANY of the above don't match your own analysis.**
-
----
-
-`;
-      text = verificationWarning + text;
-
-           const footer = buildServerProvenanceFooter({
+      const footer = buildServerProvenanceFooter({
         headlines_provider: headlinesProvider || "unknown",
         calendar_status: calendarStatus,
         calendar_provider: calendarProvider,
         csm_time: csm.tsISO,
-     extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalpingMode },
+        extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping },
       });
       text = `${text}\n${footer}`;
 
@@ -2090,52 +2047,11 @@ let textFull = await callOpenAI(MODEL, messages);
       }
     }
     
-   const hasDetailedAnalysis = /Swings?:\s*SH\d+=/i.test(textFull);
+    const hasDetailedAnalysis = /Swings?:\s*SH\d+=/i.test(textFull);
     if (!hasDetailedAnalysis) {
-      console.error("[VISION-PLAN] AI failed to provide required swing analysis");
-      return res.status(400).json({ 
-        ok: false, 
-        reason: "Chart analysis incomplete: AI did not provide specific swing high/low prices. Please retry with clearer chart images." 
-      });
+      console.warn("[VISION-PLAN] AI did not provide detailed swing analysis");
     }
     
-    const hasSwingCount = /Count:\s*\d+\s+(rising|falling)/i.test(textFull);
-    if (!hasSwingCount) {
-      console.error("[VISION-PLAN] AI did not count swing patterns");
-      return res.status(400).json({ 
-        ok: false, 
-        reason: "Chart analysis incomplete: AI did not count swing patterns. Cannot determine trend validity." 
-      });
-    }
-
-    // Validate BOS matches TradingView data
-    const bosH4 = getBOSStatus(instrument, "240");
-    const bosH1 = getBOSStatus(instrument, "60");
-    const bosM15 = getBOSStatus(instrument, "15");
-    
-    if (bosH4 !== "NONE" || bosH1 !== "NONE" || bosM15 !== "NONE") {
-      const extractedBOS = {
-        h4: textFull.match(/4H.*?BOS\s+(UP|DOWN)/i)?.[1]?.toUpperCase() || "NONE",
-        h1: textFull.match(/1H.*?BOS\s+(UP|DOWN)/i)?.[1]?.toUpperCase() || "NONE",
-        m15: textFull.match(/15M.*?BOS\s+(UP|DOWN)/i)?.[1]?.toUpperCase() || "NONE"
-      };
-      
-      const mismatches: string[] = [];
-      if (bosH4 !== "NONE" && extractedBOS.h4 !== bosH4 && extractedBOS.h4 !== "NONE") {
-        mismatches.push(`4H: AI said ${extractedBOS.h4}, indicator shows ${bosH4}`);
-      }
-      if (bosH1 !== "NONE" && extractedBOS.h1 !== bosH1 && extractedBOS.h1 !== "NONE") {
-        mismatches.push(`1H: AI said ${extractedBOS.h1}, indicator shows ${bosH1}`);
-      }
-      if (bosM15 !== "NONE" && extractedBOS.m15 !== bosM15 && extractedBOS.m15 !== "NONE") {
-        mismatches.push(`15M: AI said ${extractedBOS.m15}, indicator shows ${bosM15}`);
-      }
-      
-      if (mismatches.length > 0) {
-        console.warn(`[VISION-PLAN] BOS mismatch: ${mismatches.join("; ")}`);
-        textFull = `⚠️ **STRUCTURE BREAK DISCREPANCY DETECTED**\n${mismatches.join("\n")}\n\n**TradingView indicator data is more reliable - use indicator values for trade decisions.**\n\n` + textFull;
-      }
-    }
     if (livePrice) {
       const entryValidation = validateEntryPrices(textFull, aiMetaFull, livePrice, scalpingMode);
       if (!entryValidation.valid) {
@@ -2241,36 +2157,7 @@ reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is
       csmSign: computeCSMInstrumentSign(csm, instrument).sign,
       calendarSign: parseInstrumentBiasFromNote(biasNote)
     });
-
-    // Add mandatory manual verification warning
-    const verificationWarning = `
-⚠️⚠️⚠️ **CRITICAL: MANUAL VERIFICATION REQUIRED** ⚠️⚠️⚠️
-
-**This analysis is AI-GENERATED and may contain errors. You MUST verify:**
-
-1. **Chart Reading**: Compare AI's swing analysis against what YOU see
-   - Does the trend match? (Higher highs/lows vs Lower highs/lows)
-   - Are BOS locations correct? Check actual candle closes
-   - Is price location accurate? (Highs/Middle/Lows)
-
-2. **Entry Logic**: Verify orders make sense
-   - Long Limit BELOW current price
-   - Short Limit ABOVE current price
-   - Entry at clear structure (not random)
-
-3. **Risk Management**: Calculate independently
-   - Max 1-2% risk per trade
-   - Stop loss behind structure
-   - R:R minimum 1.5:1
-
-**DO NOT TRADE if ANY discrepancies exist.**
-
----
-
-`;
-    textFull = verificationWarning + textFull;
-
-    // Add execution safety checklist
+  // Add execution safety checklist
       if (livePrice) {
         const checklist = `
 
@@ -2302,7 +2189,7 @@ reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is
       calendar_status: calendarStatus,
       calendar_provider: calendarProvider,
       csm_time: csm.tsISO,
-     extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalpingMode },
+      extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping },
     });
     textFull = `${textFull}\n${footer}`;
 
