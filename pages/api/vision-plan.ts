@@ -925,10 +925,31 @@ function systemCore(
 "If truly no data exists, write: 'Calendar: [exact reason from analysis]'.",
   ];
 
-  const scalpingLines = !scalping ? [] : [
+ const scalpingLines = scalpingMode === "off" ? [] : scalpingMode === "soft" ? [
     "",
-    "SCALPING MODE - INTRADAY PRECISION:",
-  "- 4H/1H = bias only. Build setups on 15M. MANDATORY: Use 5M for structure AND 1M for EXACT entry.",
+    "SCALPING MODE - SOFT (Conservative Intraday):",
+    "- Respect 4H/1H trend fully. Build setups on 15M (primary). Use 5M for confirmation only.",
+    "- Target: 15-30 pip moves with tighter stops than swing (12-20 pips vs 30-50 pips).",
+    "- Entry: 15M order blocks, FVG, minor S/R within HTF structure.",
+    "- Management: Partial at 1R, BE after 10-15 pips, time-stop after 2-4 hours.",
+    "",
+    "ai_meta: include {'mode':'scalping_soft', 'time_stop_minutes': 180, 'currentPrice': <exact price from hint>}",
+  ] : [
+    "",
+    "SCALPING MODE - HARD (Micro Execution):",
+    "- If 4H/1H provided: quick bias check only (30 seconds). If not provided: assume 15M trend = bias.",
+    "- PRIMARY: 15M structure → 5M confirmation (MANDATORY) → 1M precision entry (if provided).",
+    "- Ignore macro levels. Focus: micro order blocks, 5M/1M FVG, session opens, round numbers.",
+    "- CRITICAL: For market orders, entry MUST be current price (from hint). For limit orders, max 3-5 pips away from current.",
+    "- 1M usage: Pin bar wicks, engulfing close, BOS candle. Entry at EXACT 1M wick level (e.g., 1.78536, not 1.7850).",
+    "- Stop loss: 5-8 pips ONLY. Place behind 1M structure (pin bar low/high, engulfing body, BOS candle).",
+    "- Take profits: TP1 at 8-12 pips (1.5R min), TP2 at 12-18 pips (2R). DO NOT suggest 20+ pip targets.",
+    "- If 1M shows conflicting momentum vs 15M setup, note this as execution risk but proceed with 15M plan.",
+    "- Session-specific: London open (3-5am ET), NY open (9:30-11am ET), Asia range breakout. Note current time.",
+    "- Management: partial at 1R, BE after 1R, time-stop within ~20 min if no follow-through.",
+    "",
+    "ai_meta: include {'mode':'scalping_hard', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'currentPrice': <exact price from hint>}",
+  ];
     "- CRITICAL: For market orders, entry MUST be current price (from hint). For limit orders, max 3-5 pips away from current.",
     "- 1M usage: Pin bar wicks, engulfing close, BOS candle. Entry at EXACT 1M wick level (e.g., 1.78536, not 1.7850).",
     "- Stop loss: 5-8 pips ONLY. Place behind 1M structure (pin bar low/high, engulfing body, BOS candle).",
@@ -1410,8 +1431,16 @@ const instrument = rawInstr;
     const h4 = h4FromFile || h4FromUrl;
     const calUrlOrig = calFromFile || calFromUrl || null;
 
-    if (!m15 || !h1 || !h4) {
-      return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either files or TV/Gyazo image links. (5m/1m optional)" });
+   // Hard scalping: 15M + 5M mandatory (1M highly recommended, 1H/4H optional)
+    if (scalpingMode === "hard") {
+      if (!m15 || !m5) {
+        return res.status(400).json({ ok: false, reason: "Hard scalping requires: 15M + 5M minimum. 1M highly recommended. 1H/4H optional for bias." });
+      }
+    } else {
+      // Normal/soft: 15M + 1H + 4H required
+      if (!m15 || !h1 || !h4) {
+        return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either files or TV/Gyazo image links. (5m/1m optional)" });
+      }
     }
 
     // Headlines
