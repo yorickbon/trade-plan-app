@@ -1036,7 +1036,7 @@ function messagesFull(args: {
 scalpingMode?: "soft" | "hard" | "off";
 }) {
   const system = [
-    systemCore(args.instrument, args.calendarAdvisory, args.scalping), "",
+    systemCore(args.instrument, args.calendarAdvisory, args.scalpingMode), "",
    "OUTPUT format (in this exact order):",
     "Option 1 (Primary)",
     "• Direction: ...",
@@ -1109,8 +1109,8 @@ function messagesFastStage1(args: {
   provenance?: any;
  scalpingMode?: "soft" | "hard" | "off";
 }) {
-  const system = [
-    systemCore(args.instrument, args.calendarAdvisory, args.scalping), "",
+ const system = [
+    systemCore(args.instrument, args.calendarAdvisory, args.scalpingMode), "",
     "OUTPUT ONLY:",
 "Option 1 (Primary)",
     "• Direction: ...",
@@ -1313,7 +1313,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const calAdv = await fetchCalendarForAdvisory(req, c.instrument);
       const provHint = { headlines_present: !!c.headlinesText, calendar_status: c.calendar ? "image-ocr" : (calAdv.status || "unavailable") };
 
-      const messages = messagesFull({
+    const messages = messagesFull({
         instrument: c.instrument, dateStr,
         m15: c.m15, h1: c.h1, h4: c.h4, m5: c.m5 || null, m1: null,
         calendarDataUrl: c.calendar || undefined,
@@ -1321,7 +1321,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         sentimentText: c.sentimentText || undefined,
         calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText, evidence: calAdv.evidence || [] },
         provenance: provHint,
-        scalping: false,
+        scalpingMode: "off",
       });
 
      let text = await callOpenAI(modelExpand, messages);
@@ -1725,7 +1725,7 @@ if (calUrlOrig) {
 
     // ---------- Stage-1 (fast) ----------
     if (mode === "fast") {
-      const messages = messagesFastStage1({
+   const messages = messagesFastStage1({
         instrument, dateStr, m15, h1, h4, m5, m1,
         calendarDataUrl: calDataUrlForPrompt || undefined,
         calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
@@ -1733,7 +1733,7 @@ if (calUrlOrig) {
         sentimentText: sentimentText,
         calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
         provenance: provForModel,
-        scalping,
+        scalpingMode,
       });
 if (livePrice && scalpingMode === "hard") {
         (messages[0] as any).content = (messages[0] as any).content + `\n\n**HARD SCALPING PRICE LOCK**: ${instrument} is EXACTLY at ${livePrice} RIGHT NOW. For market orders, entry = ${livePrice} (no rounding). For limit orders, max 5 pips away. SL must be 5-8 pips. TP1 = 8-12 pips, TP2 = 12-18 pips. DO NOT round to .7850 or .50 levels.`;
@@ -1853,7 +1853,7 @@ if (livePrice && scalpingMode === "hard") {
     }
 
     // ---------- FULL ----------
-    const messages = messagesFull({
+  const messages = messagesFull({
       instrument, dateStr, m15, h1, h4, m5, m1,
       calendarDataUrl: calDataUrlForPrompt || undefined,
       calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
@@ -1861,7 +1861,7 @@ if (livePrice && scalpingMode === "hard") {
       sentimentText,
       calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
       provenance: provForModel,
-      scalping,
+      scalpingMode,
     });
       if (livePrice && scalpingMode === "hard") {
         (messages[0] as any).content = (messages[0] as any).content + `\n\n**HARD SCALPING PRICE LOCK**: ${instrument} is EXACTLY at ${livePrice} RIGHT NOW. For market orders, entry = ${livePrice} (no rounding). For limit orders, max 5 pips away. SL must be 5-8 pips. TP1 = 8-12 pips, TP2 = 12-18 pips. DO NOT round to .7850 or .50 levels.`;
