@@ -41,10 +41,10 @@ const POLY_KEY = process.env.POLYGON_API_KEY || "";
 
 // ---------- small utils ----------
 const IMG_MAX_BYTES = 12 * 1024 * 1024;
-const BASE_W = 1536;                      // Higher starting width (was 1280)
-const MAX_W = 1920;                       // Higher max width (was 1500)
-const TARGET_MIN = 600 * 1024;            // Higher min size = better quality (was 420KB)
-const TARGET_MAX = 1800 * 1024;           // Higher max size (was 1.2MB)
+const BASE_W = 1280;
+const MAX_W = 1500;
+const TARGET_MIN = 420 * 1024;
+const TARGET_MAX = 1200 * 1024;
 
 function uuid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
 function dataUrlSizeBytes(s: string | null | undefined): number {
