@@ -835,7 +835,7 @@ function systemCore(
   const warn = (calendarAdvisory?.warningMinutes ?? null) != null ? calendarAdvisory!.warningMinutes : null;
   const bias = calendarAdvisory?.biasNote || null;
 
-  const baseLines = [
+ const baseLines = [
     "You are a professional discretionary trader.",
     "STRICT NO-GUESS RULES:",
     "- Only mention **Calendar** if calendar_status === 'api' or calendar_status === 'image-ocr'.",
@@ -844,11 +844,14 @@ function systemCore(
     "- Use the Sentiment snapshot exactly as given (CSM + Headlines bias + optional COT cue).",
     "- Never use the word 'mixed' for calendar verdicts — use bullish/bearish/neutral only.",
     "",
- "Execution clarity:",
-    "- Prefer **Entry zones (min–max)** for OB/FVG/SR confluence; use a **single price** for tight breakout/trigger.",
-    "- **CRITICAL: Entries must be IMMEDIATELY ACTIONABLE** - within 10-20 pips (or 0.3% for indices/commodities) of the current price hint provided.",
-    "- If current price is mid-trend with clear momentum, suggest entries AT CURRENT LEVEL or very close, not distant levels requiring 50+ pip moves first.",
-    "- SL behind structure; TP1/TP2 with R multiples; BE rules; invalidation.",
+    "Entry Strategy (Structure-First Approach):",
+    "- PRIMARY GOAL: Enter at KEY STRUCTURE LEVELS (order blocks, FVG, demand/supply zones, major S/R).",
+    "- If current price IS AT structure → Suggest immediate entry (market or tight limit 5-10 pips).",
+    "- If current price is BETWEEN structures → Suggest LIMIT ORDER at next structure level (may be 20-50+ pips away).",
+    "- For breakouts → Use STOP ORDER 5-10 pips beyond structure break for confirmation.",
+    "- PATIENCE over chasing: 'Wait for pullback to 1.7820 OB' is BETTER than 'Enter now mid-move at 1.7855'.",
+    "- Entry zones (min-max) for confluence areas; single price for precise trigger levels.",
+    "- SL always behind structure; TP1/TP2 with R multiples; BE rules; clear invalidation.",
     "",
   "Multi-timeframe roles (fixed):",
     "- 4H = HTF bias & key zones (trend, SD zones, macro S/R, structure).",
@@ -1774,7 +1777,7 @@ if (livePrice && scalpingMode === "hard") {
       text = await enforceOption1(MODEL, instrument, text);
       text = await enforceOption2(MODEL, instrument, text);
 
-      // CRITICAL: Validate entry prices are reasonable relative to current market price
+    // CRITICAL: Validate entry prices are reasonable relative to current market price
       if (livePrice && aiMeta) {
         const entries: number[] = [];
         const entryMatch = text.match(/Entry.*?:.*?([\d.]+)/i);
@@ -1785,9 +1788,11 @@ if (livePrice && scalpingMode === "hard") {
         for (const entry of entries) {
           if (isFinite(entry) && entry > 0) {
             const pctDiff = Math.abs((entry - livePrice) / livePrice);
-            if (pctDiff > 0.10) {
+            // Allow structure-based entries: 1% for hard scalping, 5% for normal/soft modes
+            const maxDiff = scalpingMode === "hard" ? 0.01 : 0.05;
+            if (pctDiff > maxDiff) {
               console.error(`[VISION-PLAN] Price validation FAILED: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
-              return res.status(400).json({ ok: false, reason: `Chart misread detected. Current price is ${livePrice} but suggested entry is ${entry} (${(pctDiff*100).toFixed(1)}% away). Please retry with clearer/zoomed-in charts.` });
+              return res.status(400).json({ ok: false, reason: `Entry too far from current price: ${entry} vs live ${livePrice} (${(pctDiff*100).toFixed(1)}% away). Max allowed: ${(maxDiff*100).toFixed(1)}% for ${scalpingMode} mode.` });
             }
           }
         }
@@ -1906,7 +1911,7 @@ reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
 
-    // CRITICAL: Validate entry prices are reasonable relative to current market price
+ // CRITICAL: Validate entry prices are reasonable relative to current market price
       if (livePrice && aiMetaFull) {
         const entries: number[] = [];
         const entryMatch = textFull.match(/Entry.*?:.*?([\d.]+)/i);
@@ -1917,9 +1922,11 @@ reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is
         for (const entry of entries) {
           if (isFinite(entry) && entry > 0) {
             const pctDiff = Math.abs((entry - livePrice) / livePrice);
-            if (pctDiff > 0.10) {
+            // Allow structure-based entries: 1% for hard scalping, 5% for normal/soft modes
+            const maxDiff = scalpingMode === "hard" ? 0.01 : 0.05;
+            if (pctDiff > maxDiff) {
               console.error(`[VISION-PLAN] Price validation FAILED: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
-              return res.status(400).json({ ok: false, reason: `Chart misread detected. Current price is ${livePrice} but suggested entry is ${entry} (${(pctDiff*100).toFixed(1)}% away). Please retry with clearer/zoomed-in charts.` });
+              return res.status(400).json({ ok: false, reason: `Entry too far from current price: ${entry} vs live ${livePrice} (${(pctDiff*100).toFixed(1)}% away). Max allowed: ${(maxDiff*100).toFixed(1)}% for ${scalpingMode} mode.` });
             }
           }
         }
