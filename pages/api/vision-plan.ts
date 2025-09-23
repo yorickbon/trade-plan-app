@@ -952,26 +952,7 @@ function systemCore(
     "",
     "CRITICAL: ai_meta MUST include 'currentPrice' field with the exact current market price from the hint provided. This is used for validation."
   ];
-    "- CRITICAL: For market orders, entry MUST be current price (from hint). For limit orders, max 3-5 pips away from current.",
-    "- 1M usage: Pin bar wicks, engulfing close, BOS candle. Entry at EXACT 1M wick level (e.g., 1.78536, not 1.7850).",
-    "- Stop loss: 5-8 pips ONLY. Place behind 1M structure (pin bar low/high, engulfing body, BOS candle).",
-    "- Take profits: TP1 at 8-12 pips (1.5R min), TP2 at 12-18 pips (2R). DO NOT suggest 20+ pip targets.",
-    "- If 1M shows conflicting momentum vs 15M setup, note this as execution risk but proceed with 15M plan (1M doesn't override HTF).",
-    "- Target: 5-15 pip moves (not 50+ pip swings). Entries at micro levels (order blocks, FVG, session opens).",
-    "- Session-specific: London open (3-5am ET), NY open (9:30-11am ET), Asia range breakout. Note current time.",
-   "- Scoring: T_candidate = clamp( 0.25*HTF_bias + 0.45*Structure(15M) + 0.20*Confirmation(5M) + 0.10*Precision(1M if provided), 0, 100 ).",
-    "- 1M adds 10 points for: clean trigger candle, precise entry wick, tight stop behind 1M structure.",
-    "- Prefer: Prior day high/low, session highs/lows, round numbers (00/50 levels), VWAP if visible.",
-    "- Prefer session confluence (London/NY kill zones), OR high/low, prior day high/low, Asia range. Reward +10 for session confluence and clean invalidation (≤0.35× ATR15) with ≥1.8R potential.",
-    "- Near red news ±30m: do not initiate new market orders; consider only pre-planned limit orders with structure protection.",
-    "- Management suggestions may include: partial at 1R, BE after 1R, time-stop within ~20 min if no follow-through.",
-    "",
- "ai_meta (append fields for downstream tools): include {'mode':'scalping', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'max_attempts': 3} in the existing ai_meta JSON.",
-    "",
-    "CRITICAL: ai_meta MUST include 'currentPrice' field with the exact current market price from the hint provided. This is used for validation."
-  ];
-
-  return [...baseLines, ...scalpingLines].join("\n");
+   return [...baseLines, ...scalpingLines].join("\n");
 }
 
 function buildUserPartsBase(args: {
