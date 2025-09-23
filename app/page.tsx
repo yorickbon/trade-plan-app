@@ -77,7 +77,7 @@ function extractAiMetaFromText(text: string): any | null {
 // ---------- page ----------
 export default function Page() {
   // controls
-const [instrument, setInstrument] = useState<string>("");
+const [instrument, setInstrument] = useState<string>(INSTRUMENTS[0]?.code || "EURUSD");
   const [dateStr, setDateStr] = useState<string>(todayISO());
 
   // calendar + headlines
