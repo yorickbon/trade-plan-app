@@ -1026,8 +1026,8 @@ function buildUserPartsBase(args: {
   const bos15M = getBOSStatus(args.instrument, "15");
   const bos5M = getBOSStatus(args.instrument, "5");
   
-  const bosContext = (bos4H !== "NONE" || bos1H !== "NONE" || bos15M !== "NONE" || bos5M !== "NONE")
-    ? `\n\nRECENT STRUCTURE BREAKS (from TradingView indicator):\n- 4H: ${bos4H === "NONE" ? "No recent BOS" : "BOS " + bos4H}\n- 1H: ${bos1H === "NONE" ? "No recent BOS" : "BOS " + bos1H}\n- 15M: ${bos15M === "NONE" ? "No recent BOS" : "BOS " + bos15M}\n- 5M: ${bos5M === "NONE" ? "No recent BOS" : "BOS " + bos5M}\n`
+const bosContext = (bos4H !== "NONE" || bos1H !== "NONE" || bos15M !== "NONE" || bos5M !== "NONE")
+    ? `\n\nRECENT STRUCTURE BREAKS (from TradingView indicator - USE THIS DATA):\n- 4H: ${bos4H === "NONE" ? "No recent BOS" : "BOS " + bos4H}\n- 1H: ${bos1H === "NONE" ? "No recent BOS" : "BOS " + bos1H}\n- 15M: ${bos15M === "NONE" ? "No recent BOS" : "BOS " + bos15M}\n- 5M: ${bos5M === "NONE" ? "No recent BOS" : "BOS " + bos5M}\n\n**MANDATORY: Your BOS analysis MUST match this TradingView data. If your visual analysis conflicts, trust the indicator and explain the discrepancy.**\n`
     : "\n\nRECENT STRUCTURE BREAKS: No BOS data from TradingView (check if alerts are active)\n";
 
   const parts: any[] = [
@@ -1922,15 +1922,52 @@ if (livePrice && scalpingMode === "hard") {
         }
       }
       
-      // 2. Chart analysis verification
+     // 2. Chart analysis verification - STRICT ENFORCEMENT
       const hasDetailedAnalysis = /Swings?:\s*SH\d+=/i.test(text);
       if (!hasDetailedAnalysis) {
-        console.warn("[VISION-PLAN] AI did not provide detailed swing analysis - response may be vague");
-        // Don't fail here, just log warning
+        console.error("[VISION-PLAN] AI failed to provide required swing analysis");
+        return res.status(400).json({ 
+          ok: false, 
+          reason: "Chart analysis incomplete: AI did not provide specific swing high/low prices. The response lacks required technical detail for trade execution. Please retry with clearer chart images showing visible price scales." 
+        });
       }
       
-      // 3. Entry price validation
-      if (livePrice) {
+      // Additional check: Must have counted swings
+      const hasSwingCount = /Count:\s*\d+\s+(rising|falling)/i.test(text);
+      if (!hasSwingCount) {
+        console.error("[VISION-PLAN] AI did not count swing patterns");
+        return res.status(400).json({ 
+          ok: false, 
+          reason: "Chart analysis incomplete: AI did not count swing patterns. Cannot determine trend validity without swing structure analysis." 
+        });
+      }
+     // 3. Validate BOS matches TradingView data
+      if (bos4H !== "NONE" || bos1H !== "NONE" || bos15M !== "NONE") {
+        const extractedBOS = {
+          h4: text.match(/4H.*?BOS\s+(UP|DOWN)/i)?.[1]?.toUpperCase() || "NONE",
+          h1: text.match(/1H.*?BOS\s+(UP|DOWN)/i)?.[1]?.toUpperCase() || "NONE",
+          m15: text.match(/15M.*?BOS\s+(UP|DOWN)/i)?.[1]?.toUpperCase() || "NONE"
+        };
+        
+        const mismatches: string[] = [];
+        if (bos4H !== "NONE" && extractedBOS.h4 !== bos4H && extractedBOS.h4 !== "NONE") {
+          mismatches.push(`4H: AI said ${extractedBOS.h4}, indicator shows ${bos4H}`);
+        }
+        if (bos1H !== "NONE" && extractedBOS.h1 !== bos1H && extractedBOS.h1 !== "NONE") {
+          mismatches.push(`1H: AI said ${extractedBOS.h1}, indicator shows ${bos1H}`);
+        }
+        if (bos15M !== "NONE" && extractedBOS.m15 !== bos15M && extractedBOS.m15 !== "NONE") {
+          mismatches.push(`15M: AI said ${extractedBOS.m15}, indicator shows ${bos15M}`);
+        }
+        
+        if (mismatches.length > 0) {
+          console.warn(`[VISION-PLAN] BOS mismatch: ${mismatches.join("; ")}`);
+          text = `⚠️ **STRUCTURE BREAK DISCREPANCY DETECTED**\n${mismatches.join("\n")}\n\n**TradingView indicator data is more reliable - use indicator values for trade decisions.**\n\n` + text;
+        }
+      }
+
+      // 3. Entry price validation (keep original numbering for clarity) 
+            if (livePrice) {
         const entryValidation = validateEntryPrices(text, aiMeta, livePrice, scalpingMode);
         if (!entryValidation.valid) {
           console.error(`[VISION-PLAN] Entry validation failed: ${entryValidation.errors.join('; ')}`);
@@ -1981,8 +2018,37 @@ if (livePrice && scalpingMode === "hard") {
         calendarSign: parseInstrumentBiasFromNote(biasNote)
       });
 
+    
     const cacheKey = setCache({ instrument, m5: m5 || null, m15: m15!, h1: h1 || "", h4: h4 || "", calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
+      // Add mandatory manual verification warning
+      const verificationWarning = `
+⚠️⚠️⚠️ **CRITICAL: MANUAL VERIFICATION REQUIRED** ⚠️⚠️⚠️
 
+**This analysis is AI-GENERATED and may contain errors. You MUST verify:**
+
+1. **Chart Reading**: Compare AI's swing analysis against what YOU see on charts
+   - Does the trend match? (Higher highs/lows vs Lower highs/lows)
+   - Are BOS locations correct? Check the actual candle closes
+   - Is price location accurate? (Highs/Middle/Lows)
+
+2. **Entry Logic**: Verify orders make sense
+   - Long Limit should be BELOW current price
+   - Short Limit should be ABOVE current price
+   - Entry should be at clear structure (not random level)
+
+3. **Risk Management**: Calculate position size independently
+   - Never risk more than 1-2% of account per trade
+   - Verify stop loss is behind structure
+   - Check R:R is minimum 1.5:1
+
+**DO NOT TRADE if ANY of the above don't match your own analysis.**
+
+---
+
+`;
+      text = verificationWarning + text;
+
+      const footer = buildServerProvenanceFooter({
       const footer = buildServerProvenanceFooter({
         headlines_provider: headlinesProvider || "unknown",
         calendar_status: calendarStatus,
@@ -2047,11 +2113,48 @@ let textFull = await callOpenAI(MODEL, messages);
       }
     }
     
-    const hasDetailedAnalysis = /Swings?:\s*SH\d+=/i.test(textFull);
+   const hasDetailedAnalysis = /Swings?:\s*SH\d+=/i.test(textFull);
     if (!hasDetailedAnalysis) {
-      console.warn("[VISION-PLAN] AI did not provide detailed swing analysis");
+      console.error("[VISION-PLAN] AI failed to provide required swing analysis");
+      return res.status(400).json({ 
+        ok: false, 
+        reason: "Chart analysis incomplete: AI did not provide specific swing high/low prices. Please retry with clearer chart images." 
+      });
     }
     
+    const hasSwingCount = /Count:\s*\d+\s+(rising|falling)/i.test(textFull);
+    if (!hasSwingCount) {
+      console.error("[VISION-PLAN] AI did not count swing patterns");
+      return res.status(400).json({ 
+        ok: false, 
+        reason: "Chart analysis incomplete: AI did not count swing patterns. Cannot determine trend validity." 
+      });
+    }
+
+    // Validate BOS matches TradingView data
+    if (bos4H !== "NONE" || bos1H !== "NONE" || bos15M !== "NONE") {
+      const extractedBOS = {
+        h4: textFull.match(/4H.*?BOS\s+(UP|DOWN)/i)?.[1]?.toUpperCase() || "NONE",
+        h1: textFull.match(/1H.*?BOS\s+(UP|DOWN)/i)?.[1]?.toUpperCase() || "NONE",
+        m15: textFull.match(/15M.*?BOS\s+(UP|DOWN)/i)?.[1]?.toUpperCase() || "NONE"
+      };
+      
+      const mismatches: string[] = [];
+      if (bos4H !== "NONE" && extractedBOS.h4 !== bos4H && extractedBOS.h4 !== "NONE") {
+        mismatches.push(`4H: AI said ${extractedBOS.h4}, indicator shows ${bos4H}`);
+      }
+      if (bos1H !== "NONE" && extractedBOS.h1 !== bos1H && extractedBOS.h1 !== "NONE") {
+        mismatches.push(`1H: AI said ${extractedBOS.h1}, indicator shows ${bos1H}`);
+      }
+      if (bos15M !== "NONE" && extractedBOS.m15 !== bos15M && extractedBOS.m15 !== "NONE") {
+        mismatches.push(`15M: AI said ${extractedBOS.m15}, indicator shows ${bos15M}`);
+      }
+      
+      if (mismatches.length > 0) {
+        console.warn(`[VISION-PLAN] BOS mismatch: ${mismatches.join("; ")}`);
+        textFull = `⚠️ **STRUCTURE BREAK DISCREPANCY DETECTED**\n${mismatches.join("\n")}\n\n**TradingView indicator data is more reliable - use indicator values for trade decisions.**\n\n` + textFull;
+      }
+    }
     if (livePrice) {
       const entryValidation = validateEntryPrices(textFull, aiMetaFull, livePrice, scalpingMode);
       if (!entryValidation.valid) {
@@ -2157,7 +2260,42 @@ reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is
       csmSign: computeCSMInstrumentSign(csm, instrument).sign,
       calendarSign: parseInstrumentBiasFromNote(biasNote)
     });
-  // Add execution safety checklist
+  textFull = applyConsistencyGuards(textFull, {
+      instrument,
+      headlinesSign: computeHeadlinesSign(hBias),
+      csmSign: computeCSMInstrumentSign(csm, instrument).sign,
+      calendarSign: parseInstrumentBiasFromNote(biasNote)
+    });
+
+    // Add mandatory manual verification warning
+    const verificationWarning = `
+⚠️⚠️⚠️ **CRITICAL: MANUAL VERIFICATION REQUIRED** ⚠️⚠️⚠️
+
+**This analysis is AI-GENERATED and may contain errors. You MUST verify:**
+
+1. **Chart Reading**: Compare AI's swing analysis against what YOU see
+   - Does the trend match? (Higher highs/lows vs Lower highs/lows)
+   - Are BOS locations correct? Check actual candle closes
+   - Is price location accurate? (Highs/Middle/Lows)
+
+2. **Entry Logic**: Verify orders make sense
+   - Long Limit BELOW current price
+   - Short Limit ABOVE current price
+   - Entry at clear structure (not random)
+
+3. **Risk Management**: Calculate independently
+   - Max 1-2% risk per trade
+   - Stop loss behind structure
+   - R:R minimum 1.5:1
+
+**DO NOT TRADE if ANY discrepancies exist.**
+
+---
+
+`;
+    textFull = verificationWarning + textFull;
+
+    // Add execution safety checklist
       if (livePrice) {
         const checklist = `
 
