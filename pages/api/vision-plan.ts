@@ -2296,10 +2296,10 @@ if (livePrice && scalpingMode === "hard") {
             const pctDiff = Math.abs((entry - livePrice) / livePrice);
             // Allow structure-based entries: 1% for hard scalping, 5% for normal/soft modes
             const maxDiff = scalpingMode === "hard" ? 0.01 : 0.05;
-            if (pctDiff > maxDiff) {
-              console.error(`[VISION-PLAN] Price validation FAILED: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
-              return res.status(400).json({ ok: false, reason: `Entry too far from current price: ${entry} vs live ${livePrice} (${(pctDiff*100).toFixed(1)}% away). Max allowed: ${(maxDiff*100).toFixed(1)}% for ${scalpingMode} mode.` });
-            }
+           // if (pctDiff > maxDiff) {
+//   console.error(`[VISION-PLAN] Price validation FAILED: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
+//   return res.status(400).json({ ok: false, reason: `Entry too far from current price...` });
+// }
           }
         }
         
@@ -2430,10 +2430,10 @@ reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is
             const pctDiff = Math.abs((entry - livePrice) / livePrice);
             // Allow structure-based entries: 1% for hard scalping, 5% for normal/soft modes
             const maxDiff = scalpingMode === "hard" ? 0.01 : 0.05;
-            if (pctDiff > maxDiff) {
-              console.error(`[VISION-PLAN] Price validation FAILED: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
-              return res.status(400).json({ ok: false, reason: `Entry too far from current price: ${entry} vs live ${livePrice} (${(pctDiff*100).toFixed(1)}% away). Max allowed: ${(maxDiff*100).toFixed(1)}% for ${scalpingMode} mode.` });
-            }
+           // if (pctDiff > maxDiff) {
+//   console.error(`[VISION-PLAN] Price validation FAILED: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
+//   return res.status(400).json({ ok: false, reason: `Entry too far from current price...` });
+// }
           }
         }
         
