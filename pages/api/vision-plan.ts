@@ -2305,13 +2305,15 @@ if (livePrice && scalpingMode === "hard") {
           if (isFinite(entry) && entry > 0) {
             const pctDiff = Math.abs((entry - livePrice) / livePrice);
             // Allow structure-based entries: 1% for hard scalping, 5% for normal/soft modes
-            const maxDiff = scalpingMode === "hard" ? 0.01 : 0.05;
-           // if (pctDiff > maxDiff) {
-//   console.error(`[VISION-PLAN] Price validation FAILED: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
-//   return res.status(400).json({ ok: false, reason: `Entry too far from current price...` });
-// }
-          }
-        }
+          // More reasonable price validation for structure-based trading
+const maxDiff = scalpingMode === "hard" ? 0.08 : 0.20; // 8% hard scalping, 20% normal
+if (pctDiff > maxDiff) {
+  console.warn(`[VISION-PLAN] Entry distant from current price: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
+  // Don't reject, just warn - but reject if extremely far
+  if (pctDiff > 0.50) { // Only reject if >50% away (clearly wrong)
+    return res.status(400).json({ ok: false, reason: `Entry too far from current price: ${entry} vs live ${livePrice} (${(pctDiff*100).toFixed(1)}% away). Charts may be stale.` });
+  }
+}
         
         const dirMatch = text.match(/Direction:\s*(Long|Short)/i);
         const orderMatch = text.match(/Order Type:\s*(Limit|Stop|Market)/i);
@@ -2439,13 +2441,15 @@ reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is
           if (isFinite(entry) && entry > 0) {
             const pctDiff = Math.abs((entry - livePrice) / livePrice);
             // Allow structure-based entries: 1% for hard scalping, 5% for normal/soft modes
-            const maxDiff = scalpingMode === "hard" ? 0.01 : 0.05;
-           // if (pctDiff > maxDiff) {
-//   console.error(`[VISION-PLAN] Price validation FAILED: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
-//   return res.status(400).json({ ok: false, reason: `Entry too far from current price...` });
-// }
-          }
-        }
+          // More reasonable price validation for structure-based trading
+const maxDiff = scalpingMode === "hard" ? 0.08 : 0.20; // 8% hard scalping, 20% normal
+if (pctDiff > maxDiff) {
+  console.warn(`[VISION-PLAN] Entry distant from current price: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
+  // Don't reject, just warn - but reject if extremely far
+  if (pctDiff > 0.50) { // Only reject if >50% away (clearly wrong)
+    return res.status(400).json({ ok: false, reason: `Entry too far from current price: ${entry} vs live ${livePrice} (${(pctDiff*100).toFixed(1)}% away). Charts may be stale.` });
+  }
+}
         
         const dirMatch = textFull.match(/Direction:\s*(Long|Short)/i);
         const orderMatch = textFull.match(/Order Type:\s*(Limit|Stop|Market)/i);
