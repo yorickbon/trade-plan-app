@@ -850,14 +850,16 @@ function systemCore(
     "- If current price is BETWEEN structures → Suggest LIMIT ORDER at next structure level (may be 20-50+ pips away).",
     "- For breakouts → Use STOP ORDER 5-10 pips beyond structure break for confirmation.",
     "- PATIENCE over chasing: 'Wait for pullback to 1.7820 OB' is BETTER than 'Enter now mid-move at 1.7855'.",
-    "- Entry zones (min-max) for confluence areas; single price for precise trigger levels.",
+   "- LIMIT orders: Always provide entry RANGE (e.g., '0.5840-0.5850 zone') for structure-based entries",
+"- MARKET orders: Use current price as single entry point",
+"- Entry zones reflect structure width, not arbitrary ranges",
     "",
     "STOP LOSS PLACEMENT - PROFESSIONAL STRUCTURE-BASED:",
     "- MANDATORY: SL must be placed behind VISIBLE structure levels on the charts",
     "- IDENTIFY the actual support/resistance/swing level on the chart first",
     "- For LONG trades: SL goes below the nearest swing low/support + buffer",
     "- For SHORT trades: SL goes above the nearest swing high/resistance + buffer",
-    "- Buffer calculation: 15M structure = 5 pips, 1H structure = 8 pips, 4H structure = 12 pips",
+    "- Buffer calculation: 3-8 pips behind the actual structure level (varies by volatility)"
     "- ALWAYS state the reasoning: 'SL at 0.5815 (5 pips below 15M swing low at 0.5820)'",
     "- If no clear structure visible: 'Setup invalid - no proper SL level identified'",
     "- Validate SL distance: Min 15 pips normal mode / 8 pips scalping, Max 80 pips normal / 25 pips scalping",
@@ -1596,13 +1598,18 @@ function applyConsistencyGuards(text: string, args: { instrument: string; headli
   const signs = [args.headlinesSign, args.csmSign, args.calendarSign].filter((s) => s !== 0);
   const hasPos = signs.some((s) => s > 0);
   const hasNeg = signs.some((s) => s < 0);
+  
+  // Only consider it a mismatch if there are actual opposing signals
+  // Neutral (no signal) should not create mismatch
   const aligned = signs.length > 0 && ((hasPos && !hasNeg) || (hasNeg && !hasPos));
-  const mismatch = hasPos && hasNeg;
+  const mismatch = hasPos && hasNeg && signs.length >= 2; // Need opposing forces
 
   if (aligned) out = out.replace(/contradict(?:ion|ing|s)?/gi, "aligning");
   const reTF = /(Tech\s*vs\s*Fundy\s*Alignment:\s*)(Match|Mismatch)/i;
   if (reTF.test(out)) {
-    out = out.replace(reTF, (_, p1) => `${p1}${aligned ? "Match" : mismatch ? "Mismatch" : "Match"}`);
+    // If no fundamental signals exist, default to Match (no conflict)
+    const alignment = signs.length === 0 ? "Match" : (aligned ? "Match" : (mismatch ? "Mismatch" : "Match"));
+    out = out.replace(reTF, (_, p1) => `${p1}${alignment}`);
   }
   return out;
 }
