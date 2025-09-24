@@ -1656,7 +1656,7 @@ let preReleaseOnly = false;
 
 let calDataUrlForPrompt: string | null = calUrlOrig;
 
-// Professional calendar analysis - reads ALL G8 currencies, applies cross-pair risk correlations
+// Professional calendar analysis - institutional-grade cross-currency scoring
 function analyzeCalendarProfessional(ocrItems: OcrCalendarRow[], instrument: string): {
   bias: string;
   reasoning: string[];
@@ -1689,122 +1689,150 @@ function analyzeCalendarProfessional(ocrItems: OcrCalendarRow[], instrument: str
   if (validEvents.length === 0) {
     return {
       bias: "neutral",
-      reasoning: [`Calendar: Analyzed ${ocrItems.length} events but found no usable data (actual + forecast/previous) for any G8 currency in last 72h`],
+      reasoning: [`Calendar: No valid data found in last 72h for ${instrument} currencies (${base}/${quote})`],
       evidence: [],
-      details: `OCR extracted ${ocrItems.length} total rows, but none had complete A/F/P data within 72h window`
+      details: `OCR extracted ${ocrItems.length} total rows, filtering for ${base}/${quote} relevance`
     };
   }
 
-  // Score each currency
+  // Initialize currency scores
   const currencyScores: Record<string, number> = {};
   const reasoning: string[] = [];
   const evidence: string[] = [];
 
-  for (const ev of validEvents) {
-    const cur = String(ev.currency).toUpperCase();
-    const title = String(ev.title || "Event");
-    const impact = ev.impact || "Medium";
+  // Process each event with institutional scoring
+  for (const event of validEvents) {
+    const currency = String(event.currency).toUpperCase();
+    const title = String(event.title || "Event");
+    const impact = event.impact || "Medium";
     
-    const a = parseNumberLoose(ev.actual)!;
-    const f = parseNumberLoose(ev.forecast);
-    const p = parseNumberLoose(ev.previous);
+    const actual = parseNumberLoose(event.actual)!;
+    const forecast = parseNumberLoose(event.forecast);
+    const previous = parseNumberLoose(event.previous);
     
-    const higherIsBetter = goodIfHigher(title);
+    // Determine if higher reading is currency positive
+    const direction = goodIfHigher(title);
+    if (direction === null) continue; // Skip unknown events
     
-    // Compare actual vs forecast (primary)
-    let score = 0;
-    if (f != null) {
-      const surprise = a - f;
-      const surprisePct = f !== 0 ? (surprise / Math.abs(f)) * 100 : 0;
+    let eventScore = 0;
+    let comparison = "";
+    
+    // Primary scoring: Actual vs Forecast (market surprise)
+    if (forecast !== null) {
+      const surprise = actual - forecast;
+      const surprisePercent = Math.abs(forecast) > 0 ? (surprise / Math.abs(forecast)) : 0;
       
-      if (higherIsBetter === true) {
-        score += surprise > 0 ? Math.min(surprisePct, 10) : Math.max(surprisePct, -10);
-      } else if (higherIsBetter === false) {
-        score += surprise < 0 ? Math.min(Math.abs(surprisePct), 10) : -Math.min(Math.abs(surprisePct), 10);
-      }
-    }
-    
-    // Compare actual vs previous (secondary)
-    if (p != null) {
-      const change = a - p;
-      const changePct = p !== 0 ? (change / Math.abs(p)) * 100 : 0;
+      // Weight surprise by significance (larger surprises = bigger impact)
+      const surpriseWeight = Math.min(Math.abs(surprisePercent), 0.5); // Cap at 50% surprise
+      const surpriseDirection = direction === true ? Math.sign(surprise) : -Math.sign(surprise);
       
-      if (higherIsBetter === true) {
-        score += (change > 0 ? 0.5 : -0.5) * Math.min(Math.abs(changePct), 5);
-      } else if (higherIsBetter === false) {
-        score += (change < 0 ? 0.5 : -0.5) * Math.min(Math.abs(changePct), 5);
-      }
+      eventScore += surpriseDirection * surpriseWeight * 10; // Scale to ±5 max
+      comparison += `vs F:${forecast}`;
     }
     
-    // Impact multiplier
-    const impactMult = impact === "High" ? 1.5 : impact === "Medium" ? 1.0 : 0.5;
-    score *= impactMult;
-    
-  currencyScores[cur] = (currencyScores[cur] || 0) + score;
-    
-    const dir = score > 0 ? "bullish" : score < 0 ? "bearish" : "neutral";
-    reasoning.push(`${cur} ${title}: ${a} vs F:${f ?? "?"}/P:${p ?? "?"} = ${dir} (${score.toFixed(1)} pts, ${impact})`);
-    evidence.push(`${cur} ${title}: ${a}/${f ?? "?"}/${p ?? "?"}`);
-  }
-
-  // Professional cross-currency correlations
-  // CAD/AUD/NZD weakness → USD strength (commodity correlation)
-  if (quote === "USD") {
-    const commodCurrencies = ["CAD", "AUD", "NZD"];
-    for (const c of commodCurrencies) {
-      if (currencyScores[c] && currencyScores[c] < 0) {
-        const transferScore = currencyScores[c] * -0.3; // 30% inverse correlation
-        currencyScores["USD"] = (currencyScores["USD"] || 0) + transferScore;
-        reasoning.push(`${c} weakness (${currencyScores[c].toFixed(1)}) → USD strength via commodity correlation (+${transferScore.toFixed(1)})`);
-      }
+    // Secondary scoring: Actual vs Previous (trend continuation/reversal)
+    if (previous !== null) {
+      const change = actual - previous;
+      const changePercent = Math.abs(previous) > 0 ? (change / Math.abs(previous)) : 0;
+      
+      const changeWeight = Math.min(Math.abs(changePercent), 0.3) * 0.5; // 50% weight of forecast surprise
+      const changeDirection = direction === true ? Math.sign(change) : -Math.sign(change);
+      
+      eventScore += changeDirection * changeWeight * 10;
+      comparison += ` vs P:${previous}`;
     }
+    
+    // Apply impact multiplier
+    const impactMultiplier = impact === "High" ? 2.0 : impact === "Medium" ? 1.0 : 0.5;
+    const finalScore = eventScore * impactMultiplier;
+    
+    // Accumulate currency score
+    currencyScores[currency] = (currencyScores[currency] || 0) + finalScore;
+    
+    // Generate reasoning
+    const sentiment = finalScore > 0.5 ? "bullish" : finalScore < -0.5 ? "bearish" : "neutral";
+    reasoning.push(`${currency} ${title}: ${actual} ${comparison} = ${sentiment} ${currency} (${finalScore.toFixed(1)} pts)`);
+    evidence.push(`${currency} — ${title}: A:${actual} F:${forecast ?? "n/a"} P:${previous ?? "n/a"}`);
   }
   
-  // EUR/GBP correlation (European bloc)
-  if (base === "EUR" && currencyScores["GBP"]) {
-    const transferScore = currencyScores["GBP"] * 0.25; // 25% positive correlation
-    currencyScores["EUR"] = (currencyScores["EUR"] || 0) + transferScore;
-    reasoning.push(`GBP ${currencyScores["GBP"] > 0 ? "strength" : "weakness"} (${currencyScores["GBP"].toFixed(1)}) → EUR correlation (+${transferScore.toFixed(1)})`);
-  }
+  // Apply institutional cross-currency correlations
+  applyInstitutionalCorrelations(currencyScores, reasoning, base, quote);
   
-  // JPY as safe-haven (inverse risk correlation)
-  if ((base === "JPY" || quote === "JPY") && currencyScores["JPY"]) {
-    const riskCurrencies = ["AUD", "NZD", "CAD"];
-    const riskScore = riskCurrencies.reduce((sum, c) => sum + (currencyScores[c] || 0), 0);
-    if (Math.abs(riskScore) > 3) {
-      // Strong risk-on/off → inverse for JPY
-      const jpyAdjust = riskScore * -0.2;
-      currencyScores["JPY"] = (currencyScores["JPY"] || 0) + jpyAdjust;
-      reasoning.push(`Risk ${riskScore > 0 ? "on" : "off"} → JPY ${jpyAdjust > 0 ? "strength" : "weakness"} (${jpyAdjust.toFixed(1)})`);
-    }
-  }
-
-  // Calculate instrument bias (base - quote) AFTER correlations
+  // Calculate final instrument bias
   const baseScore = currencyScores[base] || 0;
   const quoteScore = currencyScores[quote] || 0;
   const netScore = baseScore - quoteScore;
   
-  // Risk correlations: if major currencies show unified direction, apply correlation
-  const allCurrencies = Object.keys(currencyScores);
-  const avgScore = allCurrencies.reduce((sum, c) => sum + currencyScores[c], 0) / allCurrencies.length;
+  // Professional bias determination (stricter thresholds)
+  let finalBias: string;
+  if (netScore > 1.5) finalBias = "bullish";
+  else if (netScore < -1.5) finalBias = "bearish";
+  else finalBias = "neutral";
   
-  // If overall risk-on/off bias exists, apply to USD
-  if (Math.abs(avgScore) > 2 && quote === "USD") {
-    // Risk-on = bad for USD, risk-off = good for USD
-    const riskBias = avgScore > 0 ? -2 : 2; // Inverse for USD
-    currencyScores["USD"] = (currencyScores["USD"] || 0) + riskBias;
-    reasoning.push(`Risk sentiment adjustment: Overall ${avgScore > 0 ? "risk-on" : "risk-off"} → ${avgScore > 0 ? "bearish" : "bullish"} USD`);
-  }
-
-  const finalBias = netScore > 2 ? "bullish" : netScore < -2 ? "bearish" : "neutral";
-  const summary = `Calendar: ${base} ${baseScore.toFixed(1)} vs ${quote} ${quoteScore.toFixed(1)} = ${finalBias} ${instrument} (net ${netScore.toFixed(1)})`;
-
+  const summary = `Calendar: ${base} ${baseScore.toFixed(1)} vs ${quote} ${quoteScore.toFixed(1)} = ${finalBias} ${instrument} (net ${netScore > 0 ? "+" : ""}${netScore.toFixed(1)})`;
+  
   return {
     bias: finalBias,
     reasoning: [summary, ...reasoning],
     evidence,
-    details: `Analyzed ${validEvents.length} events across ${allCurrencies.length} currencies. ${base}:${baseScore.toFixed(1)}, ${quote}:${quoteScore.toFixed(1)}.`
+    details: `Professional analysis: ${validEvents.length} events, ${Object.keys(currencyScores).length} currencies impacted`
   };
+}
+
+// Apply institutional cross-currency correlation adjustments
+function applyInstitutionalCorrelations(
+  scores: Record<string, number>, 
+  reasoning: string[], 
+  base: string, 
+  quote: string
+) {
+  // USD Safe Haven: Risk-off strengthens USD, risk-on weakens USD
+  if (quote === "USD") {
+    const riskCurrencies = ["AUD", "NZD", "CAD"];
+    const riskOnScore = riskCurrencies.reduce((sum, curr) => sum + (scores[curr] || 0), 0);
+    
+    if (Math.abs(riskOnScore) > 2) {
+      const usdAdjustment = riskOnScore * -0.4; // 40% inverse correlation
+      scores["USD"] = (scores["USD"] || 0) + usdAdjustment;
+      const sentiment = riskOnScore > 0 ? "risk-on" : "risk-off";
+      reasoning.push(`${sentiment.toUpperCase()} environment → ${usdAdjustment > 0 ? "bullish" : "bearish"} USD (${usdAdjustment.toFixed(1)} pts)`);
+    }
+  }
+  
+  // Commodity Currency Correlation (CAD/AUD/NZD)
+  const commodCurrencies = ["CAD", "AUD", "NZD"];
+  if (commodCurrencies.includes(base) || commodCurrencies.includes(quote)) {
+    for (const curr1 of commodCurrencies) {
+      for (const curr2 of commodCurrencies) {
+        if (curr1 !== curr2 && scores[curr1] && Math.abs(scores[curr1]) > 2) {
+          const correlation = 0.3; // 30% positive correlation
+          const adjustment = scores[curr1] * correlation;
+          scores[curr2] = (scores[curr2] || 0) + adjustment;
+          reasoning.push(`${curr1} ${scores[curr1] > 0 ? "strength" : "weakness"} → ${curr2} correlation (+${adjustment.toFixed(1)} pts)`);
+        }
+      }
+    }
+  }
+  
+  // EUR/GBP European Bloc Correlation
+  if ((base === "EUR" || quote === "EUR") && scores["GBP"]) {
+    const correlation = 0.25; // 25% positive correlation
+    const adjustment = scores["GBP"] * correlation;
+    scores["EUR"] = (scores["EUR"] || 0) + adjustment;
+    reasoning.push(`GBP-EUR correlation: ${adjustment > 0 ? "+" : ""}${adjustment.toFixed(1)} pts to EUR`);
+  }
+  
+  // JPY Safe Haven (inverse to risk currencies)
+  if (base === "JPY" || quote === "JPY") {
+    const riskCurrencies = ["AUD", "NZD", "CAD"];
+    const totalRisk = riskCurrencies.reduce((sum, curr) => sum + (scores[curr] || 0), 0);
+    
+    if (Math.abs(totalRisk) > 1.5) {
+      const jpyAdjustment = totalRisk * -0.35; // 35% inverse correlation
+      scores["JPY"] = (scores["JPY"] || 0) + jpyAdjustment;
+      reasoning.push(`Risk sentiment → JPY safe-haven flow (${jpyAdjustment > 0 ? "+" : ""}${jpyAdjustment.toFixed(1)} pts)`);
+    }
+  }
 }
 
 // Calendar OCR + Processing
