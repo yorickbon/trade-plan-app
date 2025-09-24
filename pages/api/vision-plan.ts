@@ -1481,10 +1481,20 @@ function messagesFastStage1(args: {
   provenance?: any;
  scalpingMode?: "soft" | "hard" | "off";
 }) {
- const system = [
+const system = [
     systemCore(args.instrument, args.calendarAdvisory, args.scalpingMode), "",
-    "OUTPUT ONLY:",
-"Option 1 (Primary)",
+    "FAST MODE - ESSENTIAL ANALYSIS ONLY:",
+    "",
+    "Multi-Timeframe Summary (Required):",
+    "• 4H: [UPTREND/DOWNTREND/RANGE] - Price at [highs/middle/lows]",
+    "• 1H: [UPTREND/DOWNTREND/RANGE] - [Confirms/Conflicts] 4H bias", 
+    "• 15M: [UPTREND/DOWNTREND/RANGE] - Entry timeframe",
+    "",
+    "Fundamentals Summary (Required):",
+    "• Calendar Bias: [Bullish/Bearish/Neutral] - key events if any",
+    "• Tech vs Fundy: [Match/Mismatch] - brief explanation",
+    "",
+    "Option 1 (Primary)",
     "• Direction: ...",
     "• Order Type: ...",
     "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
