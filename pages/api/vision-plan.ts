@@ -2327,12 +2327,14 @@ if (pctDiff > maxDiff) {
             return res.status(400).json({ ok: false, reason: `Order type error: Long Limit orders must be BELOW current price (${livePrice}), not above at ${avgEntry}. Model may have misread chart direction.` });
           }
           
-          if (direction === "short" && orderType === "limit" && avgEntry < livePrice) {
+         if (direction === "short" && orderType === "limit" && avgEntry < livePrice) {
             console.error(`[VISION-PLAN] Order logic FAILED: Short Limit at ${avgEntry} but price is ${livePrice}`);
             return res.status(400).json({ ok: false, reason: `Order type error: Short Limit orders must be ABOVE current price (${livePrice}), not below at ${avgEntry}. Model may have misread chart direction.` });
           }
         }
       }
+    } 
+  } 
 
       // Stamp 5M/1M execution if used
       const usedM5 = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
@@ -2451,6 +2453,7 @@ if (pctDiff > maxDiff) {
   }
 }
         
+       // Validate order type logic
         const dirMatch = textFull.match(/Direction:\s*(Long|Short)/i);
         const orderMatch = textFull.match(/Order Type:\s*(Limit|Stop|Market)/i);
         if (dirMatch && orderMatch && entries.length > 0) {
@@ -2469,19 +2472,21 @@ if (pctDiff > maxDiff) {
           }
         }
       }
+    }
+  }
 
-    // Stamp 5M/1M execution if used
-    const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
-    textFull = stampM5Used(textFull, usedM5Full);
-    const usedM1Full = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(textFull);
-    textFull = stampM1Used(textFull, usedM1Full);
+  // Stamp 5M/1M execution if used
+  const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
+  textFull = stampM5Used(textFull, usedM5Full);
+  const usedM1Full = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(textFull);
+  textFull = stampM1Used(textFull, usedM1Full);
 
-    textFull = applyConsistencyGuards(textFull, {
-      instrument,
-      headlinesSign: computeHeadlinesSign(hBias),
-      csmSign: computeCSMInstrumentSign(csm, instrument).sign,
-      calendarSign: parseInstrumentBiasFromNote(biasNote)
-    });
+  textFull = applyConsistencyGuards(textFull, {
+    instrument,
+    headlinesSign: computeHeadlinesSign(hBias),
+    csmSign: computeCSMInstrumentSign(csm, instrument).sign,
+    calendarSign: parseInstrumentBiasFromNote(biasNote)
+  });
 
     const footer = buildServerProvenanceFooter({
       headlines_provider: headlinesProvider || "unknown",
