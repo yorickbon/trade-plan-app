@@ -860,7 +860,7 @@ function systemCore(
     "- For LONG trades: SL goes below the nearest swing low/support + buffer",
     "- For SHORT trades: SL goes above the nearest swing high/resistance + buffer",
     "- Buffer calculation: 3-8 pips behind the actual structure level (varies by volatility)"
-    "- ALWAYS state the reasoning: 'SL at 0.5815 (5 pips below 15M swing low at 0.5820)'",
+    "- ALWAYS state the reasoning: \"SL at 0.5815 (5 pips below 15M swing low at 0.5820)\"",
     "- If no clear structure visible: 'Setup invalid - no proper SL level identified'",
     "- Validate SL distance: Min 15 pips normal mode / 8 pips scalping, Max 80 pips normal / 25 pips scalping",
     "",
