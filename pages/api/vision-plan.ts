@@ -11,7 +11,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import fs from "node:fs/promises";
 import sharp from "sharp";
-import { getBOSStatus } from './bos-webhook';
+import { getBOSStatus, recordBOS, initializeBOSCache } from './bos-webhook';
 
 // ---------- config ----------
 export const config = { api: { bodyParser: false, sizeLimit: "25mb" } };
