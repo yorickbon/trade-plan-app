@@ -1921,11 +1921,68 @@ if (livePrice && scalpingMode === "hard") {
         (messages[0] as any).content = (messages[0] as any).content + `\n\n**CRITICAL PRICE CHECK**: Current ${instrument} price is EXACTLY ${livePrice}. You MUST report this exact price in ai_meta.currentPrice. All entry suggestions must be within 15 points (0.4%) of this level for immediate execution.`;
       }
 
-   let text = await callOpenAI(MODEL, messages);
+let text = await callOpenAI(MODEL, messages);
       let aiMeta = extractAiMeta(text) || {};
 
-      // CRITICAL: Validate model acknowledged current price correctly
+      // ========== VALIDATION CHECKPOINT ==========
+      
+      // 1. Price consistency check
       if (livePrice) {
+        const priceCheck = validatePriceConsistency(livePrice, Number(aiMeta?.currentPrice));
+        if (!priceCheck.valid && priceCheck.error) {
+          console.error(`[VISION-PLAN] ${priceCheck.error}`);
+          return res.status(400).json({ ok: false, reason: priceCheck.error });
+        }
+        if (priceCheck.warning) {
+          console.warn(`[VISION-PLAN] ${priceCheck.warning}`);
+        }
+      }
+      
+      // 2. Chart analysis verification
+      const hasDetailedAnalysis = /Swings?:\s*SH\d+=/i.test(text);
+      if (!hasDetailedAnalysis) {
+        console.warn("[VISION-PLAN] AI did not provide detailed swing analysis - response may be vague");
+        // Don't fail here, just log warning
+      }
+      
+      // 3. Entry price validation
+      if (livePrice) {
+        const entryValidation = validateEntryPrices(text, aiMeta, livePrice, scalpingMode);
+        if (!entryValidation.valid) {
+          console.error(`[VISION-PLAN] Entry validation failed: ${entryValidation.errors.join('; ')}`);
+          return res.status(400).json({ 
+            ok: false, 
+            reason: `Entry prices are invalid:\n${entryValidation.errors.join('\n')}` 
+          });
+        }
+      }
+      
+      // 4. Add risk metrics
+      const entryMatch = text.match(/Entry[^:]*:\s*(\d+\.\d+)/i);
+      const slMatch = text.match(/Stop Loss[^:]*:\s*(\d+\.\d+)/i);
+      const tp1Match = text.match(/TP1[^:]*:\s*(\d+\.\d+)/i);
+      
+      if (entryMatch && slMatch && tp1Match) {
+        const riskMetrics = calculateRiskMetrics(
+          instrument,
+          Number(entryMatch[1]),
+          Number(slMatch[1]),
+          Number(tp1Match[1])
+        );
+        
+        // Insert before Management section
+        text = text.replace(
+          /(Trade Management|Management:)/i,
+          riskMetrics + '\n$1'
+        );
+      }
+      
+      // ========== END VALIDATION ==========
+      
+      // Continue with existing code...
+      if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) {
+        aiMeta.currentPrice = livePrice;
+      }
         const modelPrice = Number(aiMeta?.currentPrice);
         
         // If model didn't report price, inject it but warn
