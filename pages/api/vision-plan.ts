@@ -1104,29 +1104,42 @@ function buildUserPartsBase(args: {
     ? `\n\nRECENT STRUCTURE BREAKS (from TradingView indicator):\n- 4H: ${bos4H === "NONE" ? "No recent BOS" : "BOS " + bos4H}\n- 1H: ${bos1H === "NONE" ? "No recent BOS" : "BOS " + bos1H}\n- 15M: ${bos15M === "NONE" ? "No recent BOS" : "BOS " + bos15M}\n- 5M: ${bos5M === "NONE" ? "No recent BOS" : "BOS " + bos5M}\n`
     : "\n\nRECENT STRUCTURE BREAKS: No BOS data from TradingView (check if alerts are active)\n";
 
-  const parts: any[] = [
+ const parts: any[] = [
     { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}${bosContext}
 
-MANDATORY CHART ANALYSIS PROTOCOL:
-For EACH chart, you must answer ALL these questions:
+MULTI-TIMEFRAME ANALYSIS PROTOCOL - INSTITUTIONAL HIERARCHY:
 
-1. Overall trend (look at full visible range, left to right):
-   - Higher highs + higher lows? = UPTREND
-   - Lower highs + lower lows? = DOWNTREND
-   
-2. Last 5-10 candles ONLY - Break of Structure check:
-   - Did the most recent candles break ABOVE the previous swing high? If YES → "Recent BOS UP"
-   - Did the most recent candles break BELOW the previous swing low? If YES → "Recent BOS DOWN"
-   - If neither → "No recent BOS"
-   
-3. Current price location: Top 25% / Middle / Bottom 25% of visible range
+STEP 1: 4H BIAS DETERMINATION (Market Direction)
+- Identify overall trend: UPTREND/DOWNTREND/RANGE
+- Key structure levels: Major S/R, round numbers, session extremes
+- Current price position: At highs/middle/lows
+- BOS status and market structure state
+- BIAS OUTPUT: "4H BIAS: [BULLISH/BEARISH/NEUTRAL] - Price [location] in [trend] structure"
 
-You MUST state the BOS status explicitly for every timeframe.` },
-    { type: "text", text: "HTF 4H Chart - Answer all 3 questions above:" },
+STEP 2: 1H CONTEXT VALIDATION (Setup Construction) 
+- Confirm/refine 4H bias OR identify counter-trend opportunity
+- Identify pullback/continuation patterns
+- Key 1H structure levels for entries/exits
+- Momentum and volume characteristics
+- CONTEXT OUTPUT: "1H CONTEXT: [CONFIRMS/CONFLICTS] 4H bias - Setup type: [CONTINUATION/REVERSAL/RANGE]"
+
+STEP 3: 15M EXECUTION TIMING (Entry Mechanics)
+- Precise entry levels based on 1H setup
+- Entry trigger conditions and confirmation
+- Exact SL placement behind 15M structure
+- TP levels at next opposing structure
+- EXECUTION OUTPUT: "15M EXECUTION: Entry [price/zone], SL [price], TP1 [price], TP2 [price]"
+
+CRITICAL HIERARCHY RULES:
+- 4H bias OVERRIDES lower timeframes (don't fade strong 4H trends)
+- 1H provides setup context within 4H bias
+- 15M provides execution timing ONLY (never changes the setup thesis)
+- If timeframes conflict, explain which takes priority and why` },
+    { type: "text", text: "4H BIAS CHART - Determine overall market direction and key levels:" },
     { type: "image_url", image_url: { url: args.h4 } },
-    { type: "text", text: "Context 1H Chart - Answer all 3 questions above:" },
+    { type: "text", text: "1H CONTEXT CHART - Setup construction within 4H bias:" },
     { type: "image_url", image_url: { url: args.h1 } },
-    { type: "text", text: "Execution 15M Chart - Answer all 3 questions above:" },
+    { type: "text", text: "15M EXECUTION CHART - Entry timing and precise levels:" },
     { type: "image_url", image_url: { url: args.m15 } },
   ];
   if (args.m5) { parts.push({ type: "text", text: "Scalp 5M Chart" }); parts.push({ type: "image_url", image_url: { url: args.m5 } }); }
