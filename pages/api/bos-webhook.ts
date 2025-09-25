@@ -72,24 +72,23 @@ export function initializeBOSCache() {
   console.log('[BOS] Cache initialized - tracking structure breaks until superseded');
 }
 
-// Webhook endpoint to receive BOS alerts from TradingView
+// Webhook endpoint to receive BOS alerts from TradingView (Debug Mode)
 export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
   
+  // Log everything TradingView sends
+  console.log('[BOS Debug] Full request body:', JSON.stringify(req.body, null, 2));
+  console.log('[BOS Debug] Content-Type:', req.headers['content-type']);
+  console.log('[BOS Debug] Raw body type:', typeof req.body);
+  
   try {
-    const { instrument, timeframe, direction, price } = req.body;
-    
-    if (!instrument || !timeframe || !direction) {
-      return res.status(400).json({ error: 'Missing required fields: instrument, timeframe, direction' });
-    }
-    
-    recordBOS(instrument, timeframe, direction.toUpperCase(), price);
-    
+    // Accept anything for now and return success
     return res.status(200).json({ 
       success: true, 
-      message: `BOS ${direction} recorded for ${instrument} ${timeframe}`,
+      message: 'Debug mode - data logged successfully',
+      received: req.body,
       timestamp: new Date().toISOString()
     });
     
