@@ -2313,7 +2313,7 @@ async function enhanceWithMissingSections(model: string, instrument: string, tex
   const missing: string[] = [];
   
   // Check for strategy tournament
- const hasAllStrategies = [
+  const hasAllStrategies = [
     /Structure Break.*Retest.*:/i,
     /Trend.*Continuation.*:/i,
     /Reversal.*Extremes.*:/i,
@@ -2327,7 +2327,10 @@ async function enhanceWithMissingSections(model: string, instrument: string, tex
   if (!/Tech vs Fundy Alignment:/i.test(text)) missing.push("Tech vs Fundy Alignment");
   
   // If nothing missing, return original
-  if (missing.length === 0) return text;
+  if (missing.length === 0) {
+    console.log(`[ENHANCEMENT] No missing sections detected, returning original text`);
+    return text;
+  }
   
   // Generate missing sections
   const enhancementPrompt = `Add the missing institutional sections to this trade analysis for ${instrument}:
@@ -2364,11 +2367,17 @@ Return the complete enhanced analysis with all missing sections added in the app
   ];
   
   try {
+    console.log(`[ENHANCEMENT] Attempting to add missing sections: ${missing.join(", ")}`);
     const enhanced = await callOpenAI(model, messages);
-    console.log(`[ENHANCEMENT] Added missing sections: ${missing.join(", ")}`);
+    if (!enhanced || enhanced.trim().length === 0) {
+      console.error(`[ENHANCEMENT] OpenAI returned empty response for missing sections`);
+      return text;
+    }
+    console.log(`[ENHANCEMENT] Successfully added missing sections: ${missing.join(", ")}`);
     return enhanced;
   } catch (error) {
-    console.error(`[ENHANCEMENT] Failed to add missing sections:`, error);
+    console.error(`[ENHANCEMENT] Failed to add missing sections:`, error?.message || error);
+    console.error(`[ENHANCEMENT] Model: ${model}, Missing: ${missing.join(", ")}`);
     return text; // Return original if enhancement fails
   }
 }
