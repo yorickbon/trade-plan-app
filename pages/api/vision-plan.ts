@@ -1070,13 +1070,25 @@ function systemCore(
     "- SL: Back inside consolidation",
     "- Score factors: Clean consolidation (25pts), Strong breakout (30pts), Volume confirmation (20pts), Target availability (25pts)",
     "",
- "TOURNAMENT SCORING (0-100 each strategy):",
+"TOURNAMENT SCORING (0-100 each strategy):",
 "1. Analyze current setup against each strategy's criteria (Base: 0-100pts)",
 "2. Market regime adjustment: Current volatility/trend strength (±10pts)",
 "3. Fundamental alignment bonus/penalty (±15pts)",
 "4. Risk-reward quality adjustment (±10pts based on R:R ratio)",
 "5. Timeframe confluence bonus (±10pts if all timeframes align)",
 "6. Option 1 = Highest scoring strategy, Option 2 = Second highest (min 15pt gap preferred)",
+"",
+"MANDATORY TOURNAMENT OUTPUT - ALL 5 STRATEGIES REQUIRED:",
+"You MUST evaluate and score ALL 5 strategies (no exceptions):",
+"",
+"Strategy Tournament Results (REQUIRED FORMAT):",
+"1. Structure Break & Retest: [Score]/100 - [Brief reasoning why this score]",
+"2. Trend Continuation: [Score]/100 - [Brief reasoning why this score]", 
+"3. Reversal at Extremes: [Score]/100 - [Brief reasoning why this score]",
+"4. Order Block Reaction: [Score]/100 - [Brief reasoning why this score]",
+"5. Breakout Continuation: [Score]/100 - [Brief reasoning why this score]",
+"",
+"NEVER skip strategy evaluation - institutional analysis requires complete tournament.",
 "",
 "TRADE METADATA (ai_meta required):",
 "• trade_id: [Generate unique UUID for this recommendation]",
@@ -1728,6 +1740,16 @@ scalpingMode?: "soft" | "hard" | "off";
     "• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m/1m if used)",
     "• Fundamental View (Calendar + Sentiment + Headlines) — include explicit Calendar bias for <PAIR> when available; if pre-release, say: 'Pre-release only, no confirmed bias until data is out.'",
     "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
+    "",
+    "MANDATORY TECHNICAL VS FUNDAMENTAL ALIGNMENT:",
+    "",
+    "REQUIRED OUTPUT FORMAT:",
+    "Tech vs Fundy Alignment: [Match/Mismatch/Neutral] - [Technical direction] vs [Fundamental direction]",
+    "• Technical: [Bullish/Bearish/Neutral] - [Brief reasoning]",
+    "• Fundamental: [Bullish/Bearish/Neutral] - [Brief reasoning]", 
+    "• Impact: [Match adds +10 conviction / Mismatch reduces -15 conviction / Neutral no change]",
+    "",
+    "NEVER skip this analysis - it's mandatory for institutional compliance.",
     "• Validation Results: [All checks passed/Failed validations listed]",
     "• Market Regime: [Trending/Ranging/Breakout/News-driven] with implications",
     "• Conditional Scenarios:",
@@ -2145,24 +2167,31 @@ function validateRiskRewardClaims(text: string, livePrice: number): {
 } {
   const errors: string[] = [];
   
-  // Extract R:R claims from text
-  const rrMatches = text.matchAll(/R:R[:\s]*(\d+\.?\d*):1/gi);
-  const rrClaims = Array.from(rrMatches).map(m => Number(m[1]));
-  
-  // Extract Option 1 and Option 2 details
+  // Extract Option 1 and Option 2 details more reliably
   const extractOptionDetails = (optionNum: number) => {
-    const regex = new RegExp(`Option ${optionNum}[\\s\\S]*?(?=Option ${optionNum + 1}|$)`, 'i');
-    const section = text.match(regex)?.[0] || '';
+    // Find the option section
+    const optionRegex = new RegExp(`Option\\s+${optionNum}[\\s\\S]*?(?=Option\\s+${optionNum + 1}|Strategy Tournament Results|Full Breakdown|$)`, 'i');
+    const section = text.match(optionRegex)?.[0] || '';
     
-    const entryMatch = section.match(/Entry[^:]*:\s*(\d+\.\d+)/i);
-    const slMatch = section.match(/Stop Loss[^:]*:\s*(\d+\.\d+)/i);
-    const tp1Match = section.match(/Take Profit[^:]*:\s*TP1[^0-9]*(\d+\.\d+)/i);
+    if (!section) return null;
+    
+    // Extract entry price - try multiple patterns
+    let entryMatch = section.match(/Entry[^:]*:\s*(\d+\.\d+)/i);
+    if (!entryMatch) entryMatch = section.match(/(?:zone|single)[^:]*:\s*(\d+\.\d+)/i);
+    
+    // Extract stop loss
+    const slMatch = section.match(/Stop\s+Loss[^:]*:\s*(\d+\.\d+)/i);
+    
+    // Extract TP1 - try multiple patterns  
+    let tp1Match = section.match(/TP1[^0-9]*(\d+\.\d+)/i);
+    if (!tp1Match) tp1Match = section.match(/Take\s+Profit[^:]*:\s*TP1[^0-9]*(\d+\.\d+)/i);
     
     if (entryMatch && slMatch && tp1Match) {
       return {
         entry: Number(entryMatch[1]),
         sl: Number(slMatch[1]),
-        tp1: Number(tp1Match[1])
+        tp1: Number(tp1Match[1]),
+        section: section
       };
     }
     return null;
@@ -2171,34 +2200,39 @@ function validateRiskRewardClaims(text: string, livePrice: number): {
   // Validate each option's R:R claims
   for (let i = 1; i <= 2; i++) {
     const details = extractOptionDetails(i);
-    if (!details) continue;
+    if (!details) {
+      errors.push(`Option ${i}: Cannot extract entry/SL/TP1 prices for validation`);
+      continue;
+    }
     
     const risk = Math.abs(details.entry - details.sl);
     const reward = Math.abs(details.tp1 - details.entry);
+    
+    if (risk === 0) {
+      errors.push(`Option ${i}: Risk is zero (Entry=${details.entry}, SL=${details.sl})`);
+      continue;
+    }
+    
     const actualRR = reward / risk;
     
-    // Find claimed R:R for this option (approximate by position in text)
-    const optionStart = text.search(new RegExp(`Option ${i}`, 'i'));
-    const nextOptionStart = text.search(new RegExp(`Option ${i + 1}`, 'i'));
-    const optionSection = nextOptionStart > 0 ? 
-      text.substring(optionStart, nextOptionStart) : 
-      text.substring(optionStart);
-    
-    const rrInSection = optionSection.match(/R:R[:\s]*(\d+\.?\d*):1/i);
+    // Check if there's a claimed R:R in this option's section
+    const rrInSection = details.section.match(/R:R[:\s]*(\d+\.?\d*):1/i);
     if (rrInSection) {
       const claimedRR = Number(rrInSection[1]);
       const difference = Math.abs(actualRR - claimedRR);
       
-      if (difference > 0.3) { // Allow small rounding differences
+      // Allow 0.4 tolerance for rounding differences
+      if (difference > 0.4) {
         errors.push(
-          `Option ${i} R:R ERROR: Claims ${claimedRR.toFixed(1)}:1 but actual is ${actualRR.toFixed(2)}:1 ` +
+          `Option ${i} R:R MISMATCH: Claims ${claimedRR.toFixed(1)}:1 but calculated ${actualRR.toFixed(2)}:1 ` +
           `(Entry: ${details.entry}, SL: ${details.sl}, TP1: ${details.tp1})`
         );
       }
-      
-      if (actualRR < 1.5) {
-        errors.push(`Option ${i} R:R too low: ${actualRR.toFixed(2)}:1 (minimum 1.5:1 required)`);
-      }
+    }
+    
+    // Check minimum R:R requirement
+    if (actualRR < 1.5) {
+      errors.push(`Option ${i} R:R too low: ${actualRR.toFixed(2)}:1 (minimum 1.5:1 required)`);
     }
   }
   
