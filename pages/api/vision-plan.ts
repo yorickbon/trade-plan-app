@@ -748,12 +748,32 @@ async function fetchCalendarForAdvisory(req: NextApiRequest, instrument: string)
   warningMinutes: number | null, advisoryText: string | null, biasNote: string | null,
   raw?: any | null, evidence?: string[] | null
 }> {
+  const base = pair.slice(0, 3);
+  const quote = pair.slice(3);
+  
   try {
-    const base = originFromReq(req);
-    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=48&_t=${Date.now()}`
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(4000) });
-    const j: any = await r.json().catch(() => ({}));
-    if (j?.ok) {
+    const baseUrl = originFromReq(req);
+    const url = `${baseUrl}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=72&_t=${Date.now()}`;
+    
+    console.log(`[CALENDAR] Fetching from: ${url}`);
+    const r = await fetch(url, { 
+      cache: "no-store", 
+      signal: AbortSignal.timeout(6000),
+      headers: { 'Accept': 'application/json' }
+    });
+    
+    if (!r.ok) {
+      console.warn(`[CALENDAR] API returned ${r.status}: ${r.statusText}`);
+      return createFallbackCalendarResponse(instrument, `API error: ${r.status}`);
+    }
+    
+    const j: any = await r.json().catch((err) => {
+      console.error(`[CALENDAR] JSON parse error:`, err);
+      return {};
+    });
+    
+    if (j?.ok && Array.isArray(j?.items)) {
+      console.log(`[CALENDAR] Successfully fetched ${j.items.length} events`);
       const t = calendarShortText(j, instrument) || `Calendar bias for ${instrument}: (no strong signal)`;
       const warn = nearestHighImpactWithin(j, 60);
       const bias = postResultBiasNote(j, instrument);
@@ -761,14 +781,49 @@ async function fetchCalendarForAdvisory(req: NextApiRequest, instrument: string)
         warn != null ? `⚠️ High-impact event in ~${warn} min.` : null,
         bias ? `Recent result alignment: ${bias}.` : null
       ].filter(Boolean).join("\n");
+      
       const rawFull = await fetchCalendarRaw(req, instrument);
       const evidence = rawFull ? buildCalendarEvidence(rawFull, instrument) : buildCalendarEvidence(j, instrument);
-      return { text: t, status: "api", provider: String(j?.provider || "mixed"), warningMinutes: warn ?? null, advisoryText: advisory || null, biasNote: bias || null, raw: j, evidence };
+      
+      return { 
+        text: t, 
+        status: "api", 
+        provider: String(j?.provider || "mixed"), 
+        warningMinutes: warn ?? null, 
+        advisoryText: advisory || null, 
+        biasNote: bias || null, 
+        raw: j, 
+        evidence 
+      };
     }
-    return { text: "Calendar unavailable.", status: "unavailable", provider: null, warningMinutes: null, advisoryText: null, biasNote: null, raw: null, evidence: [] };
-  } catch {
-    return { text: "Calendar unavailable.", status: "unavailable", provider: null, warningMinutes: null, advisoryText: null, biasNote: null, raw: null, evidence: [] };
+    
+    console.warn(`[CALENDAR] Invalid API response structure:`, { ok: j?.ok, itemsCount: j?.items?.length });
+    return createFallbackCalendarResponse(instrument, "Invalid API response");
+    
+  } catch (error: any) {
+    console.error(`[CALENDAR] Fetch failed:`, error?.message || error);
+    return createFallbackCalendarResponse(instrument, `Fetch error: ${error?.message || 'Network timeout'}`);
   }
+}
+
+function createFallbackCalendarResponse(instrument: string, reason: string): {
+  text: string | null, status: "api" | "unavailable", provider: string | null,
+  warningMinutes: number | null, advisoryText: string | null, biasNote: string | null,
+  raw?: any | null, evidence?: string[] | null
+} {
+  const base = instrument.slice(0, 3);
+  const quote = instrument.slice(3);
+  
+  return {
+    text: `Calendar: No economic events found for ${base}/${quote} in last 72h. ${reason}. Analysis proceeding with technical focus.`,
+    status: "unavailable",
+    provider: null,
+    warningMinutes: null,
+    advisoryText: `📊 Technical Analysis Focus: No calendar events affecting ${instrument}. Trade based on price action and momentum.`,
+    biasNote: `Calendar neutral for ${instrument} - no recent data available`,
+    raw: null,
+    evidence: [`${base}: No recent economic releases`, `${quote}: No recent economic releases`]
+  };
 }
 
 // ---------- Composite bias (legacy for provenance only) ----------
