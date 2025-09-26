@@ -782,68 +782,8 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
 
 //
 
-// ---------- API calendar fallback ----------
-async function fetchCalendarRaw(req: NextApiRequest, instrument: string): Promise<any | null> {
-  try {
-    const base = originFromReq(req);
-    const url = `${base}/api/calendar?instrument=${encodeURIComponent(instrument)}&windowHours=120&_t=${Date.now()}`;
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(5000) });
-    const j: any = await r.json().catch(() => ({}));
-    return j?.ok ? j : null;
-  } catch { return null; }
-}
-function calendarShortText(resp: any, pair: string): string | null {
-  if (!resp?.ok) return null;
-  const instrBias = resp?.bias?.instrument;
-  const parts: string[] = [];
-  if (instrBias && instrBias.pair === pair) { parts.push(`Instrument bias: ${instrBias.label} (${instrBias.score})`); }
-  const per = resp?.bias?.perCurrency || {};
-  const base = pair.slice(0,3), quote = pair.slice(3);
-  const b = per[base]?.label ? `${base}:${per[base].label}` : null;
-  const q = per[quote]?.label ? `${quote}:${per[quote].label}` : null;
-  if (b || q) parts.push(`Per-currency: ${[b,q].filter(Boolean).join(" / ")}`);
-  if (!parts.length) parts.push("No strong calendar bias.");
-  return `Calendar bias for ${pair}: ${parts.join("; ")}`;
-}
-function nearestHighImpactWithin(resp: any, minutes: number): number | null {
-  if (!resp?.ok || !Array.isArray(resp?.items)) return null;
-  const nowMs = Date.now(); let best: number | null = null;
-  for (const it of resp.items) {
-    if (String(it?.impact || "") !== "High") continue;
-    const t = new Date(it.time).getTime();
-    if (t >= nowMs) {
-      const mins = Math.floor((t - nowMs) / 60000);
-      if (mins <= minutes) { best = best == null ? mins : Math.min(best, mins); }
-    }
-  }
-  return best;
-}
-function postResultBiasNote(resp: any, pair: string): string | null {
-  if (!resp?.ok) return null;
-  const base = pair.slice(0,3), quote = pair.slice(3);
-  const per = resp?.bias?.perCurrency || {};
-  const b = per[base]?.label || "neutral";
-  const q = per[quote]?.label || "neutral";
-  const instr = resp?.bias?.instrument?.label || null;
-  const scores = resp?.bias?.instrument ? `(score ${resp.bias.instrument.score})` : "";
-  const line = `Per-currency: ${base} ${b} vs ${quote} ${q}${instr ? `; Instrument bias: ${instr} ${scores}` : ""}`;
-  return line;
-}
-function buildCalendarEvidence(resp: any, pair: string): string[] {
-  if (!resp?.ok || !Array.isArray(resp?.items)) return [];
-  const base = pair.slice(0,3), quote = pair.slice(3);
-  const nowMs = Date.now(), lo = nowMs - 72*3600*1000;
-  const done = resp.items.filter((it: any) => {
-    const t = new Date(it.time).getTime();
-    return t <= nowMs && t >= lo && (it.actual != null || it.forecast != null || it.previous != null) && (it.currency === base || it.currency === quote);
-  }).slice(0, 12);
-  const lines: string[] = [];
-  for (const it of done) {
-    const line = evidenceLine(it, it.currency || ""); if (line) lines.push(line);
-  }
-  return lines;
-}
-// Calendar API functions removed - using image OCR only
+// Removed unused calendar API helper functions - using OCR only
+
 
 // ---------- Composite bias (legacy for provenance only) ----------
 function splitFXPair(instr: string): { base: string|null; quote: string|null } {
