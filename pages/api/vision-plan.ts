@@ -990,7 +990,7 @@ function systemCore(
   const warn = (calendarAdvisory?.warningMinutes ?? null) != null ? calendarAdvisory!.warningMinutes : null;
   const bias = calendarAdvisory?.biasNote || null;
 
- cconst baseLines = [
+ const baseLines = [
     "You are a professional discretionary trader.",
     "",
     "🔴 MANDATORY FIRST STEP - STRATEGY TOURNAMENT:",
