@@ -1643,30 +1643,7 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
     return null;
   }
 }
-// ---------- Chart vs API price validation ----------
-function validatePriceConsistency(apiPrice: number, aiMetaPrice: number): {
-  valid: boolean;
-  error: string | null;
-  warning: string | null;
-} {
-  if (!apiPrice || apiPrice <= 0) {
-    return { valid: true, error: null, warning: "No API price available for validation" };
-  }
-  
-  // Check if AI reported price matches API (0.5% tolerance)
-  if (aiMetaPrice && isFinite(aiMetaPrice) && aiMetaPrice > 0) {
-    const diffPct = Math.abs((aiMetaPrice - apiPrice) / apiPrice);
-    if (diffPct > 0.005) {
-      return {
-        valid: false,
-        error: `AI misread current price: Reported ${aiMetaPrice} but actual is ${apiPrice} (${(diffPct*100).toFixed(2)}% difference). Charts may have wrong y-axis scale.`,
-        warning: null
-      };
-    }
-  }
-  
-  return { valid: true, error: null, warning: null };
-}
+// Price consistency validation removed - using enhanced pip-based validation in main handler
 
 // Entry price validation removed - using inline validation in main handler
 
