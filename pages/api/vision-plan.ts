@@ -2210,11 +2210,11 @@ if (pctDiff > maxDiff) {
   const usedM1Full = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(textFull);
   textFull = stampM1Used(textFull, usedM1Full);
 
-  textFull = applyConsistencyGuards(textFull, {
+ textFull = applyConsistencyGuards(textFull, {
     instrument,
-    headlinesSign: computeHeadlinesSign(hBias),
-    csmSign: computeCSMInstrumentSign(csm, instrument).sign,
-    calendarSign: parseInstrumentBiasFromNote(biasNote)
+    headlinesSign: headlinesSign,
+    csmSign: csmData.sign,
+    calendarSign: calendarSign
   });
 
     const footer = buildServerProvenanceFooter({
