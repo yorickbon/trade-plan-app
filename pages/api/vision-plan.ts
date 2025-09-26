@@ -2562,6 +2562,31 @@ if (pctDiff > maxDiff) {
     }
   }
 
+  // Additional mandatory R:R check - prevent trades with poor risk-reward
+  const entryMatches = textFull.matchAll(/Entry[^:]*:\s*(\d+\.\d+)/gi);
+  const slMatches = textFull.matchAll(/Stop Loss[^:]*:\s*(\d+\.\d+)/gi);
+  const tpMatches = textFull.matchAll(/TP1[^:]*(\d+\.\d+)/gi);
+  
+  if (entryMatches && slMatches && tpMatches) {
+    const entries = Array.from(entryMatches).map(m => Number(m[1]));
+    const stops = Array.from(slMatches).map(m => Number(m[1]));
+    const tps = Array.from(tpMatches).map(m => Number(m[1]));
+    
+    for (let i = 0; i < Math.min(entries.length, stops.length, tps.length); i++) {
+      const risk = Math.abs(entries[i] - stops[i]);
+      const reward = Math.abs(tps[i] - entries[i]);
+      const ratio = reward / risk;
+      
+      if (ratio < 1.5) {
+        console.error(`[VISION-PLAN] Trade ${i+1} R:R too low: ${ratio.toFixed(2)}:1`);
+        return res.status(400).json({
+          ok: false,
+          reason: `Trade option ${i+1} has poor risk-reward ratio: ${ratio.toFixed(2)}:1 (minimum 1.5:1 required). Entry: ${entries[i]}, SL: ${stops[i]}, TP1: ${tps[i]}`
+        });
+      }
+    }
+  }
+
   // Stamp 5M/1M execution if used
   const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
   textFull = stampM5Used(textFull, usedM5Full);
