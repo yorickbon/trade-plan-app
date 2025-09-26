@@ -203,7 +203,7 @@ async function processAdaptiveToDataUrlEnhanced(buf: Buffer): Promise<string> {
     .rotate()
     .resize({ width, withoutEnlargement: true })
     .sharpen(1.2, 1.5, 2) // Enhanced sharpening for price labels (sigma, flat, jagged)
-    .modulate({ brightness: 1.05, contrast: 1.15 }) // Slight contrast boost
+    .modulate({ brightness: 1.05, saturation: 1.1 }) // Slight brightness and saturation boost
     .jpeg({ quality, progressive: true, mozjpeg: true })
     .toBuffer();
     
