@@ -1647,73 +1647,7 @@ async function fetchLivePrice(pair: string): Promise<number | null> {
 
 // Entry price validation removed - using inline validation in main handler
 
-// Risk-reward validation
-function validateRiskRewardClaims(text: string, livePrice: number): {
-  valid: boolean;
-  errors: string[];
-} {
-  const errors: string[] = [];
-  
-  // Extract R:R claims from text
-  const rrMatches = text.matchAll(/R:R[:\s]*(\d+\.?\d*):1/gi);
-  const rrClaims = Array.from(rrMatches).map(m => Number(m[1]));
-  
-  // Extract Option 1 and Option 2 details
-  const extractOptionDetails = (optionNum: number) => {
-    const regex = new RegExp(`Option ${optionNum}[\\s\\S]*?(?=Option ${optionNum + 1}|$)`, 'i');
-    const section = text.match(regex)?.[0] || '';
-    
-    const entryMatch = section.match(/Entry[^:]*:\s*(\d+\.\d+)/i);
-    const slMatch = section.match(/Stop Loss[^:]*:\s*(\d+\.\d+)/i);
-    const tp1Match = section.match(/Take Profit[^:]*:\s*TP1[^0-9]*(\d+\.\d+)/i);
-    
-    if (entryMatch && slMatch && tp1Match) {
-      return {
-        entry: Number(entryMatch[1]),
-        sl: Number(slMatch[1]),
-        tp1: Number(tp1Match[1])
-      };
-    }
-    return null;
-  };
-  
-  // Validate each option's R:R claims
-  for (let i = 1; i <= 2; i++) {
-    const details = extractOptionDetails(i);
-    if (!details) continue;
-    
-    const risk = Math.abs(details.entry - details.sl);
-    const reward = Math.abs(details.tp1 - details.entry);
-    const actualRR = reward / risk;
-    
-    // Find claimed R:R for this option (approximate by position in text)
-    const optionStart = text.search(new RegExp(`Option ${i}`, 'i'));
-    const nextOptionStart = text.search(new RegExp(`Option ${i + 1}`, 'i'));
-    const optionSection = nextOptionStart > 0 ? 
-      text.substring(optionStart, nextOptionStart) : 
-      text.substring(optionStart);
-    
-    const rrInSection = optionSection.match(/R:R[:\s]*(\d+\.?\d*):1/i);
-    if (rrInSection) {
-      const claimedRR = Number(rrInSection[1]);
-      const difference = Math.abs(actualRR - claimedRR);
-      
-      if (difference > 0.3) { // Allow small rounding differences
-        errors.push(
-          `Option ${i} R:R ERROR: Claims ${claimedRR.toFixed(1)}:1 but actual is ${actualRR.toFixed(2)}:1 ` +
-          `(Entry: ${details.entry}, SL: ${details.sl}, TP1: ${details.tp1})`
-        );
-      }
-      
-      if (actualRR < 1.5) {
-        errors.push(`Option ${i} R:R too low: ${actualRR.toFixed(2)}:1 (minimum 1.5:1 required)`);
-      }
-    }
-  }
-  
-  return { valid: errors.length === 0, errors };
-}
-
+// Risk-reward validation function removed - using more comprehensive inline validation in main handler
 // Risk management calculator removed - using inline validation instead
 
 // ---------- Provenance footer ----------
