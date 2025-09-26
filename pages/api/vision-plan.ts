@@ -2375,7 +2375,7 @@ Return the complete enhanced analysis with all missing sections added in the app
     }
     console.log(`[ENHANCEMENT] Successfully added missing sections: ${missing.join(", ")}`);
     return enhanced;
-  } catch (error) {
+  } catch (error: any) {
     console.error(`[ENHANCEMENT] Failed to add missing sections:`, error?.message || error);
     console.error(`[ENHANCEMENT] Model: ${model}, Missing: ${missing.join(", ")}`);
     return text; // Return original if enhancement fails
