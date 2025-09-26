@@ -2178,24 +2178,35 @@ function validateRiskRewardClaims(text: string, livePrice: number): {
 } {
   const errors: string[] = [];
   
-  // Extract Option 1 and Option 2 details more reliably
+// Extract Option 1 and Option 2 details more reliably
   const extractOptionDetails = (optionNum: number) => {
-    // Find the option section
-    const optionRegex = new RegExp(`Option\\s+${optionNum}[\\s\\S]*?(?=Option\\s+${optionNum + 1}|Strategy Tournament Results|Full Breakdown|$)`, 'i');
+    // Find the option section with more flexible patterns
+    const optionRegex = new RegExp(`Option\\s*${optionNum}[\\s\\S]*?(?=Option\\s*${optionNum + 1}|Strategy Tournament|Full Breakdown|Trade Management|Executive Summary|$)`, 'i');
     const section = text.match(optionRegex)?.[0] || '';
     
-    if (!section) return null;
+    if (!section) {
+      console.warn(`[R:R-VALIDATION] Could not find Option ${optionNum} section`);
+      return null;
+    }
     
     // Extract entry price - try multiple patterns
     let entryMatch = section.match(/Entry[^:]*:\s*(\d+\.\d+)/i);
-    if (!entryMatch) entryMatch = section.match(/(?:zone|single)[^:]*:\s*(\d+\.\d+)/i);
+    if (!entryMatch) entryMatch = section.match(/Entry[^:]*zone[^:]*:\s*(\d+\.\d+)/i);
+    if (!entryMatch) entryMatch = section.match(/Entry[^:]*single[^:]*:\s*(\d+\.\d+)/i);
+    if (!entryMatch) entryMatch = section.match(/•\s*Entry[^:]*:\s*(\d+\.\d+)/i);
     
-    // Extract stop loss
-    const slMatch = section.match(/Stop\s+Loss[^:]*:\s*(\d+\.\d+)/i);
+    // Extract stop loss with more flexible patterns
+    let slMatch = section.match(/Stop\s*Loss[^:]*:\s*(\d+\.\d+)/i);
+    if (!slMatch) slMatch = section.match(/•\s*Stop\s*Loss[^:]*:\s*(\d+\.\d+)/i);
+    if (!slMatch) slMatch = section.match(/SL[^:]*:\s*(\d+\.\d+)/i);
     
-    // Extract TP1 - try multiple patterns  
-    let tp1Match = section.match(/TP1[^0-9]*(\d+\.\d+)/i);
-    if (!tp1Match) tp1Match = section.match(/Take\s+Profit[^:]*:\s*TP1[^0-9]*(\d+\.\d+)/i);
+    // Extract TP1 with more flexible patterns
+    let tp1Match = section.match(/TP1[^0-9\/]*(\d+\.\d+)/i);
+    if (!tp1Match) tp1Match = section.match(/Take\s*Profit[^:]*:\s*TP1[^0-9\/]*(\d+\.\d+)/i);
+    if (!tp1Match) tp1Match = section.match(/•\s*Take\s*Profit[^:]*TP1[^0-9\/]*(\d+\.\d+)/i);
+    if (!tp1Match) tp1Match = section.match(/Target[^:]*:\s*(\d+\.\d+)/i);
+    
+    console.log(`[R:R-VALIDATION] Option ${optionNum}: Entry=${entryMatch?.[1]}, SL=${slMatch?.[1]}, TP1=${tp1Match?.[1]}`);
     
     if (entryMatch && slMatch && tp1Match) {
       return {
@@ -2205,9 +2216,10 @@ function validateRiskRewardClaims(text: string, livePrice: number): {
         section: section
       };
     }
+    
+    console.warn(`[R:R-VALIDATION] Option ${optionNum} missing fields: Entry=${!!entryMatch}, SL=${!!slMatch}, TP1=${!!tp1Match}`);
     return null;
   };
-  
   // Validate each option's R:R claims
   for (let i = 1; i <= 2; i++) {
     const details = extractOptionDetails(i);
