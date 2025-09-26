@@ -1790,35 +1790,7 @@ function validateRiskRewardClaims(text: string, livePrice: number): {
   return { valid: errors.length === 0, errors };
 }
 
-// ---------- Risk management calculator ----------
-function calculateRiskMetrics(
-  instrument: string,
-  entry: number,
-  stopLoss: number,
-  takeProfit1: number
-): string {
-  const pipValue = instrument.includes("JPY") ? 0.01 : 0.0001;
-  const stopPips = Math.abs(entry - stopLoss) / pipValue;
-  const tp1Pips = Math.abs(takeProfit1 - entry) / pipValue;
-  const rr = tp1Pips / stopPips;
-  
-  const warnings: string[] = [];
-  if (stopPips < 15 && !instrument.startsWith("XAU")) {
-    warnings.push(`⚠️ Stop too tight: ${stopPips.toFixed(0)} pips (min 15 recommended)`);
-  }
-  if (stopPips > 100) {
-    warnings.push(`⚠️ Stop too wide: ${stopPips.toFixed(0)} pips (max 80 recommended)`);
-  }
-  if (rr < 1.5) {
-    warnings.push(`⚠️ Poor R:R: ${rr.toFixed(2)}:1 (minimum 1.5:1 recommended)`);
-  }
-  
-  return `\n**RISK METRICS**\n` +
-    `• Stop Loss: ${stopPips.toFixed(0)} pips\n` +
-    `• Take Profit 1: ${tp1Pips.toFixed(0)} pips\n` +
-    `• Risk:Reward: ${rr.toFixed(2)}:1\n` +
-    (warnings.length ? warnings.join('\n') + '\n' : '');
-}
+// Risk management calculator removed - using inline validation instead
 
 // ---------- Provenance footer ----------
 function buildServerProvenanceFooter(args: {
