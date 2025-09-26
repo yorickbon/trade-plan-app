@@ -2904,8 +2904,7 @@ if (pctDiff > maxDiff) {
     return res.status(400).json({ ok: false, reason: `Entry too far from current price: ${entry} vs live ${livePrice} (${(pctDiff*100).toFixed(1)}% away). Charts may be stale.` });
   }
 }
-        
-       // Validate order type logic
+     // Enhanced order type logic validation
         const dirMatch = textFull.match(/Direction:\s*(Long|Short)/i);
         const orderMatch = textFull.match(/Order Type:\s*(Limit|Stop|Market)/i);
         if (dirMatch && orderMatch && entries.length > 0) {
@@ -2913,14 +2912,27 @@ if (pctDiff > maxDiff) {
           const orderType = orderMatch[1].toLowerCase();
           const avgEntry = entries.reduce((a, b) => a + b, 0) / entries.length;
           
-          if (direction === "long" && orderType === "limit" && avgEntry > livePrice) {
-            console.error(`[VISION-PLAN] Order logic FAILED: Long Limit at ${avgEntry} but price is ${livePrice}`);
-            return res.status(400).json({ ok: false, reason: `Order type error: Long Limit orders must be BELOW current price (${livePrice}), not above at ${avgEntry}. Model may have misread chart direction.` });
-          }
-          
-          if (direction === "short" && orderType === "limit" && avgEntry < livePrice) {
-            console.error(`[VISION-PLAN] Order logic FAILED: Short Limit at ${avgEntry} but price is ${livePrice}`);
-            return res.status(400).json({ ok: false, reason: `Order type error: Short Limit orders must be ABOVE current price (${livePrice}), not below at ${avgEntry}. Model may have misread chart direction.` });
+          if (orderType === "limit") {
+            // Long limits must be BELOW current price (buy cheaper)
+            if (direction === "long" && avgEntry >= livePrice) {
+              const diff = Math.abs(avgEntry - livePrice);
+              console.error(`[VISION-PLAN] IMPOSSIBLE Long Limit: ${avgEntry} at/above current ${livePrice} (diff: ${diff.toFixed(5)})`);
+              return res.status(400).json({ ok: false, reason: `IMPOSSIBLE ORDER: Long Limit at ${avgEntry} cannot execute at/above current price ${livePrice}. Use Market order for immediate long entry OR Limit order BELOW current price for pullback entry.` });
+            }
+            
+            // Short limits must be ABOVE current price (sell higher)  
+            if (direction === "short" && avgEntry <= livePrice) {
+              const diff = Math.abs(avgEntry - livePrice);
+              console.error(`[VISION-PLAN] IMPOSSIBLE Short Limit: ${avgEntry} at/below current ${livePrice} (diff: ${diff.toFixed(5)})`);
+              return res.status(400).json({ ok: false, reason: `IMPOSSIBLE ORDER: Short Limit at ${avgEntry} cannot execute at/below current price ${livePrice}. Use Market order for immediate short entry OR Limit order ABOVE current price for pullback entry.` });
+            }
+            
+            // Warn if limit orders are too close (likely to fill immediately)
+            const minDistance = scalpingMode === "hard" ? 0.0005 : 0.0015; // 5 pips hard, 15 pips normal
+            const priceDistance = Math.abs(avgEntry - livePrice) / livePrice;
+            if (priceDistance < minDistance) {
+              console.warn(`[VISION-PLAN] Limit order very close to market: ${avgEntry} vs ${livePrice} (${(priceDistance*10000).toFixed(1)} pips)`);
+            }
           }
         }
       }
