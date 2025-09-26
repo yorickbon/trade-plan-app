@@ -2000,7 +2000,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     let mode: "full" | "expand" = urlMode === "expand" ? "expand" : "full"; // Always use full institutional analysis
     const debugQuery = String(req.query.debug || "").trim() === "1";
 
-    // ---------- expand ----------
     if (mode === "expand") {
       const modelExpand = pickModelFromFields(req);
       const cacheKey = String(req.query.cache || "").trim();
@@ -2008,33 +2007,30 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       if (!c) return res.status(400).json({ ok: false, reason: "Expand failed: cache expired or not found." });
 
       const dateStr = new Date().toISOString().slice(0, 10);
-      const calAdv = await fetchCalendarForAdvisory(req, c.instrument);
-      const provHint = { headlines_present: !!c.headlinesText, calendar_status: c.calendar ? "image-ocr" : (calAdv.status || "unavailable") };
+      const provHint = { headlines_present: !!c.headlinesText, calendar_status: c.calendar ? "image-ocr" : "unavailable" };
 
-    const messages = messagesFull({
+      const messages = messagesFull({
         instrument: c.instrument, dateStr,
         m15: c.m15, h1: c.h1, h4: c.h4, m5: c.m5 || null, m1: null,
         calendarDataUrl: c.calendar || undefined,
         headlinesText: c.headlinesText || undefined,
         sentimentText: c.sentimentText || undefined,
-        calendarAdvisory: { warningMinutes: calAdv.warningMinutes, biasNote: calAdv.biasNote, advisoryText: calAdv.advisoryText, evidence: calAdv.evidence || [] },
+        calendarAdvisory: { warningMinutes: null, biasNote: null, advisoryText: null, evidence: [] },
         provenance: provHint,
         scalpingMode: "off",
       });
 
-     let text = await callOpenAI(modelExpand, messages);
+      let text = await callOpenAI(modelExpand, messages);
       text = await enforceOption1(modelExpand, c.instrument, text);
       text = await enforceOption2(modelExpand, c.instrument, text);
 
-      // Visibility and stamping
-     
       const usedM5 = !!c.m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
       text = stampM5Used(text, usedM5);
 
       const footer = buildServerProvenanceFooter({
         headlines_provider: "expand-uses-stage1",
-        calendar_status: c.calendar ? "image-ocr" : (calAdv?.status || "unavailable"),
-        calendar_provider: c.calendar ? "image-ocr" : calAdv?.provider || null,
+        calendar_status: c.calendar ? "image-ocr" : "unavailable",
+        calendar_provider: c.calendar ? "image-ocr" : null,
         csm_time: null,
         extras: { vp_version: VP_VERSION, model: modelExpand, mode: "expand" },
       });
