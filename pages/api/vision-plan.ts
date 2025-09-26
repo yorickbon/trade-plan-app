@@ -1746,50 +1746,96 @@ function applyConsistencyGuards(text: string, args: { instrument: string; headli
 }
 
 // ---------- Live price ----------
-async function fetchLivePrice(pair: string): Promise<number | null> {
-  if (TD_KEY) {
-    try {
-      const sym = `${pair.slice(0, 3)}/${pair.slice(3)}`;
-      const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(sym)}&apikey=${TD_KEY}&dp=5`;
-      const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(1800) });
-      const j: any = await r.json().catch(() => ({}));
-      const p = Number(j?.price);
-      if (isFinite(p) && p > 0) return p;
-    } catch {}
-  }
-  if (FH_KEY) {
-    try {
-      const sym = `OANDA:${pair.slice(0, 3)}_${pair.slice(3)}`;
-      const to = Math.floor(Date.now() / 1000);
-      const from = to - 60 * 60 * 3;
-      const url = `https://finnhub.io/api/v1/forex/candle?symbol=${encodeURIComponent(sym)}&resolution=15&from=${from}&to=${to}&token=${FH_KEY}`;
-      const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(1800) });
-      const j: any = await r.json().catch(() => ({}));
-      const c = Array.isArray(j?.c) ? j.c : [];
-      const last = Number(c[c.length - 1]);
-      if (isFinite(last) && last > 0) return last;
-    } catch {}
-  }
-  if (POLY_KEY) {
-    try {
-      const ticker = `C:${pair}`;
-      const to = new Date();
-      const from = new Date(to.getTime() - 60 * 60 * 1000);
-      const fmt = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-      const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}/range/1/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=desc&limit=1&apiKey=${POLY_KEY}`;
-      const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(1500) });
-      const j: any = await r.json().catch(() => ({}));
-      const res = Array.isArray(j?.results) ? j.results[0] : null;
-      const last = Number(res?.c);
-      if (isFinite(last) && last > 0) return last;
-    } catch {}
-  }
+interface PriceSource {
+  provider: string;
+  price: number;
+  latency: number;
+  confidence: number;
+}
+
+async function fetchLivePriceConsensus(pair: string): Promise<{ consensus: number; sources: PriceSource[]; confidence: number } | null> {
+  const sources: Promise<PriceSource | null>[] = [];
+  
+  // Parallel fetch from all available sources
+  if (TD_KEY) sources.push(fetchTwelveDataPrice(pair));
+  if (FH_KEY) sources.push(fetchFinnhubPrice(pair));
+  if (POLY_KEY) sources.push(fetchPolygonPrice(pair));
+  
+  const startTime = Date.now();
+  const results = await Promise.allSettled(sources);
+  const validSources: PriceSource[] = results
+    .filter((r): r is PromiseFulfilledResult<PriceSource> => r.status === 'fulfilled' && r.value !== null)
+    .map(r => r.value);
+    
+  if (validSources.length === 0) return null;
+  
+  // Calculate consensus price using weighted average
+  const totalWeight = validSources.reduce((sum, s) => sum + s.confidence, 0);
+  const consensus = validSources.reduce((sum, s) => sum + (s.price * s.confidence), 0) / totalWeight;
+  
+  // Calculate confidence based on source agreement
+  const maxDiff = Math.max(...validSources.map(s => Math.abs(s.price - consensus) / consensus));
+  const confidence = maxDiff < 0.001 ? 95 : maxDiff < 0.005 ? 85 : maxDiff < 0.01 ? 70 : 50;
+  
+  return { consensus, sources: validSources, confidence };
+}
+
+async function fetchTwelveDataPrice(pair: string): Promise<PriceSource | null> {
+  const start = Date.now();
   try {
-    const S = await fetchSeries15(pair);
-    const last = S?.c?.[S.c.length - 1];
-    if (isFinite(Number(last)) && Number(last) > 0) return Number(last);
+    const sym = `${pair.slice(0, 3)}/${pair.slice(3)}`;
+    const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(sym)}&apikey=${TD_KEY}&dp=5`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(2000) });
+    const j: any = await r.json().catch(() => ({}));
+    const p = Number(j?.price);
+    if (isFinite(p) && p > 0) {
+      return { provider: "TwelveData", price: p, latency: Date.now() - start, confidence: 0.4 };
+    }
   } catch {}
   return null;
+}
+
+async function fetchFinnhubPrice(pair: string): Promise<PriceSource | null> {
+  const start = Date.now();
+  try {
+    const sym = `OANDA:${pair.slice(0, 3)}_${pair.slice(3)}`;
+    const to = Math.floor(Date.now() / 1000);
+    const from = to - 60 * 60 * 3;
+    const url = `https://finnhub.io/api/v1/forex/candle?symbol=${encodeURIComponent(sym)}&resolution=15&from=${from}&to=${to}&token=${FH_KEY}`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(2000) });
+    const j: any = await r.json().catch(() => ({}));
+    const c = Array.isArray(j?.c) ? j.c : [];
+    const last = Number(c[c.length - 1]);
+    if (isFinite(last) && last > 0) {
+      return { provider: "Finnhub", price: last, latency: Date.now() - start, confidence: 0.3 };
+    }
+  } catch {}
+  return null;
+}
+
+async function fetchPolygonPrice(pair: string): Promise<PriceSource | null> {
+  const start = Date.now();
+  try {
+    const ticker = `C:${pair}`;
+    const to = new Date();
+    const from = new Date(to.getTime() - 60 * 60 * 1000);
+    const fmt = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}/range/1/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=desc&limit=1&apiKey=${POLY_KEY}`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(2000) });
+    const j: any = await r.json().catch(() => ({}));
+    const res = Array.isArray(j?.results) ? j.results[0] : null;
+    const last = Number(res?.c);
+    if (isFinite(last) && last > 0) {
+      return { provider: "Polygon", price: last, latency: Date.now() - start, confidence: 0.3 };
+    }
+  } catch {}
+  return null;
+}
+
+// Legacy function for backward compatibility
+async function fetchLivePrice(pair: string): Promise<number | null> {
+  const result = await fetchLivePriceConsensus(pair);
+  return result?.consensus || null;
 }
 // ---------- Chart vs API price validation ----------
 function validatePriceConsistency(apiPrice: number, aiMetaPrice: number): {
