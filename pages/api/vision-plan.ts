@@ -1227,11 +1227,16 @@ STEP 2: 1H CONTEXT VALIDATION (Setup Construction)
 - CONTEXT OUTPUT: "1H CONTEXT: [CONFIRMS/CONFLICTS] 4H bias - Setup type: [CONTINUATION/REVERSAL/RANGE]"
 
 STEP 3: 15M EXECUTION TIMING (Entry Mechanics)
-- Precise entry levels based on 1H setup
+- Precise entry levels based on 1H setup with timeframe attribution
 - Entry trigger conditions and confirmation
-- Exact SL placement behind 15M structure
-- TP levels at next opposing structure
-- EXECUTION OUTPUT: "15M EXECUTION: Entry [price/zone], SL [price], TP1 [price], TP2 [price]"
+- Exact SL placement behind structure (specify 15M/1H/4H source)
+- TP levels at next opposing structure (specify timeframe source)
+- EXECUTION OUTPUT: "15M EXECUTION: Entry [price/zone] ([timeframe] structure), SL [price] ([timeframe] level), TP1 [price] ([timeframe] target), TP2 [price] ([timeframe] target)"
+
+MANDATORY TIMEFRAME LABELS:
+- Entry: Always specify source (e.g., "0.6545 (15M order block)", "1.2850-1.2860 (1H support zone)")
+- Stop Loss: State exact structure used (e.g., "0.6575 (above 1H swing high)", "1.2820 (below 15M support)")  
+- Take Profits: Label target timeframe (e.g., "TP1 0.6500 (15M resistance)", "TP2 0.6450 (1H major support)")
 
 CRITICAL HIERARCHY RULES:
 - 4H bias OVERRIDES lower timeframes (don't fade strong 4H trends)
