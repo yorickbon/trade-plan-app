@@ -2666,7 +2666,7 @@ if (!isFinite(modelPrice) || modelPrice <= 0) {
   console.error(`[VISION-PLAN] Model failed to report currentPrice: ${modelPrice}`);
   return res.status(400).json({ 
     ok: false, 
-    reason: `CRITICAL: AI could not read current price from charts. Live price is ${livePrice}. Charts may be unclear or corrupted. Please use clearer chart images.` 
+    reason: `DEBUG: AI reported currentPrice as '${aiMeta?.currentPrice}' (type: ${typeof aiMeta?.currentPrice}). Live price is ${livePrice}. Check AI's price reading explanation in the analysis output.` 
   });
 }
   
