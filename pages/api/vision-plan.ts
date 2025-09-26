@@ -2262,7 +2262,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (!OPENAI_API_KEY) return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
 
    const urlMode = String((req.query.mode as string) || "").toLowerCase();
-    let mode: "full" | "expand" = urlMode === "expand" ? "expand" : "full";
+    let mode: "full" | "expand" = urlMode === "expand" ? "expand" : "full"; // Always use full institutional analysis
     const debugQuery = String(req.query.debug || "").trim() === "1";
 
     // ---------- expand ----------
@@ -2333,7 +2333,8 @@ const instrument = rawInstr;
       (scalpingHardRaw === "1" || scalpingHardRaw === "true" || scalpingHardRaw === "on") ? "hard" :
       (scalpingRaw === "1" || scalpingRaw === "true" || scalpingRaw === "on") ? "soft" :
       "off";
- 
+    const scalping = scalpingMode !== "off";
+
     // debug toggle
     const debugField = String(pickFirst(fields.debug) || "").trim() === "1";
     const debugOCR = debugQuery || debugField;
