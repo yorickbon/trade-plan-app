@@ -218,7 +218,7 @@ async function processAdaptiveToDataUrlEnhanced(buf: Buffer): Promise<string> {
       .rotate()
       .resize({ width, withoutEnlargement: true })
       .sharpen(1.2, 1.5, 2)
-      .modulate({ brightness: 1.05, contrast: 1.15 })
+      .modulate({ brightness: 1.05, saturation: 1.1 })
       .jpeg({ quality, progressive: true, mozjpeg: true })
       .toBuffer();
     guard++;
@@ -230,7 +230,7 @@ async function processAdaptiveToDataUrlEnhanced(buf: Buffer): Promise<string> {
       .rotate()
       .resize({ width, withoutEnlargement: true })
       .sharpen(1.2, 1.5, 2)
-      .modulate({ brightness: 1.05, contrast: 1.15 })
+      .modulate({ brightness: 1.05, saturation: 1.1 })
       .jpeg({ quality: q2, progressive: true, mozjpeg: true })
       .toBuffer();
   }
