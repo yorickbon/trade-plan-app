@@ -2916,7 +2916,7 @@ if (pctDiff > maxDiff) {
   }
 }
     // Enhanced order type logic validation - CHECK BOTH OPTIONS
-        const validateOrderLogic = (text: string, optionNum: number) => {
+      const validateOrderLogic = (text: string, optionNum: number) => {
           const optionRegex = new RegExp(`Option\\s+${optionNum}[\\s\\S]*?(?=Option\\s+${optionNum + 1}|Strategy Tournament Results|Full Breakdown|$)`, 'i');
           const section = text.match(optionRegex)?.[0] || '';
           
@@ -2930,19 +2930,22 @@ if (pctDiff > maxDiff) {
             const entry = Number(entryMatch[1]);
             
             if (orderType === "limit") {
-              // Long limits must be BELOW current price (buy cheaper)
-              if (direction === "long" && entry >= livePrice) {
-                return `Option ${optionNum}: IMPOSSIBLE Long Limit at ${entry} cannot execute at/above current price ${livePrice}. Use Market order for immediate long entry OR Limit order BELOW current price for pullback entry.`;
+              // Allow small tolerance for structure-based entries (±0.5%)
+              const tolerance = livePrice * 0.005;
+              
+              // Long limits must be BELOW current price (buy cheaper) - allow small tolerance
+              if (direction === "long" && entry > (livePrice + tolerance)) {
+                return `Option ${optionNum}: IMPOSSIBLE Long Limit at ${entry} cannot execute significantly above current price ${livePrice}. Use Market order for immediate long entry OR Limit order BELOW current price for pullback entry.`;
               }
               
-              // Short limits must be ABOVE current price (sell higher)  
-              if (direction === "short" && entry <= livePrice) {
-                return `Option ${optionNum}: IMPOSSIBLE Short Limit at ${entry} cannot execute at/below current price ${livePrice}. Use Market order for immediate short entry OR Limit order ABOVE current price for pullback entry.`;
+              // Short limits must be ABOVE current price (sell higher) - allow small tolerance  
+              if (direction === "short" && entry < (livePrice - tolerance)) {
+                return `Option ${optionNum}: IMPOSSIBLE Short Limit at ${entry} cannot execute significantly below current price ${livePrice}. Use Market order for immediate short entry OR Limit order ABOVE current price for pullback entry.`;
               }
             }
           }
           return null;
-        };
+        };  
         
         // Validate both options
         const option1Error = validateOrderLogic(textFull, 1);
