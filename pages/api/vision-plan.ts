@@ -2641,14 +2641,11 @@ if (livePrice) {
   const modelPrice = Number(aiMeta?.currentPrice);
   
 if (!isFinite(modelPrice) || modelPrice <= 0) {
-  console.log(`[VISION-PLAN] AI didn't report chart price, using API price ${livePrice} as reference`);
-  aiMeta.currentPrice = livePrice;
-  aiMeta.price_validation = { 
-    status: "api_reference", 
-    chart_price: null, 
-    live_price: livePrice, 
-    note: "Using API price as reference - chart analysis relative to live market" 
-  };
+  console.error(`[VISION-PLAN] Model failed to report currentPrice: ${modelPrice}`);
+  return res.status(400).json({ 
+    ok: false, 
+    reason: `CRITICAL: AI could not read current price from charts. Live price is ${livePrice}. Charts may be unclear or corrupted. Please use clearer chart images.` 
+  });
 }
   
   else {
