@@ -785,59 +785,28 @@ function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
 // Removed unused calendar API helper functions - using OCR only
 
 
-// ---------- Composite bias (legacy for provenance only) ----------
-function splitFXPair(instr: string): { base: string|null; quote: string|null } {
-  const U = (instr || "").toUpperCase();
-  if (U.length >= 6) {
-    const base = U.slice(0,3), quote = U.slice(3,6);
-    if (G8.includes(base) && G8.includes(quote)) return { base, quote };
-  }
-  return { base: null, quote: null };
-}
-function parseInstrumentBiasFromNote(biasNote: string | null | undefined): number {
-  if (!biasNote) return 0;
-  const m = biasNote.match(/instrument[^:]*:\s*(bullish|bearish|neutral)/i);
-  if (m?.[1]) return m[1].toLowerCase() === "bullish" ? 1 : m[1].toLowerCase() === "bearish" ? -1 : 0;
-  return 0;
-}
-function computeCSMInstrumentSign(csm: CsmSnapshot, instr: string): { sign: number; zdiff: number | null } {
-  const { base, quote } = splitFXPair(instr);
-  if (!base || !quote) return { sign: 0, zdiff: null };
-  const zb = csm.scores[base], zq = csm.scores[quote];
-  if (typeof zb !== "number" || typeof zq !== "number") return { sign: 0, zdiff: null };
-  const diff = zb - zq; // >0 → base stronger → bullish instrument
-  const sign = diff > 0.4 ? 1 : diff < -0.4 ? -1 : 0;
-  return { sign, zdiff: diff };
-}
+// Composite bias calculation removed - using individual signal analysis instead
 function computeHeadlinesSign(hb: HeadlineBias): number {
   if (!hb) return 0;
   if (hb.label === "bullish") return 1;
   if (hb.label === "bearish") return -1;
   return 0;
 }
-function computeCompositeBias(args: {
-  instrument: string;
-  calendarBiasNote: string | null;
-  headlinesBias: HeadlineBias;
-  csm: CsmSnapshot;
-  warningMinutes: number | null;
-}) {
-  const calSign = parseInstrumentBiasFromNote(args.calendarBiasNote);
-  const hSign = computeHeadlinesSign(args.headlinesBias);
-  const { sign: csmSign, zdiff } = computeCSMInstrumentSign(args.csm, args.instrument);
 
-  const parts = [calSign !== 0 ? (calSign > 0 ? 1 : -1) : 0, hSign, csmSign];
-  const pos = parts.some(s => s > 0);
-  const neg = parts.some(s => s < 0);
-  const align = (pos && !neg) || (neg && !pos);
-  const conflict = pos && neg;
+function computeCSMInstrumentSign(csm: CsmSnapshot, instr: string): { sign: number; zdiff: number | null } {
+  const base = instr.slice(0, 3), quote = instr.slice(3, 6);
+  const zb = csm.scores[base], zq = csm.scores[quote];
+  if (typeof zb !== "number" || typeof zq !== "number") return { sign: 0, zdiff: null };
+  const diff = zb - zq;
+  const sign = diff > 0.4 ? 1 : diff < -0.4 ? -1 : 0;
+  return { sign, zdiff: diff };
+}
 
-  // Retained only for provenance/debug (no conviction caps applied anymore)
-  let cap = 70;
-  if (conflict) cap = 35;
-  if (args.warningMinutes != null) cap = Math.min(cap, 35);
-
-  return { calendarSign: calSign, headlinesSign: hSign, csmSign, csmZDiff: zdiff, align, conflict, cap };
+function parseInstrumentBiasFromNote(biasNote: string | null | undefined): number {
+  if (!biasNote) return 0;
+  const m = biasNote.match(/instrument[^:]*:\s*(bullish|bearish|neutral)/i);
+  if (m?.[1]) return m[1].toLowerCase() === "bullish" ? 1 : m[1].toLowerCase() === "bearish" ? -1 : 0;
+  return 0;
 }
 
 // ---------- prompts (Updated per ALLOWED CHANGES A–E) ----------
