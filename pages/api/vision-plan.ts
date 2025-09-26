@@ -2030,10 +2030,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (!OPENAI_API_KEY) return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
 
    const urlMode = String((req.query.mode as string) || "").toLowerCase();
-    let mode: "full" | "expand" = urlMode === "expand" ? "expand" : "full"; // Always use full institutional analysis
     const debugQuery = String(req.query.debug || "").trim() === "1";
 
-    if (mode === "expand") {
+    // ---------- expand ----------
+    if (urlMode === "expand") {
       const modelExpand = pickModelFromFields(req);
       const cacheKey = String(req.query.cache || "").trim();
       const c = getCache(cacheKey);
@@ -2644,11 +2644,11 @@ if (pctDiff > maxDiff) {
     textFull = `${textFull}\n${footer}`;
 
     res.setHeader("Cache-Control", "no-store");
-    return res.status(200).json({
+  return res.status(200).json({
       ok: true,
       text: textFull,
       meta: {
-        instrument, mode, vp_version: VP_VERSION, model: MODEL,
+        instrument, vp_version: VP_VERSION, model: MODEL,
         sources: {
           headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
           headlines_instrument: instrument,
