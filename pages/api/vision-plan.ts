@@ -349,23 +349,11 @@ async function fetchedHeadlinesViaServer(req: NextApiRequest, instrument: string
   }
 }
 
-// ---------- ai_meta + sanity helpers ----------
+// ---------- ai_meta extraction ----------
 function extractAiMeta(text: string) {
   if (!text) return null;
   const fences = [/\nai_meta\s*({[\s\S]*?})\s*\n/i, /\njson\s*({[\s\S]*?})\s*\n/i];
   for (const re of fences) { const m = text.match(re); if (m && m[1]) { try { return JSON.parse(m[1]); } catch {} } }
-  return null;
-}
-function invalidOrderRelativeToPrice(aiMeta: any): string | null {
-  const o = String(aiMeta?.entryOrder || "").toLowerCase();
-  const dir = String(aiMeta?.direction || "").toLowerCase();
-  const z = aiMeta?.zone || {};
-  const p = Number(aiMeta?.currentPrice);
-  const zmin = Number(z?.min);
-  const zmax = Number(z?.max);
-  if (!isFinite(p) || !isFinite(zmin) || !isFinite(zmax)) return null;
-  if (o === "sell limit" && dir === "short") { if (Math.max(zmin, zmax) <= p) return "sell-limit-below-price"; }
-  if (o === "buy limit" && dir === "long") { if (Math.min(zmin, zmax) >= p) return "buy-limit-above-price"; }
   return null;
 }
 
