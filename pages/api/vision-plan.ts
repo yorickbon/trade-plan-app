@@ -1893,8 +1893,43 @@ async function fetchPolygonPrice(pair: string): Promise<PriceSource | null> {
 
 // Legacy function for backward compatibility
 async function fetchLivePrice(pair: string): Promise<number | null> {
-  const result = await fetchLivePriceConsensus(pair);
-  return result?.consensus || null;
+  try {
+    const result = await fetchLivePriceConsensus(pair);
+    if (result?.consensus && result.consensus > 0) {
+      console.log(`[PRICE] Got consensus price for ${pair}: ${result.consensus} (${result.sources.length} sources, ${result.confidence}% confidence)`);
+      return result.consensus;
+    }
+    
+    // Fallback to individual source attempts
+    console.warn(`[PRICE] Consensus failed for ${pair}, trying individual sources`);
+    const sources = [];
+    if (TD_KEY) sources.push(fetchTwelveDataPrice(pair));
+    if (FH_KEY) sources.push(fetchFinnhubPrice(pair));
+    if (POLY_KEY) sources.push(fetchPolygonPrice(pair));
+    
+    if (sources.length === 0) {
+      console.error(`[PRICE] No price sources configured for ${pair}`);
+      return null;
+    }
+    
+    const results = await Promise.allSettled(sources);
+    const validSources = results
+      .filter((r): r is PromiseFulfilledResult<PriceSource> => r.status === 'fulfilled' && r.value !== null)
+      .map(r => r.value);
+    
+    if (validSources.length > 0) {
+      const fallbackPrice = validSources[0].price;
+      console.warn(`[PRICE] Using fallback price for ${pair}: ${fallbackPrice} from ${validSources[0].provider}`);
+      return fallbackPrice;
+    }
+    
+    console.error(`[PRICE] All price sources failed for ${pair}`);
+    return null;
+    
+  } catch (error: any) {
+    console.error(`[PRICE] Critical error fetching price for ${pair}:`, error?.message || error);
+    return null;
+  }
 }
 // ---------- Chart vs API price validation ----------
 function validatePriceConsistency(apiPrice: number, aiMetaPrice: number): {
