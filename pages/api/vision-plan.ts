@@ -2819,14 +2819,16 @@ if (pctDiff > maxDiff) {
     }
 }
 
-  // R:R validation
-  const rrValidationFull = validateRiskRewardClaims(textFull, livePrice);
-  if (!rrValidationFull.valid) {
-    console.error(`[VISION-PLAN] R:R validation failed:`, rrValidationFull.errors);
-    return res.status(400).json({ 
-      ok: false, 
-      reason: `Risk-Reward calculation errors: ${rrValidationFull.errors.join(' | ')}. Please verify trade math.` 
-    });
+ // R:R validation
+  if (livePrice) {
+    const rrValidationFull = validateRiskRewardClaims(textFull, livePrice);
+    if (!rrValidationFull.valid) {
+      console.error(`[VISION-PLAN] R:R validation failed:`, rrValidationFull.errors);
+      return res.status(400).json({ 
+        ok: false, 
+        reason: `Risk-Reward calculation errors: ${rrValidationFull.errors.join(' | ')}. Please verify trade math.` 
+      });
+    }
   }
 
   // Stamp 5M/1M execution if used
