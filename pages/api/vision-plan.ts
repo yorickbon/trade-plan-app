@@ -1110,6 +1110,8 @@ function systemCore(
 "- Read exact price number from right axis scale",
 "- Report this EXACT number in ai_meta.currentPrice",
 "- If price axis unclear, state 'Price scale unreadable'",
+"- DEBUG: Always describe what you see on the right price axis in your analysis",
+"- DEBUG: State the rightmost candle's approximate close level even if uncertain",
    "- For TradingView charts: Current price often shown in colored box on right axis",
 "- If no colored price box visible, trace rightmost candle close to right scale",
 "- Price scale shows increments like 0.65300, 0.65400 - read exact level",
