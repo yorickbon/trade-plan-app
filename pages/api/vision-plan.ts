@@ -2375,74 +2375,61 @@ function applyInstitutionalCorrelations(
   }
 }
 
-// Calendar OCR + Processing
+// Calendar Processing - Single Path (OCR priority, API fallback)
 if (calUrlOrig) {
+  console.log("[CALENDAR] Processing image via OCR");
   const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch((err) => {
     console.error("[vision-plan] Calendar OCR error:", err?.message || err);
     return null;
   });
   
-  if (ocr && Array.isArray(ocr.items)) {
+  if (ocr && Array.isArray(ocr.items) && ocr.items.length > 0) {
     console.log(`[vision-plan] OCR extracted ${ocr.items.length} calendar rows`);
+    const analysis = analyzeCalendarProfessional(ocr.items, instrument);
+    calendarProvider = "image-ocr";
+    calendarStatus = "image-ocr";
+    calendarText = analysis.reasoning[0];
+    calendarEvidence = analysis.evidence;
+    biasNote = analysis.reasoning.join("; ");
+    advisoryText = analysis.details;
+    calDataUrlForPrompt = calUrlOrig;
     
-    if (ocr.items.length > 0) {
-      const analysis = analyzeCalendarProfessional(ocr.items, instrument);
-      calendarProvider = "image-ocr";
-      calendarStatus = "image-ocr";
-      calendarText = analysis.reasoning[0];
-      calendarEvidence = analysis.evidence;
-      biasNote = analysis.reasoning.join("; ");
-      advisoryText = analysis.details;
-      calDataUrlForPrompt = calUrlOrig;
-      
-      // High-impact warning detection
-      const nowMs = Date.now();
-      for (const it of ocr.items) {
-        if (it?.impact === "High" && it?.timeISO) {
-          const t = Date.parse(it.timeISO);
-          if (isFinite(t) && t >= nowMs) {
-            const mins = Math.floor((t - nowMs) / 60000);
-            if (mins <= 60) warningMinutes = warningMinutes == null ? mins : Math.min(warningMinutes, mins);
-          }
+    // High-impact warning detection
+    const nowMs = Date.now();
+    for (const it of ocr.items) {
+      if (it?.impact === "High" && it?.timeISO) {
+        const t = Date.parse(it.timeISO);
+        if (isFinite(t) && t >= nowMs) {
+          const mins = Math.floor((t - nowMs) / 60000);
+          if (mins <= 60) warningMinutes = warningMinutes == null ? mins : Math.min(warningMinutes, mins);
         }
       }
-      
-      if (debugOCR || debugQuery || debugField) {
-        debugRows = ocr.items.slice(0, 5).map(r => ({
-          timeISO: r.timeISO || null,
-          title: r.title || null,
-          currency: r.currency || null,
-          impact: r.impact || null,
-          actual: r.actual ?? null,
-          forecast: r.forecast ?? null,
-          previous: r.previous ?? null,
-        }));
-      }
-    } else {
-      calendarProvider = "image-ocr";
-      calendarStatus = "image-ocr";
-      calendarText = "Calendar: OCR returned 0 events (image may be empty or unreadable)";
-      calendarEvidence = [];
-      biasNote = null;
-      advisoryText = null;
-      calDataUrlForPrompt = calUrlOrig;
+    }
+    
+    if (debugOCR || debugQuery || debugField) {
+      debugRows = ocr.items.slice(0, 5).map(r => ({
+        timeISO: r.timeISO || null, title: r.title || null, currency: r.currency || null,
+        impact: r.impact || null, actual: r.actual ?? null, forecast: r.forecast ?? null, previous: r.previous ?? null,
+      }));
     }
   } else {
-    console.log("[vision-plan] OCR failed, attempting API fallback");
+    // OCR failed or returned no data - use API fallback
+    console.log("[vision-plan] OCR failed or empty, using API fallback");
     const calAdv = await fetchCalendarForAdvisory(req, instrument);
-    calendarProvider = calAdv.provider;
+    calendarProvider = calAdv.provider || "api-fallback";
     calendarStatus = calAdv.status;
-    calendarText = calAdv.text || "Calendar: OCR failed, API unavailable";
+    calendarText = calAdv.text || "Calendar: No data available from image or API";
     calendarEvidence = calAdv.evidence || [];
     biasNote = calAdv.biasNote;
     advisoryText = calAdv.advisoryText;
     warningMinutes = calAdv.warningMinutes ?? null;
-    calDataUrlForPrompt = null;
+    calDataUrlForPrompt = calUrlOrig;
   }
 } else {
-  console.log("[vision-plan] No calendar image provided");
+  // No calendar image provided - API only
+  console.log("[vision-plan] No calendar image provided, using API");
   const calAdv = await fetchCalendarForAdvisory(req, instrument);
-  calendarProvider = calAdv.provider;
+  calendarProvider = calAdv.provider || "api-only";
   calendarStatus = calAdv.status;
   calendarText = calAdv.text || "Calendar: No image provided";
   calendarEvidence = calAdv.evidence || [];
@@ -2450,7 +2437,7 @@ if (calUrlOrig) {
   advisoryText = calAdv.advisoryText;
   warningMinutes = calAdv.warningMinutes ?? null;
   calDataUrlForPrompt = null;
-}  
+}
 
 
     // Sentiment + price
