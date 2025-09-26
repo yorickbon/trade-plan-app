@@ -2248,17 +2248,7 @@ if (pctDiff > maxDiff) {
     }
 }
 
- // R:R validation
-  if (livePrice) {
-    const rrValidationFull = validateRiskRewardClaims(textFull, livePrice);
-    if (!rrValidationFull.valid) {
-      console.error(`[VISION-PLAN] R:R validation failed:`, rrValidationFull.errors);
-      return res.status(400).json({ 
-        ok: false, 
-        reason: `Risk-Reward calculation errors: ${rrValidationFull.errors.join(' | ')}. Please verify trade math.` 
-      });
-    }
-  }
+// R:R validation is now handled by the inline validation code above
 
   // Additional mandatory R:R check - prevent trades with poor risk-reward
   const entryMatches = textFull.matchAll(/Entry[^:]*:\s*(\d+\.\d+)/gi);
