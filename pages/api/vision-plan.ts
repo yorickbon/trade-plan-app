@@ -2607,12 +2607,19 @@ if (livePrice) {
         reason: `CRITICAL: Chart price ${modelPrice} differs from live price ${livePrice} by ${(priceDiff*100).toFixed(2)}%. Charts appear stale or y-axis misread. Refresh charts and retry.` 
       });
     } else if (priceDiff > warnThreshold) {
-      console.warn(`[VISION-PLAN] Price drift detected: Chart=${modelPrice}, Live=${livePrice}, Diff=${(priceDiff*100).toFixed(2)}%`);
-      return res.status(400).json({ 
-        ok: false, 
-        reason: `PRICE DRIFT: Chart shows ${modelPrice} but live price is ${livePrice} (${(priceDiff*100).toFixed(2)}% difference). Please refresh charts for accurate analysis.` 
-      });
-    } else {
+  console.warn(`[VISION-PLAN] Price drift detected: Chart=${modelPrice}, Live=${livePrice}, Diff=${(priceDiff*100).toFixed(2)}%`);
+  // Continue with analysis but flag the price discrepancy
+  text = `⚠️ **PRICE DRIFT DETECTED**: Chart shows ${modelPrice}, live price is ${livePrice} (${(priceDiff*100).toFixed(2)}% difference)\n\n**RECOMMENDATION**: Manually verify entry levels against current market before placing orders.\n\n${text}`;
+  aiMeta.price_validation = { 
+    status: "drift_warning", 
+    chart_price: modelPrice, 
+    live_price: livePrice, 
+    diff_percent: priceDiff * 100,
+    warning: "Manual price verification recommended before order placement"
+  };
+}
+    
+    else {
       aiMeta.price_validation = { status: "validated", chart_price: modelPrice, live_price: livePrice, diff_percent: priceDiff * 100 };
       console.log(`[VISION-PLAN] Price validation passed: Chart=${modelPrice}, Live=${livePrice}, Diff=${(priceDiff*100).toFixed(2)}%`);
     }
