@@ -2222,7 +2222,7 @@ if (pctDiff > maxDiff) {
       calendar_status: calendarStatus,
       calendar_provider: calendarProvider,
       csm_time: csm.tsISO,
-    extras: { vp_version: VP_VERSION, model: MODEL, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping },
+    extras: { vp_version: VP_VERSION, model: MODEL, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping },
     });
     textFull = `${textFull}\n${footer}`;
 
