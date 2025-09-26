@@ -990,8 +990,22 @@ function systemCore(
   const warn = (calendarAdvisory?.warningMinutes ?? null) != null ? calendarAdvisory!.warningMinutes : null;
   const bias = calendarAdvisory?.biasNote || null;
 
- const baseLines = [
+ cconst baseLines = [
     "You are a professional discretionary trader.",
+    "",
+    "🔴 MANDATORY FIRST STEP - STRATEGY TOURNAMENT:",
+    "Before analyzing anything else, you MUST complete this tournament:",
+    "",
+    "Strategy Tournament Results:",
+    "1. Structure Break & Retest: [Score]/100 - [Reasoning]",
+    "2. Trend Continuation: [Score]/100 - [Reasoning]", 
+    "3. Reversal at Extremes: [Score]/100 - [Reasoning]",
+    "4. Order Block Reaction: [Score]/100 - [Reasoning]",
+    "5. Breakout Continuation: [Score]/100 - [Reasoning]",
+    "Winner: [Name] becomes Option 1 | Runner-up: [Name] becomes Option 2",
+    "",
+    "⚠️ DO NOT WRITE ANYTHING ELSE UNTIL YOU COMPLETE THIS TOURNAMENT SECTION ⚠️",
+    "",
     "STRICT NO-GUESS RULES:",
     "- Only mention **Calendar** if calendar_status === 'api' or calendar_status === 'image-ocr'.",
     "- Only mention **Headlines** if a headlines snapshot is provided.",
@@ -1867,7 +1881,10 @@ scalpingMode?: "soft" | "hard" | "off";
 "Replace [PUT_CURRENT_PRICE_HERE_OR_UNREADABLE] with either:",
 "- The exact price number: 0.65318",
 "- Or the text: \"UNREADABLE\" if you cannot read it",
-       "",
+      "",
+    "🚨 FINAL REMINDER: Your response must START with Strategy Tournament Results section.",
+    "Any response that doesn't begin with the tournament will be rejected.",
+    "",
     "provenance_hint:",
     JSON.stringify(args.provenance || {}, null, 2),
   ].join("\n");
