@@ -178,14 +178,65 @@ async function downloadAndProcess(url: string): Promise<string | null> {
   const html = raw.toString("utf8");
   const og = htmlFindOgImage(html); if (!og) return null;
   const resolved = absoluteUrl(url, og);
-  const r2 = await fetchWithTimeout(resolved, 8000);
+  
+  // Enhanced processing for TradingView charts
+  const isTradingView = url.includes('tradingview.com');
+  const r2 = await fetchWithTimeout(resolved, isTradingView ? 12000 : 8000); // Longer timeout for TV
   if (!r2 || !r2.ok) return null;
   const ab2 = await r2.arrayBuffer();
   const raw2 = Buffer.from(ab2);
   if (raw2.byteLength > IMG_MAX_BYTES) return null;
-  const out2 = await processAdaptiveToDataUrl(raw2);
-  if (process.env.NODE_ENV !== "production") console.log(`[vision-plan] og:image processed size=${dataUrlSizeBytes(out2)}B from ${resolved}`);
+  
+  // Use enhanced processing for TradingView charts
+  const out2 = isTradingView ? 
+    await processAdaptiveToDataUrlEnhanced(raw2) : 
+    await processAdaptiveToDataUrl(raw2);
+    
+  if (process.env.NODE_ENV !== "production") console.log(`[vision-plan] ${isTradingView ? 'TradingView' : 'og:image'} processed size=${dataUrlSizeBytes(out2)}B from ${resolved}`);
   return out2;
+}
+
+async function processAdaptiveToDataUrlEnhanced(buf: Buffer): Promise<string> {
+  // Enhanced processing specifically for TradingView charts
+  let width = 1400, quality = 82; // Higher baseline for chart clarity
+  let out = await sharp(buf)
+    .rotate()
+    .resize({ width, withoutEnlargement: true })
+    .sharpen({ sigma: 1.2, flat: 1.5, jagged: 2 }) // Enhanced sharpening for price labels
+    .modulate({ brightness: 1.05, contrast: 1.15 }) // Slight contrast boost
+    .jpeg({ quality, progressive: true, mozjpeg: true })
+    .toBuffer();
+    
+  let guard = 0;
+  const TARGET_MIN_ENHANCED = 650 * 1024; // Higher minimum for chart details
+  const TARGET_MAX_ENHANCED = 1800 * 1024; // Allow larger files
+  
+  while (out.byteLength < TARGET_MIN_ENHANCED && guard < 4) {
+    quality = Math.min(quality + 4, 90);
+    if (quality >= 85 && width < 1600) width = Math.min(width + 100, 1600);
+    out = await sharp(buf)
+      .rotate()
+      .resize({ width, withoutEnlargement: true })
+      .sharpen({ sigma: 1.2, flat: 1.5, jagged: 2 })
+      .modulate({ brightness: 1.05, contrast: 1.15 })
+      .jpeg({ quality, progressive: true, mozjpeg: true })
+      .toBuffer();
+    guard++;
+  }
+  
+  if (out.byteLength > TARGET_MAX_ENHANCED) {
+    const q2 = Math.max(75, quality - 8);
+    out = await sharp(buf)
+      .rotate()
+      .resize({ width, withoutEnlargement: true })
+      .sharpen({ sigma: 1.2, flat: 1.5, jagged: 2 })
+      .modulate({ brightness: 1.05, contrast: 1.15 })
+      .jpeg({ quality: q2, progressive: true, mozjpeg: true })
+      .toBuffer();
+  }
+  
+  if (out.byteLength > IMG_MAX_BYTES) throw new Error("TradingView chart too large after processing");
+  return `data:image/jpeg;base64,${out.toString("base64")}`;
 }
 async function linkToDataUrl(link: string): Promise<string | null> {
   if (!link) return null;
