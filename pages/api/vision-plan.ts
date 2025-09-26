@@ -1606,6 +1606,15 @@ async function enforceOption1(model: string, instrument: string, text: string) {
   ];
   return callOpenAI(model, messages);
 }
+
+async function enforceStrategyTournament(model: string, instrument: string, text: string) {
+  if (/Strategy\s+Tournament\s+Results/i.test(text)) return text;
+  const messages = [
+    { role: "system", content: "Add a 'Strategy Tournament Results' section before the trade options. Score each of the 5 strategies (Structure Break & Retest, Order Block Reaction, Reversal at Extremes, Liquidity Grab, Fair Value Gap Fill) from 0-100 with reasoning. Winner becomes Option 1, runner-up becomes Option 2." },
+    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd Strategy Tournament Results section as specified.` },
+  ];
+  return callOpenAI(model, messages);
+}
 // Quick Plan removed - using Option 1 as primary trade card
 
 // ---------- Consistency + visibility guards ----------
