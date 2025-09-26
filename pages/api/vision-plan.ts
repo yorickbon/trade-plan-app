@@ -2964,9 +2964,9 @@ if (pctDiff > maxDiff) {
     }
 }
 
-// Tournament completeness validation - check if post-processing added it
+// Tournament completeness validation - allow enhancement to handle missing sections
   const hasTournament = /Strategy Tournament Results:/i.test(textFull);
-  let hasAllStrategies = [
+  const hasAllStrategies = [
     /Structure Break & Retest:/i,
     /Trend Continuation:/i,
     /Reversal at Extremes:/i,
@@ -2974,22 +2974,12 @@ if (pctDiff > maxDiff) {
     /Breakout Continuation:/i
   ].every(regex => regex.test(textFull));
   
-  // If enhancement ran but validation still fails, bypass tournament check
   if (!hasTournament || !hasAllStrategies) {
-    // Check if this was enhanced (log shows enhancement ran)
-    const wasEnhanced = /ENHANCEMENT.*Strategy Tournament Results/i.test(textFull) || 
-                       textFull.includes("Added missing sections: Strategy Tournament Results");
-    
-    if (wasEnhanced) {
-      console.log(`[VISION-PLAN] Tournament validation bypassed - post-processing enhanced the response`);
-      hasAllStrategies = true; // Bypass validation since enhancement ran
-    } else {
-      console.error(`[VISION-PLAN] Incomplete strategy tournament - missing required sections`);
-      return res.status(400).json({ 
-        ok: false, 
-        reason: `Incomplete analysis: Strategy tournament missing or incomplete. All 5 strategies must be evaluated.` 
-      });
-    }
+    console.error(`[VISION-PLAN] Strategy tournament still missing after enhancement - this indicates a fundamental AI model issue`);
+    return res.status(400).json({ 
+      ok: false, 
+      reason: `Critical error: AI model consistently fails to generate required Strategy Tournament Results section despite multiple attempts. This suggests a deeper prompting or model configuration issue.` 
+    });
   }
   
   // Tech vs Fundy validation
