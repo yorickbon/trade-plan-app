@@ -1660,16 +1660,40 @@ function applyConsistencyGuards(text: string, args: { instrument: string; headli
   const hasPos = signs.some((s) => s > 0);
   const hasNeg = signs.some((s) => s < 0);
   
-  // Only consider it a mismatch if there are actual opposing signals
-  // Neutral (no signal) should not create mismatch
+  // Enhanced conflict detection
+  const strongConflict = hasPos && hasNeg && signs.length >= 2;
   const aligned = signs.length > 0 && ((hasPos && !hasNeg) || (hasNeg && !hasPos));
-  const mismatch = hasPos && hasNeg && signs.length >= 2; // Need opposing forces
+  
+  // Detect technical bias from trade direction
+  const techBullish = /Direction:\s*Long/i.test(out);
+  const techBearish = /Direction:\s*Short/i.test(out);
+  const fundyBullish = hasPos && !hasNeg;
+  const fundyBearish = hasNeg && !hasPos;
+  
+  // Check for fundamental-technical conflict
+  const fundamentalTechnicalConflict = 
+    (techBullish && fundyBearish) || 
+    (techBearish && fundyBullish);
 
   if (aligned) out = out.replace(/contradict(?:ion|ing|s)?/gi, "aligning");
+  
   const reTF = /(Tech\s*vs\s*Fundy\s*Alignment:\s*)(Match|Mismatch)/i;
   if (reTF.test(out)) {
-    // If no fundamental signals exist, default to Match (no conflict)
-    const alignment = signs.length === 0 ? "Match" : (aligned ? "Match" : (mismatch ? "Mismatch" : "Match"));
+    let alignment;
+    if (fundamentalTechnicalConflict) {
+      alignment = "Mismatch";
+      // Reduce conviction for conflicting trades
+      out = out.replace(/Conviction:\s*(\d+)%/gi, (match, conv) => {
+        const reducedConv = Math.min(Math.floor(Number(conv) * 0.6), 45);
+        return `Conviction: ${reducedConv}%`;
+      });
+    } else if (strongConflict) {
+      alignment = "Mismatch";
+    } else if (aligned) {
+      alignment = "Match";
+    } else {
+      alignment = "Neutral";
+    }
     out = out.replace(reTF, (_, p1) => `${p1}${alignment}`);
   }
   return out;
