@@ -1070,13 +1070,29 @@ function systemCore(
     "- SL: Back inside consolidation",
     "- Score factors: Clean consolidation (25pts), Strong breakout (30pts), Volume confirmation (20pts), Target availability (25pts)",
     "",
- "TOURNAMENT SCORING (0-100 each strategy):",
+"TOURNAMENT SCORING (0-100 each strategy):",
 "1. Analyze current setup against each strategy's criteria (Base: 0-100pts)",
 "2. Market regime adjustment: Current volatility/trend strength (±10pts)",
 "3. Fundamental alignment bonus/penalty (±15pts)",
 "4. Risk-reward quality adjustment (±10pts based on R:R ratio)",
 "5. Timeframe confluence bonus (±10pts if all timeframes align)",
 "6. Option 1 = Highest scoring strategy, Option 2 = Second highest (min 15pt gap preferred)",
+"",
+"MANDATORY TOURNAMENT OUTPUT - ALL 5 STRATEGIES REQUIRED:",
+"",
+"⚠️ CRITICAL: You MUST include this EXACT section in your response:",
+"",
+"Strategy Tournament Results:",
+"1. Structure Break & Retest: [Score]/100 - [Brief reasoning]",
+"2. Trend Continuation: [Score]/100 - [Brief reasoning]", 
+"3. Reversal at Extremes: [Score]/100 - [Brief reasoning]",
+"4. Order Block Reaction: [Score]/100 - [Brief reasoning]",
+"5. Breakout Continuation: [Score]/100 - [Brief reasoning]",
+"Winner: [Highest scoring strategy] becomes Option 1",
+"Runner-up: [Second highest scoring strategy] becomes Option 2",
+"",
+"This section is MANDATORY - responses without complete tournament evaluation will be rejected.",
+"Do NOT proceed to Option 1/Option 2 until you have completed the strategy tournament.",
 "",
 "TRADE METADATA (ai_meta required):",
 "• trade_id: [Generate unique UUID for this recommendation]",
@@ -1724,10 +1740,24 @@ scalpingMode?: "soft" | "hard" | "off";
     "• European Bloc Risk: Consider EUR/GBP correlation during London session",
     "• Safe Haven Flows: JPY/CHF/USD strength during risk-off periods",
     "",
-    "Full Breakdown",
+   "Full Breakdown",
     "• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m/1m if used)",
     "• Fundamental View (Calendar + Sentiment + Headlines) — include explicit Calendar bias for <PAIR> when available; if pre-release, say: 'Pre-release only, no confirmed bias until data is out.'",
-    "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
+    "• Tech vs Fundy Alignment: Match | Mismatch (+why) — MANDATORY SECTION",
+    "",
+    "CRITICAL: Tech vs Fundy Alignment section is REQUIRED and must appear in every trade card.",
+    "Format: 'Tech vs Fundy Alignment: [Match/Mismatch] - [Technical bias] vs [Fundamental bias]'",
+    "Example: 'Tech vs Fundy Alignment: Match - Bearish technicals vs Bearish fundamentals'",
+    "",
+    "MANDATORY TECHNICAL VS FUNDAMENTAL ALIGNMENT:",
+    "",
+    "REQUIRED OUTPUT FORMAT:",
+    "Tech vs Fundy Alignment: [Match/Mismatch/Neutral] - [Technical direction] vs [Fundamental direction]",
+    "• Technical: [Bullish/Bearish/Neutral] - [Brief reasoning]",
+    "• Fundamental: [Bullish/Bearish/Neutral] - [Brief reasoning]", 
+    "• Impact: [Match adds +10 conviction / Mismatch reduces -15 conviction / Neutral no change]",
+    "",
+    "NEVER skip this analysis - it's mandatory for institutional compliance.",
     "• Validation Results: [All checks passed/Failed validations listed]",
     "• Market Regime: [Trending/Ranging/Breakout/News-driven] with implications",
     "• Conditional Scenarios:",
@@ -1817,6 +1847,16 @@ scalpingMode?: "soft" | "hard" | "off";
     "• Risk Assessment: [ACCEPTABLE/HIGH/EXCESSIVE] - Overall risk level",
     "• Confidence Level: [HIGH/MEDIUM/LOW] - Based on alignment and quality",
     "",
+"MANDATORY SECTIONS CHECKLIST (All Required):",
+"✅ Strategy Tournament Results: MUST show all 5 strategies with scores",
+"✅ Tech vs Fundy Alignment: MUST show explicit Match/Mismatch statement", 
+"✅ Option 1 (Primary): MUST include Direction/Order Type/Entry/SL/TP1/TP2/Conviction",
+"✅ Option 2 (Alternative): MUST include Direction/Order Type/Entry/SL/TP1/TP2/Conviction",
+"✅ Full Breakdown section: Technical View + Fundamental View + Alignment",
+"",
+"⚠️ WARNING: Any response missing these sections will be automatically rejected.",
+"Complete the Strategy Tournament BEFORE writing Option 1 and Option 2.",
+"",
 "CRITICAL: End your response with this EXACT format:",
 "```json",
 "ai_meta",
@@ -2145,60 +2185,84 @@ function validateRiskRewardClaims(text: string, livePrice: number): {
 } {
   const errors: string[] = [];
   
-  // Extract R:R claims from text
-  const rrMatches = text.matchAll(/R:R[:\s]*(\d+\.?\d*):1/gi);
-  const rrClaims = Array.from(rrMatches).map(m => Number(m[1]));
-  
-  // Extract Option 1 and Option 2 details
+// Extract Option 1 and Option 2 details more reliably
   const extractOptionDetails = (optionNum: number) => {
-    const regex = new RegExp(`Option ${optionNum}[\\s\\S]*?(?=Option ${optionNum + 1}|$)`, 'i');
-    const section = text.match(regex)?.[0] || '';
+    // Find the option section with more flexible patterns
+    const optionRegex = new RegExp(`Option\\s*${optionNum}[\\s\\S]*?(?=Option\\s*${optionNum + 1}|Strategy Tournament|Full Breakdown|Trade Management|Executive Summary|$)`, 'i');
+    const section = text.match(optionRegex)?.[0] || '';
     
-    const entryMatch = section.match(/Entry[^:]*:\s*(\d+\.\d+)/i);
-    const slMatch = section.match(/Stop Loss[^:]*:\s*(\d+\.\d+)/i);
-    const tp1Match = section.match(/Take Profit[^:]*:\s*TP1[^0-9]*(\d+\.\d+)/i);
+    if (!section) {
+      console.warn(`[R:R-VALIDATION] Could not find Option ${optionNum} section`);
+      return null;
+    }
+    
+    // Extract entry price - try multiple patterns
+    let entryMatch = section.match(/Entry[^:]*:\s*(\d+\.\d+)/i);
+    if (!entryMatch) entryMatch = section.match(/Entry[^:]*zone[^:]*:\s*(\d+\.\d+)/i);
+    if (!entryMatch) entryMatch = section.match(/Entry[^:]*single[^:]*:\s*(\d+\.\d+)/i);
+    if (!entryMatch) entryMatch = section.match(/•\s*Entry[^:]*:\s*(\d+\.\d+)/i);
+    
+    // Extract stop loss with more flexible patterns
+    let slMatch = section.match(/Stop\s*Loss[^:]*:\s*(\d+\.\d+)/i);
+    if (!slMatch) slMatch = section.match(/•\s*Stop\s*Loss[^:]*:\s*(\d+\.\d+)/i);
+    if (!slMatch) slMatch = section.match(/SL[^:]*:\s*(\d+\.\d+)/i);
+    
+    // Extract TP1 with more flexible patterns
+    let tp1Match = section.match(/TP1[^0-9\/]*(\d+\.\d+)/i);
+    if (!tp1Match) tp1Match = section.match(/Take\s*Profit[^:]*:\s*TP1[^0-9\/]*(\d+\.\d+)/i);
+    if (!tp1Match) tp1Match = section.match(/•\s*Take\s*Profit[^:]*TP1[^0-9\/]*(\d+\.\d+)/i);
+    if (!tp1Match) tp1Match = section.match(/Target[^:]*:\s*(\d+\.\d+)/i);
+    
+    console.log(`[R:R-VALIDATION] Option ${optionNum}: Entry=${entryMatch?.[1]}, SL=${slMatch?.[1]}, TP1=${tp1Match?.[1]}`);
     
     if (entryMatch && slMatch && tp1Match) {
       return {
         entry: Number(entryMatch[1]),
         sl: Number(slMatch[1]),
-        tp1: Number(tp1Match[1])
+        tp1: Number(tp1Match[1]),
+        section: section
       };
     }
+    
+    console.warn(`[R:R-VALIDATION] Option ${optionNum} missing fields: Entry=${!!entryMatch}, SL=${!!slMatch}, TP1=${!!tp1Match}`);
     return null;
   };
-  
   // Validate each option's R:R claims
   for (let i = 1; i <= 2; i++) {
     const details = extractOptionDetails(i);
-    if (!details) continue;
+    if (!details) {
+      errors.push(`Option ${i}: Cannot extract entry/SL/TP1 prices for validation`);
+      continue;
+    }
     
     const risk = Math.abs(details.entry - details.sl);
     const reward = Math.abs(details.tp1 - details.entry);
+    
+    if (risk === 0) {
+      errors.push(`Option ${i}: Risk is zero (Entry=${details.entry}, SL=${details.sl})`);
+      continue;
+    }
+    
     const actualRR = reward / risk;
     
-    // Find claimed R:R for this option (approximate by position in text)
-    const optionStart = text.search(new RegExp(`Option ${i}`, 'i'));
-    const nextOptionStart = text.search(new RegExp(`Option ${i + 1}`, 'i'));
-    const optionSection = nextOptionStart > 0 ? 
-      text.substring(optionStart, nextOptionStart) : 
-      text.substring(optionStart);
-    
-    const rrInSection = optionSection.match(/R:R[:\s]*(\d+\.?\d*):1/i);
+    // Check if there's a claimed R:R in this option's section
+    const rrInSection = details.section.match(/R:R[:\s]*(\d+\.?\d*):1/i);
     if (rrInSection) {
       const claimedRR = Number(rrInSection[1]);
       const difference = Math.abs(actualRR - claimedRR);
       
-      if (difference > 0.3) { // Allow small rounding differences
+      // Allow 0.4 tolerance for rounding differences
+      if (difference > 0.4) {
         errors.push(
-          `Option ${i} R:R ERROR: Claims ${claimedRR.toFixed(1)}:1 but actual is ${actualRR.toFixed(2)}:1 ` +
+          `Option ${i} R:R MISMATCH: Claims ${claimedRR.toFixed(1)}:1 but calculated ${actualRR.toFixed(2)}:1 ` +
           `(Entry: ${details.entry}, SL: ${details.sl}, TP1: ${details.tp1})`
         );
       }
-      
-      if (actualRR < 1.5) {
-        errors.push(`Option ${i} R:R too low: ${actualRR.toFixed(2)}:1 (minimum 1.5:1 required)`);
-      }
+    }
+    
+    // Check minimum R:R requirement
+    if (actualRR < 1.5) {
+      errors.push(`Option ${i} R:R too low: ${actualRR.toFixed(2)}:1 (minimum 1.5:1 required)`);
     }
   }
   
@@ -2784,42 +2848,81 @@ if (pctDiff > maxDiff) {
     return res.status(400).json({ ok: false, reason: `Entry too far from current price: ${entry} vs live ${livePrice} (${(pctDiff*100).toFixed(1)}% away). Charts may be stale.` });
   }
 }
-     // Enhanced order type logic validation
-        const dirMatch = textFull.match(/Direction:\s*(Long|Short)/i);
-        const orderMatch = textFull.match(/Order Type:\s*(Limit|Stop|Market)/i);
-        if (dirMatch && orderMatch && entries.length > 0) {
-          const direction = dirMatch[1].toLowerCase();
-          const orderType = orderMatch[1].toLowerCase();
-          const avgEntry = entries.reduce((a, b) => a + b, 0) / entries.length;
+    // Enhanced order type logic validation - CHECK BOTH OPTIONS
+        const validateOrderLogic = (text: string, optionNum: number) => {
+          const optionRegex = new RegExp(`Option\\s+${optionNum}[\\s\\S]*?(?=Option\\s+${optionNum + 1}|Strategy Tournament Results|Full Breakdown|$)`, 'i');
+          const section = text.match(optionRegex)?.[0] || '';
           
-          if (orderType === "limit") {
-            // Long limits must be BELOW current price (buy cheaper)
-            if (direction === "long" && avgEntry >= livePrice) {
-              const diff = Math.abs(avgEntry - livePrice);
-              console.error(`[VISION-PLAN] IMPOSSIBLE Long Limit: ${avgEntry} at/above current ${livePrice} (diff: ${diff.toFixed(5)})`);
-              return res.status(400).json({ ok: false, reason: `IMPOSSIBLE ORDER: Long Limit at ${avgEntry} cannot execute at/above current price ${livePrice}. Use Market order for immediate long entry OR Limit order BELOW current price for pullback entry.` });
-            }
+          const dirMatch = section.match(/Direction:\s*(Long|Short)/i);
+          const orderMatch = section.match(/Order Type:\s*(Limit|Stop|Market)/i);
+          const entryMatch = section.match(/Entry[^:]*:\s*(\d+\.\d+)/i);
+          
+          if (dirMatch && orderMatch && entryMatch) {
+            const direction = dirMatch[1].toLowerCase();
+            const orderType = orderMatch[1].toLowerCase();
+            const entry = Number(entryMatch[1]);
             
-            // Short limits must be ABOVE current price (sell higher)  
-            if (direction === "short" && avgEntry <= livePrice) {
-              const diff = Math.abs(avgEntry - livePrice);
-              console.error(`[VISION-PLAN] IMPOSSIBLE Short Limit: ${avgEntry} at/below current ${livePrice} (diff: ${diff.toFixed(5)})`);
-              return res.status(400).json({ ok: false, reason: `IMPOSSIBLE ORDER: Short Limit at ${avgEntry} cannot execute at/below current price ${livePrice}. Use Market order for immediate short entry OR Limit order ABOVE current price for pullback entry.` });
-            }
-            
-            // Warn if limit orders are too close (likely to fill immediately)
-            const minDistance = scalpingMode === "hard" ? 0.0005 : 0.0015; // 5 pips hard, 15 pips normal
-            const priceDistance = Math.abs(avgEntry - livePrice) / livePrice;
-            if (priceDistance < minDistance) {
-              console.warn(`[VISION-PLAN] Limit order very close to market: ${avgEntry} vs ${livePrice} (${(priceDistance*10000).toFixed(1)} pips)`);
+            if (orderType === "limit") {
+              // Long limits must be BELOW current price (buy cheaper)
+              if (direction === "long" && entry >= livePrice) {
+                return `Option ${optionNum}: IMPOSSIBLE Long Limit at ${entry} cannot execute at/above current price ${livePrice}. Use Market order for immediate long entry OR Limit order BELOW current price for pullback entry.`;
+              }
+              
+              // Short limits must be ABOVE current price (sell higher)  
+              if (direction === "short" && entry <= livePrice) {
+                return `Option ${optionNum}: IMPOSSIBLE Short Limit at ${entry} cannot execute at/below current price ${livePrice}. Use Market order for immediate short entry OR Limit order ABOVE current price for pullback entry.`;
+              }
             }
           }
+          return null;
+        };
+        
+        // Validate both options
+        const option1Error = validateOrderLogic(textFull, 1);
+        const option2Error = validateOrderLogic(textFull, 2);
+        
+        if (option1Error) {
+          console.error(`[VISION-PLAN] ${option1Error}`);
+          return res.status(400).json({ ok: false, reason: option1Error });
+        }
+        
+        if (option2Error) {
+          console.error(`[VISION-PLAN] ${option2Error}`);
+          return res.status(400).json({ ok: false, reason: option2Error });
         }
       }
     }
 }
 
- // R:R validation
+ // Tournament completeness validation
+  const hasTournament = /Strategy Tournament Results:/i.test(textFull);
+  const hasAllStrategies = [
+    /Structure Break & Retest:/i,
+    /Trend Continuation:/i,
+    /Reversal at Extremes:/i,
+    /Order Block Reaction:/i,
+    /Breakout Continuation:/i
+  ].every(regex => regex.test(textFull));
+  
+  if (!hasTournament || !hasAllStrategies) {
+    console.error(`[VISION-PLAN] Incomplete strategy tournament - missing required sections`);
+    return res.status(400).json({ 
+      ok: false, 
+      reason: `Incomplete analysis: Strategy tournament missing or incomplete. All 5 strategies must be evaluated.` 
+    });
+  }
+  
+  // Tech vs Fundy validation
+  const hasTechFundy = /Tech vs Fundy Alignment:/i.test(textFull);
+  if (!hasTechFundy) {
+    console.error(`[VISION-PLAN] Missing Tech vs Fundy Alignment section`);
+    return res.status(400).json({ 
+      ok: false, 
+      reason: `Missing required section: Tech vs Fundy Alignment analysis is mandatory.` 
+    });
+  }
+
+  // R:R validation
   if (livePrice) {
     const rrValidationFull = validateRiskRewardClaims(textFull, livePrice);
     if (!rrValidationFull.valid) {
