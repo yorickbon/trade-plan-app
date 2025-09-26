@@ -1,11 +1,11 @@
 // /pages/api/vision-plan.ts
 /**
- * OCR-first calendar (image priority) — improved acceptance of pre-release rows
- * - Accepts forecast-vs-previous (no actual yet) to derive expected bias.
- * - Only shows "Calendar provided, but no relevant info for <INSTRUMENT>." when OCR has zero rows for the pair’s currencies.
- * - Keeps API calendar fallback, but OCR should satisfy most cases now.
- * - Preserves section enforcement, consistency guard, conviction (0–100, no hard caps), caching, and provenance.
- * - Adds scalping mode (query/body field `scalping=true|1|on|yes`) and optional 1m chart.
+ * Professional FX Trading Analysis API
+ * - Multi-timeframe institutional analysis (4H/1H/15M + optional 5M/1M)
+ * - Strategy tournament with 5 institutional approaches
+ * - OCR-based economic calendar analysis
+ * - Real-time price validation and R:R enforcement
+ * - Professional structure-based entry recommendations
  */
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -19,7 +19,7 @@ export const config = { api: { bodyParser: false, sizeLimit: "25mb" } };
 type Ok = { ok: true; text: string; meta?: any };
 type Err = { ok: false; reason: string };
 
-const VP_VERSION = "2025-09-12-ocrv10-fund0to100+tournament+no-mixed+scalp-flag";
+const VP_VERSION = "2025-09-26-institutional-v1.0-tournament-ocr-rr-validation";
 
 // ---------- OpenAI / Model pick ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || "";
