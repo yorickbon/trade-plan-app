@@ -1771,10 +1771,10 @@ scalpingMode?: "soft" | "hard" | "off";
     "• Risk Assessment: [ACCEPTABLE/HIGH/EXCESSIVE] - Overall risk level",
     "• Confidence Level: [HIGH/MEDIUM/LOW] - Based on alignment and quality",
     "",
-    "MANDATORY: Append a fenced JSON block labeled ai_meta at the very end.",
+"MANDATORY: Append a fenced JSON block labeled ai_meta at the very end.",
 "The ai_meta block MUST include currentPrice field - never omit this field.",
-"Example: { \"currentPrice\": 0.65304 } or { \"currentPrice\": \"PRICE_UNREADABLE\" }"
-    "",
+"Example: { \"currentPrice\": 0.65304 } or { \"currentPrice\": \"PRICE_UNREADABLE\" }",
+       "",
     "provenance_hint:",
     JSON.stringify(args.provenance || {}, null, 2),
   ].join("\n");
