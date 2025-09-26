@@ -748,8 +748,8 @@ async function fetchCalendarForAdvisory(req: NextApiRequest, instrument: string)
   warningMinutes: number | null, advisoryText: string | null, biasNote: string | null,
   raw?: any | null, evidence?: string[] | null
 }> {
-  const base = pair.slice(0, 3);
-  const quote = pair.slice(3);
+ const base = instrument.slice(0, 3);
+const quote = instrument.slice(3);
   
   try {
     const baseUrl = originFromReq(req);
