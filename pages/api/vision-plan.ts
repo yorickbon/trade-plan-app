@@ -340,14 +340,15 @@ async function fetchSeries15(pair: string): Promise<Series | null> {
   return null;
 }
 function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnapshot | null {
-  const weights = { r60: 0.6, r240: 0.4 };
+  const weights = { r1h: 0.6, r4h: 0.4 };
   const curScore: Record<string, number> = Object.fromEntries(G8.map((c) => [c, 0]));
   for (const pair of USD_PAIRS) {
     const S = seriesMap[pair];
     if (!S || !Array.isArray(S.c) || S.c.length < 17) continue;
-    const r60 = kbarReturn(S.c, 4) ?? 0;
-    const r240 = kbarReturn(S.c, 16) ?? 0;
-    const r = r60 * weights.r60 + r240 * weights.r240;
+    // 4 periods on 15M chart = 1 hour, 16 periods = 4 hours
+    const r1h = kbarReturn(S.c, 4) ?? 0;   // 1-hour return
+    const r4h = kbarReturn(S.c, 16) ?? 0;  // 4-hour return
+    const r = r1h * weights.r1h + r4h * weights.r4h;
     const base = pair.slice(0, 3);
     const quote = pair.slice(3);
     curScore[base] += r;
