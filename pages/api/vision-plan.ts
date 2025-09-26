@@ -2471,22 +2471,26 @@ if (calUrlOrig) {
       scalping_mode: !!scalping
     };
 
-    // ---------- Stage-1 (fast) ----------
-    if (mode === "fast") {
-  const messages = messagesFastStage1({
-        instrument, dateStr, 
-        m15: m15!, 
-        h1: h1 || "", 
-        h4: h4 || "", 
-        m5, m1,
-        calendarDataUrl: calDataUrlForPrompt || undefined,
-        calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
-        headlinesText: headlinesText || undefined,
-        sentimentText: sentimentText,
-        calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
-        provenance: provForModel,
-        scalpingMode,
-      });
+   // ---------- Unified Full Analysis (Fast mode removed) ----------
+// Force all requests to use institutional-grade full analysis
+if (mode === "fast") mode = "full";
+
+if (mode === "full") {
+  const messages = messagesFull({
+    instrument, dateStr, 
+    m15: m15!, 
+    h1: h1 || "", 
+    h4: h4 || "", 
+    m5, m1,
+    calendarDataUrl: calDataUrlForPrompt || undefined,
+    calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
+    headlinesText: headlinesText || undefined,
+    sentimentText,
+    calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
+    provenance: provForModel,
+    scalpingMode,
+  });
+  
 if (livePrice && scalpingMode === "hard") {
         (messages[0] as any).content = (messages[0] as any).content + `\n\n**HARD SCALPING PRICE LOCK**: ${instrument} is EXACTLY at ${livePrice} RIGHT NOW. For market orders, entry = ${livePrice} (no rounding). For limit orders, max 5 pips away. SL must be 5-8 pips. TP1 = 8-12 pips, TP2 = 12-18 pips. DO NOT round to .7850 or .50 levels.`;
       } else if (livePrice) {
