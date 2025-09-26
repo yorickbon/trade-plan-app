@@ -2338,6 +2338,71 @@ function buildServerProvenanceFooter(args: {
   return lines.join("\n");
 }
 
+// Post-processing function to add missing institutional sections
+async function enhanceWithMissingSections(model: string, instrument: string, text: string, livePrice: number | null): Promise<string> {
+  const missing: string[] = [];
+  
+  // Check for strategy tournament
+  const hasAllStrategies = [
+    /Structure Break & Retest:/i,
+    /Trend Continuation:/i,
+    /Reversal at Extremes:/i,
+    /Order Block Reaction:/i,
+    /Breakout Continuation:/i
+  ].every(regex => regex.test(text));
+  
+  if (!hasAllStrategies) missing.push("Strategy Tournament Results");
+  
+  // Check for Tech vs Fundy alignment
+  if (!/Tech vs Fundy Alignment:/i.test(text)) missing.push("Tech vs Fundy Alignment");
+  
+  // If nothing missing, return original
+  if (missing.length === 0) return text;
+  
+  // Generate missing sections
+  const enhancementPrompt = `Add the missing institutional sections to this trade analysis for ${instrument}:
+
+MISSING SECTIONS: ${missing.join(", ")}
+
+CURRENT ANALYSIS:
+${text}
+
+${missing.includes("Strategy Tournament Results") ? `
+Add this section after the multi-timeframe analysis:
+
+Strategy Tournament Results:
+1. Structure Break & Retest: [Score based on current setup]/100 - [Brief reasoning]
+2. Trend Continuation: [Score based on current setup]/100 - [Brief reasoning]
+3. Reversal at Extremes: [Score based on current setup]/100 - [Brief reasoning] 
+4. Order Block Reaction: [Score based on current setup]/100 - [Brief reasoning]
+5. Breakout Continuation: [Score based on current setup]/100 - [Brief reasoning]
+Winner: [Highest scoring] becomes basis for Option 1
+Runner-up: [Second highest] becomes basis for Option 2
+` : ""}
+
+${missing.includes("Tech vs Fundy Alignment") ? `
+Add this section in the Full Breakdown:
+
+Tech vs Fundy Alignment: [Match/Mismatch] - [Technical bias from charts] vs [Fundamental bias from calendar/sentiment]
+` : ""}
+
+Return the complete enhanced analysis with all missing sections added in the appropriate locations.`;
+
+  const messages = [
+    { role: "system", content: "You are enhancing a trade analysis by adding missing institutional sections. Keep all existing content and add the missing sections in appropriate locations." },
+    { role: "user", content: enhancementPrompt }
+  ];
+  
+  try {
+    const enhanced = await callOpenAI(model, messages);
+    console.log(`[ENHANCEMENT] Added missing sections: ${missing.join(", ")}`);
+    return enhanced;
+  } catch (error) {
+    console.error(`[ENHANCEMENT] Failed to add missing sections:`, error);
+    return text; // Return original if enhancement fails
+  }
+}
+
 // ---------- Handler ----------
 export default async function handler(req: NextApiRequest, res: NextApiResponse<Ok | Err>) {
   try {
@@ -2818,6 +2883,10 @@ const messages = messagesFull({
       }
 
  let textFull = await callOpenAI(MODEL, messages);
+    
+    // POST-PROCESSING: Add missing institutional sections
+    textFull = await enhanceWithMissingSections(MODEL, instrument, textFull, livePrice);
+    
     let aiMetaFull = extractAiMeta(textFull) || {};
 
     // CRITICAL: Validate model acknowledged current price correctly
