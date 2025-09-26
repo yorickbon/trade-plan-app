@@ -2493,6 +2493,7 @@ reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is
 
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
+    textFull = await enforceStrategyTournament(MODEL, instrument, textFull);
 
  // CRITICAL: Validate entry prices are reasonable relative to current market price
       if (livePrice && aiMetaFull) {
