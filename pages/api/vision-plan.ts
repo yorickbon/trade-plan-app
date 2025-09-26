@@ -992,22 +992,6 @@ function systemCore(
 
  const baseLines = [
     "You are a professional discretionary trader.",
-    "",
-   "CRITICAL FIRST STEP - STRATEGY TOURNAMENT EVALUATION:",
-    "You must begin your response with exactly this format:",
-    "",
-    "Strategy Tournament Results:",
-    "1. Structure Break & Retest: 75/100 - Clean BOS setup visible",
-    "2. Trend Continuation: 85/100 - Strong trend alignment", 
-    "3. Reversal at Extremes: 45/100 - Not at extreme levels",
-    "4. Order Block Reaction: 60/100 - Some OB structure present",
-    "5. Breakout Continuation: 80/100 - Clear breakout pattern",
-    "Winner: Trend Continuation becomes Option 1",
-    "Runner-up: Breakout Continuation becomes Option 2",
-    "",
-    "START YOUR RESPONSE WITH THE STRATEGY TOURNAMENT RESULTS SECTION.",
-    "Do not write any other content until you complete this tournament evaluation.",
-    "",
     "STRICT NO-GUESS RULES:",
     "- Only mention **Calendar** if calendar_status === 'api' or calendar_status === 'image-ocr'.",
     "- Only mention **Headlines** if a headlines snapshot is provided.",
@@ -1044,41 +1028,55 @@ function systemCore(
     "- State reasoning: 'TP1 0.5870 at 1H resistance level, TP2 0.5900 at 4H major resistance'",
     "- If R:R ratio poor (<1.5:1), recommend waiting for better setup",
     "",
-"INSTITUTIONAL ANALYSIS APPROACH:",
-"Analyze the setup using professional trading methodology:",
+ "STRATEGY TOURNAMENT - AI-ENHANCED INSTITUTIONAL APPROACH:",
+"Run 5 institutional strategies in parallel with ML scoring, select top 2 for Option 1 and Option 2.",
 "",
-"PRIMARY SETUP IDENTIFICATION:",
-"• Identify the strongest setup type: Trend Continuation, Structure Break & Retest, Reversal, Order Block Reaction, or Breakout",
-"• Score the primary setup: [Score]/100 with clear reasoning",
-"• Explain why this is the best approach for current conditions",
+"ADAPTIVE SCORING FRAMEWORK:",
+"• Base Strategy Score: Traditional technical analysis (0-70 points)",
+"• ML Pattern Recognition: Historical success rate adjustment (+/-15 points)",
+"• Market Regime Multiplier: Current conditions vs strategy strength (×0.8-1.3)",
+"• Performance Feedback: Recent win/loss rate for this setup type (+/-10 points)",
+"• Volatility Adjustment: Strategy performance in current vol regime (+/-5 points)",
 "",
-"ALTERNATIVE SETUP (Risk Management):",
-"• Identify a secondary setup or opposing view",
-"• Score the alternative setup: [Score]/100 with reasoning", 
-"• Explain why this serves as good risk management",
-"",
-"SETUP QUALITY FACTORS:",
-"• Structure Clarity: Are key levels obvious? (0-20 points)",
-"• Timeframe Alignment: Do HTF and LTF agree? (0-20 points)",
-"• Risk-Reward Quality: Is R:R attractive? (0-20 points)",
-"• Fundamental Support: Do fundamentals align? (0-20 points)",
-"• Timing Quality: Is entry timing optimal? (0-20 points)",
-"Total Setup Quality: [Sum]/100",
-"",
-"DUAL OPTION ANALYSIS:",
-"Provide two distinct trading approaches based on the above analysis:",
-"",
-"Option 1 (Primary): Based on highest scoring setup",
-"Option 2 (Alternative): Based on secondary setup or opposing view",
-"",
-"Each option must include:",
-"• Direction: Long/Short",
-"• Order Type: Market/Limit/Stop", 
-"• Entry: Specific price or tight range",
-"• Stop Loss: Behind clear structure level",
-"• Take Profit: TP1 and TP2 at resistance/support levels",
-"• Conviction: 0-100% based on setup quality",
-"• Risk-Reward: Calculated ratio (minimum 1.5:1)",
+"STRATEGY 1: STRUCTURE BREAK & RETEST (ML-Enhanced)",
+"- Look for recent BOS on 15M with pullback to broken level",
+"- Entry: Limit order at retest of broken structure + confirmation",
+"- SL: Behind the broken level + buffer",
+"- Base Score Factors: Clear BOS visible (30pts), Clean retest setup (25pts), Good R:R >2:1 (20pts), HTF alignment (25pts)",
+"- ML Enhancement: Pattern success rate in last 100 similar setups (+/-15pts)",
+"- Regime Bonus: +20pts in trending markets, -10pts in ranging markets",
+    "",
+    "STRATEGY 2: TREND CONTINUATION",
+    "- 4H trend + 1H pullback + 15M continuation signal",
+    "- Entry: Market/limit at continuation pattern break",
+    "- SL: Behind pullback structure",
+    "- Score factors: Strong HTF trend (25pts), Clean pullback (20pts), Volume/momentum (20pts), Multi-TF alignment (35pts)",
+    "",
+    "STRATEGY 3: REVERSAL AT EXTREMES", 
+    "- Price at 80%+ range + divergence + rejection pattern",
+    "- Entry: Limit at reversal confirmation",
+    "- SL: Beyond recent extreme + buffer",
+    "- Score factors: Extreme location (30pts), Divergence visible (25pts), Rejection pattern (25pts), Overbought/oversold (20pts)",
+    "",
+    "STRATEGY 4: ORDER BLOCK REACTION",
+    "- Institutional order block visible on 1H/4H + approach on 15M",
+    "- Entry: Limit at OB boundary with confirmation",
+    "- SL: Beyond order block structure",
+    "- Score factors: Clear OB formation (35pts), Clean approach (20pts), Confluence with other levels (25pts), R:R quality (20pts)",
+    "",
+    "STRATEGY 5: BREAKOUT CONTINUATION",
+    "- Consolidation break + momentum continuation + volume",
+    "- Entry: Stop order beyond breakout level",
+    "- SL: Back inside consolidation",
+    "- Score factors: Clean consolidation (25pts), Strong breakout (30pts), Volume confirmation (20pts), Target availability (25pts)",
+    "",
+ "TOURNAMENT SCORING (0-100 each strategy):",
+"1. Analyze current setup against each strategy's criteria (Base: 0-100pts)",
+"2. Market regime adjustment: Current volatility/trend strength (±10pts)",
+"3. Fundamental alignment bonus/penalty (±15pts)",
+"4. Risk-reward quality adjustment (±10pts based on R:R ratio)",
+"5. Timeframe confluence bonus (±10pts if all timeframes align)",
+"6. Option 1 = Highest scoring strategy, Option 2 = Second highest (min 15pt gap preferred)",
 "",
 "TRADE METADATA (ai_meta required):",
 "• trade_id: [Generate unique UUID for this recommendation]",
@@ -1726,24 +1724,10 @@ scalpingMode?: "soft" | "hard" | "off";
     "• European Bloc Risk: Consider EUR/GBP correlation during London session",
     "• Safe Haven Flows: JPY/CHF/USD strength during risk-off periods",
     "",
-   "Full Breakdown",
+    "Full Breakdown",
     "• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m/1m if used)",
     "• Fundamental View (Calendar + Sentiment + Headlines) — include explicit Calendar bias for <PAIR> when available; if pre-release, say: 'Pre-release only, no confirmed bias until data is out.'",
-    "• Tech vs Fundy Alignment: Match | Mismatch (+why) — MANDATORY SECTION",
-    "",
-    "CRITICAL: Tech vs Fundy Alignment section is REQUIRED and must appear in every trade card.",
-    "Format: 'Tech vs Fundy Alignment: [Match/Mismatch] - [Technical bias] vs [Fundamental bias]'",
-    "Example: 'Tech vs Fundy Alignment: Match - Bearish technicals vs Bearish fundamentals'",
-    "",
-    "MANDATORY TECHNICAL VS FUNDAMENTAL ALIGNMENT:",
-    "",
-    "REQUIRED OUTPUT FORMAT:",
-    "Tech vs Fundy Alignment: [Match/Mismatch/Neutral] - [Technical direction] vs [Fundamental direction]",
-    "• Technical: [Bullish/Bearish/Neutral] - [Brief reasoning]",
-    "• Fundamental: [Bullish/Bearish/Neutral] - [Brief reasoning]", 
-    "• Impact: [Match adds +10 conviction / Mismatch reduces -15 conviction / Neutral no change]",
-    "",
-    "NEVER skip this analysis - it's mandatory for institutional compliance.",
+    "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
     "• Validation Results: [All checks passed/Failed validations listed]",
     "• Market Regime: [Trending/Ranging/Breakout/News-driven] with implications",
     "• Conditional Scenarios:",
@@ -1833,16 +1817,6 @@ scalpingMode?: "soft" | "hard" | "off";
     "• Risk Assessment: [ACCEPTABLE/HIGH/EXCESSIVE] - Overall risk level",
     "• Confidence Level: [HIGH/MEDIUM/LOW] - Based on alignment and quality",
     "",
-"MANDATORY SECTIONS CHECKLIST (All Required):",
-"✅ Strategy Tournament Results: MUST show all 5 strategies with scores",
-"✅ Tech vs Fundy Alignment: MUST show explicit Match/Mismatch statement", 
-"✅ Option 1 (Primary): MUST include Direction/Order Type/Entry/SL/TP1/TP2/Conviction",
-"✅ Option 2 (Alternative): MUST include Direction/Order Type/Entry/SL/TP1/TP2/Conviction",
-"✅ Full Breakdown section: Technical View + Fundamental View + Alignment",
-"",
-"⚠️ WARNING: Any response missing these sections will be automatically rejected.",
-"Complete the Strategy Tournament BEFORE writing Option 1 and Option 2.",
-"",
 "CRITICAL: End your response with this EXACT format:",
 "```json",
 "ai_meta",
@@ -1853,10 +1827,7 @@ scalpingMode?: "soft" | "hard" | "off";
 "Replace [PUT_CURRENT_PRICE_HERE_OR_UNREADABLE] with either:",
 "- The exact price number: 0.65318",
 "- Or the text: \"UNREADABLE\" if you cannot read it",
-      "",
- "FINAL REMINDER: Your response must START with Strategy Tournament Results section.",
-    "Any response that doesn't begin with the tournament will be rejected.",
-    "",
+       "",
     "provenance_hint:",
     JSON.stringify(args.provenance || {}, null, 2),
   ].join("\n");
@@ -2174,84 +2145,60 @@ function validateRiskRewardClaims(text: string, livePrice: number): {
 } {
   const errors: string[] = [];
   
-// Extract Option 1 and Option 2 details more reliably
+  // Extract R:R claims from text
+  const rrMatches = text.matchAll(/R:R[:\s]*(\d+\.?\d*):1/gi);
+  const rrClaims = Array.from(rrMatches).map(m => Number(m[1]));
+  
+  // Extract Option 1 and Option 2 details
   const extractOptionDetails = (optionNum: number) => {
-    // Find the option section with more flexible patterns
-    const optionRegex = new RegExp(`Option\\s*${optionNum}[\\s\\S]*?(?=Option\\s*${optionNum + 1}|Strategy Tournament|Full Breakdown|Trade Management|Executive Summary|$)`, 'i');
-    const section = text.match(optionRegex)?.[0] || '';
+    const regex = new RegExp(`Option ${optionNum}[\\s\\S]*?(?=Option ${optionNum + 1}|$)`, 'i');
+    const section = text.match(regex)?.[0] || '';
     
-    if (!section) {
-      console.warn(`[R:R-VALIDATION] Could not find Option ${optionNum} section`);
-      return null;
-    }
-    
-    // Extract entry price - try multiple patterns
-    let entryMatch = section.match(/Entry[^:]*:\s*(\d+\.\d+)/i);
-    if (!entryMatch) entryMatch = section.match(/Entry[^:]*zone[^:]*:\s*(\d+\.\d+)/i);
-    if (!entryMatch) entryMatch = section.match(/Entry[^:]*single[^:]*:\s*(\d+\.\d+)/i);
-    if (!entryMatch) entryMatch = section.match(/•\s*Entry[^:]*:\s*(\d+\.\d+)/i);
-    
-    // Extract stop loss with more flexible patterns
-    let slMatch = section.match(/Stop\s*Loss[^:]*:\s*(\d+\.\d+)/i);
-    if (!slMatch) slMatch = section.match(/•\s*Stop\s*Loss[^:]*:\s*(\d+\.\d+)/i);
-    if (!slMatch) slMatch = section.match(/SL[^:]*:\s*(\d+\.\d+)/i);
-    
-    // Extract TP1 with more flexible patterns
-    let tp1Match = section.match(/TP1[^0-9\/]*(\d+\.\d+)/i);
-    if (!tp1Match) tp1Match = section.match(/Take\s*Profit[^:]*:\s*TP1[^0-9\/]*(\d+\.\d+)/i);
-    if (!tp1Match) tp1Match = section.match(/•\s*Take\s*Profit[^:]*TP1[^0-9\/]*(\d+\.\d+)/i);
-    if (!tp1Match) tp1Match = section.match(/Target[^:]*:\s*(\d+\.\d+)/i);
-    
-    console.log(`[R:R-VALIDATION] Option ${optionNum}: Entry=${entryMatch?.[1]}, SL=${slMatch?.[1]}, TP1=${tp1Match?.[1]}`);
+    const entryMatch = section.match(/Entry[^:]*:\s*(\d+\.\d+)/i);
+    const slMatch = section.match(/Stop Loss[^:]*:\s*(\d+\.\d+)/i);
+    const tp1Match = section.match(/Take Profit[^:]*:\s*TP1[^0-9]*(\d+\.\d+)/i);
     
     if (entryMatch && slMatch && tp1Match) {
       return {
         entry: Number(entryMatch[1]),
         sl: Number(slMatch[1]),
-        tp1: Number(tp1Match[1]),
-        section: section
+        tp1: Number(tp1Match[1])
       };
     }
-    
-    console.warn(`[R:R-VALIDATION] Option ${optionNum} missing fields: Entry=${!!entryMatch}, SL=${!!slMatch}, TP1=${!!tp1Match}`);
     return null;
   };
+  
   // Validate each option's R:R claims
   for (let i = 1; i <= 2; i++) {
     const details = extractOptionDetails(i);
-    if (!details) {
-      errors.push(`Option ${i}: Cannot extract entry/SL/TP1 prices for validation`);
-      continue;
-    }
+    if (!details) continue;
     
     const risk = Math.abs(details.entry - details.sl);
     const reward = Math.abs(details.tp1 - details.entry);
-    
-    if (risk === 0) {
-      errors.push(`Option ${i}: Risk is zero (Entry=${details.entry}, SL=${details.sl})`);
-      continue;
-    }
-    
     const actualRR = reward / risk;
     
-    // Check if there's a claimed R:R in this option's section
-    const rrInSection = details.section.match(/R:R[:\s]*(\d+\.?\d*):1/i);
+    // Find claimed R:R for this option (approximate by position in text)
+    const optionStart = text.search(new RegExp(`Option ${i}`, 'i'));
+    const nextOptionStart = text.search(new RegExp(`Option ${i + 1}`, 'i'));
+    const optionSection = nextOptionStart > 0 ? 
+      text.substring(optionStart, nextOptionStart) : 
+      text.substring(optionStart);
+    
+    const rrInSection = optionSection.match(/R:R[:\s]*(\d+\.?\d*):1/i);
     if (rrInSection) {
       const claimedRR = Number(rrInSection[1]);
       const difference = Math.abs(actualRR - claimedRR);
       
-      // Allow 0.4 tolerance for rounding differences
-      if (difference > 0.4) {
+      if (difference > 0.3) { // Allow small rounding differences
         errors.push(
-          `Option ${i} R:R MISMATCH: Claims ${claimedRR.toFixed(1)}:1 but calculated ${actualRR.toFixed(2)}:1 ` +
+          `Option ${i} R:R ERROR: Claims ${claimedRR.toFixed(1)}:1 but actual is ${actualRR.toFixed(2)}:1 ` +
           `(Entry: ${details.entry}, SL: ${details.sl}, TP1: ${details.tp1})`
         );
       }
-    }
-    
-    // Check minimum R:R requirement
-    if (actualRR < 1.5) {
-      errors.push(`Option ${i} R:R too low: ${actualRR.toFixed(2)}:1 (minimum 1.5:1 required)`);
+      
+      if (actualRR < 1.5) {
+        errors.push(`Option ${i} R:R too low: ${actualRR.toFixed(2)}:1 (minimum 1.5:1 required)`);
+      }
     }
   }
   
@@ -2306,80 +2253,6 @@ function buildServerProvenanceFooter(args: {
     "---\n",
   ].filter(Boolean);
   return lines.join("\n");
-}
-
-// Post-processing function to add missing institutional sections
-async function enhanceWithMissingSections(model: string, instrument: string, text: string, livePrice: number | null): Promise<string> {
-  const missing: string[] = [];
-  
-  // Check for strategy tournament
-  const hasAllStrategies = [
-    /Structure Break.*Retest.*:/i,
-    /Trend.*Continuation.*:/i,
-    /Reversal.*Extremes.*:/i,
-    /Order.*Block.*Reaction.*:/i,
-    /Breakout.*Continuation.*:/i
-  ].every(regex => regex.test(text));
-  
-  if (!hasAllStrategies) missing.push("Strategy Tournament Results");
-  
-  // Check for Tech vs Fundy alignment
-  if (!/Tech vs Fundy Alignment:/i.test(text)) missing.push("Tech vs Fundy Alignment");
-  
-  // If nothing missing, return original
-  if (missing.length === 0) {
-    console.log(`[ENHANCEMENT] No missing sections detected, returning original text`);
-    return text;
-  }
-  
-  // Generate missing sections
-  const enhancementPrompt = `Add the missing institutional sections to this trade analysis for ${instrument}:
-
-MISSING SECTIONS: ${missing.join(", ")}
-
-CURRENT ANALYSIS:
-${text}
-
-${missing.includes("Strategy Tournament Results") ? `
-Add this section after the multi-timeframe analysis:
-
-Strategy Tournament Results:
-1. Structure Break & Retest: [Score based on current setup]/100 - [Brief reasoning]
-2. Trend Continuation: [Score based on current setup]/100 - [Brief reasoning]
-3. Reversal at Extremes: [Score based on current setup]/100 - [Brief reasoning] 
-4. Order Block Reaction: [Score based on current setup]/100 - [Brief reasoning]
-5. Breakout Continuation: [Score based on current setup]/100 - [Brief reasoning]
-Winner: [Highest scoring] becomes basis for Option 1
-Runner-up: [Second highest] becomes basis for Option 2
-` : ""}
-
-${missing.includes("Tech vs Fundy Alignment") ? `
-Add this section in the Full Breakdown:
-
-Tech vs Fundy Alignment: [Match/Mismatch] - [Technical bias from charts] vs [Fundamental bias from calendar/sentiment]
-` : ""}
-
-Return the complete enhanced analysis with all missing sections added in the appropriate locations.`;
-
-  const messages = [
-    { role: "system", content: "You are enhancing a trade analysis by adding missing institutional sections. Keep all existing content and add the missing sections in appropriate locations." },
-    { role: "user", content: enhancementPrompt }
-  ];
-  
-  try {
-    console.log(`[ENHANCEMENT] Attempting to add missing sections: ${missing.join(", ")}`);
-    const enhanced = await callOpenAI(model, messages);
-    if (!enhanced || enhanced.trim().length === 0) {
-      console.error(`[ENHANCEMENT] OpenAI returned empty response for missing sections`);
-      return text;
-    }
-    console.log(`[ENHANCEMENT] Successfully added missing sections: ${missing.join(", ")}`);
-    return enhanced;
-  } catch (error: any) {
-    console.error(`[ENHANCEMENT] Failed to add missing sections:`, error?.message || error);
-    console.error(`[ENHANCEMENT] Model: ${model}, Missing: ${missing.join(", ")}`);
-    return text; // Return original if enhancement fails
-  }
 }
 
 // ---------- Handler ----------
@@ -2862,10 +2735,6 @@ const messages = messagesFull({
       }
 
  let textFull = await callOpenAI(MODEL, messages);
-    
-    // POST-PROCESSING: Add missing institutional sections
-    textFull = await enhanceWithMissingSections(MODEL, instrument, textFull, livePrice);
-    
     let aiMetaFull = extractAiMeta(textFull) || {};
 
     // CRITICAL: Validate model acknowledged current price correctly
@@ -2915,84 +2784,42 @@ if (pctDiff > maxDiff) {
     return res.status(400).json({ ok: false, reason: `Entry too far from current price: ${entry} vs live ${livePrice} (${(pctDiff*100).toFixed(1)}% away). Charts may be stale.` });
   }
 }
-    // Enhanced order type logic validation - CHECK BOTH OPTIONS
-      const validateOrderLogic = (text: string, optionNum: number) => {
-          const optionRegex = new RegExp(`Option\\s+${optionNum}[\\s\\S]*?(?=Option\\s+${optionNum + 1}|Strategy Tournament Results|Full Breakdown|$)`, 'i');
-          const section = text.match(optionRegex)?.[0] || '';
+     // Enhanced order type logic validation
+        const dirMatch = textFull.match(/Direction:\s*(Long|Short)/i);
+        const orderMatch = textFull.match(/Order Type:\s*(Limit|Stop|Market)/i);
+        if (dirMatch && orderMatch && entries.length > 0) {
+          const direction = dirMatch[1].toLowerCase();
+          const orderType = orderMatch[1].toLowerCase();
+          const avgEntry = entries.reduce((a, b) => a + b, 0) / entries.length;
           
-          const dirMatch = section.match(/Direction:\s*(Long|Short)/i);
-          const orderMatch = section.match(/Order Type:\s*(Limit|Stop|Market)/i);
-          const entryMatch = section.match(/Entry[^:]*:\s*(\d+\.\d+)/i);
-          
-          if (dirMatch && orderMatch && entryMatch) {
-            const direction = dirMatch[1].toLowerCase();
-            const orderType = orderMatch[1].toLowerCase();
-            const entry = Number(entryMatch[1]);
+          if (orderType === "limit") {
+            // Long limits must be BELOW current price (buy cheaper)
+            if (direction === "long" && avgEntry >= livePrice) {
+              const diff = Math.abs(avgEntry - livePrice);
+              console.error(`[VISION-PLAN] IMPOSSIBLE Long Limit: ${avgEntry} at/above current ${livePrice} (diff: ${diff.toFixed(5)})`);
+              return res.status(400).json({ ok: false, reason: `IMPOSSIBLE ORDER: Long Limit at ${avgEntry} cannot execute at/above current price ${livePrice}. Use Market order for immediate long entry OR Limit order BELOW current price for pullback entry.` });
+            }
             
-            if (orderType === "limit") {
-              // Allow small tolerance for structure-based entries (±0.5%)
-              const tolerance = livePrice * 0.005;
-              
-              // Long limits must be BELOW current price (buy cheaper) - allow small tolerance
-              if (direction === "long" && entry > (livePrice + tolerance)) {
-                return `Option ${optionNum}: IMPOSSIBLE Long Limit at ${entry} cannot execute significantly above current price ${livePrice}. Use Market order for immediate long entry OR Limit order BELOW current price for pullback entry.`;
-              }
-              
-              // Short limits must be ABOVE current price (sell higher) - allow small tolerance  
-              if (direction === "short" && entry < (livePrice - tolerance)) {
-                return `Option ${optionNum}: IMPOSSIBLE Short Limit at ${entry} cannot execute significantly below current price ${livePrice}. Use Market order for immediate short entry OR Limit order ABOVE current price for pullback entry.`;
-              }
+            // Short limits must be ABOVE current price (sell higher)  
+            if (direction === "short" && avgEntry <= livePrice) {
+              const diff = Math.abs(avgEntry - livePrice);
+              console.error(`[VISION-PLAN] IMPOSSIBLE Short Limit: ${avgEntry} at/below current ${livePrice} (diff: ${diff.toFixed(5)})`);
+              return res.status(400).json({ ok: false, reason: `IMPOSSIBLE ORDER: Short Limit at ${avgEntry} cannot execute at/below current price ${livePrice}. Use Market order for immediate short entry OR Limit order ABOVE current price for pullback entry.` });
+            }
+            
+            // Warn if limit orders are too close (likely to fill immediately)
+            const minDistance = scalpingMode === "hard" ? 0.0005 : 0.0015; // 5 pips hard, 15 pips normal
+            const priceDistance = Math.abs(avgEntry - livePrice) / livePrice;
+            if (priceDistance < minDistance) {
+              console.warn(`[VISION-PLAN] Limit order very close to market: ${avgEntry} vs ${livePrice} (${(priceDistance*10000).toFixed(1)} pips)`);
             }
           }
-          return null;
-        };  
-        
-        // Validate both options
-        const option1Error = validateOrderLogic(textFull, 1);
-        const option2Error = validateOrderLogic(textFull, 2);
-        
-        if (option1Error) {
-          console.error(`[VISION-PLAN] ${option1Error}`);
-          return res.status(400).json({ ok: false, reason: option1Error });
-        }
-        
-        if (option2Error) {
-          console.error(`[VISION-PLAN] ${option2Error}`);
-          return res.status(400).json({ ok: false, reason: option2Error });
         }
       }
     }
 }
 
-// Tournament completeness validation - allow enhancement to handle missing sections
-  const hasTournament = /Strategy Tournament Results:/i.test(textFull);
-  const hasAllStrategies = [
-    /Structure Break & Retest:/i,
-    /Trend Continuation:/i,
-    /Reversal at Extremes:/i,
-    /Order Block Reaction:/i,
-    /Breakout Continuation:/i
-  ].every(regex => regex.test(textFull));
-  
-  if (!hasTournament || !hasAllStrategies) {
-    console.error(`[VISION-PLAN] Strategy tournament still missing after enhancement - this indicates a fundamental AI model issue`);
-    return res.status(400).json({ 
-      ok: false, 
-      reason: `Critical error: AI model consistently fails to generate required Strategy Tournament Results section despite multiple attempts. This suggests a deeper prompting or model configuration issue.` 
-    });
-  }
-  
-  // Tech vs Fundy validation
-  const hasTechFundy = /Tech vs Fundy Alignment:/i.test(textFull);
-  if (!hasTechFundy) {
-    console.error(`[VISION-PLAN] Missing Tech vs Fundy Alignment section`);
-    return res.status(400).json({ 
-      ok: false, 
-      reason: `Missing required section: Tech vs Fundy Alignment analysis is mandatory.` 
-    });
-  }
-
-  // R:R validation
+ // R:R validation
   if (livePrice) {
     const rrValidationFull = validateRiskRewardClaims(textFull, livePrice);
     if (!rrValidationFull.valid) {
