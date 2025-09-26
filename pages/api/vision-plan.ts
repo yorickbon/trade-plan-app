@@ -2194,6 +2194,73 @@ function validateEntryPrices(text: string, aiMeta: any, livePrice: number, scalp
   return { valid: errors.length === 0, errors };
 }
 
+// Risk-reward validation
+function validateRiskRewardClaims(text: string, livePrice: number): {
+  valid: boolean;
+  errors: string[];
+} {
+  const errors: string[] = [];
+  
+  // Extract R:R claims from text
+  const rrMatches = text.matchAll(/R:R[:\s]*(\d+\.?\d*):1/gi);
+  const rrClaims = Array.from(rrMatches).map(m => Number(m[1]));
+  
+  // Extract Option 1 and Option 2 details
+  const extractOptionDetails = (optionNum: number) => {
+    const regex = new RegExp(`Option ${optionNum}[\\s\\S]*?(?=Option ${optionNum + 1}|$)`, 'i');
+    const section = text.match(regex)?.[0] || '';
+    
+    const entryMatch = section.match(/Entry[^:]*:\s*(\d+\.\d+)/i);
+    const slMatch = section.match(/Stop Loss[^:]*:\s*(\d+\.\d+)/i);
+    const tp1Match = section.match(/Take Profit[^:]*:\s*TP1[^0-9]*(\d+\.\d+)/i);
+    
+    if (entryMatch && slMatch && tp1Match) {
+      return {
+        entry: Number(entryMatch[1]),
+        sl: Number(slMatch[1]),
+        tp1: Number(tp1Match[1])
+      };
+    }
+    return null;
+  };
+  
+  // Validate each option's R:R claims
+  for (let i = 1; i <= 2; i++) {
+    const details = extractOptionDetails(i);
+    if (!details) continue;
+    
+    const risk = Math.abs(details.entry - details.sl);
+    const reward = Math.abs(details.tp1 - details.entry);
+    const actualRR = reward / risk;
+    
+    // Find claimed R:R for this option (approximate by position in text)
+    const optionStart = text.search(new RegExp(`Option ${i}`, 'i'));
+    const nextOptionStart = text.search(new RegExp(`Option ${i + 1}`, 'i'));
+    const optionSection = nextOptionStart > 0 ? 
+      text.substring(optionStart, nextOptionStart) : 
+      text.substring(optionStart);
+    
+    const rrInSection = optionSection.match(/R:R[:\s]*(\d+\.?\d*):1/i);
+    if (rrInSection) {
+      const claimedRR = Number(rrInSection[1]);
+      const difference = Math.abs(actualRR - claimedRR);
+      
+      if (difference > 0.3) { // Allow small rounding differences
+        errors.push(
+          `Option ${i} R:R ERROR: Claims ${claimedRR.toFixed(1)}:1 but actual is ${actualRR.toFixed(2)}:1 ` +
+          `(Entry: ${details.entry}, SL: ${details.sl}, TP1: ${details.tp1})`
+        );
+      }
+      
+      if (actualRR < 1.5) {
+        errors.push(`Option ${i} R:R too low: ${actualRR.toFixed(2)}:1 (minimum 1.5:1 required)`);
+      }
+    }
+  }
+  
+  return { valid: errors.length === 0, errors };
+}
+
 // ---------- Risk management calculator ----------
 function calculateRiskMetrics(
   instrument: string,
@@ -2516,16 +2583,28 @@ function analyzeCalendarProfessional(ocrItems: OcrCalendarRow[], instrument: str
   // Apply institutional cross-currency correlations
   applyInstitutionalCorrelations(currencyScores, reasoning, base, quote);
   
-  // Calculate final instrument bias
-  const baseScore = currencyScores[base] || 0;
-  const quoteScore = currencyScores[quote] || 0;
-  const netScore = baseScore - quoteScore;
-  
-  // Professional bias determination (stricter thresholds)
-  let finalBias: string;
-  if (netScore > 1.5) finalBias = "bullish";
-  else if (netScore < -1.5) finalBias = "bearish";
-  else finalBias = "neutral";
+  // Calculate final instrument bias using proper cross-currency logic
+const baseScore = currencyScores[base] || 0;
+const quoteScore = currencyScores[quote] || 0;
+const netScore = baseScore - quoteScore;
+
+// Professional bias determination with explicit reasoning
+let finalBias: string;
+let biasReasoning: string;
+
+if (netScore > 1.5) {
+  finalBias = "bullish";
+  biasReasoning = `${base} strength (${baseScore.toFixed(1)}) > ${quote} strength (${quoteScore.toFixed(1)}) = Bullish ${base}${quote}`;
+} else if (netScore < -1.5) {
+  finalBias = "bearish"; 
+  biasReasoning = `${quote} strength (${quoteScore.toFixed(1)}) > ${base} strength (${baseScore.toFixed(1)}) = Bearish ${base}${quote}`;
+} else {
+  finalBias = "neutral";
+  biasReasoning = `${base} (${baseScore.toFixed(1)}) vs ${quote} (${quoteScore.toFixed(1)}) = Balanced, no clear bias`;
+}
+
+// Debug logging for validation
+console.log(`[CALENDAR] ${base}${quote}: Base=${baseScore.toFixed(1)}, Quote=${quoteScore.toFixed(1)}, Net=${netScore.toFixed(1)}, Bias=${finalBias}`);
   
   const summary = `Calendar: ${base} ${baseScore.toFixed(1)} vs ${quote} ${quoteScore.toFixed(1)} = ${finalBias} ${instrument} (net ${netScore > 0 ? "+" : ""}${netScore.toFixed(1)})`;
   
@@ -2957,6 +3036,16 @@ if (pctDiff > maxDiff) {
         }
       }
     }
+}
+
+  // R:R validation
+  const rrValidationFull = validateRiskRewardClaims(textFull, livePrice);
+  if (!rrValidationFull.valid) {
+    console.error(`[VISION-PLAN] R:R validation failed:`, rrValidationFull.errors);
+    return res.status(400).json({ 
+      ok: false, 
+      reason: `Risk-Reward calculation errors: ${rrValidationFull.errors.join(' | ')}. Please verify trade math.` 
+    });
   }
 
   // Stamp 5M/1M execution if used
