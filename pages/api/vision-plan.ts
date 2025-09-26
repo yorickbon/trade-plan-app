@@ -1845,63 +1845,7 @@ scalpingMode?: "soft" | "hard" | "off";
   ];
 }
 
-function messagesFastStage1(args: {
-  instrument: string; dateStr: string; m15: string; h1: string; h4: string; m5?: string | null; m1?: string | null;
-  calendarDataUrl?: string | null; calendarText?: string | null;
-  headlinesText?: string | null; sentimentText?: string | null;
-  calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null; debugRows?: any[] | null; preReleaseOnly?: boolean | null };
-  provenance?: any;
- scalpingMode?: "soft" | "hard" | "off";
-}) {
-const system = [
-    systemCore(args.instrument, args.calendarAdvisory, args.scalpingMode), "",
-    "FAST MODE - ESSENTIAL ANALYSIS ONLY:",
-    "",
-    "Multi-Timeframe Summary (Required):",
-    "• 4H: [UPTREND/DOWNTREND/RANGE] - Price at [highs/middle/lows]",
-    "• 1H: [UPTREND/DOWNTREND/RANGE] - [Confirms/Conflicts] 4H bias", 
-    "• 15M: [UPTREND/DOWNTREND/RANGE] - Entry timeframe",
-    "",
-  "Fundamentals Summary (Required - Show ALL Scores):",
-    "• Calendar Bias: [Bullish/Bearish/Neutral] (Score: X/100) - key events if any",
-    "• Headlines Bias: [Bullish/Bearish/Neutral] (Score: X/100) - from sentiment data",
-    "• CSM Bias: [Bullish/Bearish/Neutral] (Score: X/100) - currency strength",
-    "• Combined Fundamentals: [Bullish/Bearish/Neutral] (F = X/100)",
-    "• Tech vs Fundy: [Match/Mismatch] - [Technical direction] vs [Fundamental direction]",
-    "",
-    "Option 1 (Primary)",
-    "• Direction: ...",
-    "• Order Type: ...",
-    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%", "• Why this is primary:",
-    "",
-    "Option 2 (Alternative)",
-    "• Direction: ...",
-    "• Order Type: ...",
-    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
-    "• Conviction: <0–100>%", "• Why this alternative:",
-    "",
-    "Management: Brief actionable playbook.",
-    "",
-    "Append ONLY a fenced JSON block labeled ai_meta.",
-    "",
-    "provenance_hint:",
-    JSON.stringify(args.provenance || {}, null, 2),
-  ].join("\n");
 
-  const parts = buildUserPartsBase({
-    instrument: args.instrument, dateStr: args.dateStr, m15: args.m15, h1: args.h1, h4: args.h4, m5: args.m5 || null, m1: args.m1 || null,
-    calendarDataUrl: args.calendarDataUrl,
-    calendarText: !args.calendarDataUrl && args.calendarText ? args.calendarText : undefined,
-    headlinesText: args.headlinesText || undefined,
-    sentimentText: args.sentimentText || undefined,
-    calendarAdvisoryText: args.calendarAdvisory?.advisoryText || null,
-    calendarEvidence: args.calendarAdvisory?.evidence || null,
-    debugOCRRows: args.calendarAdvisory?.debugRows || null,
-  });
-
-  return [{ role: "system", content: system }, { role: "user", content: parts }];
-}
 
 // ---------- Enforcement helpers ----------
 function hasCompliantOption2(text: string): boolean {
@@ -2317,8 +2261,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (req.method !== "POST") return res.status(405).json({ ok: false, reason: "Method not allowed" });
     if (!OPENAI_API_KEY) return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
 
-    const urlMode = String((req.query.mode as string) || "").toLowerCase();
-    let mode: "full" | "fast" | "expand" = urlMode === "fast" ? "fast" : urlMode === "expand" ? "expand" : "full";
+   const urlMode = String((req.query.mode as string) || "").toLowerCase();
+    let mode: "full" | "expand" = urlMode === "expand" ? "expand" : "full"; // Always use full institutional analysis
     const debugQuery = String(req.query.debug || "").trim() === "1";
 
     // ---------- expand ----------
@@ -2379,8 +2323,7 @@ if (!rawInstr) {
 }
 const instrument = rawInstr;
 
-    const requestedMode = String(fields.mode || "").toLowerCase();
-    if (requestedMode === "fast") mode = "fast";
+    // All requests use full institutional analysis
 
   // Scalping mode detection from frontend checkboxes
     const scalpingRaw = String(pickFirst(fields.scalping) || "").trim().toLowerCase();
@@ -2768,169 +2711,7 @@ if (calUrlOrig) {
     };
 
    // ---------- Unified Full Analysis (Fast mode removed) ----------
-// Force all requests to use institutional-grade full analysis
-if (mode === "fast") mode = "full";
 
-if (mode === "full") {
-  const messages = messagesFull({
-    instrument, dateStr, 
-    m15: m15!, 
-    h1: h1 || "", 
-    h4: h4 || "", 
-    m5, m1,
-    calendarDataUrl: calDataUrlForPrompt || undefined,
-    calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
-    headlinesText: headlinesText || undefined,
-    sentimentText,
-    calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
-    provenance: provForModel,
-    scalpingMode,
-  });
-  
-if (livePrice && scalpingMode === "hard") {
-        (messages[0] as any).content = (messages[0] as any).content + `\n\n**HARD SCALPING PRICE LOCK**: ${instrument} is EXACTLY at ${livePrice} RIGHT NOW. For market orders, entry = ${livePrice} (no rounding). For limit orders, max 5 pips away. SL must be 5-8 pips. TP1 = 8-12 pips, TP2 = 12-18 pips. DO NOT round to .7850 or .50 levels.`;
-      } else if (livePrice) {
-        (messages[0] as any).content = (messages[0] as any).content + `\n\n**CRITICAL PRICE CHECK**: Current ${instrument} price is EXACTLY ${livePrice}. You MUST report this exact price in ai_meta.currentPrice. All entry suggestions must be within 15 points (0.4%) of this level for immediate execution.`;
-      }
-
-   let text = await callOpenAI(MODEL, messages);
-      let aiMeta = extractAiMeta(text) || {};
-
-   // CRITICAL: Enhanced price validation with strict enforcement
-if (livePrice) {
-  const modelPrice = Number(aiMeta?.currentPrice);
-  
-if (!isFinite(modelPrice) || modelPrice <= 0) {
-  console.error(`[VISION-PLAN] Model failed to report currentPrice: ${modelPrice}`);
-  return res.status(400).json({ 
-    ok: false, 
-    reason: `DEBUG: AI reported currentPrice as '${aiMeta?.currentPrice}' (type: ${typeof aiMeta?.currentPrice}). Live price is ${livePrice}. Check AI's price reading explanation in the analysis output.` 
-  });
-}
-  
-  else {
-    const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
-    const warnThreshold = 0.002; // 0.2% warning threshold
-    const errorThreshold = 0.008; // 0.8% error threshold (account for normal market movement)
-    
-    if (priceDiff > errorThreshold) {
-      console.error(`[VISION-PLAN] MAJOR price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(2)}%`);
-      return res.status(400).json({ 
-        ok: false, 
-        reason: `CRITICAL: Chart price ${modelPrice} differs from live price ${livePrice} by ${(priceDiff*100).toFixed(2)}%. Charts appear stale or y-axis misread. Refresh charts and retry.` 
-      });
-    } else if (priceDiff > warnThreshold) {
-  console.warn(`[VISION-PLAN] Price drift detected: Chart=${modelPrice}, Live=${livePrice}, Diff=${(priceDiff*100).toFixed(2)}%`);
-  // Continue with analysis but flag the price discrepancy
-  text = `⚠️ **PRICE DRIFT DETECTED**: Chart shows ${modelPrice}, live price is ${livePrice} (${(priceDiff*100).toFixed(2)}% difference)\n\n**RECOMMENDATION**: Manually verify entry levels against current market before placing orders.\n\n${text}`;
-  aiMeta.price_validation = { 
-    status: "drift_warning", 
-    chart_price: modelPrice, 
-    live_price: livePrice, 
-    diff_percent: priceDiff * 100,
-    warning: "Manual price verification recommended before order placement"
-  };
-}
-    
-    else {
-      aiMeta.price_validation = { status: "validated", chart_price: modelPrice, live_price: livePrice, diff_percent: priceDiff * 100 };
-      console.log(`[VISION-PLAN] Price validation passed: Chart=${modelPrice}, Live=${livePrice}, Diff=${(priceDiff*100).toFixed(2)}%`);
-    }
-  }
-}
-
-      if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
-
-      text = await enforceOption1(MODEL, instrument, text);
-      text = await enforceOption2(MODEL, instrument, text);
-
-    // CRITICAL: Validate entry prices are reasonable relative to current market price
-      if (livePrice && aiMeta) {
-        const entries: number[] = [];
-        const entryMatch = text.match(/Entry.*?:.*?([\d.]+)/i);
-        if (entryMatch) entries.push(Number(entryMatch[1]));
-        if (aiMeta.zone?.min) entries.push(Number(aiMeta.zone.min));
-        if (aiMeta.zone?.max) entries.push(Number(aiMeta.zone.max));
-        
-        for (const entry of entries) {
-          if (isFinite(entry) && entry > 0) {
-            const pctDiff = Math.abs((entry - livePrice) / livePrice);
-            // Allow structure-based entries: 1% for hard scalping, 5% for normal/soft modes
-          // More reasonable price validation for structure-based trading
-const maxDiff = scalpingMode === "hard" ? 0.08 : 0.20; // 8% hard scalping, 20% normal
-if (pctDiff > maxDiff) {
-  console.warn(`[VISION-PLAN] Entry distant from current price: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
-  // Don't reject, just warn - but reject if extremely far
-  if (pctDiff > 0.50) { // Only reject if >50% away (clearly wrong)
-    return res.status(400).json({ ok: false, reason: `Entry too far from current price: ${entry} vs live ${livePrice} (${(pctDiff*100).toFixed(1)}% away). Charts may be stale.` });
-  }
-}
-        
-        const dirMatch = text.match(/Direction:\s*(Long|Short)/i);
-        const orderMatch = text.match(/Order Type:\s*(Limit|Stop|Market)/i);
-        if (dirMatch && orderMatch && entries.length > 0) {
-          const direction = dirMatch[1].toLowerCase();
-          const orderType = orderMatch[1].toLowerCase();
-          const avgEntry = entries.reduce((a, b) => a + b, 0) / entries.length;
-          
-          if (direction === "long" && orderType === "limit" && avgEntry > livePrice) {
-            console.error(`[VISION-PLAN] Order logic FAILED: Long Limit at ${avgEntry} but price is ${livePrice}`);
-            return res.status(400).json({ ok: false, reason: `Order type error: Long Limit orders must be BELOW current price (${livePrice}), not above at ${avgEntry}. Model may have misread chart direction.` });
-          }
-          
-         if (direction === "short" && orderType === "limit" && avgEntry < livePrice) {
-            console.error(`[VISION-PLAN] Order logic FAILED: Short Limit at ${avgEntry} but price is ${livePrice}`);
-            return res.status(400).json({ ok: false, reason: `Order type error: Short Limit orders must be ABOVE current price (${livePrice}), not below at ${avgEntry}. Model may have misread chart direction.` });
-          }
-        }
-      }
-    } 
-  } 
-
-      // Stamp 5M/1M execution if used
-      const usedM5 = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(text);
-      text = stampM5Used(text, usedM5);
-      const usedM1 = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(text);
-      text = stampM1Used(text, usedM1);
-
-      text = applyConsistencyGuards(text, {
-      instrument,
-        headlinesSign: computeHeadlinesSign(hBias),
-        csmSign: computeCSMInstrumentSign(csm, instrument).sign,
-        calendarSign: parseInstrumentBiasFromNote(biasNote)
-      });
-
-    const cacheKey = setCache({ instrument, m5: m5 || null, m15: m15!, h1: h1 || "", h4: h4 || "", calendar: calDataUrlForPrompt || null, headlinesText: headlinesText || null, sentimentText });
-
-      const footer = buildServerProvenanceFooter({
-        headlines_provider: headlinesProvider || "unknown",
-        calendar_status: calendarStatus,
-        calendar_provider: calendarProvider,
-        csm_time: csm.tsISO,
-        extras: { vp_version: VP_VERSION, model: MODEL, mode, composite_cap: composite.cap, composite_align: composite.align, composite_conflict: composite.conflict, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping },
-      });
-      text = `${text}\n${footer}`;
-
-      res.setHeader("Cache-Control", "no-store");
-      return res.status(200).json({
-        ok: true,
-        text,
-        meta: {
-          instrument, mode, cacheKey, vp_version: VP_VERSION, model: MODEL,
-          sources: {
-            headlines_used: Math.min(6, Array.isArray(headlineItems) ? headlineItems.length : 0),
-            headlines_instrument: instrument,
-            headlines_provider: headlinesProvider || "unknown",
-            calendar_used: calendarStatus !== "unavailable",
-            calendar_status: calendarStatus,
-            calendar_provider: calendarProvider,
-            csm_used: true,
-            csm_time: csm.tsISO,
-          },
-          aiMeta,
-        },
-      });
-    }
 
     // ---------- FULL ----------
 const messages = messagesFull({
