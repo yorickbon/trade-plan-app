@@ -202,7 +202,7 @@ async function processAdaptiveToDataUrlEnhanced(buf: Buffer): Promise<string> {
   let out = await sharp(buf)
     .rotate()
     .resize({ width, withoutEnlargement: true })
-    .sharpen({ sigma: 1.2, flat: 1.5, jagged: 2 }) // Enhanced sharpening for price labels
+    .sharpen(1.2, 1.5, 2) // Enhanced sharpening for price labels (sigma, flat, jagged)
     .modulate({ brightness: 1.05, contrast: 1.15 }) // Slight contrast boost
     .jpeg({ quality, progressive: true, mozjpeg: true })
     .toBuffer();
@@ -217,7 +217,7 @@ async function processAdaptiveToDataUrlEnhanced(buf: Buffer): Promise<string> {
     out = await sharp(buf)
       .rotate()
       .resize({ width, withoutEnlargement: true })
-      .sharpen({ sigma: 1.2, flat: 1.5, jagged: 2 })
+      .sharpen(1.2, 1.5, 2)
       .modulate({ brightness: 1.05, contrast: 1.15 })
       .jpeg({ quality, progressive: true, mozjpeg: true })
       .toBuffer();
@@ -229,7 +229,7 @@ async function processAdaptiveToDataUrlEnhanced(buf: Buffer): Promise<string> {
     out = await sharp(buf)
       .rotate()
       .resize({ width, withoutEnlargement: true })
-      .sharpen({ sigma: 1.2, flat: 1.5, jagged: 2 })
+      .sharpen(1.2, 1.5, 2)
       .modulate({ brightness: 1.05, contrast: 1.15 })
       .jpeg({ quality: q2, progressive: true, mozjpeg: true })
       .toBuffer();
