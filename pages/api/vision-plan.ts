@@ -2313,12 +2313,12 @@ async function enhanceWithMissingSections(model: string, instrument: string, tex
   const missing: string[] = [];
   
   // Check for strategy tournament
-  const hasAllStrategies = [
-    /Structure Break & Retest:/i,
-    /Trend Continuation:/i,
-    /Reversal at Extremes:/i,
-    /Order Block Reaction:/i,
-    /Breakout Continuation:/i
+ const hasAllStrategies = [
+    /Structure Break.*Retest.*:/i,
+    /Trend.*Continuation.*:/i,
+    /Reversal.*Extremes.*:/i,
+    /Order.*Block.*Reaction.*:/i,
+    /Breakout.*Continuation.*:/i
   ].every(regex => regex.test(text));
   
   if (!hasAllStrategies) missing.push("Strategy Tournament Results");
