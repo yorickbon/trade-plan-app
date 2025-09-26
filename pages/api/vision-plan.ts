@@ -2501,7 +2501,7 @@ const messages = messagesFull({
  let textFull = await callOpenAI(MODEL, messages);
     let aiMetaFull = extractAiMeta(textFull) || {};
 
-    // CRITICAL: Validate model acknowledged current price correctly
+  // Enhanced price validation with pip-based tolerance
     if (livePrice) {
       const modelPrice = Number(aiMetaFull?.currentPrice);
       
@@ -2510,14 +2510,22 @@ const messages = messagesFull({
         console.warn(`[VISION-PLAN] Model failed to report currentPrice, injecting live price ${livePrice}`);
         aiMetaFull.currentPrice = livePrice;
       } else {
-   const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
-          const maxDiff = 0.002; // 0.2% max (very tight - about 7.5 points for Gold at 3750)
-          if (priceDiff > maxDiff) {
-          console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(1)}%`);
+        // Calculate pip difference (more relevant than percentage for FX)
+        const pipValue = instrument.includes("JPY") ? 0.01 : 0.0001;
+        const pipDiff = Math.abs(modelPrice - livePrice) / pipValue;
+        const maxPipDiff = 5; // Allow 5 pip tolerance
+        
+        if (pipDiff > maxPipDiff) {
+          console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${pipDiff.toFixed(1)} pips`);
           return res.status(400).json({ 
             ok: false, 
-reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is ${livePrice} (${(priceDiff*100).toFixed(1)}% difference). Chart y-axis may be misread - please use clearer images.` 
+            reason: `Price reading error: Model read ${modelPrice} from chart but actual price is ${livePrice} (${pipDiff.toFixed(1)} pips difference). Chart may be unclear - please use clearer TradingView images.` 
           });
+        }
+        
+        // Warn for differences above 2 pips but allow to proceed
+        if (pipDiff > 2) {
+          console.warn(`[VISION-PLAN] Price reading tolerance: ${pipDiff.toFixed(1)} pips difference detected`);
         }
       }
     }
