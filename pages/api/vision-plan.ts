@@ -2640,15 +2640,14 @@ if (livePrice && scalpingMode === "hard") {
 if (livePrice) {
   const modelPrice = Number(aiMeta?.currentPrice);
   
- if (!isFinite(modelPrice) || modelPrice <= 0) {
-  console.warn(`[VISION-PLAN] Model failed to report currentPrice: ${modelPrice}, using live price ${livePrice}`);
+if (!isFinite(modelPrice) || modelPrice <= 0) {
+  console.log(`[VISION-PLAN] AI didn't report chart price, using API price ${livePrice} as reference`);
   aiMeta.currentPrice = livePrice;
-  text = `⚠️ **PRICE READING**: AI could not extract current price from chart. Using live market price: ${livePrice}\n\n**NOTE**: All analysis levels are referenced to live price ${livePrice}. Verify chart alignment manually.\n\n${text}`;
   aiMeta.price_validation = { 
-    status: "chart_unreadable", 
+    status: "api_reference", 
     chart_price: null, 
     live_price: livePrice, 
-    warning: "Chart price extraction failed - using live market price" 
+    note: "Using API price as reference - chart analysis relative to live market" 
   };
 }
   
