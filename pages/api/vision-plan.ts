@@ -2041,23 +2041,18 @@ if (calUrlOrig) {
     const livePrice = await fetchLivePrice(instrument);
     const dateStr = new Date().toISOString().slice(0, 10);
 
-    // Composite bias (provenance only)
-    const composite = computeCompositeBias({
-      instrument,
-      calendarBiasNote: biasNote,
-      headlinesBias: hBias,
-      csm,
-      warningMinutes
-    });
+  // Individual signal analysis for conflict detection
+    const calendarSign = parseInstrumentBiasFromNote(biasNote);
+    const headlinesSign = computeHeadlinesSign(hBias);
+    const csmData = computeCSMInstrumentSign(csm, instrument);
 
     const provForModel = {
       headlines_present: !!headlinesText,
       calendar_status: calendarStatus,
-      composite,
       fundamentals_hint: {
-        calendar_sign: parseInstrumentBiasFromNote(biasNote),
+        calendar_sign: calendarSign,
         headlines_label: hBias.label,
-        csm_diff: computeCSMInstrumentSign(csm, instrument).zdiff,
+        csm_diff: csmData.zdiff,
         cot_cue_present: !!cotCue
       },
       proximity_flag: warningMinutes != null ? 1 : 0,
