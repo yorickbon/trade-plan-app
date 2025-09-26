@@ -229,11 +229,59 @@ function headlinesToPromptLines(items: AnyHeadline[], limit = 6): string | null 
 
 function computeHeadlinesBias(items: AnyHeadline[]): HeadlineBias {
   if (!Array.isArray(items) || items.length === 0) return { label: "unavailable", avg: null, count: 0 };
-  const scores = items.map(h => typeof h?.sentiment?.score === "number" ? Number(h.sentiment!.score) : null).filter(v => Number.isFinite(v)) as number[];
-  if (scores.length === 0) return { label: "unavailable", avg: null, count: 0 };
-  const avg = scores.reduce((a, b) => a + b, 0) / (scores.length || 1);
- const label = avg > 0.02 ? "bullish" : avg < -0.02 ? "bearish" : "neutral";
-  return { label, avg, count: scores.length };
+  
+  // Extract valid sentiment scores with metadata
+  const validItems = items
+    .map(h => ({
+      score: typeof h?.sentiment?.score === "number" ? Number(h.sentiment.score) : null,
+      published: h?.published_at || h?.ago || null,
+      source: h?.source || "unknown"
+    }))
+    .filter(item => Number.isFinite(item.score));
+    
+  if (validItems.length === 0) return { label: "unavailable", avg: null, count: 0 };
+  
+  // Apply recency weighting (more recent = higher weight)
+  const now = Date.now();
+  const weightedScores = validItems.map(item => {
+    let timeWeight = 1.0; // Default weight
+    
+    // Try to parse publication time for recency weighting
+    if (item.published) {
+      const pubTime = new Date(item.published).getTime();
+      if (isFinite(pubTime)) {
+        const hoursAgo = (now - pubTime) / (1000 * 60 * 60);
+        // Recent news (0-6h) gets full weight, older news decays
+        timeWeight = hoursAgo <= 6 ? 1.0 : Math.max(0.3, Math.exp(-hoursAgo / 12));
+      }
+    }
+    
+    // Apply source credibility weighting
+    const sourceWeight = getSourceCredibility(item.source);
+    
+    return {
+      score: item.score!,
+      weight: timeWeight * sourceWeight
+    };
+  });
+  
+  // Calculate weighted average
+  const totalWeight = weightedScores.reduce((sum, item) => sum + item.weight, 0);
+  const weightedAvg = weightedScores.reduce((sum, item) => sum + (item.score * item.weight), 0) / totalWeight;
+  
+  // More sensitive thresholds due to weighting
+  const label = weightedAvg > 0.015 ? "bullish" : weightedAvg < -0.015 ? "bearish" : "neutral";
+  return { label, avg: weightedAvg, count: validItems.length };
+}
+
+function getSourceCredibility(source: string): number {
+  const sourceLC = (source || "").toLowerCase();
+  // Major financial news sources get higher weight
+  if (sourceLC.includes("reuters") || sourceLC.includes("bloomberg") || sourceLC.includes("wsj")) return 1.2;
+  if (sourceLC.includes("cnbc") || sourceLC.includes("marketwatch") || sourceLC.includes("ft")) return 1.1;
+  if (sourceLC.includes("yahoo") || sourceLC.includes("seeking alpha")) return 0.9;
+  if (sourceLC.includes("twitter") || sourceLC.includes("reddit") || sourceLC.includes("blog")) return 0.7;
+  return 1.0; // Default weight for unknown sources
 }
 
 async function fetchedHeadlinesViaServer(req: NextApiRequest, instrument: string): Promise<{ items: AnyHeadline[]; promptText: string | null; provider: string }> {
