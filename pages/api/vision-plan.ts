@@ -2295,26 +2295,35 @@ if (livePrice && scalpingMode === "hard") {
    let text = await callOpenAI(MODEL, messages);
       let aiMeta = extractAiMeta(text) || {};
 
-      // CRITICAL: Validate model acknowledged current price correctly
-      if (livePrice) {
-        const modelPrice = Number(aiMeta?.currentPrice);
-        
-        // If model didn't report price, inject it but warn
-        if (!isFinite(modelPrice) || modelPrice <= 0) {
-          console.warn(`[VISION-PLAN] Model failed to report currentPrice, injecting live price ${livePrice}`);
-          aiMeta.currentPrice = livePrice;
-        } else {
-      const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
-          const maxDiff = 0.002; // 0.2% max (very tight - about 7.5 points for Gold at 3750)
-          if (priceDiff > maxDiff) {
-            console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(1)}%`);
-            return res.status(400).json({ 
-              ok: false, 
-              reason: `Price mismatch: Model read ${modelPrice} from chart but actual price is ${livePrice} (${(priceDiff*100).toFixed(1)}% difference). Chart y-axis may be misread - please use clearer images.` 
-            });
-          }
-        }
-      }
+     // CRITICAL: Enhanced price validation with graduated warnings
+if (livePrice) {
+  const modelPrice = Number(aiMeta?.currentPrice);
+  
+  if (!isFinite(modelPrice) || modelPrice <= 0) {
+    console.warn(`[VISION-PLAN] Model failed to report currentPrice, injecting live price ${livePrice}`);
+    aiMeta.currentPrice = livePrice;
+    // Add warning to output text
+    text = `⚠️ **PRICE WARNING**: Chart analysis may be imprecise. Current live price: ${livePrice}\n\n${text}`;
+  } else {
+    const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
+    const warnThreshold = 0.001; // 0.1% warning
+    const errorThreshold = 0.005; // 0.5% error (more realistic)
+    
+    if (priceDiff > errorThreshold) {
+      console.error(`[VISION-PLAN] MAJOR price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(priceDiff*100).toFixed(2)}%`);
+      return res.status(400).json({ 
+        ok: false, 
+        reason: `CRITICAL: Chart price ${modelPrice} differs from live price ${livePrice} by ${(priceDiff*100).toFixed(2)}%. Charts may be stale or y-axis misread. Please refresh charts.` 
+      });
+    } else if (priceDiff > warnThreshold) {
+      console.warn(`[VISION-PLAN] Price drift detected: Chart=${modelPrice}, Live=${livePrice}, Diff=${(priceDiff*100).toFixed(2)}%`);
+      text = `⚠️ **PRICE DRIFT**: Chart shows ${modelPrice}, live price ${livePrice} (${(priceDiff*100).toFixed(2)}% difference)\n\n${text}`;
+      aiMeta.price_validation = { status: "drift", chart_price: modelPrice, live_price: livePrice, diff_percent: priceDiff * 100 };
+    } else {
+      aiMeta.price_validation = { status: "validated", chart_price: modelPrice, live_price: livePrice, diff_percent: priceDiff * 100 };
+    }
+  }
+}
 
       if (livePrice && (aiMeta.currentPrice == null || !isFinite(Number(aiMeta.currentPrice)))) aiMeta.currentPrice = livePrice;
 
