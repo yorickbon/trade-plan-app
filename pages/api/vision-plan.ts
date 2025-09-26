@@ -1668,60 +1668,7 @@ function validatePriceConsistency(apiPrice: number, aiMetaPrice: number): {
   return { valid: true, error: null, warning: null };
 }
 
-// ---------- Entry price validation vs current market ----------
-function validateEntryPrices(text: string, aiMeta: any, livePrice: number, scalpingMode: string): {
-  valid: boolean;
-  errors: string[];
-} {
-  const errors: string[] = [];
-  
-  // Extract all entry prices mentioned in text
-  const entryMatches = text.matchAll(/Entry[^:]*:\s*(\d+\.\d+)/gi);
-  const entries = Array.from(entryMatches).map(m => Number(m[1]));
-  
-  // Add zone prices from ai_meta
-  if (aiMeta?.zone?.min) entries.push(Number(aiMeta.zone.min));
-  if (aiMeta?.zone?.max) entries.push(Number(aiMeta.zone.max));
-  
-  if (entries.length === 0) {
-    errors.push("No entry prices found in trade plan");
-    return { valid: false, errors };
-  }
-  
-  // Check each entry is reasonable distance from current price
-  const maxDriftPct = scalpingMode === "hard" ? 0.015 : scalpingMode === "soft" ? 0.03 : 0.05;
-  
-  for (const entry of entries) {
-    if (!isFinite(entry) || entry <= 0) continue;
-    const drift = Math.abs((entry - livePrice) / livePrice);
-    if (drift > maxDriftPct) {
-      errors.push(
-        `Entry ${entry} is ${(drift*100).toFixed(1)}% from current ${livePrice} (max allowed: ${(maxDriftPct*100).toFixed(1)}%)`
-      );
-    }
-  }
-  
-  // Validate order type logic
-  const dirMatch = text.match(/Direction:\s*(Long|Short)/i);
-  const orderMatch = text.match(/Order Type:\s*(Market|Limit|Stop)/i);
-  
-  if (dirMatch && orderMatch && entries.length > 0) {
-    const dir = dirMatch[1].toLowerCase();
-    const order = orderMatch[1].toLowerCase();
-    const avgEntry = entries.reduce((a, b) => a + b, 0) / entries.length;
-    
-    if (order === "limit") {
-      if (dir === "long" && avgEntry >= livePrice) {
-        errors.push(`LOGIC ERROR: Long Limit order must be BELOW current price ${livePrice}, not at ${avgEntry}`);
-      }
-      if (dir === "short" && avgEntry <= livePrice) {
-        errors.push(`LOGIC ERROR: Short Limit order must be ABOVE current price ${livePrice}, not at ${avgEntry}`);
-      }
-    }
-  }
-  
-  return { valid: errors.length === 0, errors };
-}
+// Entry price validation removed - using inline validation in main handler
 
 // Risk-reward validation
 function validateRiskRewardClaims(text: string, livePrice: number): {
