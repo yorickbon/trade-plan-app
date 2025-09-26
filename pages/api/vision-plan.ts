@@ -2290,24 +2290,33 @@ function analyzeCalendarProfessional(ocrItems: OcrCalendarRow[], instrument: str
   // Apply institutional cross-currency correlations
   applyInstitutionalCorrelations(currencyScores, reasoning, base, quote);
   
-  // Calculate final instrument bias using proper cross-currency logic
+// Calculate final instrument bias using proper cross-currency logic
 const baseScore = currencyScores[base] || 0;
 const quoteScore = currencyScores[quote] || 0;
 const netScore = baseScore - quoteScore;
 
-// Professional bias determination with explicit reasoning
+// Professional bias determination with improved thresholds
 let finalBias: string;
 let biasReasoning: string;
 
-if (netScore > 1.5) {
+// Use magnitude-based thresholds - consider both individual scores and net difference
+const strongThreshold = 2.0;
+const moderateThreshold = 1.0;
+
+if (Math.abs(netScore) < moderateThreshold && Math.abs(baseScore) < moderateThreshold && Math.abs(quoteScore) < moderateThreshold) {
+  finalBias = "neutral";
+  biasReasoning = `${base} (${baseScore.toFixed(1)}) vs ${quote} (${quoteScore.toFixed(1)}) = Weak signals, neutral bias`;
+} else if (netScore > moderateThreshold) {
   finalBias = "bullish";
-  biasReasoning = `${base} strength (${baseScore.toFixed(1)}) > ${quote} strength (${quoteScore.toFixed(1)}) = Bullish ${base}${quote}`;
-} else if (netScore < -1.5) {
-  finalBias = "bearish"; 
-  biasReasoning = `${quote} strength (${quoteScore.toFixed(1)}) > ${base} strength (${baseScore.toFixed(1)}) = Bearish ${base}${quote}`;
+  const strength = netScore > strongThreshold ? "Strong" : "Moderate";
+  biasReasoning = `${strength} ${base} bias: ${base} (${baseScore.toFixed(1)}) > ${quote} (${quoteScore.toFixed(1)}) = Bullish ${base}${quote}`;
+} else if (netScore < -moderateThreshold) {
+  finalBias = "bearish";
+  const strength = netScore < -strongThreshold ? "Strong" : "Moderate"; 
+  biasReasoning = `${strength} ${quote} bias: ${quote} (${Math.abs(quoteScore).toFixed(1)}) > ${base} (${Math.abs(baseScore).toFixed(1)}) = Bearish ${base}${quote}`;
 } else {
   finalBias = "neutral";
-  biasReasoning = `${base} (${baseScore.toFixed(1)}) vs ${quote} (${quoteScore.toFixed(1)}) = Balanced, no clear bias`;
+  biasReasoning = `${base} (${baseScore.toFixed(1)}) vs ${quote} (${quoteScore.toFixed(1)}) = Conflicting signals, neutral bias`;
 }
 
 // Debug logging for validation
