@@ -2640,13 +2640,19 @@ if (livePrice && scalpingMode === "hard") {
 if (livePrice) {
   const modelPrice = Number(aiMeta?.currentPrice);
   
-  if (!isFinite(modelPrice) || modelPrice <= 0) {
-    console.error(`[VISION-PLAN] Model failed to report currentPrice: ${modelPrice}`);
-    return res.status(400).json({ 
-      ok: false, 
-      reason: `CRITICAL: AI could not read current price from charts. Live price is ${livePrice}. Charts may be unclear or corrupted. Please use clearer chart images.` 
-    });
-  } else {
+ if (!isFinite(modelPrice) || modelPrice <= 0) {
+  console.warn(`[VISION-PLAN] Model failed to report currentPrice: ${modelPrice}, using live price ${livePrice}`);
+  aiMeta.currentPrice = livePrice;
+  text = `⚠️ **PRICE READING**: AI could not extract current price from chart. Using live market price: ${livePrice}\n\n**NOTE**: All analysis levels are referenced to live price ${livePrice}. Verify chart alignment manually.\n\n${text}`;
+  aiMeta.price_validation = { 
+    status: "chart_unreadable", 
+    chart_price: null, 
+    live_price: livePrice, 
+    warning: "Chart price extraction failed - using live market price" 
+  };
+}
+  
+  else {
     const priceDiff = Math.abs((modelPrice - livePrice) / livePrice);
     const warnThreshold = 0.002; // 0.2% warning threshold
     const errorThreshold = 0.008; // 0.8% error threshold (account for normal market movement)
