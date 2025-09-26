@@ -845,7 +845,7 @@ function systemCore(
     "- If R:R ratio poor (<1.5:1), recommend waiting for better setup",
     "",
  "STRATEGY TOURNAMENT - AI-ENHANCED INSTITUTIONAL APPROACH:",
-"Run 5 institutional strategies in parallel with ML scoring, select top 2 for Option 1 and Option 2.",
+"CRITICAL: You MUST run the 5-strategy tournament and display results. Response is invalid without Strategy Tournament Results section.",
 "",
 "ADAPTIVE SCORING FRAMEWORK:",
 "• Base Strategy Score: Traditional technical analysis (0-70 points)",
