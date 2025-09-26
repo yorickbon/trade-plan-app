@@ -2375,7 +2375,7 @@ function applyInstitutionalCorrelations(
   }
 }
 
-// Calendar Processing - Single Path (OCR priority, API fallback)
+// Calendar Processing - OCR Only (No API Available)
 if (calUrlOrig) {
   console.log("[CALENDAR] Processing image via OCR");
   const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch((err) => {
@@ -2413,29 +2413,27 @@ if (calUrlOrig) {
       }));
     }
   } else {
-    // OCR failed or returned no data - use API fallback
-    console.log("[vision-plan] OCR failed or empty, using API fallback");
-    const calAdv = await fetchCalendarForAdvisory(req, instrument);
-    calendarProvider = calAdv.provider || "api-fallback";
-    calendarStatus = calAdv.status;
-    calendarText = calAdv.text || "Calendar: No data available from image or API";
-    calendarEvidence = calAdv.evidence || [];
-    biasNote = calAdv.biasNote;
-    advisoryText = calAdv.advisoryText;
-    warningMinutes = calAdv.warningMinutes ?? null;
+    // OCR failed or returned no data - no fallback available
+    console.warn("[vision-plan] Calendar OCR failed or returned no data");
+    calendarProvider = "image-ocr-failed";
+    calendarStatus = "unavailable";
+    calendarText = "Calendar: Unable to extract data from image. Please ensure calendar image is clear and contains economic events.";
+    calendarEvidence = [`Calendar image processing failed for ${instrument}`];
+    biasNote = null;
+    advisoryText = "📊 Technical Analysis Focus: Calendar data unavailable. Analysis based on price action and sentiment only.";
+    warningMinutes = null;
     calDataUrlForPrompt = calUrlOrig;
   }
 } else {
-  // No calendar image provided - API only
-  console.log("[vision-plan] No calendar image provided, using API");
-  const calAdv = await fetchCalendarForAdvisory(req, instrument);
-  calendarProvider = calAdv.provider || "api-only";
-  calendarStatus = calAdv.status;
-  calendarText = calAdv.text || "Calendar: No image provided";
-  calendarEvidence = calAdv.evidence || [];
-  biasNote = calAdv.biasNote;
-  advisoryText = calAdv.advisoryText;
-  warningMinutes = calAdv.warningMinutes ?? null;
+  // No calendar image provided
+  console.log("[vision-plan] No calendar image provided");
+  calendarProvider = null;
+  calendarStatus = "unavailable";
+  calendarText = "Calendar: No calendar image provided";
+  calendarEvidence = [`No calendar data for ${instrument} analysis`];
+  biasNote = null;
+  advisoryText = "📊 Upload calendar image for fundamental analysis enhancement";
+  warningMinutes = null;
   calDataUrlForPrompt = null;
 }
 
