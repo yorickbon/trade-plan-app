@@ -2101,23 +2101,51 @@ const messages = messagesFull({
         console.warn(`[VISION-PLAN] Model failed to report currentPrice, injecting live price ${livePrice}`);
         aiMetaFull.currentPrice = livePrice;
       } else {
-        // Calculate pip difference (more relevant than percentage for FX)
-        const pipValue = instrument.includes("JPY") ? 0.01 : 0.0001;
-        const pipDiff = Math.abs(modelPrice - livePrice) / pipValue;
-        const maxPipDiff = 5; // Allow 5 pip tolerance
-        
-        if (pipDiff > maxPipDiff) {
-          console.error(`[VISION-PLAN] Model price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${pipDiff.toFixed(1)} pips`);
-          return res.status(400).json({ 
-            ok: false, 
-            reason: `Price reading error: Model read ${modelPrice} from chart but actual price is ${livePrice} (${pipDiff.toFixed(1)} pips difference). Chart may be unclear - please use clearer TradingView images.` 
-          });
-        }
-        
-        // Warn for differences above 2 pips but allow to proceed
-        if (pipDiff > 2) {
-          console.warn(`[VISION-PLAN] Price reading tolerance: ${pipDiff.toFixed(1)} pips difference detected`);
-        }
+      // Instrument-specific price validation with proper tolerances
+if (instrument.includes("BTC") || instrument.includes("ETH") || instrument.startsWith("CRYPTO")) {
+  // Crypto: Use percentage-based validation (5% tolerance)
+  const percentDiff = Math.abs((modelPrice - livePrice) / livePrice);
+  if (percentDiff > 0.05) {
+    console.error(`[VISION-PLAN] Crypto price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(percentDiff*100).toFixed(1)}%`);
+    return res.status(400).json({ 
+      ok: false, 
+      reason: `Price reading error: Model read ${modelPrice} but actual is ${livePrice} (${(percentDiff*100).toFixed(1)}% difference).` 
+    });
+  }
+} else if (instrument.includes("XAU") || instrument.includes("GOLD")) {
+  // Gold: Use dollar-based validation ($10 tolerance)
+  const dollarDiff = Math.abs(modelPrice - livePrice);
+  if (dollarDiff > 10) {
+    console.error(`[VISION-PLAN] Gold price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=$${dollarDiff.toFixed(2)}`);
+    return res.status(400).json({ 
+      ok: false, 
+      reason: `Price reading error: Model read ${modelPrice} but actual is ${livePrice} ($${dollarDiff.toFixed(2)} difference).` 
+    });
+  }
+} else if (instrument.includes("NAS") || instrument.includes("SPX") || instrument.includes("GER") || instrument.includes("UK100") || instrument.includes("JPN")) {
+  // Indices: Use point-based validation (50 points tolerance)
+  const pointDiff = Math.abs(modelPrice - livePrice);
+  if (pointDiff > 50) {
+    console.error(`[VISION-PLAN] Index price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${pointDiff.toFixed(1)} points`);
+    return res.status(400).json({ 
+      ok: false, 
+      reason: `Price reading error: Model read ${modelPrice} but actual is ${livePrice} (${pointDiff.toFixed(1)} points difference).` 
+    });
+  }
+} else {
+  // FX pairs (including JPY): Use pip-based validation
+  const pipValue = instrument.includes("JPY") ? 0.01 : 0.0001;
+  const pipDiff = Math.abs(modelPrice - livePrice) / pipValue;
+  const maxPipDiff = 5;
+  
+  if (pipDiff > maxPipDiff) {
+    console.error(`[VISION-PLAN] FX price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${pipDiff.toFixed(1)} pips`);
+    return res.status(400).json({ 
+      ok: false, 
+      reason: `Price reading error: Model read ${modelPrice} but actual is ${livePrice} (${pipDiff.toFixed(1)} pips difference).` 
+    });
+  }
+}
       }
     }
 
