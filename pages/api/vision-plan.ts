@@ -821,13 +821,24 @@ function systemCore(
     "- If current price is BETWEEN structures → Suggest LIMIT ORDER at next structure level (may be 20-50+ pips away).",
     "- For breakouts → Use STOP ORDER 5-10 pips beyond structure break for confirmation.",
     "- PATIENCE over chasing: 'Wait for pullback to 1.7820 OB' is BETTER than 'Enter now mid-move at 1.7855'.",
- "PROFESSIONAL ENTRY SPECIFICATIONS:",
-"- LIMIT orders: MANDATORY range format '0.5840-0.5850 (order block zone)' - never single points",
-"- MARKET orders: Use exact current price as single entry point", 
-"- Range width: 5-15 pips based on structure thickness and timeframe",
-"- ALWAYS format as: 'Entry: 0.6535-0.6545 (15M order block)' or 'Entry: 0.6540 (market at current price)'",
-"- INVALID: Single point limit entries like 'Entry: 0.6540' without range specification",
-"- Structure source MANDATORY: State exact timeframe and structure type for every entry",
+ "PROFESSIONAL ENTRY SPECIFICATIONS - MANDATORY FORMATS:",
+"",
+"LIMIT ORDERS (Structure-Based Entries):",
+"- MUST use range format: 'Entry: 0.5840-0.5850 (15M order block zone)'",
+"- NEVER use single point: 'Entry: 0.5845' is INVALID for limit orders",
+"- Range width: 8-15 pips typical (0.6555-0.6565 = 10 pip zone)",
+"- SHORT limits must be ABOVE current price (sell higher)",
+"- LONG limits must be BELOW current price (buy cheaper)",
+"",
+"MARKET ORDERS (Immediate Execution):",
+"- Use single point at current price: 'Entry: 0.6571 (current market price)'",
+"- Must match or be within 2 pips of currentPrice value",
+"",
+"EXAMPLES:",
+"✓ CORRECT: 'Entry: 0.6555-0.6565 (15M resistance zone)' for SHORT limit",
+"✓ CORRECT: 'Entry: 0.6571 (current market price)' for market order",
+"✗ WRONG: 'Entry: 0.6560 (15M resistance)' - single point for limit order",
+"✗ WRONG: Short limit at 0.6560 when current is 0.6571 (below current)",
     "",
     "STOP LOSS PLACEMENT - PROFESSIONAL STRUCTURE-BASED:",
     "- MANDATORY: SL must be placed behind VISIBLE structure levels on the charts",
@@ -2201,6 +2212,29 @@ if (pctDiff > maxDiff) {
     return res.status(400).json({ ok: false, reason: `Entry too far from current price: ${entry} vs live ${livePrice} (${(pctDiff*100).toFixed(1)}% away). Charts may be stale.` });
   }
 }
+
+ // CRITICAL: Pre-validate limit order logic before finalizing response
+const limitOrderCheck = textFull.match(/Direction:\s*(Long|Short)[\s\S]{0,300}Order Type:\s*Limit[\s\S]{0,300}Entry[^:]*:\s*([\d.]+)/i);
+if (limitOrderCheck && livePrice) {
+  const direction = limitOrderCheck[1].toLowerCase();
+  const entry = Number(limitOrderCheck[2]);
+  
+  if (direction === "long" && entry >= livePrice) {
+    console.error(`[VISION-PLAN] AI Logic Error: Long Limit at ${entry} cannot be at/above current ${livePrice}`);
+    return res.status(400).json({ 
+      ok: false, 
+      reason: `AI generated impossible order: Long Limit at ${entry} must be BELOW current price ${livePrice}. Regenerate analysis.` 
+    });
+  }
+  
+  if (direction === "short" && entry <= livePrice) {
+    console.error(`[VISION-PLAN] AI Logic Error: Short Limit at ${entry} cannot be at/below current ${livePrice}`);
+    return res.status(400).json({ 
+      ok: false, 
+      reason: `AI generated impossible order: Short Limit at ${entry} must be ABOVE current price ${livePrice}. Regenerate analysis.` 
+    });
+  }
+}           
      // Enhanced order type logic validation
         const dirMatch = textFull.match(/Direction:\s*(Long|Short)/i);
         const orderMatch = textFull.match(/Order Type:\s*(Limit|Stop|Market)/i);
