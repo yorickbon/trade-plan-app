@@ -1380,6 +1380,9 @@ function systemCore(
     "",
     "For Option 1 and Option 2 independently:",
     "",
+    "IMPORTANT: Option 2 conviction must be 10-25% lower than Option 1 (it's the runner-up for a reason)",
+    "If calculated conviction for Option 2 is within 5% of Option 1, reduce Option 2 by additional 10%",
+    "",
     "1. Get Technical Score (T): From tournament scoring (0-100)",
     "2. Get Fundamentals Score (F): From calculation above (0-100)",
     "3. Calculate Risk-Adjusted Score (R): Based on R:R ratio",
@@ -1656,6 +1659,7 @@ function messagesFull(args: {
     "• Why this is primary:",
     "",
     "Option 2 (Alternative)",
+    "• Strategy: [Name of runner-up strategy from tournament]",
     "• Direction: ...",
     "• Order Type: ...",
     "• Trigger:", 
@@ -1663,8 +1667,8 @@ function messagesFull(args: {
     "• Stop Loss:", 
     "• Take Profit(s): TP1 / TP2",
     "• Spread Adjustment: Entry ±[X] pips, SL +[Y] pips buffer",
-    "• Conviction: <0–100>% (independent calculation - may be higher than Option 1)",
-    "• Why this alternative:",
+    "• Conviction: <0–100>% (independent calculation - typically 10-20% lower than Option 1)",
+    "• Why this alternative: [Explain why runner-up strategy also has merit here]",
     "",
     "Performance Tracking",
     "• Expected R:R Ratio: [Calculated from entry/SL/TP levels]",
@@ -1795,7 +1799,21 @@ async function validateOrderTypeLogic(model: string, instrument: string, text: s
   const dirMatch = text.match(/Direction:\s*(Long|Short)/i);
   const orderMatch = text.match(/Order Type:\s*(Limit|Stop|Market)/i);
   const entryMatch = text.match(/Entry[^:]*:\s*([\d.]+(?:-[\d.]+)?)/i);
-  
+  // Check for trigger/order type conflicts
+  const triggerMatch = text.match(/Trigger:\s*([^\n]+)/i);
+  if (triggerMatch && orderMatch) {
+    const trigger = triggerMatch[1].toLowerCase();
+    const orderType = orderMatch[1].toLowerCase();
+    
+    // Market orders can't have future triggers
+    if (orderType === "market" && (trigger.includes("break") || trigger.includes("wait") || trigger.includes("reach"))) {
+      const messages = [
+        { role: "system", content: "FIX CONFLICT: Market orders execute immediately and cannot have future triggers like 'break below' or 'wait for'. Either change to LIMIT/STOP order, or change trigger to 'immediate execution'. Keep all other analysis unchanged." },
+        { role: "user", content: `${instrument}\n\n${text}\n\nFIX: Market order cannot wait for "${trigger}".` }
+      ];
+      return callOpenAI(model, messages);
+    }
+  }
   if (!dirMatch || !orderMatch || !entryMatch) return text;
   
   const direction = dirMatch[1].toLowerCase();
@@ -2347,6 +2365,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
     textFull = await enforceStrategyTournament(MODEL, instrument, textFull);
+    // Ensure both options have strategy names
+    const opt1HasStrategy = /Option\s*1[\s\S]{50,300}Strategy[^:]*:\s*\w+/i.test(textFull);
+    const opt2HasStrategy = /Option\s*2[\s\S]{50,300}Strategy[^:]*:\s*\w+/i.test(textFull);
+    
+    if (!opt1HasStrategy || !opt2HasStrategy) {
+      const messages = [
+        { role: "system", content: "Add missing strategy names. Each option MUST start with '• Strategy: [Strategy Name]'. Use tournament winner for Option 1, runner-up for Option 2." },
+        { role: "user", content: `${instrument}\n\n${textFull}\n\nAdd strategy attribution lines.` }
+      ];
+      textFull = await callOpenAI(MODEL, messages);
+    }
     // Validate tournament was actually used
     const tournamentMatch = textFull.match(/Strategy Tournament Results:[\s\S]{200,800}/i);
     const option1Match = textFull.match(/Option 1[\s\S]{100,500}Strategy.*?:\s*(\w+)/i);
@@ -2383,6 +2412,52 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           ok: false, 
           reason: `Analysis quality error: Conflicting trade directions detected (${directions.join(' vs ')}). System generated inconsistent recommendations. Please regenerate.` 
         });
+      }
+    }
+
+    // Validate Option 2 entry price logic separately
+    const option2Block = textFull.match(/Option\s*2[\s\S]{400,1000}/i)?.[0] || "";
+    if (option2Block && livePrice) {
+      const opt2Entry = option2Block.match(/Entry[^:]*:\s*([\d.]+(?:-[\d.]+)?)/i)?.[1];
+      const opt2Order = option2Block.match(/Order Type:\s*(Limit|Stop|Market)/i)?.[1]?.toLowerCase();
+      const opt2Dir = option2Block.match(/Direction:\s*(Long|Short)/i)?.[1]?.toLowerCase();
+      
+      if (opt2Entry && opt2Order && opt2Dir) {
+        const entryNums = opt2Entry.split('-').map(Number);
+        const avgEntry = entryNums.reduce((a, b) => a + b, 0) / entryNums.length;
+        
+        // Market orders must be at current price
+        if (opt2Order === "market") {
+          const priceDiff = Math.abs(avgEntry - livePrice);
+          const pipValue = instrument.includes("JPY") ? 0.01 : 0.0001;
+          const pipDiff = priceDiff / pipValue;
+          
+          if (pipDiff > 2) {
+            console.error(`[VISION-PLAN] Option 2 market order at wrong price: Entry=${avgEntry}, Live=${livePrice}`);
+            return res.status(400).json({
+              ok: false,
+              reason: `Option 2 error: Market orders execute at current price (${livePrice}), not ${avgEntry}. Entry must match current price within 2 pips.`
+            });
+          }
+        }
+        
+        // Limit order direction check
+        if (opt2Order === "limit") {
+          if (opt2Dir === "long" && avgEntry >= livePrice) {
+            console.error(`[VISION-PLAN] Option 2 impossible long limit: ${avgEntry} >= ${livePrice}`);
+            return res.status(400).json({
+              ok: false,
+              reason: `Option 2 error: Long Limit must be BELOW current price ${livePrice}, not at ${avgEntry}.`
+            });
+          }
+          if (opt2Dir === "short" && avgEntry <= livePrice) {
+            console.error(`[VISION-PLAN] Option 2 impossible short limit: ${avgEntry} <= ${livePrice}`);
+            return res.status(400).json({
+              ok: false,
+              reason: `Option 2 error: Short Limit must be ABOVE current price ${livePrice}, not at ${avgEntry}.`
+            });
+          }
+        }
       }
     }
 
