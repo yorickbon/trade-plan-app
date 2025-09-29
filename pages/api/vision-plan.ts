@@ -1954,9 +1954,9 @@ async function fetchLivePriceConsensus(pair: string): Promise<{ consensus: numbe
   ]).catch(() => []);
   
   if (!Array.isArray(results)) return null;
-  const validSources: PriceSource[] = results
-    .filter((r): r is PromiseFulfilledResult<PriceSource> => r.status === 'fulfilled' && r.value !== null)
-    .map(r => r.value);
+ const validSources: PriceSource[] = results
+    .filter((r): r is PromiseFulfilledResult<PriceSource | null> => r.status === 'fulfilled' && r.value !== null)
+    .map(r => r.value as PriceSource);
     
   if (validSources.length === 0) return null;
   
