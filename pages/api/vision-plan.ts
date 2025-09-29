@@ -144,19 +144,22 @@ async function processAdaptiveToDataUrl(buf: Buffer, isTradingView: boolean = fa
   let out = await sharpPipeline.jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
   
   let guard = 0;
-  while (out.byteLength < targetMin && guard < 4) {
+ const buildPipeline = (buf: Buffer, width: number, quality: number, enhance: boolean) => {
+  const pipeline = sharp(buf).rotate().resize({ width, withoutEnlargement: true });
+  if (enhance) {
+    pipeline.sharpen(1.2, 1.5, 2).modulate({ brightness: 1.05, saturation: 1.1 });
+  }
+  return pipeline.jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
+};
+
+while (out.byteLength < targetMin && guard < 4) {
     quality = Math.min(quality + (isTradingView ? 4 : 6), isTradingView ? 90 : 88);
     if (quality >= (isTradingView ? 85 : 82) && width < maxWidth) {
       width = Math.min(width + 100, maxWidth);
     }
-    
-    const pipeline = sharp(buf).rotate().resize({ width, withoutEnlargement: true });
-    if (isTradingView) {
-      pipeline.sharpen(1.2, 1.5, 2).modulate({ brightness: 1.05, saturation: 1.1 });
-    }
-    out = await pipeline.jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
+    out = await buildPipeline(buf, width, quality, isTradingView);
     guard++;
-  }
+}
   
   if (out.byteLength < targetMin && (quality < (isTradingView ? 90 : 88) || width < maxWidth)) {
     quality = Math.min(quality + (isTradingView ? 2 : 4), isTradingView ? 90 : 88);
@@ -1646,8 +1649,9 @@ function messagesFull(args: {
     "- Reduce targets by 1-2 pips for realistic profit taking",
     "- Consider order queue depth for large positions",
     "",
-    "OUTPUT format (in this exact order):",
+   "OUTPUT format (in this exact order):",
     "Option 1 (Primary)",
+    "• Strategy: [Name of winner strategy from tournament]",
     "• Direction: ...",
     "• Order Type: ...",
     "• Trigger:", 
@@ -1758,12 +1762,15 @@ async function enforceOption2(model: string, instrument: string, text: string) {
   if (hasCompliantOption2(text)) return text;
   
   // Extract tournament results to guide Option 2
-  const tournamentBlock = text.match(/Strategy Tournament Results:[\s\S]{200,1000}/i)?.[0] || "";
+  const tournamentBlock = text.match(/Strategy Tournament Results:[\s\S]{200,2000}/i)?.[0] || "";
   const scores: Array<{name: string, score: number}> = [];
   const scoreMatches = tournamentBlock.matchAll(/(\w+[\s\w]*?):\s*(\d+)/g);
-  for (const match of scoreMatches) {
-    scores.push({name: match[1], score: parseInt(match[2])});
-  }
+ for (const match of scoreMatches) {
+    const score = parseInt(match[2]);
+    if (isFinite(score)) {
+      scores.push({name: match[1], score});
+    }
+}
   scores.sort((a, b) => b.score - a.score);
   
   const runnerUp = scores.length > 1 ? scores[1].name : "alternative approach";
@@ -1937,7 +1944,16 @@ async function fetchLivePriceConsensus(pair: string): Promise<{ consensus: numbe
   if (FH_KEY) sources.push(fetchFinnhubPrice(pair));
   if (POLY_KEY) sources.push(fetchPolygonPrice(pair));
   
-  const results = await Promise.allSettled(sources);
+  const timeoutPromise = new Promise<never>((_, reject) => 
+    setTimeout(() => reject(new Error('Price consensus timeout')), 5000)
+  );
+  
+  const results = await Promise.race([
+    Promise.allSettled(sources),
+    timeoutPromise
+  ]).catch(() => []);
+  
+  if (!Array.isArray(results)) return null;
   const validSources: PriceSource[] = results
     .filter((r): r is PromiseFulfilledResult<PriceSource> => r.status === 'fulfilled' && r.value !== null)
     .map(r => r.value);
@@ -1992,7 +2008,7 @@ async function fetchPolygonPrice(pair: string): Promise<PriceSource | null> {
     const ticker = `C:${pair}`;
     const to = new Date();
     const from = new Date(to.getTime() - 60 * 60 * 1000);
-    const fmt = (d: Date) => `${d.getFullYear()}-String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    const fmt = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
     const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}/range/1/minute/${fmt(from)}/${fmt(to)}?adjusted=true&sort=desc&limit=1&apiKey=${POLY_KEY}`;
     const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(2000) });
     const j: any = await r.json().catch(() => ({}));
@@ -2386,6 +2402,25 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const strategy2 = option2Match[1];
       
       // Check if strategies are actually different and valid
+     const validStrategies = [
+  "Structure Break & Retest", "BOS Strategy", "Structure",
+  "Order Block Reaction", "OB Strategy", "Order Block",
+  "Reversal at Extremes", "Reversal Strategy", "Reversal",
+  "Liquidity Grab", "Liquidity Strategy", "Liquidity",
+  "Fair Value Gap Fill", "FVG Strategy", "FVG", "Fair Value"
+];
+const isValid1 = validStrategies.some(s => strategy1.toLowerCase().includes(s.toLowerCase()));
+const isValid2 = validStrategies.some(s => strategy2.toLowerCase().includes(s.toLowerCase()));
+      
+      if (!isValid1 || !isValid2) {
+        console.warn(`[VISION-PLAN] Tournament strategies not properly applied: ${strategy1} / ${strategy2}`);
+      }
+    }
+if (tournamentMatch && option1Match && option2Match) {
+      const strategy1 = option1Match[1];
+      const strategy2 = option2Match[1];
+      
+      // Check if strategies are actually different and valid
       const validStrategies = ["Structure", "Order", "Reversal", "Liquidity", "Fair", "FVG", "BOS", "OB"];
       const isValid1 = validStrategies.some(s => strategy1.includes(s));
       const isValid2 = validStrategies.some(s => strategy2.includes(s));
@@ -2395,6 +2430,36 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       }
     }
 
+    // Validate conviction differentiation between options
+    const conv1Match = textFull.match(/Option\s*1[\s\S]{200,600}Conviction:\s*(\d+)%/i);
+    const conv2Match = textFull.match(/Option\s*2[\s\S]{200,600}Conviction:\s*(\d+)%/i);
+    
+    if (conv1Match && conv2Match) {
+      const conv1 = parseInt(conv1Match[1]);
+      const conv2 = parseInt(conv2Match[1]);
+      const diff = Math.abs(conv1 - conv2);
+      
+      if (diff < 5) {
+        console.warn(`[VISION-PLAN] Conviction too similar: Opt1=${conv1}%, Opt2=${conv2}%, Diff=${diff}%`);
+        const messages = [
+          { role: "system", content: "FIX: Option 2 conviction must be 10-25% lower than Option 1 (it's the runner-up). Reduce Option 2 conviction by 15%. Keep all other content unchanged." },
+          { role: "user", content: `${instrument}\n\n${textFull}\n\nFIX: Convictions too close (${conv1}% vs ${conv2}%). Reduce Option 2.` }
+        ];
+        textFull = await callOpenAI(MODEL, messages);
+      }
+      
+      if (conv2 > conv1) {
+        console.error(`[VISION-PLAN] Option 2 conviction higher than Option 1: ${conv2}% > ${conv1}%`);
+        return res.status(400).json({
+          ok: false,
+          reason: `Logic error: Option 2 conviction (${conv2}%) cannot exceed Option 1 (${conv1}%). Runner-up must have lower conviction.`
+        });
+      }
+    }
+
+    if (livePrice) {
+      textFull = await validateOrderTypeLogic(MODEL, instrument, textFull, livePrice);
+    }
     if (livePrice) {
       textFull = await validateOrderTypeLogic(MODEL, instrument, textFull, livePrice);
     }
@@ -2433,7 +2498,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           const pipDiff = priceDiff / pipValue;
           
           if (pipDiff > 2) {
-            console.error(`[VISION-PLAN] Option 2 market order at wrong price: Entry=${avgEntry}, Live=${livePrice}`);
+            console.error(`[VISION-PLAN] OPTION 2 VALIDATION FAILED - Market order at wrong price: Entry=${avgEntry}, Live=${livePrice}, Diff=${Math.abs(avgEntry-livePrice).toFixed(5)}`);
             return res.status(400).json({
               ok: false,
               reason: `Option 2 error: Market orders execute at current price (${livePrice}), not ${avgEntry}. Entry must match current price within 2 pips.`
