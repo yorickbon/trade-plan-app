@@ -877,45 +877,82 @@ function systemCore(
     "- State reasoning: 'TP1 0.5870 at 1H resistance level, TP2 0.5900 at 4H major resistance'",
     "- If R:R ratio poor (<1.5:1), recommend waiting for better setup",
     "",
-    "STRATEGY TOURNAMENT - AI-ENHANCED INSTITUTIONAL APPROACH:",
-    "CRITICAL: You MUST run the 5-strategy tournament and display results. Response is invalid without Strategy Tournament Results section.",
+   "STRATEGY TOURNAMENT - PROFESSIONAL TRADE GENERATION:",
+    "CRITICAL: Tournament determines BOTH Option 1 AND Option 2. You MUST score all 5 strategies, then build trades using the winner and runner-up.",
     "",
-    "ADAPTIVE SCORING FRAMEWORK:",
-    "• Base Strategy Score: Traditional technical analysis (0-70 points)",
-    "• ML Pattern Recognition: Historical success rate adjustment (+/-15 points)",
-    "• Market Regime Multiplier: Current conditions vs strategy strength (×0.8-1.3)",
-    "• Performance Feedback: Recent win/loss rate for this setup type (+/-10 points)",
-    "• Volatility Adjustment: Strategy performance in current vol regime (+/-5 points)",
+    "SCORING PROCESS:",
+    "1. Score each strategy 0-100 based on current chart setup",
+    "2. Apply fundamental alignment adjustment (+15 bullish fundy if long, -15 if short against fundy)",
+    "3. Apply context grade penalty (B=-12pts, C=-30pts, D=-60pts)",
+    "4. Winner = Option 1, Runner-up = Option 2",
     "",
-    "STRATEGY 1: STRUCTURE BREAK & RETEST",
-    "- Recent BOS on higher timeframe + pullback to broken level",
-    "- Entry: Limit order at retest zone with rejection confirmation",
-    "- SL: Behind the broken structure + buffer",
-    "- Score factors: Clear BOS visible (25pts), Clean retest setup (25pts), Strong rejection (25pts), HTF alignment (25pts)",
+    "STRATEGY 1: STRUCTURE BREAK & RETEST (BOS Strategy)",
+    "WHEN TO USE: Recent BOS visible on 1H/4H + price pulled back to broken level",
+    "OPTION 1 BUILD (if winner):",
+    "  - Direction: [LONG if BOS up, SHORT if BOS down]",
+    "  - Order Type: LIMIT (waiting for retest)",
+    "  - Entry: [Broken level ± 5 pips] (retest zone)",
+    "  - SL: [Behind the BOS structure + 8 pips]",
+    "  - TP1: [Next structure level, min 1.5R]",
+    "  - TP2: [Major structure level, min 2.5R]",
+    "OPTION 2 BUILD (if runner-up): Same levels, tighter execution",
+    "SCORE FACTORS: BOS visible (25), Clean retest (25), Rejection pattern (25), HTF confirms (25)",
     "",
-    "STRATEGY 2: ORDER BLOCK REACTION",
-    "- Institutional demand/supply zone on 1H/4H + price approaching on 15M",
-    "- Entry: Limit order at order block boundary with confirmation",
-    "- SL: Beyond order block structure",
-    "- Score factors: Clear OB formation (30pts), Fresh/untested zone (25pts), Confluence with other levels (25pts), Clean approach (20pts)",
+    "STRATEGY 2: ORDER BLOCK REACTION (OB Strategy)",
+    "WHEN TO USE: Fresh 1H/4H demand/supply zone + price approaching on 15M",
+    "OPTION 1 BUILD (if winner):",
+    "  - Direction: [LONG at demand, SHORT at supply]",
+    "  - Order Type: LIMIT (at OB boundary)",
+    "  - Entry: [OB zone boundary ± 8 pips]",
+    "  - SL: [Beyond OB + 10 pips]",
+    "  - TP1: [Opposite OB or structure, min 1.5R]",
+    "  - TP2: [Major opposing structure, min 2.5R]",
+    "OPTION 2 BUILD (if runner-up): Market entry if price already in OB",
+    "SCORE FACTORS: Clear OB (30), Fresh/untested (25), Confluence (25), Clean approach (20)",
     "",
-    "STRATEGY 3: REVERSAL AT EXTREMES",
-    "- Price at 80%+ of range + oversold/overbought + rejection pattern",
-    "- Entry: Limit order at reversal confirmation level",
-    "- SL: Beyond recent extreme + buffer",
-    "- Score factors: Extreme location (30pts), Rejection pattern visible (25pts), Divergence present (20pts), Range clearly defined (25pts)",
+    "STRATEGY 3: REVERSAL AT EXTREMES (Reversal Strategy)",
+    "WHEN TO USE: Price at 80%+ of range + rejection pattern forming",
+    "OPTION 1 BUILD (if winner):",
+    "  - Direction: [LONG at low extreme, SHORT at high extreme]",
+    "  - Order Type: LIMIT (at extreme level)",
+    "  - Entry: [Extreme level with rejection ± 5 pips]",
+    "  - SL: [Beyond the extreme + 12 pips]",
+    "  - TP1: [Middle of range, min 1.5R]",
+    "  - TP2: [Opposite extreme, min 2.5R]",
+    "OPTION 2 BUILD (if runner-up): Tighter stop, smaller target",
+    "SCORE FACTORS: At extreme (30), Rejection visible (25), Divergence (20), Range clear (25)",
     "",
-    "STRATEGY 4: LIQUIDITY GRAB",
-    "- Price sweeps recent highs/lows to grab stops then shows reversal",
-    "- Entry: Market/limit order after liquidity sweep + immediate reversal",
-    "- SL: Beyond the liquidity grab point",
-    "- Score factors: Clear liquidity level (30pts), Sweep completion (25pts), Immediate reversal (25pts), Volume spike (20pts)",
+    "STRATEGY 4: LIQUIDITY GRAB (Liquidity Strategy)",
+    "WHEN TO USE: Price swept recent high/low + immediate reversal candle",
+    "OPTION 1 BUILD (if winner):",
+    "  - Direction: [LONG after low sweep, SHORT after high sweep]",
+    "  - Order Type: MARKET (if reversal confirmed) or STOP (5 pips from reversal)",
+    "  - Entry: [Current price if confirmed, or stop order]",
+    "  - SL: [Beyond liquidity point + 8 pips]",
+    "  - TP1: [Previous structure, min 1.5R]",
+    "  - TP2: [Major structure, min 2.5R]",
+    "OPTION 2 BUILD (if runner-up): Limit order at next liquidity level",
+    "SCORE FACTORS: Liquidity visible (30), Sweep complete (25), Reversal candle (25), Volume (20)",
     "",
-    "STRATEGY 5: FAIR VALUE GAP FILL",
-    "- Unfilled imbalance (gap) on 1H/4H + price returning to fill",
-    "- Entry: Limit order within the gap zone",
-    "- SL: Beyond the gap structure",
-    "- Score factors: Clear FVG formation (25pts), Unfilled/fresh gap (30pts), Price approaching cleanly (25pts), Gap size appropriate (20pts)",
+    "STRATEGY 5: FAIR VALUE GAP FILL (FVG Strategy)",
+    "WHEN TO USE: Clear FVG on 1H/4H + price moving to fill it",
+    "OPTION 1 BUILD (if winner):",
+    "  - Direction: [LONG into bullish FVG, SHORT into bearish FVG]",
+    "  - Order Type: LIMIT (inside gap)",
+    "  - Entry: [Middle of FVG ± 5 pips]",
+    "  - SL: [Beyond FVG + 10 pips]",
+    "  - TP1: [FVG fill target, min 1.5R]",
+    "  - TP2: [Next major structure, min 2.5R]",
+    "OPTION 2 BUILD (if runner-up): Enter at gap edge instead of middle",
+    "SCORE FACTORS: FVG clear (25), Unfilled (30), Price approaching (25), Size appropriate (20)",
+    "",
+    "TOURNAMENT EXECUTION:",
+    "Step 1: Score all 5 strategies (show scores in 'Strategy Tournament Results' section)",
+    "Step 2: Rank by final score (after fundamental + context adjustments)",
+    "Step 3: Build Option 1 using winner's template above",
+    "Step 4: Build Option 2 using runner-up's template above",
+    "Step 5: CRITICAL - Both options must have SAME direction (never mix long/short)",
+    "Step 6: Calculate conviction for each independently",
     "",
     "MARKET CONTEXT ASSESSMENT - PROFESSIONAL DISCRETIONARY ANALYSIS:",
     "",
@@ -1715,9 +1752,21 @@ function hasCompliantOption2(text: string): boolean {
 
 async function enforceOption2(model: string, instrument: string, text: string) {
   if (hasCompliantOption2(text)) return text;
+  
+  // Extract tournament results to guide Option 2
+  const tournamentBlock = text.match(/Strategy Tournament Results:[\s\S]{200,1000}/i)?.[0] || "";
+  const scores: Array<{name: string, score: number}> = [];
+  const scoreMatches = tournamentBlock.matchAll(/(\w+[\s\w]*?):\s*(\d+)/g);
+  for (const match of scoreMatches) {
+    scores.push({name: match[1], score: parseInt(match[2])});
+  }
+  scores.sort((a, b) => b.score - a.score);
+  
+  const runnerUp = scores.length > 1 ? scores[1].name : "alternative approach";
+  
   const messages = [
-    { role: "system", content: "Add a compliant **Option 2 (Alternative)**. Keep everything else unchanged. Include Direction, Order Type, explicit Trigger, Entry (zone or single), SL, TP1/TP2, Conviction %." },
-    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd Option 2 (Alternative) below Option 1.` },
+    { role: "system", content: `Add **Option 2 (Alternative)** using the RUNNER-UP strategy from tournament: "${runnerUp}". Must have SAME direction as Option 1 (never mix long/short). Build complete trade with: Direction, Order Type, Trigger, Entry (zone or single), SL, TP1/TP2, Conviction %. Use the strategy template for ${runnerUp}.` },
+    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd Option 2 using runner-up strategy: ${runnerUp}` },
   ];
   return callOpenAI(model, messages);
 }
@@ -2298,6 +2347,24 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
     textFull = await enforceStrategyTournament(MODEL, instrument, textFull);
+    // Validate tournament was actually used
+    const tournamentMatch = textFull.match(/Strategy Tournament Results:[\s\S]{200,800}/i);
+    const option1Match = textFull.match(/Option 1[\s\S]{100,500}Strategy.*?:\s*(\w+)/i);
+    const option2Match = textFull.match(/Option 2[\s\S]{100,500}Strategy.*?:\s*(\w+)/i);
+    
+    if (tournamentMatch && option1Match && option2Match) {
+      const strategy1 = option1Match[1];
+      const strategy2 = option2Match[1];
+      
+      // Check if strategies are actually different and valid
+      const validStrategies = ["Structure", "Order", "Reversal", "Liquidity", "Fair", "FVG", "BOS", "OB"];
+      const isValid1 = validStrategies.some(s => strategy1.includes(s));
+      const isValid2 = validStrategies.some(s => strategy2.includes(s));
+      
+      if (!isValid1 || !isValid2) {
+        console.warn(`[VISION-PLAN] Tournament strategies not properly applied: ${strategy1} / ${strategy2}`);
+      }
+    }
 
     if (livePrice) {
       textFull = await validateOrderTypeLogic(MODEL, instrument, textFull, livePrice);
