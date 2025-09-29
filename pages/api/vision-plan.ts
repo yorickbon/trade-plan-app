@@ -1253,19 +1253,51 @@ STEP 1: 4H BIAS DETERMINATION (Market Direction)
 - BOS status and market structure state
 - BIAS OUTPUT: "4H BIAS: [BULLISH/BEARISH/NEUTRAL] - Price [location] in [trend] structure"
 
-STEP 2: 1H CONTEXT VALIDATION (Setup Construction) 
-- Confirm/refine 4H bias OR identify counter-trend opportunity
-- Identify pullback/continuation patterns
-- Key 1H structure levels for entries/exits
-- Momentum and volume characteristics
-- CONTEXT OUTPUT: "1H CONTEXT: [CONFIRMS/CONFLICTS] 4H bias - Setup type: [CONTINUATION/REVERSAL/RANGE]"
+STEP 2: 1H INDEPENDENT ANALYSIS (Setup Construction)
+CRITICAL: Analyze 1H chart INDEPENDENTLY first, then compare to 4H
 
-STEP 3: 15M EXECUTION TIMING (Entry Mechanics)
-- Precise entry levels based on 1H setup with timeframe attribution
-- Entry trigger conditions and confirmation
-- Exact SL placement behind structure (specify 15M/1H/4H source)
-- TP levels at next opposing structure (specify timeframe source)
-- EXECUTION OUTPUT: "15M EXECUTION: Entry [price/zone] ([timeframe] structure), SL [price] ([timeframe] level), TP1 [price] ([timeframe] target), TP2 [price] ([timeframe] target)"
+2A: INDEPENDENT 1H STRUCTURE READING:
+- Look at 1H swing highs from left to right: State 3-5 exact prices
+- Look at 1H swing lows from left to right: State 3-5 exact prices
+- DETERMINE 1H TREND INDEPENDENTLY:
+  * If both highs AND lows ascending → 1H UPTREND
+  * If both highs AND lows descending → 1H DOWNTREND
+  * If mixed pattern → 1H RANGE
+- Example: "1H highs: 0.6680 → 0.6720 → 0.6750 = ascending"
+- Example: "1H lows: 0.6550 → 0.6580 → 0.6600 = ascending"
+- Independent 1H verdict: UPTREND (both ascending)
+
+2B: COMPARE 1H TO 4H BIAS:
+- 4H bias from Step 1: [state it]
+- 1H independent bias: [state it]
+- Relationship:
+  * If same direction → "CONFIRMS 4H bias"
+  * If opposite direction → "CONFLICTS with 4H - counter-trend move"
+  * If 1H range but 4H trending → "CONSOLIDATION within 4H trend"
+
+2C: PATTERN & SETUP IDENTIFICATION:
+- Current 1H pattern: Continuation / Reversal / Range breakout
+- Key 1H support: [price] | Key 1H resistance: [price]
+- Setup type: [Pullback entry / Breakout confirmation / Reversal at extreme]
+
+1H CONTEXT OUTPUT: "1H BIAS: [INDEPENDENT DIRECTION] - [CONFIRMS/CONFLICTS/CONSOLIDATES] 4H [direction]. Setup type: [pattern]"
+Example: "1H BIAS: UPTREND (ascending structure) - CONFLICTS with 4H downtrend. Counter-trend bounce in progress."
+
+STEP 3: 15M CHART CONTEXT ANALYSIS (Structure & Momentum Reading)
+- DO NOT suggest entries yet - this is chart reading only
+- Identify current 15M trend: UPTREND (higher highs + higher lows) / DOWNTREND (lower highs + lower lows) / RANGING
+- Recent 15M swing high price: [state exact price from chart]
+- Recent 15M swing low price: [state exact price from chart]
+- Current 15M momentum: Bullish/Bearish/Consolidating
+- Key 15M structure levels: Support at [price], Resistance at [price]
+- 15M position relative to 1H setup: [approaching resistance / at support / mid-range / etc]
+- CONTEXT OUTPUT: "15M CONTEXT: [Current trend] with price at [location], approaching [next structure level]"
+
+STEP 4: STRATEGY TOURNAMENT & TRADE EXECUTION PLAN (After analyzing all charts)
+- NOW you can suggest entries based on multi-timeframe analysis
+- Run 5-strategy tournament as specified earlier
+- Build Option 1 (Primary) and Option 2 (Alternative)
+- EXECUTION OUTPUT: Comes in 'Option 1' and 'Option 2' sections below
 
 MANDATORY TIMEFRAME LABELS:
 - Entry: Always specify source (e.g., "0.6545 (15M order block)", "1.2850-1.2860 (1H support zone)")
@@ -1281,7 +1313,7 @@ CRITICAL HIERARCHY RULES:
     { type: "image_url", image_url: { url: args.h4 } },
     { type: "text", text: "1H CONTEXT CHART - Setup construction within 4H bias:" },
     { type: "image_url", image_url: { url: args.h1 } },
-    { type: "text", text: "15M EXECUTION CHART - Entry timing and precise levels:" },
+    { type: "text", text: "15M CHART - Structure and momentum context (do NOT suggest trades yet):" },
     { type: "image_url", image_url: { url: args.m15 } },
   ];
   if (args.m5) { parts.push({ type: "text", text: "Scalp 5M Chart" }); parts.push({ type: "image_url", image_url: { url: args.m5 } }); }
@@ -1457,6 +1489,55 @@ async function enforceStrategyTournament(model: string, instrument: string, text
   return callOpenAI(model, messages);
 }
 // Quick Plan removed - using Option 1 as primary trade card
+
+// ---------- Order Type Logic Validator ----------
+async function validateOrderTypeLogic(model: string, instrument: string, text: string, currentPrice: number): Promise<string> {
+  const dirMatch = text.match(/Direction:\s*(Long|Short)/i);
+  const orderMatch = text.match(/Order Type:\s*(Limit|Stop|Market)/i);
+  const entryMatch = text.match(/Entry[^:]*:\s*([\d.]+(?:-[\d.]+)?)/i);
+  
+  if (!dirMatch || !orderMatch || !entryMatch) return text;
+  
+  const direction = dirMatch[1].toLowerCase();
+  const orderType = orderMatch[1].toLowerCase();
+  const entryStr = entryMatch[1];
+  
+  const entryNums = entryStr.split('-').map(Number);
+  const avgEntry = entryNums.reduce((a, b) => a + b, 0) / entryNums.length;
+  
+  if (orderType === "limit") {
+    if (direction === "long" && avgEntry >= currentPrice) {
+      const messages = [
+        { role: "system", content: "FIX CRITICAL ERROR: Long Limit orders MUST be BELOW current price. Convert to either: (1) Market order for immediate entry, OR (2) Limit order BELOW current price for pullback entry. Keep all other analysis unchanged." },
+        { role: "user", content: `Current ${instrument} price: ${currentPrice}\n\n${text}\n\nFIX: Long Limit at ${avgEntry} is impossible (at/above current price). Suggest correct order type.` }
+      ];
+      return callOpenAI(model, messages);
+    }
+    
+    if (direction === "short" && avgEntry <= currentPrice) {
+      const messages = [
+        { role: "system", content: "FIX CRITICAL ERROR: Short Limit orders MUST be ABOVE current price. Convert to either: (1) Market order for immediate entry, OR (2) Limit order ABOVE current price for rally entry. Keep all other analysis unchanged." },
+        { role: "user", content: `Current ${instrument} price: ${currentPrice}\n\n${text}\n\nFIX: Short Limit at ${avgEntry} is impossible (at/below current price). Suggest correct order type.` }
+      ];
+      return callOpenAI(model, messages);
+    }
+  }
+  
+  return text;
+}
+
+// ---------- Entry Format Enforcer ----------
+async function enforceEntryFormat(model: string, instrument: string, text: string): Promise<string> {
+  const limitSingleMatch = text.match(/Order Type:\s*Limit[\s\S]{0,300}Entry[^:]*:\s*(\d+\.\d+)\s*\([^)]*\)/i);
+  if (limitSingleMatch && !/-/.test(limitSingleMatch[1])) {
+    const messages = [
+      { role: "system", content: "FIX: Limit orders MUST use range format (e.g., '0.6555-0.6565'), not single point. Convert single-point limit entries to proper ranges. Width: 10-15 pips for structure zones." },
+      { role: "user", content: `${instrument}\n\n${text}\n\nFIX: Convert limit entry "${limitSingleMatch[1]}" to range format.` }
+    ];
+    return callOpenAI(model, messages);
+  }
+  return text;
+}
 
 // ---------- Consistency + visibility guards ----------
 // Quick Plan removed - calendar visibility now in Option 1 and Full Breakdown only
@@ -2200,9 +2281,15 @@ if (instrument.includes("BTC") || instrument.includes("ETH") || instrument.start
 
     if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
-   textFull = await enforceOption1(MODEL, instrument, textFull);
+  textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
     textFull = await enforceStrategyTournament(MODEL, instrument, textFull);
+
+    // NEW: Validate order type logic and entry format
+    if (livePrice) {
+      textFull = await validateOrderTypeLogic(MODEL, instrument, textFull, livePrice);
+    }
+    textFull = await enforceEntryFormat(MODEL, instrument, textFull);
 
     // Validate directional consistency
     const dirMatches = textFull.matchAll(/Direction:\s*(Long|Short)/gi);
