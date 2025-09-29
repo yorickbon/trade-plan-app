@@ -628,153 +628,178 @@ async function ocrCalendarFromImage(model: string, calendarDataUrl: string): Pro
   return { items };
 }
 
-// -------- Enhanced OCR analysis: STRICT pre-release handling + final bias rule --------
-function analyzeCalendarOCR(ocr: OcrCalendar, pair: string): {
-  biasLine: string | null;
-  biasNote: string | null;
-  warningMinutes: number | null;
-  evidenceLines: string[];
-  preReleaseOnly: boolean;
-  rowsForDebug: {
-    timeISO: string | null;
-    title: string | null;
-    currency: string | null;
-    impact: any;
-    actual: any;
-    forecast: any;
-    previous: any;
-  }[];
+
+// Professional calendar analysis - institutional-grade cross-currency scoring
+function analyzeCalendarProfessional(ocrItems: OcrCalendarRow[], instrument: string): {
+  bias: string;
+  reasoning: string[];
+  evidence: string[];
+  details: string;
 } {
-  const base = pair.slice(0, 3), quote = pair.slice(3);
+  const base = instrument.slice(0, 3);
+  const quote = instrument.slice(3, 6);
+  
   const nowMs = Date.now();
-  const H72 = 72 * 3600 * 1000;
-
-  const lines: string[] = [];
-  const postRows: OcrCalendarRow[] = [];
-  const rowsForDebug = (ocr.items || []).slice(0, 3).map(r => ({
-    timeISO: r.timeISO || null,
-    title: r.title || null,
-    currency: r.currency || null,
-    impact: r.impact || null,
-    actual: r.actual ?? null,
-    forecast: r.forecast ?? null,
-    previous: r.previous ?? null,
-  }));
-
-  let warn: number | null = null;
-
-  for (const it of (ocr.items || [])) {
-    const cur = (it?.currency || "").toUpperCase();
-    if (!cur) continue;
-
-    // High-impact upcoming event warning (≤60 minutes)
-    if (it?.impact === "High" && it?.timeISO) {
-      const tt = Date.parse(it.timeISO);
-      if (isFinite(tt) && tt >= nowMs) {
-        const mins = Math.floor((tt - nowMs) / 60000);
-        if (mins <= 60) warn = warn == null ? mins : Math.min(warn, mins);
-      }
+  const h72ago = nowMs - 72 * 3600 * 1000;
+  
+  const validEvents = ocrItems.filter(r => {
+    if (!r?.currency) return false;
+    const a = parseNumberLoose(r.actual);
+    if (a == null) return false;
+    const f = parseNumberLoose(r.forecast);
+    const p = parseNumberLoose(r.previous);
+    if (f == null && p == null) return false;
+    
+    if (r.timeISO) {
+      const t = Date.parse(r.timeISO);
+      if (isFinite(t) && (t < h72ago || t > nowMs)) return false;
     }
+    return true;
+  });
 
-    const a = parseNumberLoose(it.actual);
-    const f = parseNumberLoose(it.forecast);
-    const p = parseNumberLoose(it.previous);
-
-    // Only include rows with actuals in the last 72h
-    const ts = it.timeISO ? Date.parse(it.timeISO) : NaN;
-    const isWithin72h = isFinite(ts) ? ts <= nowMs && nowMs - ts <= H72 : true;
-
-    if (a != null && (f != null || p != null) && isWithin72h) {
-      postRows.push({ ...it, actual: a, forecast: f, previous: p });
-    }
-  }
-
-  // If no post-result rows → pre-release only
-  if (postRows.length === 0) {
-    const preLine = `Calendar: ${
-      warn != null ? `High-impact events scheduled (≤${warn} min). ` : ""
-    }Pre-release only, no confirmed bias until data is out.`;
+  if (validEvents.length === 0) {
     return {
-      biasLine: preLine,
-      biasNote: null,
-      warningMinutes: warn,
-      evidenceLines: [],
-      preReleaseOnly: true,
-      rowsForDebug,
+      bias: "neutral",
+      reasoning: [`Calendar: No valid data found in last 72h for ${instrument} currencies (${base}/${quote})`],
+      evidence: [],
+      details: `OCR extracted ${ocrItems.length} total rows, filtering for ${base}/${quote} relevance`
     };
   }
 
-  // --- Scoring setup ---
-  const scoreByCur: Record<string, number> = {};
-  const impactW: Record<string, number> = { Low: 0.5, Medium: 0.8, High: 1.0 };
-  function add(cur: string, v: number) {
-    scoreByCur[cur] = (scoreByCur[cur] ?? 0) + v;
+  const currencyScores: Record<string, number> = {};
+  const reasoning: string[] = [];
+  const evidence: string[] = [];
+
+  for (const event of validEvents) {
+    const currency = String(event.currency).toUpperCase();
+    const title = String(event.title || "Event");
+    const impact = event.impact || "Medium";
+    
+    const actual = parseNumberLoose(event.actual)!;
+    const forecast = parseNumberLoose(event.forecast);
+    const previous = parseNumberLoose(event.previous);
+    
+    const direction = goodIfHigher(title);
+    if (direction === null) continue;
+    
+    let eventScore = 0;
+    let comparison = "";
+    
+    if (forecast !== null) {
+      const surprise = actual - forecast;
+      const surprisePercent = Math.abs(forecast) > 0 ? (surprise / Math.abs(forecast)) : 0;
+      const surpriseWeight = Math.min(Math.abs(surprisePercent), 0.5);
+      const surpriseDirection = direction === true ? Math.sign(surprise) : -Math.sign(surprise);
+      eventScore += surpriseDirection * surpriseWeight * 10;
+      comparison += `vs F:${forecast}`;
+    }
+    
+    if (previous !== null) {
+      const change = actual - previous;
+      const changePercent = Math.abs(previous) > 0 ? (change / Math.abs(previous)) : 0;
+      const changeWeight = Math.min(Math.abs(changePercent), 0.3) * 0.5;
+      const changeDirection = direction === true ? Math.sign(change) : -Math.sign(change);
+      eventScore += changeDirection * changeWeight * 10;
+      comparison += ` vs P:${previous}`;
+    }
+    
+    const impactMultiplier = impact === "High" ? 2.0 : impact === "Medium" ? 1.0 : 0.5;
+    const finalScore = eventScore * impactMultiplier;
+    
+    currencyScores[currency] = (currencyScores[currency] || 0) + finalScore;
+    
+    const sentiment = finalScore > 0.5 ? "bullish" : finalScore < -0.5 ? "bearish" : "neutral";
+    reasoning.push(`${currency} ${title}: ${actual} ${comparison} = ${sentiment} ${currency} (${finalScore.toFixed(1)} pts)`);
+    evidence.push(`${currency} — ${title}: A:${actual} F:${forecast ?? "n/a"} P:${previous ?? "n/a"}`);
+  }
+  
+  applyInstitutionalCorrelations(currencyScores, reasoning, base, quote);
+  
+  const baseScore = currencyScores[base] || 0;
+  const quoteScore = currencyScores[quote] || 0;
+  const netScore = baseScore - quoteScore;
+
+  let finalBias: string;
+  const strongThreshold = 2.0;
+  const moderateThreshold = 1.0;
+
+  if (Math.abs(netScore) < moderateThreshold && Math.abs(baseScore) < moderateThreshold && Math.abs(quoteScore) < moderateThreshold) {
+    finalBias = "neutral";
+  } else if (netScore > moderateThreshold) {
+    finalBias = "bullish";
+  } else if (netScore < -moderateThreshold) {
+    finalBias = "bearish";
+  } else {
+    finalBias = "neutral";
   }
 
-  for (const it of postRows) {
-    const cur = (it.currency || "").toUpperCase();
-    const dir = goodIfHigher(String(it.title || "")); // true=higher good; false=lower good
-    if (dir == null) continue;
-
-    const ref = (it.forecast ?? it.previous) as number | null;
-    if (ref == null) continue;
-
-    const aNum = Number(it.actual);
-    const raw = (aNum - ref) / Math.max(Math.abs(ref), 1e-9);
-    const clamped = Math.max(-0.25, Math.min(0.25, raw)); // limit ±25%
-
-    // Score 0–10 scaled, impact-weighted
-    const unsigned0to10 = Math.round((Math.abs(clamped) / 0.25) * 10);
-    const w = impactW[it.impact as keyof typeof impactW] ?? 1.0;
-    const lineScore = Math.round(unsigned0to10 * w);
-
-    // Signed score (goodIfHigher flips)
-    const signed = (dir ? Math.sign(clamped) : -Math.sign(clamped)) * lineScore;
-
-    // Evidence line (never "mixed")
-    const fNum = it.forecast != null ? Number(it.forecast) : null;
-    const pNum = it.previous != null ? Number(it.previous) : null;
-    let comp: string[] = [];
-    if (fNum != null) comp.push(aNum < fNum ? "< forecast" : aNum > fNum ? "> forecast" : "= forecast");
-    if (pNum != null) comp.push(aNum < pNum ? "< previous" : aNum > pNum ? "> previous" : "= previous");
-    const comps = comp.join(" & ");
-
-    const impactTag = it.impact ? ` (${it.impact})` : "";
-    const signWord: "bullish" | "bearish" | "neutral" = signed > 0 ? "bullish" : signed < 0 ? "bearish" : "neutral";
-    lines.push(`${cur} — ${it.title}: ${aNum}${comps ? " " + comps : ""} → ${signWord} ${cur} (${signed >= 0 ? "+" : ""}${signed}/10${impactTag})`);
-
-    add(cur, signed);
-  }
-
-  // Net per-currency and instrument bias — baseMinusQuote rule with strict labels
-  const sumBase = Math.round(scoreByCur[base] ?? 0);
-  const sumQuote = Math.round(scoreByCur[quote] ?? 0);
-  const netInstr = sumBase - sumQuote;
-
-  let instrLabel: "bullish" | "bearish" | "neutral";
-  if (sumBase === 0 && sumQuote === 0) instrLabel = "neutral";
-  else instrLabel = netInstr > 0 ? "bullish" : netInstr < 0 ? "bearish" : "neutral";
-
-  const biasLine = `Calendar bias for ${pair}: ${instrLabel} (${base}:${sumBase >= 0 ? "+" : ""}${sumBase} / ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}, Net ${netInstr >= 0 ? "+" : ""}${netInstr}).`;
-  const biasNote = `Per-currency totals → ${base}:${sumBase >= 0 ? "+" : ""}${sumBase}, ${quote}:${sumQuote >= 0 ? "+" : ""}${sumQuote}; Net = ${netInstr >= 0 ? "+" : ""}${netInstr} (Instrument bias: ${instrLabel})`;
-
+  console.log(`[CALENDAR] ${base}${quote}: Base=${baseScore.toFixed(1)}, Quote=${quoteScore.toFixed(1)}, Net=${netScore.toFixed(1)}, Bias=${finalBias}`);
+  
+  const summary = `Calendar: ${base} ${baseScore.toFixed(1)} vs ${quote} ${quoteScore.toFixed(1)} = ${finalBias} ${instrument} (net ${netScore > 0 ? "+" : ""}${netScore.toFixed(1)})`;
+  
   return {
-    biasLine,
-    biasNote,
-    warningMinutes: warn,
-    evidenceLines: lines,
-    preReleaseOnly: false,
-    rowsForDebug,
+    bias: finalBias,
+    reasoning: [summary, ...reasoning],
+    evidence,
+    details: `Professional analysis: ${validEvents.length} events, ${Object.keys(currencyScores).length} currencies impacted`
   };
+}
+
+function applyInstitutionalCorrelations(
+  scores: Record<string, number>, 
+  reasoning: string[], 
+  base: string, 
+  quote: string
+) {
+  if (quote === "USD") {
+    const riskCurrencies = ["AUD", "NZD", "CAD"];
+    const riskOnScore = riskCurrencies.reduce((sum, curr) => sum + (scores[curr] || 0), 0);
+    
+    if (Math.abs(riskOnScore) > 2) {
+      const usdAdjustment = riskOnScore * -0.4;
+      scores["USD"] = (scores["USD"] || 0) + usdAdjustment;
+      const sentiment = riskOnScore > 0 ? "risk-on" : "risk-off";
+      reasoning.push(`${sentiment.toUpperCase()} environment → ${usdAdjustment > 0 ? "bullish" : "bearish"} USD (${usdAdjustment.toFixed(1)} pts)`);
+    }
+  }
+  
+  const commodCurrencies = ["CAD", "AUD", "NZD"];
+  if (commodCurrencies.includes(base) || commodCurrencies.includes(quote)) {
+    for (const curr1 of commodCurrencies) {
+      for (const curr2 of commodCurrencies) {
+        if (curr1 !== curr2 && scores[curr1] && Math.abs(scores[curr1]) > 2) {
+          const correlation = 0.3;
+          const adjustment = scores[curr1] * correlation;
+          scores[curr2] = (scores[curr2] || 0) + adjustment;
+          reasoning.push(`${curr1} ${scores[curr1] > 0 ? "strength" : "weakness"} → ${curr2} correlation (+${adjustment.toFixed(1)} pts)`);
+        }
+      }
+    }
+  }
+  
+  if ((base === "EUR" || quote === "EUR") && scores["GBP"]) {
+    const correlation = 0.25;
+    const adjustment = scores["GBP"] * correlation;
+    scores["EUR"] = (scores["EUR"] || 0) + adjustment;
+    reasoning.push(`GBP-EUR correlation: ${adjustment > 0 ? "+" : ""}${adjustment.toFixed(1)} pts to EUR`);
+  }
+  
+  if (base === "JPY" || quote === "JPY") {
+    const riskCurrencies = ["AUD", "NZD", "CAD"];
+    const totalRisk = riskCurrencies.reduce((sum, curr) => sum + (scores[curr] || 0), 0);
+    
+    if (Math.abs(totalRisk) > 1.5) {
+      const jpyAdjustment = totalRisk * -0.35;
+      scores["JPY"] = (scores["JPY"] || 0) + jpyAdjustment;
+      reasoning.push(`Risk sentiment → JPY safe-haven flow (${jpyAdjustment > 0 ? "+" : ""}${jpyAdjustment.toFixed(1)} pts)`);
+    }
+  }
 }
 
 //
 
-// Removed unused calendar API helper functions - using OCR only
 
-
-// Composite bias calculation removed - using individual signal analysis instead
-function computeHeadlinesSign(hb: HeadlineBias): number {
+Function computeHeadlinesSign(hb: HeadlineBias): number {
   if (!hb) return 0;
   if (hb.label === "bullish") return 1;
   if (hb.label === "bearish") return -1;
@@ -2161,84 +2186,70 @@ if (instrument.includes("BTC") || instrument.includes("ETH") || instrument.start
       }
     }
 
- // CRITICAL: Validate entry prices are reasonable relative to current market price
-      if (livePrice && aiMetaFull) {
-        const entries: number[] = [];
-        const entryMatch = textFull.match(/Entry.*?:.*?([\d.]+)/i);
-        if (entryMatch) entries.push(Number(entryMatch[1]));
-        if (aiMetaFull.zone?.min) entries.push(Number(aiMetaFull.zone.min));
-        if (aiMetaFull.zone?.max) entries.push(Number(aiMetaFull.zone.max));
+// CRITICAL: Consolidated entry and order type validation
+    if (livePrice && aiMetaFull) {
+      // Extract all entry prices
+      const entries: number[] = [];
+      const entryMatch = textFull.match(/Entry.*?:.*?([\d.]+)/i);
+      if (entryMatch) entries.push(Number(entryMatch[1]));
+      if (aiMetaFull.zone?.min) entries.push(Number(aiMetaFull.zone.min));
+      if (aiMetaFull.zone?.max) entries.push(Number(aiMetaFull.zone.max));
+      
+      // Extract direction and order type
+      const dirMatch = textFull.match(/Direction:\s*(Long|Short)/i);
+      const orderMatch = textFull.match(/Order Type:\s*(Limit|Stop|Market)/i);
+      
+      if (dirMatch && orderMatch && entries.length > 0) {
+        const direction = dirMatch[1].toLowerCase();
+        const orderType = orderMatch[1].toLowerCase();
+        const avgEntry = entries.reduce((a, b) => a + b, 0) / entries.length;
         
+        // Validation 1: Entry price reasonableness (structure-based allowance)
         for (const entry of entries) {
           if (isFinite(entry) && entry > 0) {
             const pctDiff = Math.abs((entry - livePrice) / livePrice);
-            // Allow structure-based entries: 1% for hard scalping, 5% for normal/soft modes
-          // More reasonable price validation for structure-based trading
-const maxDiff = scalpingMode === "hard" ? 0.08 : 0.20; // 8% hard scalping, 20% normal
-if (pctDiff > maxDiff) {
-  console.warn(`[VISION-PLAN] Entry distant from current price: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
-  // Don't reject, just warn - but reject if extremely far
-  if (pctDiff > 0.50) { // Only reject if >50% away (clearly wrong)
-    return res.status(400).json({ ok: false, reason: `Entry too far from current price: ${entry} vs live ${livePrice} (${(pctDiff*100).toFixed(1)}% away). Charts may be stale.` });
-  }
-}
-
- // CRITICAL: Pre-validate limit order logic before finalizing response
-const limitOrderCheck = textFull.match(/Direction:\s*(Long|Short)[\s\S]{0,300}Order Type:\s*Limit[\s\S]{0,300}Entry[^:]*:\s*([\d.]+)/i);
-if (limitOrderCheck && livePrice) {
-  const direction = limitOrderCheck[1].toLowerCase();
-  const entry = Number(limitOrderCheck[2]);
-  
-  if (direction === "long" && entry >= livePrice) {
-    console.error(`[VISION-PLAN] AI Logic Error: Long Limit at ${entry} cannot be at/above current ${livePrice}`);
-    return res.status(400).json({ 
-      ok: false, 
-      reason: `AI generated impossible order: Long Limit at ${entry} must be BELOW current price ${livePrice}. Regenerate analysis.` 
-    });
-  }
-  
-  if (direction === "short" && entry <= livePrice) {
-    console.error(`[VISION-PLAN] AI Logic Error: Short Limit at ${entry} cannot be at/below current ${livePrice}`);
-    return res.status(400).json({ 
-      ok: false, 
-      reason: `AI generated impossible order: Short Limit at ${entry} must be ABOVE current price ${livePrice}. Regenerate analysis.` 
-    });
-  }
-}           
-     // Enhanced order type logic validation
-        const dirMatch = textFull.match(/Direction:\s*(Long|Short)/i);
-        const orderMatch = textFull.match(/Order Type:\s*(Limit|Stop|Market)/i);
-        if (dirMatch && orderMatch && entries.length > 0) {
-          const direction = dirMatch[1].toLowerCase();
-          const orderType = orderMatch[1].toLowerCase();
-          const avgEntry = entries.reduce((a, b) => a + b, 0) / entries.length;
+            const maxDiff = scalpingMode === "hard" ? 0.08 : 0.20;
+            
+            if (pctDiff > 0.50) {
+              return res.status(400).json({ 
+                ok: false, 
+                reason: `Entry too far from current price: ${entry} vs live ${livePrice} (${(pctDiff*100).toFixed(1)}% away). Charts may be stale.` 
+              });
+            }
+            
+            if (pctDiff > maxDiff) {
+              console.warn(`[VISION-PLAN] Entry distant from current: Live=${livePrice}, Entry=${entry}, Diff=${(pctDiff*100).toFixed(1)}%`);
+            }
+          }
+        }
+        
+        // Validation 2: Limit order direction logic
+        if (orderType === "limit") {
+          if (direction === "long" && avgEntry >= livePrice) {
+            console.error(`[VISION-PLAN] IMPOSSIBLE Long Limit: ${avgEntry} at/above current ${livePrice}`);
+            return res.status(400).json({ 
+              ok: false, 
+              reason: `IMPOSSIBLE ORDER: Long Limit at ${avgEntry} must be BELOW current price ${livePrice}. Use Market order OR Limit BELOW current.` 
+            });
+          }
           
-          if (orderType === "limit") {
-            // Long limits must be BELOW current price (buy cheaper)
-            if (direction === "long" && avgEntry >= livePrice) {
-              const diff = Math.abs(avgEntry - livePrice);
-              console.error(`[VISION-PLAN] IMPOSSIBLE Long Limit: ${avgEntry} at/above current ${livePrice} (diff: ${diff.toFixed(5)})`);
-              return res.status(400).json({ ok: false, reason: `IMPOSSIBLE ORDER: Long Limit at ${avgEntry} cannot execute at/above current price ${livePrice}. Use Market order for immediate long entry OR Limit order BELOW current price for pullback entry.` });
-            }
-            
-            // Short limits must be ABOVE current price (sell higher)  
-            if (direction === "short" && avgEntry <= livePrice) {
-              const diff = Math.abs(avgEntry - livePrice);
-              console.error(`[VISION-PLAN] IMPOSSIBLE Short Limit: ${avgEntry} at/below current ${livePrice} (diff: ${diff.toFixed(5)})`);
-              return res.status(400).json({ ok: false, reason: `IMPOSSIBLE ORDER: Short Limit at ${avgEntry} cannot execute at/below current price ${livePrice}. Use Market order for immediate short entry OR Limit order ABOVE current price for pullback entry.` });
-            }
-            
-            // Warn if limit orders are too close (likely to fill immediately)
-            const minDistance = scalpingMode === "hard" ? 0.0005 : 0.0015; // 5 pips hard, 15 pips normal
-            const priceDistance = Math.abs(avgEntry - livePrice) / livePrice;
-            if (priceDistance < minDistance) {
-              console.warn(`[VISION-PLAN] Limit order very close to market: ${avgEntry} vs ${livePrice} (${(priceDistance*10000).toFixed(1)} pips)`);
-            }
+          if (direction === "short" && avgEntry <= livePrice) {
+            console.error(`[VISION-PLAN] IMPOSSIBLE Short Limit: ${avgEntry} at/below current ${livePrice}`);
+            return res.status(400).json({ 
+              ok: false, 
+              reason: `IMPOSSIBLE ORDER: Short Limit at ${avgEntry} must be ABOVE current price ${livePrice}. Use Market order OR Limit ABOVE current.` 
+            });
+          }
+          
+          // Validation 3: Warn if too close to market
+          const minDistance = scalpingMode === "hard" ? 0.0005 : 0.0015;
+          const priceDistance = Math.abs(avgEntry - livePrice) / livePrice;
+          if (priceDistance < minDistance) {
+            console.warn(`[VISION-PLAN] Limit order close to market: ${avgEntry} vs ${livePrice} (${(priceDistance*10000).toFixed(1)} pips)`);
           }
         }
       }
     }
-}
 
 // R:R validation is now handled by the inline validation code above
 
