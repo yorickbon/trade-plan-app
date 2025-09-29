@@ -798,8 +798,8 @@ function applyInstitutionalCorrelations(
 
 //
 
-
-Function computeHeadlinesSign(hb: HeadlineBias): number {
+// Composite bias calculation removed - using individual signal analysis instead
+function computeHeadlinesSign(hb: HeadlineBias): number {
   if (!hb) return 0;
   if (hb.label === "bullish") return 1;
   if (hb.label === "bearish") return -1;
