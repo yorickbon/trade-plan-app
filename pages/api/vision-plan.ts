@@ -1559,8 +1559,44 @@ async function validateOrderTypeLogic(model: string, instrument: string, text: s
   const entryNums = entryStr.split('-').map(Number);
   const avgEntry = entryNums.reduce((a, b) => a + b, 0) / entryNums.length;
   
+ async function validateOrderTypeLogic(model: string, instrument: string, text: string, currentPrice: number): Promise<string> {
+  const dirMatch = text.match(/Direction:\s*(Long|Short)/i);
+  const orderMatch = text.match(/Order Type:\s*(Limit|Stop|Market)/i);
+  const entryMatch = text.match(/Entry[^:]*:\s*([\d.]+(?:-[\d.]+)?)/i);
+  
+  if (!dirMatch || !orderMatch || !entryMatch) return text;
+  
+  const direction = dirMatch[1].toLowerCase();
+  const orderType = orderMatch[1].toLowerCase();
+  const entryStr = entryMatch[1];
+  
+  const entryNums = entryStr.split('-').map(Number);
+  const avgEntry = entryNums.reduce((a, b) => a + b, 0) / entryNums.length;
+  const minEntry = Math.min(...entryNums);
+  const maxEntry = Math.max(...entryNums);
+  
   if (orderType === "limit") {
-    if (direction === "long" && avgEntry >= currentPrice) {
+    // Long limit: ALL entry prices must be BELOW current
+    if (direction === "long" && minEntry >= currentPrice) {
+      const messages = [
+        { role: "system", content: "FIX CRITICAL ERROR: Long Limit orders MUST be BELOW current price. Current price is already at or above your suggested entry. Either: (1) Market order for immediate entry, OR (2) Limit order further BELOW current price. Keep all other analysis unchanged." },
+        { role: "user", content: `Current ${instrument} price: ${currentPrice}\n\n${text}\n\nFIX: Long Limit at ${entryStr} is impossible. Price already there or above.` }
+      ];
+      return callOpenAI(model, messages);
+    }
+    
+    // Short limit: ALL entry prices must be ABOVE current
+    if (direction === "short" && maxEntry <= currentPrice) {
+      const messages = [
+        { role: "system", content: "FIX CRITICAL ERROR: Short Limit orders MUST be ABOVE current price. Current price is already at or below your suggested entry. Either: (1) Market order for immediate entry, OR (2) Limit order further ABOVE current price. Keep all other analysis unchanged." },
+        { role: "user", content: `Current ${instrument} price: ${currentPrice}\n\n${text}\n\nFIX: Short Limit at ${entryStr} is impossible. Price already there or below.` }
+      ];
+      return callOpenAI(model, messages);
+    }
+  }
+  
+  return text;
+}
       const messages = [
         { role: "system", content: "FIX CRITICAL ERROR: Long Limit orders MUST be BELOW current price. Convert to either: (1) Market order for immediate entry, OR (2) Limit order BELOW current price for pullback entry. Keep all other analysis unchanged." },
         { role: "user", content: `Current ${instrument} price: ${currentPrice}\n\n${text}\n\nFIX: Long Limit at ${avgEntry} is impossible (at/above current price). Suggest correct order type.` }
