@@ -897,7 +897,7 @@ function systemCore(
     "- SL: Beyond the gap structure",
     "- Score factors: Clear FVG formation (25pts), Unfilled/fresh gap (30pts), Price approaching cleanly (25pts), Gap size appropriate (20pts)",
     "",
- "MANDATORY TOURNAMENT SCORING (0-100 each strategy):",
+"MANDATORY TOURNAMENT SCORING (0-100 each strategy):",
 "1. Score each strategy against current setup (0-100 base points)",
 "2. Apply market regime adjustment (±10pts)",
 "3. Apply fundamental alignment (±15pts)", 
@@ -907,6 +907,13 @@ function systemCore(
 "7. Winner (highest score) = Option 1, Runner-up = Option 2",
 "8. Response invalid without tournament results section",
 "",
+"DIRECTIONAL CONSISTENCY REQUIREMENT:",
+"- Determine ONE primary direction from 4H/1H/15M structure analysis",
+"- If 4H+1H+15M = UPTREND → Option 1 = LONG, Option 2 = LONG (different entries)",
+"- If 4H+1H+15M = DOWNTREND → Option 1 = SHORT, Option 2 = SHORT (different entries)",
+"- NEVER mix Long and Short in same analysis - this indicates analytical failure",
+"- Both options trade same direction, only differ in entry method/risk profile",
+  "",
 "TRADE METADATA (ai_meta required):",
 "• trade_id: [Generate unique UUID for this recommendation]",
 "• strategy_used: [Primary strategy from tournament winner]",
@@ -2187,9 +2194,24 @@ if (instrument.includes("BTC") || instrument.includes("ETH") || instrument.start
 
     if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
-    textFull = await enforceOption1(MODEL, instrument, textFull);
+   textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
     textFull = await enforceStrategyTournament(MODEL, instrument, textFull);
+
+    // Validate directional consistency
+    const dirMatches = textFull.matchAll(/Direction:\s*(Long|Short)/gi);
+    const directions = Array.from(dirMatches).map(m => m[1].toLowerCase());
+    if (directions.length >= 2) {
+      const allLong = directions.every(d => d === 'long');
+      const allShort = directions.every(d => d === 'short');
+      if (!allLong && !allShort) {
+        console.error(`[VISION-PLAN] Directional conflict: ${directions.join(', ')}`);
+        return res.status(400).json({ 
+          ok: false, 
+          reason: `Analysis quality error: Conflicting trade directions detected (${directions.join(' vs ')}). System generated inconsistent recommendations. Please regenerate.` 
+        });
+      }
+    }
 
  // CRITICAL: Validate entry prices are reasonable relative to current market price
       if (livePrice && aiMetaFull) {
