@@ -2577,7 +2577,12 @@ if (calUrlOrig) {
       { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
       scalpingMode
     );
-    let aiMetaFull = extractAiMeta(textFull) || {};
+   let aiMetaFull = extractAiMeta(textFull) || {};
+    
+    // Inject chart data into ai_meta if missing
+    if (!aiMetaFull.currentPrice || !isFinite(Number(aiMetaFull.currentPrice))) {
+      aiMetaFull.currentPrice = chartData.current_price;
+    }
 
   // Enhanced price validation with pip-based tolerance
     if (livePrice) {
