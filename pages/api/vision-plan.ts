@@ -1892,49 +1892,60 @@ function messagesFull(args: {
 }
 
 async function enforceAllSections(model: string, instrument: string, text: string): Promise<string> {
-  const requiredSections = [
-    { name: "4H BIAS", pattern: /4H\s+BIAS\s*(?:DETERMINATION)?:/i },
-    { name: "1H CONTEXT", pattern: /1H\s+CONTEXT\s*(?:ANALYSIS)?:/i },
-    { name: "15M EXECUTION", pattern: /15M\s+(?:EXECUTION\s+)?CONTEXT:/i },
-    { name: "Market Context Assessment", pattern: /Market\s+Context\s+Assessment:/i },
-    { name: "Strategy Tournament Results", pattern: /Strategy\s+Tournament\s+Results:/i },
-    { name: "Option 1 (Primary)", pattern: /Option\s+1\s*\(?(Primary)?\)?/i },
-    { name: "Option 2 (Alternative)", pattern: /Option\s+2\s*\(?(Alternative)?\)?/i },
-    { name: "Performance Tracking", pattern: /Performance\s+Tracking/i },
-    { name: "Trade Management", pattern: /Trade\s+Management/i },
-    { name: "Full Breakdown", pattern: /Full\s+Breakdown/i },
-    { name: "Trade Summary", pattern: /Trade\s+Summary/i },
-    { name: "Trade Validation", pattern: /Trade\s+Validation/i },
-    { name: "Trader's Honest Assessment", pattern: /Trader'?s\s+Honest\s+Assessment/i }
-  ];
+  // Check if critical sections are missing
+  const has4H = /4H\s+BIAS/i.test(text);
+  const has1H = /1H\s+CONTEXT/i.test(text);
+  const has15M = /15M\s+EXECUTION/i.test(text);
+  const hasContext = /Market\s+Context\s+Assessment/i.test(text);
+  const hasTournament = /Strategy\s+Tournament\s+Results/i.test(text);
+  const hasPerformance = /Performance\s+Tracking/i.test(text);
+  const hasManagement = /Trade\s+Management/i.test(text);
+  const hasBreakdown = /Full\s+Breakdown/i.test(text);
+  const hasSummary = /Trade\s+Summary/i.test(text);
+  const hasValidation = /Trade\s+Validation/i.test(text);
+  const hasAssessment = /Trader'?s\s+Honest\s+Assessment/i.test(text);
   
-  const missing = requiredSections.filter(section => !section.pattern.test(text));
+  // If ANY critical section is missing, rebuild the entire response
+  if (!has4H || !has1H || !has15M || !hasContext || !hasTournament || 
+      !hasPerformance || !hasManagement || !hasBreakdown || !hasSummary || 
+      !hasValidation || !hasAssessment) {
+    
+    console.error(`[VISION-PLAN] CRITICAL: Missing major sections. Forcing complete rebuild.`);
+    
+    const messages = [
+      {
+        role: "system",
+        content: `CRITICAL ERROR: Your response is missing mandatory sections. You MUST include ALL of these IN ORDER:
+
+**4H BIAS DETERMINATION:**
+Show trend, exact swing prices, key levels, BOS status, final bias
+
+**1H CONTEXT ANALYSIS:**
+Show independent trend, exact swing highs/lows, relationship to 4H
+
+**15M EXECUTION CONTEXT:**
+Show current trend, recent high/low prices, momentum, structure levels
+
+**Market Context Assessment:**
+Calculate move maturity, position quality, exhaustion signals, assign grade A/B/C/D
+
+**Strategy Tournament Results:**
+Score all 5 strategies (Structure Break, Order Block, Reversal, Liquidity, FVG) from 0-100
+
+Then include Option 1, Option 2, Performance Tracking, Trade Management, Full Breakdown, Trade Summary, Trade Validation, and Trader's Honest Assessment.
+
+REGENERATE THE ENTIRE ANALYSIS WITH ALL SECTIONS.`
+      },
+      {
+        role: "user",
+        content: `${instrument} - INCOMPLETE OUTPUT DETECTED. Include ALL sections:\n\n${text.substring(0, 500)}...\n\nREBUILD with all mandatory sections.`
+      }
+    ];
+    
+    return callOpenAI(model, messages);
+  }
   
-  if (missing.length === 0) return text;
-  
-  const missingNames = missing.map(s => s.name).join(", ");
-  console.warn(`[VISION-PLAN] Missing sections: ${missingNames}`);
-  
-  const messages = [
-    {
-      role: "system",
-      content: `Add these missing MANDATORY sections: ${missingNames}. 
-      
-      CRITICAL for chart sections:
-      - 4H BIAS: Must include trend, swings with exact prices, key levels, BOS status
-      - 1H CONTEXT: Must show independent analysis with exact swing prices
-      - 15M EXECUTION: Must show current price, recent highs/lows, momentum
-      - Market Context Assessment: Must include move maturity calculation and context grade
-      
-      Each section is MANDATORY. Follow the exact format specified in the OUTPUT structure.`
-    },
-    {
-      role: "user",
-      content: `Instrument: ${instrument}\n\n${text}\n\nAdd missing sections: ${missingNames}`
-    }
-  ];
-  
-  return callOpenAI(model, messages);
+  return text;
 }
 
 // ---------- Enforcement helpers ----------
@@ -2598,6 +2609,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     textFull = await enforceOption2(MODEL, instrument, textFull);
     textFull = await enforceStrategyTournament(MODEL, instrument, textFull);
     textFull = await enforceAllSections(MODEL, instrument, textFull);
+    // Double-check critical sections exist
+if (!textFull.includes("4H BIAS") || !textFull.includes("1H CONTEXT") || 
+    !textFull.includes("15M EXECUTION") || !textFull.includes("Market Context Assessment")) {
+  console.error("[VISION-PLAN] CRITICAL: Chart analysis sections still missing after enforcement!");
+  const forceMsg = [
+    { role: "system", content: "MANDATORY: Add 4H BIAS DETERMINATION, 1H CONTEXT ANALYSIS, 15M EXECUTION CONTEXT, and Market Context Assessment sections at the beginning. These are NOT optional." },
+    { role: "user", content: `${instrument}\n\n${textFull}\n\nADD MISSING CHART ANALYSIS SECTIONS AT THE TOP.` }
+  ];
+  textFull = await callOpenAI(MODEL, forceMsg);
+}
     // Ensure both options have strategy names
     const opt1HasStrategy = /Option\s*1[\s\S]{50,300}Strategy[^:]*:\s*\w+/i.test(textFull);
     const opt2HasStrategy = /Option\s*2[\s\S]{50,300}Strategy[^:]*:\s*\w+/i.test(textFull);
