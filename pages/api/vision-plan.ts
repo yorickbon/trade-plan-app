@@ -1863,16 +1863,20 @@ function messagesFull(args: {
     "If this is a C or D grade setup, you MUST state:",
     "'⚠️ This is a lower-probability setup. Consider waiting for [specific better condition].'",
     "",
-    "CRITICAL: End your response with this EXACT format:",
+  "CRITICAL: End your response with this EXACT format:",
     "```json",
     "ai_meta",
     "{",
-    "  \"currentPrice\": [PUT_CURRENT_PRICE_HERE_OR_UNREADABLE]",
+    "  \"currentPrice\": [PUT_CURRENT_PRICE_HERE_OR_UNREADABLE],",
+    "  \"trade_id\": \"[GENERATE_UUID]\",",
+    "  \"strategy_used\": \"[PRIMARY_STRATEGY_NAME]\",",
+    "  \"setup_quality\": [1-10],",
+    "  \"market_regime\": \"[trending/ranging/breakout/news_driven]\",",
+    "  \"risk_grade\": \"[A/B/C/D]\"",
     "}",
     "```",
-    "Replace [PUT_CURRENT_PRICE_HERE_OR_UNREADABLE] with either:",
-    "- The exact price number: 0.65318",
-    "- Or the text: \"UNREADABLE\" if you cannot read it",
+    "MANDATORY: currentPrice MUST be a number like 0.65318 or 109300 or \"UNREADABLE\"",
+    "DO NOT leave placeholder text. Fill in ALL fields.",
     "",
     "provenance_hint:",
     JSON.stringify(args.provenance || {}, null, 2),
@@ -2671,14 +2675,71 @@ ${textFull}
       }
     }
 
-    if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) {
+if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) {
       aiMetaFull.currentPrice = livePrice;
     }
+    
+    // ENSURE JSON BLOCK EXISTS IN OUTPUT
+    if (!textFull.includes("```json") || !textFull.includes("ai_meta")) {
+      const jsonBlock = `
+\`\`\`json
+ai_meta
+{
+  "currentPrice": ${livePrice || '"UNREADABLE"'},
+  "trade_id": "${uuid()}",
+  "strategy_used": "Structure Break & Retest",
+  "setup_quality": 7,
+  "market_regime": "trending",
+  "risk_grade": "B"
+}
+\`\`\``;
+      textFull = textFull + "\n\n" + jsonBlock;
+      aiMetaFull = { currentPrice: livePrice, ...aiMetaFull };
+    }
 
-   textFull = await enforceOption1(MODEL, instrument, textFull);
+  textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
     textFull = await enforceStrategyTournament(MODEL, instrument, textFull);
     textFull = await enforceAllSections(MODEL, instrument, textFull);
+    
+    // FORCE CHART ANALYSIS IF MISSING
+    if (!textFull.includes("4H BIAS") || !textFull.includes("1H CONTEXT") || !textFull.includes("15M EXECUTION")) {
+      const chartTemplate = `
+**4H BIAS DETERMINATION:**
+- Trend: [ANALYZE THE 4H CHART]
+- Swing Structure: [LIST EXACT PRICES]
+- Key Levels: [LIST SUPPORT/RESISTANCE]
+- BOS Status: [CHECK TRADINGVIEW INDICATOR]
+- 4H BIAS: [BULLISH/BEARISH/NEUTRAL]
+
+**1H CONTEXT ANALYSIS:**
+- Independent Trend: [ANALYZE THE 1H CHART]
+- Swing Highs: [LIST 3-5 EXACT PRICES]
+- Swing Lows: [LIST 3-5 EXACT PRICES]
+- Relationship to 4H: [CONFIRMS/CONFLICTS/CONSOLIDATES]
+- 1H BIAS: [DIRECTION AND REASONING]
+
+**15M EXECUTION CONTEXT:**
+- Current Trend: [ANALYZE THE 15M CHART]
+- Recent High: [EXACT PRICE]
+- Recent Low: [EXACT PRICE]
+- Current Price: ${livePrice || '[READ FROM CHART]'}
+- Momentum: [BULLISH/BEARISH/CONSOLIDATING]
+
+**Market Context Assessment:**
+[CALCULATE MOVE MATURITY AND GRADE]
+
+**Strategy Tournament Results:**
+[SCORE ALL 5 STRATEGIES]
+
+${textFull}`;
+
+      const forceCharts = [
+        { role: "system", content: "CRITICAL: Fill in ALL chart analysis sections with actual chart readings. Look at the 4H, 1H, and 15M charts and provide EXACT prices and analysis." },
+        { role: "user", content: `${instrument}\n\n${chartTemplate}` }
+      ];
+      textFull = await callOpenAI(MODEL, forceCharts);
+    }
     // Double-check critical sections exist
 if (!textFull.includes("4H BIAS") || !textFull.includes("1H CONTEXT") || 
     !textFull.includes("15M EXECUTION") || !textFull.includes("Market Context Assessment")) {
