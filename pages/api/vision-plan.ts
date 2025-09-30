@@ -127,14 +127,34 @@ async function fileToDataUrl(file: any): Promise<string | null> {
   return processImageToDataUrl(raw);
 }
 
-async function linkToDataUrl(url: string): Promise<string | null> {
+aasync function linkToDataUrl(url: string): Promise<string | null> {
   if (!url) return null;
   try {
-    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!r.ok) return null;
-    const buf = Buffer.from(await r.arrayBuffer());
-    return processImageToDataUrl(buf);
-  } catch {
+    // First fetch - might be HTML with og:image
+    const r1 = await fetch(url, { signal: AbortSignal.timeout(8000), redirect: "follow" });
+    if (!r1.ok) return null;
+    
+    const contentType = String(r1.headers.get("content-type") || "").toLowerCase();
+    const buf1 = Buffer.from(await r1.arrayBuffer());
+    
+    // If it's an image, process directly
+    if (contentType.includes("image/")) {
+      return `data:image/jpeg;base64,${buf1.toString("base64")}`;
+    }
+    
+    // If it's HTML, extract og:image
+    const html = buf1.toString("utf8");
+    const ogMatch = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
+    if (!ogMatch) return null;
+    
+    const imageUrl = ogMatch[1];
+    const r2 = await fetch(imageUrl, { signal: AbortSignal.timeout(8000) });
+    if (!r2.ok) return null;
+    
+    const buf2 = Buffer.from(await r2.arrayBuffer());
+    return `data:image/jpeg;base64,${buf2.toString("base64")}`;
+  } catch (err) {
+    console.error("[linkToDataUrl] Error:", err);
     return null;
   }
 }
