@@ -1750,7 +1750,49 @@ function messagesFull(args: {
     }) },
   ];
 }
+// ---------- Enforcement helpers ----------
+async function enforceFullStructure(model: string, instrument: string, text: string): Promise<string> {
+  // Check if all required sections are present
+  const hasPerformanceTracking = /Performance Tracking/i.test(text);
+  const hasFullBreakdown = /Full Breakdown/i.test(text);
+  const hasTradeSummary = /Trade Summary/i.test(text);
+  const hasTraderAssessment = /Trader'?s? Honest Assessment/i.test(text);
+  
+  if (hasPerformanceTracking && hasFullBreakdown && hasTradeSummary && hasTraderAssessment) {
+    return text; // All sections present
+  }
+  
+  // Generate missing sections
+  const messages = [
+    { role: "system", content: "You MUST add all missing sections after Option 2. Required sections: Performance Tracking, Trade Management, Full Breakdown (Technical View + Market Context Grade + Fundamental View), Trade Summary, Trade Validation, Trader's Honest Assessment. Keep Options 1 and 2 unchanged." },
+    { role: "user", content: `${instrument}\n\n${text}\n\nCOMPLETE THE ANALYSIS - Add all missing sections as specified in the output format.` }
+  ];
+  
+  return callOpenAI(model, messages);
+}
 
+// ---------- Enforcement helpers ----------
+async function enforceFullStructure(model: string, instrument: string, text: string): Promise<string> {
+  // Check if all required sections are present
+  const hasPerformanceTracking = /Performance Tracking/i.test(text);
+  const hasFullBreakdown = /Full Breakdown/i.test(text);
+  const hasTradeSummary = /Trade Summary/i.test(text);
+  const hasTraderAssessment = /Trader'?s? Honest Assessment/i.test(text);
+  
+  if (hasPerformanceTracking && hasFullBreakdown && hasTradeSummary && hasTraderAssessment) {
+    return text; // All sections present
+  }
+  
+  // Generate missing sections
+  const messages = [
+    { role: "system", content: "You MUST add all missing sections after Option 2. Required sections: Performance Tracking, Trade Management, Full Breakdown (Technical View + Market Context Grade + Fundamental View), Trade Summary, Trade Validation, Trader's Honest Assessment. Keep Options 1 and 2 unchanged." },
+    { role: "user", content: `${instrument}\n\n${text}\n\nCOMPLETE THE ANALYSIS - Add all missing sections as specified in the output format.` }
+  ];
+  
+  return callOpenAI(model, messages);
+}
+
+function hasCompliantOption2(text: string): boolean {
 // ---------- Enforcement helpers ----------
 function hasCompliantOption2(text: string): boolean {
   if (!/Option\s*2/i.test(text || "")) return false;
@@ -2386,6 +2428,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
     textFull = await enforceStrategyTournament(MODEL, instrument, textFull);
+    textFull = await enforceFullStructure(MODEL, instrument, textFull); 
     // Ensure both options have strategy names
     const opt1HasStrategy = /Option\s*1[\s\S]{50,300}Strategy[^:]*:\s*\w+/i.test(textFull);
     const opt2HasStrategy = /Option\s*2[\s\S]{50,300}Strategy[^:]*:\s*\w+/i.test(textFull);
