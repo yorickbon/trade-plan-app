@@ -2547,8 +2547,78 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       (messages[0] as any).content = (messages[0] as any).content + `\n\n**CRITICAL PRICE CHECK**: Current ${instrument} price is EXACTLY ${livePrice}. You MUST report this exact price in ai_meta.currentPrice. All entry suggestions must be within 15 points (0.4%) of this level for immediate execution.`;
     }
 
-    let textFull = await callOpenAI(MODEL, messages);
+   let textFull = await callOpenAI(MODEL, messages);
     let aiMetaFull = extractAiMeta(textFull) || {};
+    
+    // FORCE COMPLETE OUTPUT IF SECTIONS ARE MISSING
+    const requiredSections = [
+      "4H BIAS",
+      "1H CONTEXT", 
+      "15M EXECUTION",
+      "Market Context Assessment",
+      "Strategy Tournament Results",
+      "Performance Tracking",
+      "Trade Management",
+      "Full Breakdown",
+      "Trade Summary",
+      "Trade Validation",
+      "Trader's Honest Assessment"
+    ];
+
+    const missingSections = requiredSections.filter(section => !new RegExp(section, 'i').test(textFull));
+
+    if (missingSections.length > 0) {
+      console.error(`[VISION-PLAN] CRITICAL: Missing sections: ${missingSections.join(', ')}`);
+      
+      const template = `
+**4H BIAS DETERMINATION:**
+[INSERT 4H ANALYSIS HERE - trend, swings, levels, BOS status]
+
+**1H CONTEXT ANALYSIS:**
+[INSERT 1H ANALYSIS HERE - independent trend, swings, relationship to 4H]
+
+**15M EXECUTION CONTEXT:**
+[INSERT 15M ANALYSIS HERE - current trend, recent highs/lows, momentum]
+
+**Market Context Assessment:**
+[INSERT CONTEXT GRADE HERE - move maturity, position quality, grade A-D]
+
+**Strategy Tournament Results:**
+[INSERT 5 STRATEGIES SCORED 0-100]
+
+${textFull}
+
+**Performance Tracking**
+[INSERT R:R RATIO AND SETUP QUALITY]
+
+**Trade Management - Essential Metrics**
+[INSERT SL DISTANCE, R:R RATIO, ENTRY LOGIC]
+
+**Full Breakdown**
+[INSERT ALL BREAKDOWN SECTIONS]
+
+**Trade Summary**
+[INSERT SUMMARY]
+
+**Trade Validation**
+[INSERT VALIDATION CHECKS]
+
+**Trader's Honest Assessment**
+[INSERT HONEST ASSESSMENT WITH ALL 5 QUESTIONS]`;
+
+      const fixMessages = [
+        {
+          role: "system",
+          content: "Fill in ALL the [INSERT] sections in this template with proper analysis. Do NOT skip any section. Each section is MANDATORY."
+        },
+        {
+          role: "user", 
+          content: `${instrument}\n\n${template}\n\nFill in ALL missing sections.`
+        }
+      ];
+      
+      textFull = await callOpenAI(MODEL, fixMessages);
+    }
 
     // Enhanced price validation
     if (livePrice) {
