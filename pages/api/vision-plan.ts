@@ -1971,11 +1971,7 @@ async function enforceAllSections(model: string, instrument: string, text: strin
       ];
       return callOpenAI(model, messages);
     }
-  }
-  return text;
-}
-  
-  return text;
+ return text;
 }
 
 // ---------- Enforcement helpers ----------
