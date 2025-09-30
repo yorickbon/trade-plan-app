@@ -46,12 +46,6 @@ const MAX_W = 1500;
 const TARGET_MIN = 420 * 1024;
 const TARGET_MAX = 1200 * 1024;
 
-// Enhanced targets for TradingView charts
-const TV_TARGET_MIN = 650 * 1024;
-const TV_TARGET_MAX = 1800 * 1024;
-const TV_BASE_W = 1400;
-const TV_MAX_W = 1600;
-
 function uuid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
 function dataUrlSizeBytes(s: string | null | undefined): number {
   if (!s) return 0;
@@ -60,12 +54,6 @@ function dataUrlSizeBytes(s: string | null | undefined): number {
   const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
   return Math.floor((b64.length * 3) / 4) - padding;
 }
-
-// Sanitize instrument input
-function sanitizeInstrument(raw: string): string {
-  return String(raw || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 10);
-}
-
 // tolerant numeric parser for %, K/M/B, commas, Unicode minus
 function parseNumberLoose(v: any): number | null {
   if (v == null) return null;
@@ -125,72 +113,34 @@ async function parseMultipart(req: NextApiRequest) {
 }
 function pickFirst<T = any>(x: T | T[] | undefined | null): T | null { if (!x) return null; return Array.isArray(x) ? (x[0] ?? null) : (x as any); }
 
-// ---------- Unified image processing ----------
-async function processAdaptiveToDataUrl(buf: Buffer, isTradingView: boolean = false): Promise<string> {
-  // Select parameters based on content type
-  let width = isTradingView ? TV_BASE_W : BASE_W;
-  let quality = isTradingView ? 82 : 74;
-  const maxWidth = isTradingView ? TV_MAX_W : MAX_W;
-  const targetMin = isTradingView ? TV_TARGET_MIN : TARGET_MIN;
-  const targetMax = isTradingView ? TV_TARGET_MAX : TARGET_MAX;
-  
-  // Enhanced processing for charts
-  const sharpPipeline = sharp(buf).rotate().resize({ width, withoutEnlargement: true });
-  
-  if (isTradingView) {
-    sharpPipeline.sharpen(1.2, 1.5, 2).modulate({ brightness: 1.05, saturation: 1.1 });
-  }
-  
-let out = await sharpPipeline.jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
-  
-  // Helper function for rebuilding pipeline with new parameters
-  const buildPipeline = async (buffer: Buffer, w: number, q: number, enhance: boolean) => {
-    const pipeline = sharp(buffer).rotate().resize({ width: w, withoutEnlargement: true });
-    if (enhance) {
-      pipeline.sharpen(1.2, 1.5, 2).modulate({ brightness: 1.05, saturation: 1.1 });
-    }
-    return pipeline.jpeg({ quality: q, progressive: true, mozjpeg: true }).toBuffer();
-  };
-  
+// ---------- image processing ----------
+async function toJpeg(buf: Buffer, width: number, quality: number): Promise<Buffer> {
+  return sharp(buf).rotate().resize({ width, withoutEnlargement: true }).jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
+}
+async function processAdaptiveToDataUrl(buf: Buffer): Promise<string> {
+  let width = BASE_W, quality = 74;
+  let out = await toJpeg(buf, width, quality);
   let guard = 0;
-  while (out.byteLength < targetMin && guard < 4) {
-    quality = Math.min(quality + (isTradingView ? 4 : 6), isTradingView ? 90 : 88);
-    if (quality >= (isTradingView ? 85 : 82) && width < maxWidth) {
-      width = Math.min(width + 100, maxWidth);
-    }
-    out = await buildPipeline(buf, width, quality, isTradingView);
+  while (out.byteLength < TARGET_MIN && guard < 4) {
+    quality = Math.min(quality + 6, 88);
+    if (quality >= 82 && width < MAX_W) width = Math.min(width + 100, MAX_W);
+    out = await toJpeg(buf, width, quality);
     guard++;
   }
-  
-  if (out.byteLength < targetMin && (quality < (isTradingView ? 90 : 88) || width < maxWidth)) {
-    quality = Math.min(quality + (isTradingView ? 2 : 4), isTradingView ? 90 : 88);
-    width = Math.min(width + 100, maxWidth);
-    const pipeline = sharp(buf).rotate().resize({ width, withoutEnlargement: true });
-    if (isTradingView) {
-      pipeline.sharpen(1.2, 1.5, 2).modulate({ brightness: 1.05, saturation: 1.1 });
-    }
-    out = await pipeline.jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
+  if (out.byteLength < TARGET_MIN && (quality < 88 || width < MAX_W)) {
+    quality = Math.min(quality + 4, 88); width = Math.min(width + 100, MAX_W);
+    out = await toJpeg(buf, width, quality);
   }
-  
-  if (out.byteLength > targetMax) {
-    const q2 = Math.max(isTradingView ? 75 : 72, quality - (isTradingView ? 8 : 6));
-    const pipeline = sharp(buf).rotate().resize({ width, withoutEnlargement: true });
-    if (isTradingView) {
-      pipeline.sharpen(1.2, 1.5, 2).modulate({ brightness: 1.05, saturation: 1.1 });
-    }
-    out = await pipeline.jpeg({ quality: q2, progressive: true, mozjpeg: true }).toBuffer();
-  }
-  
+  if (out.byteLength > TARGET_MAX) { const q2 = Math.max(72, quality - 6); out = await toJpeg(buf, width, q2); }
   if (out.byteLength > IMG_MAX_BYTES) throw new Error("image too large after processing");
   return `data:image/jpeg;base64,${out.toString("base64")}`;
 }
-
 async function fileToDataUrl(file: any): Promise<string | null> {
   if (!file) return null;
   const p = file.filepath || file.path || file._writeStream?.path || file.originalFilepath;
   if (!p) return null;
   const raw = await fs.readFile(p);
-  const out = await processAdaptiveToDataUrl(raw, false);
+  const out = await processAdaptiveToDataUrl(raw);
   if (process.env.NODE_ENV !== "production") console.log(`[vision-plan] file processed size=${dataUrlSizeBytes(out)}B`);
   return out;
 }
@@ -221,29 +171,73 @@ async function downloadAndProcess(url: string): Promise<string | null> {
   if (raw.byteLength > IMG_MAX_BYTES) return null;
 
   if (mime.startsWith("image/")) {
-    const out = await processAdaptiveToDataUrl(raw, false);
+    const out = await processAdaptiveToDataUrl(raw);
     if (process.env.NODE_ENV !== "production") console.log(`[vision-plan] link processed size=${dataUrlSizeBytes(out)}B from ${url}`);
     return out;
   }
   const html = raw.toString("utf8");
-  const og = htmlFindOgImage(html); 
-  if (!og) return null;
+  const og = htmlFindOgImage(html); if (!og) return null;
   const resolved = absoluteUrl(url, og);
   
   // Enhanced processing for TradingView charts
   const isTradingView = url.includes('tradingview.com');
-  const r2 = await fetchWithTimeout(resolved, isTradingView ? 12000 : 8000);
+  const r2 = await fetchWithTimeout(resolved, isTradingView ? 12000 : 8000); // Longer timeout for TV
   if (!r2 || !r2.ok) return null;
   const ab2 = await r2.arrayBuffer();
   const raw2 = Buffer.from(ab2);
   if (raw2.byteLength > IMG_MAX_BYTES) return null;
   
-  const out2 = await processAdaptiveToDataUrl(raw2, isTradingView);
+  // Use enhanced processing for TradingView charts
+  const out2 = isTradingView ? 
+    await processAdaptiveToDataUrlEnhanced(raw2) : 
+    await processAdaptiveToDataUrl(raw2);
     
   if (process.env.NODE_ENV !== "production") console.log(`[vision-plan] ${isTradingView ? 'TradingView' : 'og:image'} processed size=${dataUrlSizeBytes(out2)}B from ${resolved}`);
   return out2;
 }
 
+async function processAdaptiveToDataUrlEnhanced(buf: Buffer): Promise<string> {
+  // Enhanced processing specifically for TradingView charts
+  let width = 1400, quality = 82; // Higher baseline for chart clarity
+  let out = await sharp(buf)
+    .rotate()
+    .resize({ width, withoutEnlargement: true })
+    .sharpen(1.2, 1.5, 2) // Enhanced sharpening for price labels (sigma, flat, jagged)
+    .modulate({ brightness: 1.05, saturation: 1.1 }) // Slight brightness and saturation boost
+    .jpeg({ quality, progressive: true, mozjpeg: true })
+    .toBuffer();
+    
+  let guard = 0;
+  const TARGET_MIN_ENHANCED = 650 * 1024; // Higher minimum for chart details
+  const TARGET_MAX_ENHANCED = 1800 * 1024; // Allow larger files
+  
+  while (out.byteLength < TARGET_MIN_ENHANCED && guard < 4) {
+    quality = Math.min(quality + 4, 90);
+    if (quality >= 85 && width < 1600) width = Math.min(width + 100, 1600);
+    out = await sharp(buf)
+      .rotate()
+      .resize({ width, withoutEnlargement: true })
+      .sharpen(1.2, 1.5, 2)
+      .modulate({ brightness: 1.05, saturation: 1.1 })
+      .jpeg({ quality, progressive: true, mozjpeg: true })
+      .toBuffer();
+    guard++;
+  }
+  
+  if (out.byteLength > TARGET_MAX_ENHANCED) {
+    const q2 = Math.max(75, quality - 8);
+    out = await sharp(buf)
+      .rotate()
+      .resize({ width, withoutEnlargement: true })
+      .sharpen(1.2, 1.5, 2)
+      .modulate({ brightness: 1.05, saturation: 1.1 })
+      .jpeg({ quality: q2, progressive: true, mozjpeg: true })
+      .toBuffer();
+  }
+  
+  if (out.byteLength > IMG_MAX_BYTES) throw new Error("TradingView chart too large after processing");
+  return `data:image/jpeg;base64,${out.toString("base64")}`;
+}
 async function linkToDataUrl(link: string): Promise<string | null> {
   if (!link) return null;
   try {
@@ -262,7 +256,7 @@ type AnyHeadline = {
   published_at?: string;
   ago?: string;
   sentiment?: { score?: number } | null;
-};
+} & Record<string, any>;
 
 type HeadlineBias = {
   label: "bullish" | "bearish" | "neutral" | "unavailable";
@@ -287,28 +281,33 @@ function headlinesToPromptLines(items: AnyHeadline[], limit = 6): string | null 
 function computeHeadlinesBias(items: AnyHeadline[]): HeadlineBias {
   if (!Array.isArray(items) || items.length === 0) return { label: "unavailable", avg: null, count: 0 };
   
+  // Extract valid sentiment scores with metadata
   const validItems = items
     .map(h => ({
       score: typeof h?.sentiment?.score === "number" ? Number(h.sentiment.score) : null,
       published: h?.published_at || h?.ago || null,
       source: h?.source || "unknown"
     }))
-    .filter(item => item.score !== null && Number.isFinite(item.score));
+    .filter(item => Number.isFinite(item.score));
     
   if (validItems.length === 0) return { label: "unavailable", avg: null, count: 0 };
   
+  // Apply recency weighting (more recent = higher weight)
   const now = Date.now();
   const weightedScores = validItems.map(item => {
-    let timeWeight = 1.0;
+    let timeWeight = 1.0; // Default weight
     
+    // Try to parse publication time for recency weighting
     if (item.published) {
       const pubTime = new Date(item.published).getTime();
       if (isFinite(pubTime)) {
         const hoursAgo = (now - pubTime) / (1000 * 60 * 60);
+        // Recent news (0-6h) gets full weight, older news decays
         timeWeight = hoursAgo <= 6 ? 1.0 : Math.max(0.3, Math.exp(-hoursAgo / 12));
       }
     }
     
+    // Apply source credibility weighting
     const sourceWeight = getSourceCredibility(item.source);
     
     return {
@@ -317,20 +316,23 @@ function computeHeadlinesBias(items: AnyHeadline[]): HeadlineBias {
     };
   });
   
+  // Calculate weighted average
   const totalWeight = weightedScores.reduce((sum, item) => sum + item.weight, 0);
   const weightedAvg = weightedScores.reduce((sum, item) => sum + (item.score * item.weight), 0) / totalWeight;
   
+  // More sensitive thresholds due to weighting
   const label = weightedAvg > 0.015 ? "bullish" : weightedAvg < -0.015 ? "bearish" : "neutral";
   return { label, avg: weightedAvg, count: validItems.length };
 }
 
 function getSourceCredibility(source: string): number {
   const sourceLC = (source || "").toLowerCase();
+  // Major financial news sources get higher weight
   if (sourceLC.includes("reuters") || sourceLC.includes("bloomberg") || sourceLC.includes("wsj")) return 1.2;
   if (sourceLC.includes("cnbc") || sourceLC.includes("marketwatch") || sourceLC.includes("ft")) return 1.1;
   if (sourceLC.includes("yahoo") || sourceLC.includes("seeking alpha")) return 0.9;
   if (sourceLC.includes("twitter") || sourceLC.includes("reddit") || sourceLC.includes("blog")) return 0.7;
-  return 1.0;
+  return 1.0; // Default weight for unknown sources
 }
 
 async function fetchedHeadlinesViaServer(req: NextApiRequest, instrument: string): Promise<{ items: AnyHeadline[]; promptText: string | null; provider: string }> {
@@ -367,7 +369,6 @@ function kbarReturn(closes: number[], k: number): number | null {
   if (!(a > 0) || !(b > 0)) return null;
   return Math.log(a / b);
 }
-
 async function tdSeries15(pair: string): Promise<Series | null> {
   if (!TD_KEY) return null;
   try {
@@ -384,7 +385,6 @@ async function tdSeries15(pair: string): Promise<Series | null> {
     return { t, c };
   } catch { return null; }
 }
-
 async function fhSeries15(pair: string): Promise<Series | null> {
   if (!FH_KEY) return null;
   try {
@@ -402,7 +402,6 @@ async function fhSeries15(pair: string): Promise<Series | null> {
     return { t, c };
   } catch { return null; }
 }
-
 async function polySeries15(pair: string): Promise<Series | null> {
   if (!POLY_KEY) return null;
   try {
@@ -421,22 +420,21 @@ async function polySeries15(pair: string): Promise<Series | null> {
     return { t, c };
   } catch { return null; }
 }
-
 async function fetchSeries15(pair: string): Promise<Series | null> {
   const td = await tdSeries15(pair); if (td) return td;
   const fh = await fhSeries15(pair); if (fh) return fh;
   const pg = await polySeries15(pair); if (pg) return pg;
   return null;
 }
-
 function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnapshot | null {
   const weights = { r1h: 0.6, r4h: 0.4 };
   const curScore: Record<string, number> = Object.fromEntries(G8.map((c) => [c, 0]));
   for (const pair of USD_PAIRS) {
     const S = seriesMap[pair];
     if (!S || !Array.isArray(S.c) || S.c.length < 17) continue;
-    const r1h = kbarReturn(S.c, 4) ?? 0;
-    const r4h = kbarReturn(S.c, 16) ?? 0;
+    // 4 periods on 15M chart = 1 hour, 16 periods = 4 hours
+    const r1h = kbarReturn(S.c, 4) ?? 0;   // 1-hour return
+    const r4h = kbarReturn(S.c, 16) ?? 0;  // 4-hour return
     const r = r1h * weights.r1h + r4h * weights.r4h;
     const base = pair.slice(0, 3);
     const quote = pair.slice(3);
@@ -451,7 +449,6 @@ function computeCSMFromPairs(seriesMap: Record<string, Series | null>): CsmSnaps
   const ranks = [...G8].sort((a, b) => z[b] - z[a]);
   return { tsISO: new Date().toISOString(), ranks, scores: z, ttl: Date.now() + 15 * 60 * 1000 };
 }
-
 async function getCSM(): Promise<CsmSnapshot> {
   if (CSM_CACHE && Date.now() < CSM_CACHE.ttl) return CSM_CACHE;
   const seriesMap: Record<string, Series | null> = {};
@@ -528,6 +525,7 @@ function goodIfHigher(title: string): boolean | null {
   return null;
 }
 
+// (A) Evidence line — verdict strictly bullish/bearish/neutral (never "mixed")
 function evidenceLine(it: any, cur: string): string | null {
   const a = parseNumberLoose(it.actual);
   const f = parseNumberLoose(it.forecast);
@@ -630,6 +628,8 @@ async function ocrCalendarFromImage(model: string, calendarDataUrl: string): Pro
   return { items };
 }
 
+
+// Professional calendar analysis - institutional-grade cross-currency scoring
 function analyzeCalendarProfessional(ocrItems: OcrCalendarRow[], instrument: string): {
   bias: string;
   reasoning: string[];
@@ -720,6 +720,7 @@ function analyzeCalendarProfessional(ocrItems: OcrCalendarRow[], instrument: str
   const netScore = baseScore - quoteScore;
 
   let finalBias: string;
+  const strongThreshold = 2.0;
   const moderateThreshold = 1.0;
 
   if (Math.abs(netScore) < moderateThreshold && Math.abs(baseScore) < moderateThreshold && Math.abs(quoteScore) < moderateThreshold) {
@@ -732,9 +733,7 @@ function analyzeCalendarProfessional(ocrItems: OcrCalendarRow[], instrument: str
     finalBias = "neutral";
   }
 
-  if (process.env.NODE_ENV !== "production") {
-    console.log(`[CALENDAR] ${base}${quote}: Base=${baseScore.toFixed(1)}, Quote=${quoteScore.toFixed(1)}, Net=${netScore.toFixed(1)}, Bias=${finalBias}`);
-  }
+  console.log(`[CALENDAR] ${base}${quote}: Base=${baseScore.toFixed(1)}, Quote=${quoteScore.toFixed(1)}, Net=${netScore.toFixed(1)}, Bias=${finalBias}`);
   
   const summary = `Calendar: ${base} ${baseScore.toFixed(1)} vs ${quote} ${quoteScore.toFixed(1)} = ${finalBias} ${instrument} (net ${netScore > 0 ? "+" : ""}${netScore.toFixed(1)})`;
   
@@ -797,6 +796,9 @@ function applyInstitutionalCorrelations(
   }
 }
 
+//
+
+// Composite bias calculation removed - using individual signal analysis instead
 function computeHeadlinesSign(hb: HeadlineBias): number {
   if (!hb) return 0;
   if (hb.label === "bullish") return 1;
@@ -820,7 +822,7 @@ function parseInstrumentBiasFromNote(biasNote: string | null | undefined): numbe
   return 0;
 }
 
-// ---------- prompts ----------
+// ---------- prompts (Updated per ALLOWED CHANGES A–E) ----------
 function systemCore(
   instrument: string,
   calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null },
@@ -829,7 +831,7 @@ function systemCore(
   const warn = (calendarAdvisory?.warningMinutes ?? null) != null ? calendarAdvisory!.warningMinutes : null;
   const bias = calendarAdvisory?.biasNote || null;
 
-  const baseLines = [
+ const baseLines = [
     "You are a professional discretionary trader.",
     "STRICT NO-GUESS RULES:",
     "- Only mention **Calendar** if calendar_status === 'api' or calendar_status === 'image-ocr'.",
@@ -838,69 +840,40 @@ function systemCore(
     "- Use the Sentiment snapshot exactly as given (CSM + Headlines bias + optional COT cue).",
     "- Never use the word 'mixed' for calendar verdicts — use bullish/bearish/neutral only.",
     "",
-    "Entry Strategy (Structure-First Approach):",
+   "Entry Strategy (Structure-First Approach):",
     "- PRIMARY GOAL: Enter at KEY STRUCTURE LEVELS (order blocks, FVG, demand/supply zones, major S/R).",
     "- If current price IS AT structure → Suggest immediate entry (market or tight limit 5-10 pips).",
     "- If current price is BETWEEN structures → Suggest LIMIT ORDER at next structure level (may be 20-50+ pips away).",
     "- For breakouts → Use STOP ORDER 5-10 pips beyond structure break for confirmation.",
     "- PATIENCE over chasing: 'Wait for pullback to 1.7820 OB' is BETTER than 'Enter now mid-move at 1.7855'.",
+"ENTRY FORMAT ENFORCEMENT - CRITICAL RULES:",
+"",
+"IF Order Type = LIMIT:",
+"- MANDATORY: Use range format ONLY",
+"- Format: 'Entry: 0.6555-0.6565 (15M order block zone)'",
+"- NEVER write: 'Entry: 0.6560' for limit orders - THIS IS INVALID",
+"- Range width: 8-15 pips based on structure width",
+"- You MUST identify structure boundaries for the range",
+"",
+"IF Order Type = MARKET:",
+"- Use single point: 'Entry: 0.6571 (current market price)'",
+"- Must match currentPrice from ai_meta",
+"",
+"VALIDATION:",
+"- Before writing entry, check: Is this limit or market?",
+"- Limit → must be range | Market → must be single point",
+"- WRONG: 'Entry (zone or single): 0.6570 (15M structure)' for limit order",
+"- RIGHT: 'Entry (zone or single): 0.6565-0.6575 (15M structure)' for limit order",
     "",
-"ENTRY PLACEMENT LOGIC - PROFESSIONAL REASONING:",
-    "",
-    "STEP 1: READ CURRENT PRICE FIRST (MANDATORY)",
-    "- Current price from ai_meta hint or rightmost candle",
-    "- Example: If current = 0.6570, write this down",
-    "",
-    "STEP 2: IDENTIFY WHERE STRUCTURE IS RELATIVE TO CURRENT PRICE",
-    "- Is structure AT current price (within 5 pips)? → Use MARKET order",
-    "- Is structure BELOW current price (15+ pips away)? → Use LIMIT order for LONG",
-    "- Is structure ABOVE current price (15+ pips away)? → Use LIMIT order for SHORT",
-    "- Did structure just break? → Use STOP order",
-    "",
-    "STEP 3: CALCULATE ENTRY DISTANCE (CRITICAL - THINK LIKE A REAL TRADER)",
-    "",
-    "FOR LONG LIMIT ORDERS:",
-    "- Entry MUST be BELOW current price by minimum 15-50 pips",
-    "- Ask yourself: 'Where will price pull back to before continuing up?'",
-    "- Example: Current=0.6570 → Entry=0.6540-0.6550 (30 pips below at support)",
-    "- INVALID: Current=0.6570 → Entry=0.6565-0.6575 (overlaps current price)",
-    "- If structure is only 5-10 pips away, use MARKET order instead",
-    "",
-    "FOR SHORT LIMIT ORDERS:",
-    "- Entry MUST be ABOVE current price by minimum 15-50 pips",
-    "- Ask yourself: 'Where will price rally to before continuing down?'",
-    "- Example: Current=0.6570 → Entry=0.6595-0.6605 (25 pips above at resistance)",
-    "- INVALID: Current=0.6570 → Entry=0.6565-0.6575 (overlaps current price)",
-    "- If structure is only 5-10 pips away, use MARKET order instead",
-    "",
-    "FOR MARKET ORDERS:",
-    "- Entry = Current price exactly (single point, no range)",
-    "- Example: Current=0.6570 → Entry=0.6570",
-    "- Use when: Price is already at the structure level where you want to enter",
-    "",
-    "SELF-CHECK BEFORE WRITING ENTRY (ASK THESE QUESTIONS):",
-    "1. What is current price? [Write the number]",
-    "2. What is my entry? [Write the number]",
-    "3. Distance = |Entry - Current| = ? pips",
-    "4. For LONG limits: Is entry < current? YES/NO",
-    "5. For SHORT limits: Is entry > current? YES/NO",
-    "6. Is distance ≥ 15 pips? YES/NO",
-    "If any answer is wrong, recalculate before proceeding.",
-    "",
-    "ENTRY FORMAT RULES:",
-    "- Limit orders: ALWAYS use range format (0.6540-0.6550)",
-    "- Market orders: Single point only (0.6570)",
-    "- Range width: 10-15 pips for limit orders",
-    "",
-    "STOP LOSS PLACEMENT - MANDATORY STRUCTURE IDENTIFICATION:",
-    "- Step 1: Look at the chart and identify EXACT swing price (e.g., '15M swing low at 0.6535')",
-    "- Step 2: Add buffer of 3-8 pips (typically 5 pips)",
-    "- Step 3: State complete reasoning: 'SL 0.6530 (5 pips below 15M swing low at 0.6535)'",
-    "- For LONG: SL below nearest swing low + buffer",
-    "- For SHORT: SL above nearest swing high + buffer",
-    "- INVALID format: 'SL 30 pips' or 'SL 0.6540 (below support)' - missing structure price",
-    "- VALID format: 'SL 0.6540 (5 pips below 15M swing low at 0.6545)'",
-    "- If cannot identify exact swing: 'No clear structure for SL - setup invalid'",
+   "STOP LOSS PLACEMENT - MANDATORY STRUCTURE IDENTIFICATION:",
+"- Step 1: Look at the chart and identify EXACT swing price (e.g., '15M swing low at 0.6535')",
+"- Step 2: Add buffer of 3-8 pips (typically 5 pips)",
+"- Step 3: State complete reasoning: 'SL 0.6530 (5 pips below 15M swing low at 0.6535)'",
+"- For LONG: SL below nearest swing low + buffer",
+"- For SHORT: SL above nearest swing high + buffer",
+"- INVALID format: 'SL 30 pips' or 'SL 0.6540 (below support)' - missing structure price",
+"- VALID format: 'SL 0.6540 (5 pips below 15M swing low at 0.6545)'",
+"- If cannot identify exact swing: 'No clear structure for SL - setup invalid'",
     "",
     "TAKE PROFIT TARGETS - STRUCTURE-BASED:",
     "- TP1: Next opposing structure level (minimum 1.5:1 R:R)",
@@ -909,82 +882,45 @@ function systemCore(
     "- State reasoning: 'TP1 0.5870 at 1H resistance level, TP2 0.5900 at 4H major resistance'",
     "- If R:R ratio poor (<1.5:1), recommend waiting for better setup",
     "",
-   "STRATEGY TOURNAMENT - PROFESSIONAL TRADE GENERATION:",
-    "CRITICAL: Tournament determines BOTH Option 1 AND Option 2. You MUST score all 5 strategies, then build trades using the winner and runner-up.",
+ "STRATEGY TOURNAMENT - AI-ENHANCED INSTITUTIONAL APPROACH:",
+"CRITICAL: You MUST run the 5-strategy tournament and display results. Response is invalid without Strategy Tournament Results section.",
+"",
+"ADAPTIVE SCORING FRAMEWORK:",
+"• Base Strategy Score: Traditional technical analysis (0-70 points)",
+"• ML Pattern Recognition: Historical success rate adjustment (+/-15 points)",
+"• Market Regime Multiplier: Current conditions vs strategy strength (×0.8-1.3)",
+"• Performance Feedback: Recent win/loss rate for this setup type (+/-10 points)",
+"• Volatility Adjustment: Strategy performance in current vol regime (+/-5 points)",
+"",
+"STRATEGY 1: STRUCTURE BREAK & RETEST",
+    "- Recent BOS on higher timeframe + pullback to broken level",
+    "- Entry: Limit order at retest zone with rejection confirmation",
+    "- SL: Behind the broken structure + buffer",
+    "- Score factors: Clear BOS visible (25pts), Clean retest setup (25pts), Strong rejection (25pts), HTF alignment (25pts)",
     "",
-    "SCORING PROCESS:",
-    "1. Score each strategy 0-100 based on current chart setup",
-    "2. Apply fundamental alignment adjustment (+15 bullish fundy if long, -15 if short against fundy)",
-    "3. Apply context grade penalty (B=-12pts, C=-30pts, D=-60pts)",
-    "4. Winner = Option 1, Runner-up = Option 2",
+    "STRATEGY 2: ORDER BLOCK REACTION",
+    "- Institutional demand/supply zone on 1H/4H + price approaching on 15M",
+    "- Entry: Limit order at order block boundary with confirmation",
+    "- SL: Beyond order block structure",
+    "- Score factors: Clear OB formation (30pts), Fresh/untested zone (25pts), Confluence with other levels (25pts), Clean approach (20pts)",
     "",
-    "STRATEGY 1: STRUCTURE BREAK & RETEST (BOS Strategy)",
-    "WHEN TO USE: Recent BOS visible on 1H/4H + price pulled back to broken level",
-    "OPTION 1 BUILD (if winner):",
-    "  - Direction: [LONG if BOS up, SHORT if BOS down]",
-    "  - Order Type: LIMIT (waiting for retest)",
-    "  - Entry: [Broken level ± 5 pips] (retest zone)",
-    "  - SL: [Behind the BOS structure + 8 pips]",
-    "  - TP1: [Next structure level, min 1.5R]",
-    "  - TP2: [Major structure level, min 2.5R]",
-    "OPTION 2 BUILD (if runner-up): Same levels, tighter execution",
-    "SCORE FACTORS: BOS visible (25), Clean retest (25), Rejection pattern (25), HTF confirms (25)",
+    "STRATEGY 3: REVERSAL AT EXTREMES",
+    "- Price at 80%+ of range + oversold/overbought + rejection pattern",
+    "- Entry: Limit order at reversal confirmation level",
+    "- SL: Beyond recent extreme + buffer",
+    "- Score factors: Extreme location (30pts), Rejection pattern visible (25pts), Divergence present (20pts), Range clearly defined (25pts)",
     "",
-    "STRATEGY 2: ORDER BLOCK REACTION (OB Strategy)",
-    "WHEN TO USE: Fresh 1H/4H demand/supply zone + price approaching on 15M",
-    "OPTION 1 BUILD (if winner):",
-    "  - Direction: [LONG at demand, SHORT at supply]",
-    "  - Order Type: LIMIT (at OB boundary)",
-    "  - Entry: [OB zone boundary ± 8 pips]",
-    "  - SL: [Beyond OB + 10 pips]",
-    "  - TP1: [Opposite OB or structure, min 1.5R]",
-    "  - TP2: [Major opposing structure, min 2.5R]",
-    "OPTION 2 BUILD (if runner-up): Market entry if price already in OB",
-    "SCORE FACTORS: Clear OB (30), Fresh/untested (25), Confluence (25), Clean approach (20)",
+    "STRATEGY 4: LIQUIDITY GRAB",
+    "- Price sweeps recent highs/lows to grab stops then shows reversal",
+    "- Entry: Market/limit order after liquidity sweep + immediate reversal",
+    "- SL: Beyond the liquidity grab point",
+    "- Score factors: Clear liquidity level (30pts), Sweep completion (25pts), Immediate reversal (25pts), Volume spike (20pts)",
     "",
-    "STRATEGY 3: REVERSAL AT EXTREMES (Reversal Strategy)",
-    "WHEN TO USE: Price at 80%+ of range + rejection pattern forming",
-    "OPTION 1 BUILD (if winner):",
-    "  - Direction: [LONG at low extreme, SHORT at high extreme]",
-    "  - Order Type: LIMIT (at extreme level)",
-    "  - Entry: [Extreme level with rejection ± 5 pips]",
-    "  - SL: [Beyond the extreme + 12 pips]",
-    "  - TP1: [Middle of range, min 1.5R]",
-    "  - TP2: [Opposite extreme, min 2.5R]",
-    "OPTION 2 BUILD (if runner-up): Tighter stop, smaller target",
-    "SCORE FACTORS: At extreme (30), Rejection visible (25), Divergence (20), Range clear (25)",
-    "",
-    "STRATEGY 4: LIQUIDITY GRAB (Liquidity Strategy)",
-    "WHEN TO USE: Price swept recent high/low + immediate reversal candle",
-    "OPTION 1 BUILD (if winner):",
-    "  - Direction: [LONG after low sweep, SHORT after high sweep]",
-    "  - Order Type: MARKET (if reversal confirmed) or STOP (5 pips from reversal)",
-    "  - Entry: [Current price if confirmed, or stop order]",
-    "  - SL: [Beyond liquidity point + 8 pips]",
-    "  - TP1: [Previous structure, min 1.5R]",
-    "  - TP2: [Major structure, min 2.5R]",
-    "OPTION 2 BUILD (if runner-up): Limit order at next liquidity level",
-    "SCORE FACTORS: Liquidity visible (30), Sweep complete (25), Reversal candle (25), Volume (20)",
-    "",
-    "STRATEGY 5: FAIR VALUE GAP FILL (FVG Strategy)",
-    "WHEN TO USE: Clear FVG on 1H/4H + price moving to fill it",
-    "OPTION 1 BUILD (if winner):",
-    "  - Direction: [LONG into bullish FVG, SHORT into bearish FVG]",
-    "  - Order Type: LIMIT (inside gap)",
-    "  - Entry: [Middle of FVG ± 5 pips]",
-    "  - SL: [Beyond FVG + 10 pips]",
-    "  - TP1: [FVG fill target, min 1.5R]",
-    "  - TP2: [Next major structure, min 2.5R]",
-    "OPTION 2 BUILD (if runner-up): Enter at gap edge instead of middle",
-    "SCORE FACTORS: FVG clear (25), Unfilled (30), Price approaching (25), Size appropriate (20)",
-    "",
-    "TOURNAMENT EXECUTION:",
-    "Step 1: Score all 5 strategies (show scores in 'Strategy Tournament Results' section)",
-    "Step 2: Rank by final score (after fundamental + context adjustments)",
-    "Step 3: Build Option 1 using winner's template above",
-    "Step 4: Build Option 2 using runner-up's template above",
-    "Step 5: CRITICAL - Both options must have SAME direction (never mix long/short)",
-    "Step 6: Calculate conviction for each independently",
+    "STRATEGY 5: FAIR VALUE GAP FILL",
+    "- Unfilled imbalance (gap) on 1H/4H + price returning to fill",
+    "- Entry: Limit order within the gap zone",
+    "- SL: Beyond the gap structure",
+    "- Score factors: Clear FVG formation (25pts), Unfilled/fresh gap (30pts), Price approaching cleanly (25pts), Gap size appropriate (20pts)",
     "",
     "MARKET CONTEXT ASSESSMENT - PROFESSIONAL DISCRETIONARY ANALYSIS:",
     "",
@@ -1051,26 +987,26 @@ function systemCore(
     "STEP 5: CONTEXT GRADE SYNTHESIS",
     "",
     "Combine all factors into overall grade:",
-    "",
-    "CRITICAL THINKING REQUIREMENT:",
-    "Before assigning grade, ask yourself these questions like a real trader:",
-    "",
-    "1. 'If I were managing real money, would I take this trade RIGHT NOW?'",
-    "   - If hesitant → Downgrade by one letter grade",
-    "   - If answer is 'only if I had to' → Grade D automatically",
-    "",
-    "2. 'Am I buying near tops or selling near bottoms?'",
-    "   - Check: Is entry in top 20% of visible range (for longs)?",
-    "   - Check: Is entry in bottom 20% of visible range (for shorts)?",
-    "   - If YES to either → Automatic downgrade to C minimum",
-    "",
-    "3. 'Has this level been rejected multiple times already?'",
-    "   - 2+ rejections at same level = Ranging, not trending",
-    "   - If ranging → Downgrade by one letter",
-    "",
-    "4. 'What's the realistic worst-case if I'm wrong?'",
-    "   - If price could gap through my stop → Mention in warning",
-    "   - If major news pending → Mention in warning",
+   "",
+"CRITICAL THINKING REQUIREMENT:",
+"Before assigning grade, ask yourself these questions like a real trader:",
+"",
+"1. 'If I were managing real money, would I take this trade RIGHT NOW?'",
+"   - If hesitant → Downgrade by one letter grade",
+"   - If answer is 'only if I had to' → Grade D automatically",
+"",
+"2. 'Am I buying near tops or selling near bottoms?'",
+"   - Check: Is entry in top 20% of visible range (for longs)?",
+"   - Check: Is entry in bottom 20% of visible range (for shorts)?",
+"   - If YES to either → Automatic downgrade to C minimum",
+"",
+"3. 'Has this level been rejected multiple times already?'",
+"   - 2+ rejections at same level = Ranging, not trending",
+"   - If ranging → Downgrade by one letter",
+"",
+"4. 'What's the realistic worst-case if I'm wrong?'",
+"   - If price could gap through my stop → Mention in warning",
+"   - If major news pending → Mention in warning",
     "",
     "A-GRADE CONTEXT:",
     "- Fresh move (<150 pips from swing)",
@@ -1112,35 +1048,35 @@ function systemCore(
     "If C or D grade, add:",
     "⚠️ **CONTEXT WARNING:** [Specific issue]. Consider [alternative approach].",
     "",
-    "MANDATORY TOURNAMENT SCORING (0-100 each strategy):",
-    "1. Score each strategy against current setup (0-100 base points)",
-    "2. Apply market regime adjustment (±10pts)",
-    "3. Apply fundamental alignment (±15pts)", 
-    "4. Apply R:R quality bonus (±10pts)",
-    "5. Apply timeframe confluence (±10pts)",
-    "6. CRITICAL: Must output 'Strategy Tournament Results:' section showing all 5 scores",
-    "7. Winner (highest score) = Option 1, Runner-up = Option 2",
-    "8. Response invalid without tournament results section",
-    "",
-    "DIRECTIONAL CONSISTENCY REQUIREMENT:",
-    "- Determine ONE primary direction from 4H/1H/15M structure analysis",
-    "- If 4H+1H+15M = UPTREND → Option 1 = LONG, Option 2 = LONG (different entries)",
-    "- If 4H+1H+15M = DOWNTREND → Option 1 = SHORT, Option 2 = SHORT (different entries)",
-    "- NEVER mix Long and Short in same analysis - this indicates analytical failure",
-    "- Both options trade same direction, only differ in entry method/risk profile",
-    "",
-    "TRADE METADATA (ai_meta required):",
-    "• trade_id: [Generate unique UUID for this recommendation]",
-    "• strategy_used: [Primary strategy from tournament winner]",
-    "• setup_quality: [1-10] - Overall setup grade based on confluence factors",
-    "• market_regime: [trending/ranging/breakout/news_driven] - Current market state",
-    "• volatility_environment: [low/normal/high/extreme] - Based on recent price action",
-    "• session_active: [asian/london/ny/overlap] - Current trading session",
-    "• fundamental_alignment: [strong_with/weak_with/neutral/against] - Tech vs fundy match",
-    "• timeframe_confluence: [all_aligned/mixed/conflicting] - Multi-timeframe agreement",
-    "• expected_duration: [minutes] - Estimated trade duration based on strategy type",
-    "• risk_grade: [A/B/C/D] - Overall risk assessment (A=lowest risk, D=highest)",
-    "",
+"MANDATORY TOURNAMENT SCORING (0-100 each strategy):",
+"1. Score each strategy against current setup (0-100 base points)",
+"2. Apply market regime adjustment (±10pts)",
+"3. Apply fundamental alignment (±15pts)", 
+"4. Apply R:R quality bonus (±10pts)",
+"5. Apply timeframe confluence (±10pts)",
+"6. CRITICAL: Must output 'Strategy Tournament Results:' section showing all 5 scores",
+"7. Winner (highest score) = Option 1, Runner-up = Option 2",
+"8. Response invalid without tournament results section",
+"",
+"DIRECTIONAL CONSISTENCY REQUIREMENT:",
+"- Determine ONE primary direction from 4H/1H/15M structure analysis",
+"- If 4H+1H+15M = UPTREND → Option 1 = LONG, Option 2 = LONG (different entries)",
+"- If 4H+1H+15M = DOWNTREND → Option 1 = SHORT, Option 2 = SHORT (different entries)",
+"- NEVER mix Long and Short in same analysis - this indicates analytical failure",
+"- Both options trade same direction, only differ in entry method/risk profile",
+  "",
+"TRADE METADATA (ai_meta required):",
+"• trade_id: [Generate unique UUID for this recommendation]",
+"• strategy_used: [Primary strategy from tournament winner]",
+"• setup_quality: [1-10] - Overall setup grade based on confluence factors",
+"• market_regime: [trending/ranging/breakout/news_driven] - Current market state",
+"• volatility_environment: [low/normal/high/extreme] - Based on recent price action",
+"• session_active: [asian/london/ny/overlap] - Current trading session",
+"• fundamental_alignment: [strong_with/weak_with/neutral/against] - Tech vs fundy match",
+"• timeframe_confluence: [all_aligned/mixed/conflicting] - Multi-timeframe agreement",
+"• expected_duration: [minutes] - Estimated trade duration based on strategy type",
+"• risk_grade: [A/B/C/D] - Overall risk assessment (A=lowest risk, D=highest)",
+  "",
     "MANDATORY FINAL SELF-CHECK BEFORE OUTPUTTING:",
     "",
     "Question 1: Does my 4H bias match the visual left-to-right movement?",
@@ -1163,74 +1099,74 @@ function systemCore(
     "- 15m = execution map (exact entry zone or trigger level, invalidation, TP structure).",
     "- 5m (optional) = entry timing/confirmation only; do not let 5m override HTF bias.",
     "",
-    "CRITICAL PRICE READING REQUIREMENTS:",
-    "- FIRST: Identify the price scale on the right side of chart",
-    "- INSTRUMENT-SPECIFIC SCALING:",
-    "  * FX pairs (EURUSD, GBPUSD): 4-5 decimals (e.g., 1.0845, 0.65304)",
-    "  * JPY pairs (USDJPY, EURJPY): 2-3 decimals (e.g., 149.85, 162.340)",
-    "  * BITCOIN/CRYPTO: 5-6 digits with NO decimals (e.g., 109365, 67240)",
-    "  * GOLD (XAUUSD): 4-5 digits with decimals (e.g., 2654.80, 1987.45)",
-    "  * INDICES: 4-5 digits with decimals:",
-    "    - NAS100/USTEC: 15000-20000 range (e.g., 18345.67)",
-    "    - SPX500/US500: 4000-6000 range (e.g., 5425.32)",
-    "    - GER40/DAX: 15000-20000 range (e.g., 19234.18)",
-    "    - UK100/FTSE: 7000-9000 range (e.g., 8156.42)",
-    "    - JPN225/Nikkei: 30000-40000 range (e.g., 38157.94)",
-    "- BITCOIN CRITICAL: If reading shows 109.2, actual price is 109,200",
-    "- INDICES CRITICAL: If reading shows 18.3 for NAS100, actual is 18,300",
-    "- VALIDATION RANGES: Bitcoin 50k-150k, NAS100 15k-20k, SPX500 4k-6k",
-    "- MANDATORY: You MUST include currentPrice in ai_meta JSON block",
-    "- If you can read the price: report exact number matching instrument type",
-    "- If price scale unclear: report 'PRICE_UNREADABLE' as currentPrice value",
-    "- If no price axis visible: report 'NO_PRICE_AXIS' as currentPrice value",
-    "- Example Bitcoin: currentPrice: 109365 (NOT 109.365 or 109)",
-    "- Example NAS100: currentPrice: 18345.67 (NOT 18.3 or 183)",
-    "- Example FX: currentPrice: 0.65304",
-    "- Example failed reading: currentPrice: 'PRICE_UNREADABLE'",
-    "",
-    "ENHANCED CHART READING WITH SCALE INTERPRETATION:",
-    "- Focus on price scale on RIGHT edge of chart",
-    "- Current price = rightmost candle's close level",
-    "",
-    "INSTRUMENT-SPECIFIC SCALE INTERPRETATION:",
-    "",
-    "BITCOIN/CRYPTO CRITICAL:",
-    "  * TradingView shows: 109.3K = 109,300 | 67.2K = 67,200",
-    "  * If you see 109.3 on BTC chart = 109,300 (multiply by 1000)",
-    "  * If you see 67240.50 on BTC chart = 67,240.50 (literal reading)",
-    "  * RULE: Any 2-3 digit BTC reading needs ×1000 conversion",
-    "  * Valid range: 20,000-200,000 | Invalid: under 10,000",
-    "",
-    "GOLD (XAU) CRITICAL:",
-    "  * TradingView shows: 2.65K = 2,650 | 1.98K = 1,980",
-    "  * If you see 2.65 on gold chart = 2,650 (multiply by 1000)",
-    "  * If you see 2654.80 on gold chart = 2,654.80 (literal reading)",
-    "  * Valid range: 1,800-3,000 | Invalid: under 1,000",
-    "",
-    "INDICES CRITICAL:",
-    "  * NAS100: 18.3K = 18,300 | SPX500: 5.4K = 5,400",
-    "  * If you see 18.3 on NAS100 = 18,300 (multiply by 1000)",
-    "  * If you see 18345.67 = 18,345.67 (literal reading)",
-    "  * Valid ranges: NAS100 15k-25k, SPX500 4k-7k | Invalid: under 1k",
-    "",
-    "JPY PAIRS CRITICAL:",
-    "  * USDJPY: Shows 149.85 = 149.85 (literal, NO conversion)",
-    "  * If you see 150 on JPY chart = 150.00 (add decimals)",
-    "  * Valid range: 100-200 | Invalid: under 50 or over 300",
-    "",
-    "FX PAIRS STANDARD:",
-    "  * EURUSD: 1.0845 = 1.0845 (literal decimals)",
-    "  * GBPUSD: 1.2650 = 1.2650 (literal decimals)",
-    "  * Valid ranges: Major pairs 0.5-2.0 | Invalid: under 0.1 or over 5.0",
-    "",
-    "VALIDATION RULES:",
-    "- If reading seems wrong for instrument type, STOP and report 'SCALE_UNCLEAR'",
-    "- Always trace from rightmost candle to right price axis",
-    "- TradingView current price often in colored box on right",
-    "- Report EXACT interpreted number in ai_meta.currentPrice",
-    "- Examples: BTC=109300, Gold=2650, NAS100=18300, USDJPY=149.85, EURUSD=1.0845",
-    "",
-    "MANDATORY CHART ANALYSIS PROTOCOL - PROFESSIONAL STRUCTURE READING:",
+   "CRITICAL PRICE READING REQUIREMENTS:",
+"- FIRST: Identify the price scale on the right side of chart",
+"- INSTRUMENT-SPECIFIC SCALING:",
+"  * FX pairs (EURUSD, GBPUSD): 4-5 decimals (e.g., 1.0845, 0.65304)",
+"  * JPY pairs (USDJPY, EURJPY): 2-3 decimals (e.g., 149.85, 162.340)",
+"  * BITCOIN/CRYPTO: 5-6 digits with NO decimals (e.g., 109365, 67240)",
+"  * GOLD (XAUUSD): 4-5 digits with decimals (e.g., 2654.80, 1987.45)",
+"  * INDICES: 4-5 digits with decimals:",
+"    - NAS100/USTEC: 15000-20000 range (e.g., 18345.67)",
+"    - SPX500/US500: 4000-6000 range (e.g., 5425.32)",
+"    - GER40/DAX: 15000-20000 range (e.g., 19234.18)",
+"    - UK100/FTSE: 7000-9000 range (e.g., 8156.42)",
+"    - JPN225/Nikkei: 30000-40000 range (e.g., 38157.94)",
+"- BITCOIN CRITICAL: If reading shows 109.2, actual price is 109,200",
+"- INDICES CRITICAL: If reading shows 18.3 for NAS100, actual is 18,300",
+"- VALIDATION RANGES: Bitcoin 50k-150k, NAS100 15k-20k, SPX500 4k-6k",
+"- MANDATORY: You MUST include currentPrice in ai_meta JSON block",
+"- If you can read the price: report exact number matching instrument type",
+"- If price scale unclear: report 'PRICE_UNREADABLE' as currentPrice value",
+"- If no price axis visible: report 'NO_PRICE_AXIS' as currentPrice value",
+"- Example Bitcoin: currentPrice: 109365 (NOT 109.365 or 109)",
+"- Example NAS100: currentPrice: 18345.67 (NOT 18.3 or 183)",
+"- Example FX: currentPrice: 0.65304",
+"- Example failed reading: currentPrice: 'PRICE_UNREADABLE'",
+"",
+"ENHANCED CHART READING WITH SCALE INTERPRETATION:",
+"- Focus on price scale on RIGHT edge of chart",
+"- Current price = rightmost candle's close level",
+"",
+"INSTRUMENT-SPECIFIC SCALE INTERPRETATION:",
+"",
+"BITCOIN/CRYPTO CRITICAL:",
+"  * TradingView shows: 109.3K = 109,300 | 67.2K = 67,200",
+"  * If you see 109.3 on BTC chart = 109,300 (multiply by 1000)",
+"  * If you see 67240.50 on BTC chart = 67,240.50 (literal reading)",
+"  * RULE: Any 2-3 digit BTC reading needs ×1000 conversion",
+"  * Valid range: 20,000-200,000 | Invalid: under 10,000",
+"",
+"GOLD (XAU) CRITICAL:",
+"  * TradingView shows: 2.65K = 2,650 | 1.98K = 1,980",
+"  * If you see 2.65 on gold chart = 2,650 (multiply by 1000)",
+"  * If you see 2654.80 on gold chart = 2,654.80 (literal reading)",
+"  * Valid range: 1,800-3,000 | Invalid: under 1,000",
+"",
+"INDICES CRITICAL:",
+"  * NAS100: 18.3K = 18,300 | SPX500: 5.4K = 5,400",
+"  * If you see 18.3 on NAS100 = 18,300 (multiply by 1000)",
+"  * If you see 18345.67 = 18,345.67 (literal reading)",
+"  * Valid ranges: NAS100 15k-25k, SPX500 4k-7k | Invalid: under 1k",
+"",
+"JPY PAIRS CRITICAL:",
+"  * USDJPY: Shows 149.85 = 149.85 (literal, NO conversion)",
+"  * If you see 150 on JPY chart = 150.00 (add decimals)",
+"  * Valid range: 100-200 | Invalid: under 50 or over 300",
+"",
+"FX PAIRS STANDARD:",
+"  * EURUSD: 1.0845 = 1.0845 (literal decimals)",
+"  * GBPUSD: 1.2650 = 1.2650 (literal decimals)",
+"  * Valid ranges: Major pairs 0.5-2.0 | Invalid: under 0.1 or over 5.0",
+"",
+"VALIDATION RULES:",
+"- If reading seems wrong for instrument type, STOP and report 'SCALE_UNCLEAR'",
+"- Always trace from rightmost candle to right price axis",
+"- TradingView current price often in colored box on right",
+"- Report EXACT interpreted number in ai_meta.currentPrice",
+"- Examples: BTC=109300, Gold=2650, NAS100=18300, USDJPY=149.85, EURUSD=1.0845",
+"",
+   "MANDATORY CHART ANALYSIS PROTOCOL - PROFESSIONAL STRUCTURE READING:",
     "",
     "FOR EACH TIMEFRAME - EXECUTE IN ORDER:",
     "",
@@ -1270,59 +1206,71 @@ function systemCore(
     "- If within 100 pips: RANGE",
     "- State: 'Overall flow: [LEFT_PRICE] → [RIGHT_PRICE] = [UPTREND/DOWNTREND/RANGE]'",
     "",
-    "Step 2: SWING STRUCTURE CONFIRMATION - CRITICAL TREND IDENTIFICATION:", 
-    "MANDATORY: First complete Step 0 Visual Sanity Check above. If Step 0 shows downward movement, swings MUST confirm this.",
-    "",
-    "- Identify RECENT swings only (last 10-15 candles visible on right side)",
-    "- IGNORE old swings from left side - focus on RIGHT SIDE recent action",
-    "- CRITICAL: Focus ONLY on the RIGHT 30% of the chart (most recent price action)",
-    "- Ignore any price levels older than 20 candles from current price",
-    "",
-    "HOW TO READ SWINGS CORRECTLY (CHRONOLOGICAL METHOD):",
-    "",
-    "CRITICAL: You must identify swings in TIME ORDER, not just any 3 highs.",
-    "",
-    "FOR SWING HIGHS:",
-    "Step A: Find the RIGHTMOST peak (closest to current price) = Most Recent High",
-    "Step B: Find the peak BEFORE that (moving left on chart) = Second Recent High", 
-    "Step C: Find the peak BEFORE that = Third Recent High",
-    "",
-    "Step D: Write them in CHRONOLOGICAL order (oldest → newest):",
-    "Example: If you found three peaks at these times:",
-    "  - Sept 20: 175.00",
-    "  - Sept 24: 174.80", 
-    "  - Sept 28: 174.50 (rightmost/current)",
-    "",
-    "Step E: Write as: '175.00 → 174.80 → 174.50 = DESCENDING'",
-    "NOT: '174.50 → 174.80 → 175.00' (this is wrong order)",
-    "",
-    "Step F: Check direction: Is rightmost number HIGHER or LOWER than leftmost?",
-    "  - 175.00 → 174.80 → 174.50: Right (174.50) < Left (175.00) = DESCENDING = DOWNTREND",
-    "  - 174.50 → 174.80 → 175.00: Right (175.00) > Left (174.50) = ASCENDING = UPTREND",
-    "",
-    "REPEAT SAME PROCESS FOR SWING LOWS:",
-    "Find 3 most recent troughs in same way, write chronologically, check direction",
-    "",
-    "FINAL STEP: Cross-check against Step 0 Visual Sanity Check",
-    "If Step 0 said 'chart declined left-to-right' but swings show ascending:",
-    "→ YOU MADE AN ERROR. Re-read the chart. Current price MUST be lower than old highs if declining.",
-    "",
-    "VALIDATION RULE:",
-    "Recent swing high MUST be within 100 pips of current price",
-    "If you're stating 0.6750 as 'recent high' but current is 0.6567 → THAT'S 183 PIPS OLD = NOT RECENT",
-    "- State exact prices: 'Swing lows: 0.6700 → 0.6650 → 0.6280 = descending'",
-    "",
-    "CRITICAL VALIDATION:",
-    "- Most recent swing high MUST be close to current price (within last 20% of chart)",
-    "- If your 'recent high' is 0.6750 but current price is 0.6567, that high is NOT recent",
-    "- Recent = within last 5-10 candles visible on screen",
-    "",
-    "UPTREND = Both highs AND lows ascending (each peak higher, each trough higher)",
-    "DOWNTREND = Both highs AND lows descending (each peak lower, each trough lower)",
-    "RANGE = Mixed pattern (highs/lows not consistently ascending or descending)",
-    "",
-    "CRITICAL: If Step 0 shows -100 pips movement, but your swings show 'ascending', YOU ARE READING WRONG PERIOD. Fix it.",
-    "- Example: '1H shows downtrend (descending swings) with current bounce to 0.6570'",
+"Step 2: SWING STRUCTURE CONFIRMATION - CRITICAL TREND IDENTIFICATION:", 
+"MANDATORY: First complete Step 0 Visual Sanity Check above. If Step 0 shows downward movement, swings MUST confirm this.",
+"",
+"- Identify RECENT swings only (last 10-15 candles visible on right side)",
+"- IGNORE old swings from left side - focus on RIGHT SIDE recent action",
+"- CRITICAL: Focus ONLY on the RIGHT 30% of the chart (most recent price action)",
+"- Ignore any price levels older than 20 candles from current price",
+   "",
+"HOW TO READ SWINGS CORRECTLY (CHRONOLOGICAL METHOD):",
+"",
+"CRITICAL: You must identify swings in TIME ORDER, not just any 3 highs.",
+"",
+"FOR SWING HIGHS:",
+"Step A: Find the RIGHTMOST peak (closest to current price) = Most Recent High",
+"Step B: Find the peak BEFORE that (moving left on chart) = Second Recent High", 
+"Step C: Find the peak BEFORE that = Third Recent High",
+"",
+"Step D: Write them in CHRONOLOGICAL order (oldest → newest):",
+"Example: If you found three peaks at these times:",
+"  - Sept 20: 175.00",
+"  - Sept 24: 174.80", 
+"  - Sept 28: 174.50 (rightmost/current)",
+"",
+"Step E: Write as: '175.00 → 174.80 → 174.50 = DESCENDING'",
+"NOT: '174.50 → 174.80 → 175.00' (this is wrong order)",
+"",
+"Step F: Check direction: Is rightmost number HIGHER or LOWER than leftmost?",
+"  - 175.00 → 174.80 → 174.50: Right (174.50) < Left (175.00) = DESCENDING = DOWNTREND",
+"  - 174.50 → 174.80 → 175.00: Right (175.00) > Left (174.50) = ASCENDING = UPTREND",
+"",
+"REPEAT SAME PROCESS FOR SWING LOWS:",
+"Find 3 most recent troughs in same way, write chronologically, check direction",
+"",
+"FINAL STEP: Cross-check against Step 0 Visual Sanity Check",
+"If Step 0 said 'chart declined left-to-right' but swings show ascending:",
+"→ YOU MADE AN ERROR. Re-read the chart. Current price MUST be lower than old highs if declining.",
+"",
+"",
+"HOW TO READ SWINGS CORRECTLY:",
+"Step A: Identify the 3 most recent swing highs visible on RIGHT side of chart",
+"Step B: Write their prices from oldest to newest: e.g., '0.6900 → 0.6850 → 0.6800'",
+"Step C: Check: Is the rightmost number HIGHER or LOWER than leftmost?",
+"  - If rightmost HIGHER (0.6800 → 0.6850 → 0.6900) = ASCENDING",
+"  - If rightmost LOWER (0.6900 → 0.6850 → 0.6800) = DESCENDING",
+"",
+"Step D: Repeat for swing lows",
+"Step E: Cross-check: Does this match Step 0 Visual Sanity Check?",
+"  - If Step 0 said DOWNWARD but swings show ascending → YOU ARE WRONG, re-read chart",
+"",
+"VALIDATION RULE:",
+"Recent swing high MUST be within 100 pips of current price",
+"If you're stating 0.6750 as 'recent high' but current is 0.6567 → THAT'S 183 PIPS OLD = NOT RECENT",
+"- State exact prices: 'Swing lows: 0.6700 → 0.6650 → 0.6280 = descending'",
+"",
+"CRITICAL VALIDATION:",
+"- Most recent swing high MUST be close to current price (within last 20% of chart)",
+"- If your 'recent high' is 0.6750 but current price is 0.6567, that high is NOT recent",
+"- Recent = within last 5-10 candles visible on screen",
+"",
+"UPTREND = Both highs AND lows ascending (each peak higher, each trough higher)",
+"DOWNTREND = Both highs AND lows descending (each peak lower, each trough lower)",
+"RANGE = Mixed pattern (highs/lows not consistently ascending or descending)",
+"",
+"CRITICAL: If Step 0 shows -100 pips movement, but your swings show 'ascending', YOU ARE READING WRONG PERIOD. Fix it.",
+"- Example: '1H shows downtrend (descending swings) with current bounce to 0.6570'",
     "",
     "Step 3: RECENT MOMENTUM (Last 20 candles)",
     "- Recent high in last 20 candles: [price]",
@@ -1336,22 +1284,22 @@ function systemCore(
     "- Position = (Current - Low) / (High - Low) × 100",
     "- >80%: At highs | 60-80%: Upper range | 40-60%: Middle | 20-40%: Lower range | <20%: At lows",
     "",
-    "Step 5: MANDATORY STRUCTURE IDENTIFICATION - EXACT PRICE LEVELS:",
-    "- Check TradingView BOS indicator if available (state UP/DOWN/NONE)",
-    "- YOU MUST identify these EXACT prices by reading the chart:",
-    "  * Most recent swing high: State exact price (e.g., 0.6575)",
-    "  * Most recent swing low: State exact price (e.g., 0.6535)",
-    "  * Previous swing high: State exact price",
-    "  * Previous swing low: State exact price",
-    "  * Current resistance: [price] at [timeframe]",
-    "  * Current support: [price] at [timeframe]",
-    "",
-    "MANDATORY 15M STRUCTURE OUTPUT:",
-    "- '15M Structure: Recent high 0.6575 (2h ago), Recent low 0.6535 (30m ago), Current 0.6557'",
-    "- '15M Key Levels: Resistance 0.6575, Support 0.6535, Trend: [up/down/ranging]'",
-    "- INVALID: '15M structure shows support' - no specific prices",
-    "- VALID: '15M swing low at 0.6535 provides support, swing high at 0.6575 is resistance'",
-    "- If cannot read prices: 'CHART UNREADABLE - price scale unclear'",
+"Step 5: MANDATORY STRUCTURE IDENTIFICATION - EXACT PRICE LEVELS:",
+"- Check TradingView BOS indicator if available (state UP/DOWN/NONE)",
+"- YOU MUST identify these EXACT prices by reading the chart:",
+"  * Most recent swing high: State exact price (e.g., 0.6575)",
+"  * Most recent swing low: State exact price (e.g., 0.6535)",
+"  * Previous swing high: State exact price",
+"  * Previous swing low: State exact price",
+"  * Current resistance: [price] at [timeframe]",
+"  * Current support: [price] at [timeframe]",
+"",
+"MANDATORY 15M STRUCTURE OUTPUT:",
+"- '15M Structure: Recent high 0.6575 (2h ago), Recent low 0.6535 (30m ago), Current 0.6557'",
+"- '15M Key Levels: Resistance 0.6575, Support 0.6535, Trend: [up/down/ranging]'",
+"- INVALID: '15M structure shows support' - no specific prices",
+"- VALID: '15M swing low at 0.6535 provides support, swing high at 0.6575 is resistance'",
+"- If cannot read prices: 'CHART UNREADABLE - price scale unclear'",
     "",
     "MANDATORY OUTPUT FORMAT:",
     "4H: Flow 0.5610→0.5860 = UPTREND | Swings: ascending highs/lows | Momentum: broke recent high | Position: 85% (at highs) | BOS: UP confirmed",
@@ -1360,8 +1308,21 @@ function systemCore(
     "- If you cannot read price levels clearly, state 'CHART UNREADABLE' and STOP",
     "- If trend direction conflicts between steps, re-examine and explain discrepancy",
     "- Price position MUST be mathematically calculated, not estimated",
+    "   - Example: '15M: Downtrend → Recent BOS up → Reversal potential' or '5M: Uptrend → Recent BOS down → Momentum fading'",
+    "   - This timing detail is CRITICAL - don't skip it",
+    "   - Higher highs + higher lows = UPTREND (bias long setups)",
+    "   - Lower highs + lower lows = DOWNTREND (bias short setups)",
+    "   - If price just BROKE a major trendline/level = potential REVERSAL",
+    "2. CURRENT PRICE CONTEXT:",
+    "   - Is price at RECENT HIGHS (top 25% of visible range)? → Likely resistance/exhaustion",
+    "   - Is price at RECENT LOWS (bottom 25% of visible range)? → Likely support/bounce zone",
+    "   - Is price in MIDDLE? → Range/consolidation",
+    "3. STRUCTURE BREAKS:",
+    "   - Did price just break ABOVE a resistance that held multiple times? → BULLISH",
+    "   - Did price just break BELOW a support that held multiple times? → BEARISH",
+   
     "",
-    "FUNDAMENTALS SCORING SYSTEM (0-100, show your work):",
+     "FUNDAMENTALS SCORING SYSTEM (0-100, show your work):",
     "",
     "Step 1: Component Scores - MANDATORY INTERPRETATION:",
     "• Calendar (S_cal): Extract bias from calendar analysis",
@@ -1400,20 +1361,17 @@ function systemCore(
     "YOU MUST SHOW THIS CALCULATION:",
     "Example: 'F = (0.40×100) + (0.25×25) + (0.25×65) + (0.10×50) = 67.5 → 68'",
     "",
-    "RISK MANAGEMENT - SIMPLIFIED:",
-    "",
-    "BASIC RISK METRICS:",
-    "• Stop Loss Distance: Calculate exact pip distance from entry to SL",
-    "• Risk-Reward Ratio: Must be minimum 1.5:1 (reward ÷ risk)",
-    "• Position Size: Trader determines based on 0.5% base risk + conviction adjustment",
-    "• Maximum Loss: State pip distance and approximate dollar impact",
+"RISK MANAGEMENT - SIMPLIFIED:",
+"",
+"BASIC RISK METRICS:",
+"• Stop Loss Distance: Calculate exact pip distance from entry to SL",
+"• Risk-Reward Ratio: Must be minimum 1.5:1 (reward ÷ risk)",
+"• Position Size: Trader determines based on 0.5% base risk + conviction adjustment",
+"• Maximum Loss: State pip distance and approximate dollar impact",
     "",
     "CONVICTION CALCULATION (per option, 0-100):",
     "",
     "For Option 1 and Option 2 independently:",
-    "",
-    "IMPORTANT: Option 2 conviction must be 10-25% lower than Option 1 (it's the runner-up for a reason)",
-    "If calculated conviction for Option 2 is within 5% of Option 1, reduce Option 2 by additional 10%",
     "",
     "1. Get Technical Score (T): From tournament scoring (0-100)",
     "2. Get Fundamentals Score (F): From calculation above (0-100)",
@@ -1423,21 +1381,21 @@ function systemCore(
     "   - If option direction matches fundamental bias: +10",
     "   - If opposite direction: -15",
     "   - If fundamentals neutral: 0",
-    "5. Base conviction: Conv = (0.50 × T) + (0.35 × F) + (0.15 × R) + alignment",
+   "5. Base conviction: Conv = (0.50 × T) + (0.35 × F) + (0.15 × R) + alignment",
     "6. Event proximity penalty: If high-impact event ≤60 min: Conv × 0.80",
-    "7. Context Grade Adjustment (MANDATORY from Market Context Assessment above):",
-    "   - A-grade: No penalty (Conv × 1.0)",
-    "   - B-grade: Conv × 0.88 (12% reduction)",
-    "   - C-grade: Conv × 0.70 (30% reduction) + ADD WARNING",
-    "   - D-grade: Cap at 40 maximum + MANDATORY strong warning",
-    "",
-    "8. Real Trader Gut Check:",
-    "   - Ask: 'Would I actually risk money on this?'",
-    "   - If you feel 'meh' about it → Reduce by additional 10%",
-    "   - If multiple concerns → Reduce by additional 15%",
-    "",
-    "9. Final: Round to whole number, clamp between 0-100",
-    "   - But if final conviction >70% with C or D grade → Something is wrong, recalculate",
+   "7. Context Grade Adjustment (MANDATORY from Market Context Assessment above):",
+"   - A-grade: No penalty (Conv × 1.0)",
+"   - B-grade: Conv × 0.88 (12% reduction)",
+"   - C-grade: Conv × 0.70 (30% reduction) + ADD WARNING",
+"   - D-grade: Cap at 40 maximum + MANDATORY strong warning",
+"",
+"8. Real Trader Gut Check:",
+"   - Ask: 'Would I actually risk money on this?'",
+"   - If you feel 'meh' about it → Reduce by additional 10%",
+"   - If multiple concerns → Reduce by additional 15%",
+"",
+"9. Final: Round to whole number, clamp between 0-100",
+"   - But if final conviction >70% with C or D grade → Something is wrong, recalculate",
     "",
     "EXAMPLE:",
     "Option 1 (Long): T=75, F=68, R:R=2.5:1 (+10), Alignment=+10",
@@ -1449,40 +1407,39 @@ function systemCore(
     "• Risk-Reward Ratio: [A:B] (TP1 vs SL distance)",
     "• Correlation Warning: [None/USD exposure/Commodity overlap/etc]",
     "",
-    "Essential Trade Quality Checks:",
+  "Essential Trade Quality Checks:",
     "- Minimum 1.5:1 R:R ratio (enforced by system validation)",
     "- Entry must reference specific chart structure (swing high/low, order block, S/R)",
     "- Clear stop loss placement behind structure level",
     "- Take profits at opposing structure levels",
     "",
-    "Structure-Based Entry Requirements:",
-    "- Entry must be at identified chart structure (swing high/low, order block, S/R level)",
-    "- Stop loss placed beyond the structure level with appropriate buffer",  
-    "- Take profits target opposing structure levels on the charts",
-    "- All levels must reference specific timeframe source (15M/1H/4H structure)",
-    "",
+  "Structure-Based Entry Requirements:",
+"- Entry must be at identified chart structure (swing high/low, order block, S/R level)",
+"- Stop loss placed beyond the structure level with appropriate buffer",  
+"- Take profits target opposing structure levels on the charts",
+"- All levels must reference specific timeframe source (15M/1H/4H structure)",
     "Consistency rule:",
     "- If Calendar/Headlines/CSM align, do not say 'contradicting'; say 'aligning'.",
     "- 'Tech vs Fundy Alignment' must be Match when aligned, Mismatch when conflicted.",
     "",
     `Keep instrument alignment with ${instrument}.`,
-    warn !== null ? `\nCALENDAR WARNING: High-impact event within ~${warn} min. Avoid impulsive market entries right before release.` : "",
+warn !== null ? `\nCALENDAR WARNING: High-impact event within ~${warn} min. Avoid impulsive market entries right before release.` : "",
     bias ? `\nPOST-RESULT ALIGNMENT: ${bias}.` : "",
     "",
-    "MARKET STRUCTURE FOCUS:",
-    "- Identify key support/resistance levels on all timeframes",
-    "- Look for institutional order blocks and fair value gaps",
-    "- Note any recent liquidity grabs or stop hunts",
-    "- Assess current price position relative to major structure",
+"MARKET STRUCTURE FOCUS:",
+"- Identify key support/resistance levels on all timeframes",
+"- Look for institutional order blocks and fair value gaps",
+"- Note any recent liquidity grabs or stop hunts",
+"- Assess current price position relative to major structure",
     "",
-    "Under **Fundamental View**, you MUST include the complete calendar analysis provided.",
-    "If calendar_status === 'image-ocr', use the calendar reasoning lines provided in the calendar evidence.",
-    "Format: 'Calendar: [exact text from calendar analysis]' then list each event on new lines.",
-    "NEVER write just 'Calendar: neutral' or 'Calendar: unavailable' without the supporting evidence lines.",
-    "If truly no data exists, write: 'Calendar: [exact reason from analysis]'.",
+   "Under **Fundamental View**, you MUST include the complete calendar analysis provided.",
+"If calendar_status === 'image-ocr', use the calendar reasoning lines provided in the calendar evidence.",
+"Format: 'Calendar: [exact text from calendar analysis]' then list each event on new lines.",
+"NEVER write just 'Calendar: neutral' or 'Calendar: unavailable' without the supporting evidence lines.",
+"If truly no data exists, write: 'Calendar: [exact reason from analysis]'.",
   ];
 
-  const scalpingLines = scalpingMode === "off" ? [] : scalpingMode === "soft" ? [
+ const scalpingLines = scalpingMode === "off" ? [] : scalpingMode === "soft" ? [
     "",
     "SCALPING MODE - SOFT (Conservative Intraday):",
     "- Respect 4H/1H trend fully. Build setups on 15M (primary). Use 5M for confirmation only.",
@@ -1490,34 +1447,33 @@ function systemCore(
     "- Entry: 15M order blocks, FVG, minor S/R within HTF structure.",
     "- Management: Partial at 1R, BE after 10-15 pips, time-stop after 2-4 hours.",
     "",
-    "ai_meta: include {'mode':'scalping_soft', 'time_stop_minutes': 180, 'currentPrice': EXACT_PRICE_FROM_HINT}",
+   "ai_meta: include {'mode':'scalping_soft', 'time_stop_minutes': 180, 'currentPrice': EXACT_PRICE_FROM_HINT}",
   ] : [
-    "",
+     "",
     "SCALPING MODE - HARD (Micro Execution):",
-    "- If 4H/1H provided: quick bias check only (30 seconds). If not provided: assume 15M trend = bias.",
-    "- PRIMARY: 15M structure → 5M confirmation (MANDATORY) → 1M precision entry (if provided).",
-    "- Ignore macro levels. Focus: micro order blocks, 5M/1M FVG, session opens, round numbers.",
-    "- CRITICAL: For market orders, entry MUST be current price (from hint). For limit orders, max 3-5 pips away from current.",
-    "- 1M usage: Pin bar wicks, engulfing close, BOS candle. Entry at EXACT 1M wick level (e.g., 1.78536, not 1.7850).",
-    "- Stop loss: 12-20 pips minimum (accounts for 2-3 pip spread + 2 pip slippage + 8-15 pip structure buffer).",
-    "- SL Placement: Behind 5M structure preferred, 1M only for ultra-tight setups with high conviction.",
-    "- Take profits: TP1 at 18-30 pips (1.5R min), TP2 at 30-40 pips (2R). Target actual resistance levels.",
-    "- Spread considerations: Add 3 pips to all calculations (entry slippage + exit spread costs).",
-    "- If 1M shows conflicting momentum vs 15M setup, note this as execution risk but proceed with 15M plan.",
-    "- Session-specific: London open (8-10am GMT), NY open (1:30-3:30pm GMT), Asia range breakout.",
-    "- Management: partial at 1R, BE after 1.2R (account for spread), time-stop within 30-45 min.",
-    "",
-    "SCALPING VALIDATION OVERRIDES:",
-    "- Minimum SL distance for hard scalping: 12 pips (overrides normal 15 pip minimum)",
-    "- Maximum SL distance for hard scalping: 25 pips (tighter than normal 80 pip maximum)",
-    "- R:R requirement reduced to 1.2:1 minimum for scalping (vs 1.5:1 normal)",
+"- If 4H/1H provided: quick bias check only (30 seconds). If not provided: assume 15M trend = bias.",
+"- PRIMARY: 15M structure → 5M confirmation (MANDATORY) → 1M precision entry (if provided).",
+"- Ignore macro levels. Focus: micro order blocks, 5M/1M FVG, session opens, round numbers.",
+"- CRITICAL: For market orders, entry MUST be current price (from hint). For limit orders, max 3-5 pips away from current.",
+"- 1M usage: Pin bar wicks, engulfing close, BOS candle. Entry at EXACT 1M wick level (e.g., 1.78536, not 1.7850).",
+"- Stop loss: 12-20 pips minimum (accounts for 2-3 pip spread + 2 pip slippage + 8-15 pip structure buffer).",
+"- SL Placement: Behind 5M structure preferred, 1M only for ultra-tight setups with high conviction.",
+"- Take profits: TP1 at 18-30 pips (1.5R min), TP2 at 30-40 pips (2R). Target actual resistance levels.",
+"- Spread considerations: Add 3 pips to all calculations (entry slippage + exit spread costs).",
+"- If 1M shows conflicting momentum vs 15M setup, note this as execution risk but proceed with 15M plan.",
+"- Session-specific: London open (8-10am GMT), NY open (1:30-3:30pm GMT), Asia range breakout.",
+"- Management: partial at 1R, BE after 1.2R (account for spread), time-stop within 30-45 min.",
+"",
+"SCALPING VALIDATION OVERRIDES:",
+"- Minimum SL distance for hard scalping: 12 pips (overrides normal 15 pip minimum)",
+"- Maximum SL distance for hard scalping: 25 pips (tighter than normal 80 pip maximum)",
+"- R:R requirement reduced to 1.2:1 minimum for scalping (vs 1.5:1 normal)",
     "",
     "ai_meta: include {'mode':'scalping_hard', 'vwap_used': boolean if VWAP referenced, 'time_stop_minutes': 20, 'currentPrice': EXACT_PRICE_FROM_HINT}",
     "",
     "CRITICAL: ai_meta MUST include 'currentPrice' field with the exact current market price from the hint provided. This is used for validation."
   ];
-  
-  return [...baseLines, ...scalpingLines].join("\n");
+   return [...baseLines, ...scalpingLines].join("\n");
 }
 
 function buildUserPartsBase(args: {
@@ -1534,6 +1490,7 @@ function buildUserPartsBase(args: {
   calendarEvidence?: string[] | null;
   debugOCRRows?: { timeISO: string | null; title: string | null; currency: string | null; impact: any; actual: any; forecast: any; previous: any }[] | null;
 }) {
+  // Get BOS data from TradingView webhook cache
   const bos4H = getBOSStatus(args.instrument, "240");
   const bos1H = getBOSStatus(args.instrument, "60");
   const bos15M = getBOSStatus(args.instrument, "15");
@@ -1543,7 +1500,7 @@ function buildUserPartsBase(args: {
     ? `\n\nRECENT STRUCTURE BREAKS (from TradingView indicator):\n- 4H: ${bos4H === "NONE" ? "No recent BOS" : "BOS " + bos4H}\n- 1H: ${bos1H === "NONE" ? "No recent BOS" : "BOS " + bos1H}\n- 15M: ${bos15M === "NONE" ? "No recent BOS" : "BOS " + bos15M}\n- 5M: ${bos5M === "NONE" ? "No recent BOS" : "BOS " + bos5M}\n`
     : "\n\nRECENT STRUCTURE BREAKS: No BOS data from TradingView (check if alerts are active)\n";
 
-  const parts: any[] = [
+ const parts: any[] = [
     { type: "text", text: `Instrument: ${args.instrument}\nDate: ${args.dateStr}${bosContext}
 
 MULTI-TIMEFRAME ANALYSIS PROTOCOL - INSTITUTIONAL HIERARCHY:
@@ -1618,20 +1575,19 @@ CRITICAL HIERARCHY RULES:
     { type: "text", text: "15M CHART - Structure and momentum context (do NOT suggest trades yet):" },
     { type: "image_url", image_url: { url: args.m15 } },
   ];
-  
   if (args.m5) { parts.push({ type: "text", text: "Scalp 5M Chart" }); parts.push({ type: "image_url", image_url: { url: args.m5 } }); }
   if (args.m1) { parts.push({ type: "text", text: "Timing 1M Chart" }); parts.push({ type: "image_url", image_url: { url: args.m1 } }); }
   if (args.calendarDataUrl) { parts.push({ type: "text", text: "Economic Calendar Image:" }); parts.push({ type: "image_url", image_url: { url: args.calendarDataUrl } }); }
-  if (!args.calendarDataUrl && args.calendarText) { 
-    const calBlock = args.calendarEvidence && args.calendarEvidence.length > 0
-      ? `Calendar Analysis:\n${args.calendarText}\n\nEvents:\n${args.calendarEvidence.join("\n")}`
-      : `Calendar Analysis:\n${args.calendarText}`;
-    parts.push({ type: "text", text: calBlock }); 
-  }
+ if (!args.calendarDataUrl && args.calendarText) { 
+  const calBlock = args.calendarEvidence && args.calendarEvidence.length > 0
+    ? `Calendar Analysis:\n${args.calendarText}\n\nEvents:\n${args.calendarEvidence.join("\n")}`
+    : `Calendar Analysis:\n${args.calendarText}`;
+  parts.push({ type: "text", text: calBlock }); 
+}
   if (args.calendarAdvisoryText) { parts.push({ type: "text", text: `Calendar advisory:\n${args.calendarAdvisoryText}` }); }
   if (args.calendarEvidence && args.calendarEvidence.length && args.calendarDataUrl) { 
-    parts.push({ type: "text", text: `MANDATORY: Use this calendar analysis in your Fundamental View:\n${args.calendarEvidence.join("\n")}` }); 
-  }
+  parts.push({ type: "text", text: `MANDATORY: Use this calendar analysis in your Fundamental View:\n${args.calendarEvidence.join("\n")}` }); 
+}
   if (args.headlinesText) { parts.push({ type: "text", text: `Headlines snapshot:\n${args.headlinesText}` }); }
   if (args.sentimentText) { parts.push({ type: "text", text: `Sentiment snapshot (server):\n${args.sentimentText}` }); }
   if (args.debugOCRRows && args.debugOCRRows.length) {
@@ -1641,17 +1597,18 @@ CRITICAL HIERARCHY RULES:
   return parts;
 }
 
+// ---------- Message builders ----------
 function messagesFull(args: {
   instrument: string; dateStr: string; m15: string; h1: string; h4: string; m5?: string | null; m1?: string | null;
   calendarDataUrl?: string | null; calendarText?: string | null;
   headlinesText?: string | null; sentimentText?: string | null;
   calendarAdvisory?: { warningMinutes?: number | null; biasNote?: string | null; advisoryText?: string | null; evidence?: string[] | null; debugRows?: any[] | null; preReleaseOnly?: boolean | null };
   provenance?: any;
-  scalpingMode?: "soft" | "hard" | "off";
+scalpingMode?: "soft" | "hard" | "off";
 }) {
   const system = [
     systemCore(args.instrument, args.calendarAdvisory, args.scalpingMode), "",
-    "EXECUTION REALISM - REAL WORLD CONSIDERATIONS:",
+"EXECUTION REALISM - REAL WORLD CONSIDERATIONS:",
     "",
     "SPREAD AND SLIPPAGE ADJUSTMENTS:",
     "- Major pairs (EUR/USD, GBP/USD): 2-3 pip spread typical",
@@ -1678,105 +1635,59 @@ function messagesFull(args: {
     "- Reduce targets by 1-2 pips for realistic profit taking",
     "- Consider order queue depth for large positions",
     "",
-"MANDATORY OUTPUT STRUCTURE - ALL SECTIONS REQUIRED:",
-"",
-"Your response MUST contain ALL these sections in this EXACT order:",
-"",
-"**4H BIAS DETERMINATION:**",
-"• Trend: [UPTREND/DOWNTREND/RANGE]",
-"• Swing Structure: [ascending/descending highs and lows with exact prices]",
-"• Key Levels: [Major S/R levels with prices]",
-"• Position: [At highs/middle/lows]",
-"• BOS Status: [UP/DOWN/NONE]",
-"• 4H BIAS: [BULLISH/BEARISH/NEUTRAL] - [Reasoning]",
-"",
-"**1H CONTEXT ANALYSIS:**",
-"• Independent Trend: [UPTREND/DOWNTREND/RANGE]",
-"• Swing Highs: [List 3-5 exact prices chronologically]",
-"• Swing Lows: [List 3-5 exact prices chronologically]",
-"• Relationship to 4H: [CONFIRMS/CONFLICTS/CONSOLIDATES]",
-"• Pattern: [Continuation/Reversal/Range breakout]",
-"• 1H BIAS: [Direction] - [Setup type]",
-"",
-"**15M EXECUTION CONTEXT:**",
-"• Current Trend: [UPTREND/DOWNTREND/RANGING]",
-"• Recent High: [Exact price] | Recent Low: [Exact price]",
-"• Current Price: [Exact price from rightmost candle]",
-"• Momentum: [Bullish/Bearish/Consolidating]",
-"• Key Structure: Support at [price], Resistance at [price]",
-"• 15M Position: [At support/resistance/mid-range]",
-"",
-"**Market Context Assessment:**",
-"• Move Maturity: [X] pips from [swing level at price] = [FRESH/DEVELOPING/EXTENDED/EXHAUSTED]",
-"• Structural Position: [Current price] is at [support/resistance/mid-range] = [GOOD/POOR] for [LONG/SHORT]",
-"• Market Regime: [TRENDING/RANGING] based on [observation]",
-"• Exhaustion Signals: [count] detected - [list them if any]",
-"• **CONTEXT GRADE: [A/B/C/D]**",
-"• Conviction Adjustment: [percentage reduction if any]",
-"",
-"**Strategy Tournament Results:**",
-"[Show all 5 strategies scored 0-100 with reasoning]",
-"",
-"**Option 1 (Primary)**",
-"• Strategy: [Name of winner strategy from tournament]",
-"• Direction: ...",
-"• Order Type: ...",
-"• Trigger:", 
-"• Entry (zone or single):", 
-"• Stop Loss:", 
-"• Take Profit(s): TP1 / TP2",
-"• Spread Adjustment: Entry ±[X] pips, SL +[Y] pips buffer",
-"• Conviction: <0–100>% (independent calculation for this option)",
+    "OUTPUT format (in this exact order):",
+    "Option 1 (Primary)",
+    "• Direction: ...",
+    "• Order Type: ...",
+    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
+    "• Spread Adjustment: Entry ±[X] pips, SL +[Y] pips buffer",
+   "• Conviction: <0–100>% (independent calculation for this option)",
 "• Why this is primary:",
 "",
-"**Option 2 (Alternative)**",
-"• Strategy: [Name of runner-up strategy from tournament]",
-"• Direction: ...",
-"• Order Type: ...",
-"• Trigger:", 
-"• Entry (zone or single):", 
-"• Stop Loss:", 
-"• Take Profit(s): TP1 / TP2",
-"• Spread Adjustment: Entry ±[X] pips, SL +[Y] pips buffer",
-"• Conviction: <0–100>% (must be 10-20% lower than Option 1)",
+"Option 2 (Alternative)",
+    "• Direction: ...",
+    "• Order Type: ...",
+    "• Trigger:", "• Entry (zone or single):", "• Stop Loss:", "• Take Profit(s): TP1 / TP2",
+    "• Spread Adjustment: Entry ±[X] pips, SL +[Y] pips buffer",
+   "• Conviction: <0–100>% (independent calculation - may be higher than Option 1)",
 "• Why this alternative:",
 "",
-"**Performance Tracking**",
+"Performance Tracking",
 "• Expected R:R Ratio: [Calculated from entry/SL/TP levels]",
 "• Strategy Attribution: [Primary strategy from tournament]",
 "• Setup Quality: [High/Medium/Low] based on confluence factors",
-"",
-"**Trade Management - Essential Metrics**",
+    "",
+  "Trade Management - Essential Metrics",
 "• Stop Loss Distance: [X] pips from entry to SL",
 "• Risk-Reward Ratio: [X:1] (minimum 1.5:1 required)",
 "• Entry Logic: Structure-based with clear invalidation level",
-"",
-"**Full Breakdown**",
-"• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m/1m if used)",
-"• Market Context Grade: [A/B/C/D] - [Brief explanation]",
-"• Move Maturity: [X] pips from [swing at price level]",
-"• Position Quality: [At support/resistance/mid-range] = [Good/Poor for trade direction]",
-"• Fundamental View (Calendar + Sentiment + Headlines) — include explicit Calendar bias",
-"• Tech vs Fundy Alignment: Match | Mismatch (+why)",
-"• Validation Results: [All checks passed/Failed validations listed]",
-"• Market Regime: [Trending/Ranging/Breakout/News-driven] with implications",
-"• Conditional Scenarios: [If price does X, then Y]",
-"• Surprise Risk: [What could unexpectedly go wrong]",
-"• Invalidation: [Specific price level where setup fails]",
-"• One-liner Summary: [Single sentence trade thesis]",
-"",
-"**Trade Summary**",
-"• Instrument: [PAIR]",
-"• Primary Strategy: [Strategy from tournament winner]", 
-"• Setup Quality: [High/Medium/Low] based on confluence",
-"• Key Invalidation: [Price level where setup becomes wrong]",
-"",
-"**Trade Validation**",
-"• Logic Check: Trade direction aligns with analysis reasoning",
-"• Price Validation: Entry/SL/TP levels are structure-based and realistic",
-"• R:R Confirmation: Minimum 1.5:1 ratio achieved",
-"",
-"**Trader's Honest Assessment**",
+    "",
+    "Full Breakdown",
+    "• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m/1m if used)",
+    "• Market Context Grade: [A/B/C/D] - [Brief explanation]",
+    "• Move Maturity: [X] pips from [swing at price level]",
+    "• Position Quality: [At support/resistance/mid-range] = [Good/Poor for trade direction]",
+    "• Fundamental View (Calendar + Sentiment + Headlines) — include explicit Calendar bias for <PAIR> when available; if pre-release, say: 'Pre-release only, no confirmed bias until data is out.'",
+    "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
+    "• Validation Results: [All checks passed/Failed validations listed]",
+    "• Market Regime: [Trending/Ranging/Breakout/News-driven] with implications",
+    "• Conditional Scenarios:",
+    "• Surprise Risk:",
+    "• Invalidation:",
+    "• One-liner Summary:",
+    "",
+ "Trade Summary",
+    "• Instrument: [PAIR]",
+    "• Primary Strategy: [Strategy from tournament winner]", 
+    "• Setup Quality: [High/Medium/Low] based on confluence",
+    "• Key Invalidation: [Price level where setup becomes wrong]",
+   "",
+    "Trade Validation",
+    "• Logic Check: Trade direction aligns with analysis reasoning",
+    "• Price Validation: Entry/SL/TP levels are structure-based and realistic",
+    "• R:R Confirmation: Minimum 1.5:1 ratio achieved",
+    "",
+"Trader's Honest Assessment",
 "",
 "Answer these like you're explaining to a fellow trader:",
 "",
@@ -1788,126 +1699,19 @@ function messagesFull(args: {
 "",
 "If this is a C or D grade setup, you MUST state:",
 "'⚠️ This is a lower-probability setup. Consider waiting for [specific better condition].'",
-
     "",
-"OUTPUT format (in this exact order):",
-    "",
-    "**4H Analysis:**",
-    "• Trend: [state trend]",
-    "• Swing highs: [list prices]", 
-    "• Swing lows: [list prices]",
-    "• Key S/R: [list levels]",
-    "• BOS Status: [UP/DOWN/NONE]",
-    "• 4H BIAS: [BULLISH/BEARISH/NEUTRAL]",
-    "",
-    "**1H Analysis:**",
-    "• Independent trend: [state trend]",
-    "• Swing highs: [list prices]",
-    "• Swing lows: [list prices]",
-    "• Relationship to 4H: [CONFIRMS/CONFLICTS/CONSOLIDATES]",
-    "• Key levels: [support and resistance]",
-    "• 1H BIAS: [direction and reasoning]",
-    "",
-    "**15M Analysis:**",
-    "• Current trend: [state trend]",
-    "• Recent high: [exact price]",
-    "• Recent low: [exact price]",
-    "• Current price: [exact price]",
-    "• Momentum: [state momentum]",
-    "• Key structure: [support and resistance]",
-    "",
-    "**Market Context Assessment:**",
-    "• Move Maturity: [calculation]",
-    "• Structural Position: [assessment]",
-    "• Market Regime: [type]",
-    "• Exhaustion Signals: [count and list]",
-    "• CONTEXT GRADE: [A/B/C/D]",
-    "• Conviction Adjustment: [percentage if any]",
-    "",
-    "**Strategy Tournament Results:**",
-    "• Structure Break & Retest: [X]/100 - [reason]",
-    "• Order Block Reaction: [X]/100 - [reason]",
-    "• Reversal at Extremes: [X]/100 - [reason]",
-    "• Liquidity Grab: [X]/100 - [reason]",
-    "• Fair Value Gap Fill: [X]/100 - [reason]",
-    "Winner: [strategy] | Runner-up: [strategy]",
-    "",
-    "**Option 1 (Primary)**",
-    "• Direction: ...",
-    "• Order Type: ...",
-    "• Trigger: ...",
-    "• Entry (zone or single): ...",
-    "• Stop Loss: ...",
-    "• Take Profit(s): TP1 ... / TP2 ...",
-    "• Spread Adjustment: Entry ±... pips, SL +... pips buffer",
-    "• Conviction: ...%",
-    "• Why this is primary: ...",
-    "",
-    "**Option 2 (Alternative)**",
-    "• Direction: ...",
-    "• Order Type: ...",
-    "• Trigger: ...",
-    "• Entry (zone or single): ...",
-    "• Stop Loss: ...",
-    "• Take Profit(s): TP1 ... / TP2 ...",
-    "• Spread Adjustment: Entry ±... pips, SL +... pips buffer",
-    "• Conviction: ...%",
-    "• Why this alternative: ...",
-    "",
-    "**Performance Tracking**",
-    "• Expected R:R Ratio: ...",
-    "• Strategy Attribution: ...",
-    "• Setup Quality: ...",
-    "",
-    "**Trade Management - Essential Metrics**",
-    "• Stop Loss Distance: ... pips",
-    "• Risk-Reward Ratio: ...:1",
-    "• Entry Logic: ...",
-    "",
-    "**Full Breakdown**",
-    "• Technical View (HTF + Intraday): ...",
-    "• Market Context Grade: ...",
-    "• Move Maturity: ...",
-    "• Position Quality: ...",
-    "• Fundamental View (Calendar + Sentiment + Headlines): ...",
-    "• Tech vs Fundy Alignment: ...",
-    "• Validation Results: ...",
-    "• Market Regime: ...",
-    "• Conditional Scenarios: ...",
-    "• Surprise Risk: ...",
-    "• Invalidation: ...",
-    "• One-liner Summary: ...",
-    "",
-    "**Trade Summary**",
-    "• Instrument: ...",
-    "• Primary Strategy: ...",
-    "• Setup Quality: ...",
-    "• Key Invalidation: ...",
-    "",
-    "**Trade Validation**",
-    "• Logic Check: ...",
-    "• Price Validation: ...",
-    "• R:R Confirmation: ...",
-    "",
-    "**Trader's Honest Assessment**",
-    "• What's the best case? ...",
-    "• What's the realistic case? ...",
-    "• What's the risk case? ...",
-    "• Would I take this? ...",
-    "• Key concern: ...",
-    "",
-    "```json",
-    "ai_meta",
-    "{",
-    "  \"currentPrice\": ...,",
-    "  \"trade_id\": \"...\",",
-    "  \"strategy_used\": \"...\",",
-    "  \"setup_quality\": ...,",
-    "  \"market_regime\": \"...\",",
-    "  \"risk_grade\": \"...\"",
-    "}",
-    "```",
-    "",
+"CRITICAL: End your response with this EXACT format:",
+"```json",
+"ai_meta",
+"{",
+"  \"currentPrice\": [PUT_CURRENT_PRICE_HERE_OR_UNREADABLE]",
+"}",
+"```",
+"Replace [PUT_CURRENT_PRICE_HERE_OR_UNREADABLE] with either:",
+"- The exact price number: 0.65318",
+"- Or the text: \"UNREADABLE\" if you cannot read it",
+       "",
+    "provenance_hint:",
     JSON.stringify(args.provenance || {}, null, 2),
   ].join("\n");
 
@@ -1924,45 +1728,7 @@ function messagesFull(args: {
   ];
 }
 
-async function enforceAllSections(model: string, instrument: string, text: string): Promise<string> {
-  const mandatorySections = [
-    "4H Analysis:",
-    "1H Analysis:",
-    "15M Analysis:",
-    "Market Context Assessment:",
-    "Strategy Tournament Results:",
-    "Option 1 (Primary)",
-    "Option 2 (Alternative)",
-    "Performance Tracking",
-    "Trade Management",
-    "Full Breakdown",
-    "Trade Summary",
-    "Trade Validation",
-    "Trader's Honest Assessment"
-  ];
-  
-  for (const section of mandatorySections) {
-    if (!text.includes(section)) {
-      console.error(`[VISION-PLAN] MISSING SECTION: ${section}`);
-      const messages = [
-        {
-          role: "system",
-          content: `CRITICAL: Output is missing "${section}". You MUST include ALL these sections:
-          4H Analysis, 1H Analysis, 15M Analysis, Market Context Assessment, Strategy Tournament Results,
-          Option 1, Option 2, Performance Tracking, Trade Management, Full Breakdown,
-          Trade Summary, Trade Validation, Trader's Honest Assessment.
-          REGENERATE with ALL sections included.`
-        },
-        {
-          role: "user",
-          content: `${instrument}\n\nMISSING: ${section}\n\n${text}\n\nADD ALL MISSING SECTIONS.`
-        }
-      ];
-      return callOpenAI(model, messages);
-    }
- }
-  return text;
-}
+
 
 // ---------- Enforcement helpers ----------
 function hasCompliantOption2(text: string): boolean {
@@ -1971,33 +1737,15 @@ function hasCompliantOption2(text: string): boolean {
   const must = ["direction", "order type", "trigger", "entry", "stop", "tp", "conviction"];
   return must.every((k) => block.includes(k));
 }
-
 async function enforceOption2(model: string, instrument: string, text: string) {
   if (hasCompliantOption2(text)) return text;
-  
-  // Extract tournament results to guide Option 2
-  const tournamentBlock = text.match(/Strategy Tournament Results:[\s\S]{200,2000}/i)?.[0] || "";
-  const scores: Array<{name: string, score: number}> = [];
-  const scoreMatches = tournamentBlock.matchAll(/(\w+[\s\w]*?):\s*(\d+)/g);
- for (const match of scoreMatches) {
-    const score = parseInt(match[2]);
-    if (isFinite(score)) {
-      scores.push({name: match[1], score});
-    }
-}
-  scores.sort((a, b) => b.score - a.score);
-  
-  const runnerUp = scores.length > 1 ? scores[1].name : "alternative approach";
-  
   const messages = [
-    { role: "system", content: `Add **Option 2 (Alternative)** using the RUNNER-UP strategy from tournament: "${runnerUp}". Must have SAME direction as Option 1 (never mix long/short). Build complete trade with: Direction, Order Type, Trigger, Entry (zone or single), SL, TP1/TP2, Conviction %. Use the strategy template for ${runnerUp}.` },
-    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd Option 2 using runner-up strategy: ${runnerUp}` },
+    { role: "system", content: "Add a compliant **Option 2 (Alternative)**. Keep everything else unchanged. Include Direction, Order Type, explicit Trigger, Entry (zone or single), SL, TP1/TP2, Conviction %." },
+    { role: "user", content: `Instrument: ${instrument}\n\n${text}\n\nAdd Option 2 (Alternative) below Option 1.` },
   ];
   return callOpenAI(model, messages);
 }
-
 function hasOption1(text: string): boolean { return /Option\s*1\s*\(?(Primary)?\)?/i.test(text || ""); }
-
 async function enforceOption1(model: string, instrument: string, text: string) {
   if (hasOption1(text)) return text;
   const messages = [
@@ -2015,26 +1763,14 @@ async function enforceStrategyTournament(model: string, instrument: string, text
   ];
   return callOpenAI(model, messages);
 }
+// Quick Plan removed - using Option 1 as primary trade card
 
+// ---------- Order Type Logic Validator ----------
 async function validateOrderTypeLogic(model: string, instrument: string, text: string, currentPrice: number): Promise<string> {
   const dirMatch = text.match(/Direction:\s*(Long|Short)/i);
   const orderMatch = text.match(/Order Type:\s*(Limit|Stop|Market)/i);
   const entryMatch = text.match(/Entry[^:]*:\s*([\d.]+(?:-[\d.]+)?)/i);
-  // Check for trigger/order type conflicts
-  const triggerMatch = text.match(/Trigger:\s*([^\n]+)/i);
-  if (triggerMatch && orderMatch) {
-    const trigger = triggerMatch[1].toLowerCase();
-    const orderType = orderMatch[1].toLowerCase();
-    
-    // Market orders can't have future triggers
-    if (orderType === "market" && (trigger.includes("break") || trigger.includes("wait") || trigger.includes("reach"))) {
-      const messages = [
-        { role: "system", content: "FIX CONFLICT: Market orders execute immediately and cannot have future triggers like 'break below' or 'wait for'. Either change to LIMIT/STOP order, or change trigger to 'immediate execution'. Keep all other analysis unchanged." },
-        { role: "user", content: `${instrument}\n\n${text}\n\nFIX: Market order cannot wait for "${trigger}".` }
-      ];
-      return callOpenAI(model, messages);
-    }
-  }
+  
   if (!dirMatch || !orderMatch || !entryMatch) return text;
   
   const direction = dirMatch[1].toLowerCase();
@@ -2045,52 +1781,28 @@ async function validateOrderTypeLogic(model: string, instrument: string, text: s
   const minEntry = Math.min(...entryNums);
   const maxEntry = Math.max(...entryNums);
   
-if (orderType === "limit") {
-    const minDistancePips = 15;
-    const pipValue = instrument.includes("JPY") ? 0.01 : 0.0001;
-    
-    if (direction === "long") {
-      if (minEntry >= currentPrice) {
-        const messages = [
-          { role: "system", content: `FIX CRITICAL ERROR: Long Limit MUST be BELOW current price by at least ${minDistancePips} pips. Current: ${currentPrice}, Your entry: ${entryStr} is AT/ABOVE current. This is impossible - limit orders execute when price REACHES the level. For long, price must FALL to your entry. Find support structure BELOW ${currentPrice} or use market order. Keep other analysis unchanged.` },
-          { role: "user", content: `Current ${instrument}: ${currentPrice}\n\n${text}\n\nFIX: Long Limit at ${entryStr} impossible. Need entry BELOW current price.` }
-        ];
-        return callOpenAI(model, messages);
-      }
-      
-      const distancePips = (currentPrice - maxEntry) / pipValue;
-      if (distancePips < minDistancePips) {
-        const messages = [
-          { role: "system", content: `FIX: Long Limit too close. Current: ${currentPrice}, Entry: ${entryStr}, Distance: ${distancePips.toFixed(1)} pips. Need minimum ${minDistancePips} pips. Current price might already hit your entry on next tick. Find structure at least ${minDistancePips} pips BELOW current, or use market order. Keep other analysis unchanged.` },
-          { role: "user", content: `${instrument}\n\n${text}\n\nFIX: Entry only ${distancePips.toFixed(1)} pips away. Need ${minDistancePips}+ pips distance.` }
-        ];
-        return callOpenAI(model, messages);
-      }
+  if (orderType === "limit") {
+    if (direction === "long" && minEntry >= currentPrice) {
+      const messages = [
+        { role: "system", content: "FIX CRITICAL ERROR: Long Limit orders MUST be BELOW current price. Current price is already at or above your suggested entry. Either: (1) Market order for immediate entry, OR (2) Limit order further BELOW current price. Keep all other analysis unchanged." },
+        { role: "user", content: `Current ${instrument} price: ${currentPrice}\n\n${text}\n\nFIX: Long Limit at ${entryStr} is impossible. Price already there or above.` }
+      ];
+      return callOpenAI(model, messages);
     }
     
-    if (direction === "short") {
-      if (maxEntry <= currentPrice) {
-        const messages = [
-          { role: "system", content: `FIX CRITICAL ERROR: Short Limit MUST be ABOVE current price by at least ${minDistancePips} pips. Current: ${currentPrice}, Your entry: ${entryStr} is AT/BELOW current. This is impossible - limit orders execute when price REACHES the level. For short, price must RISE to your entry. Find resistance structure ABOVE ${currentPrice} or use market order. Keep other analysis unchanged.` },
-          { role: "user", content: `Current ${instrument}: ${currentPrice}\n\n${text}\n\nFIX: Short Limit at ${entryStr} impossible. Need entry ABOVE current price.` }
-        ];
-        return callOpenAI(model, messages);
-      }
-      
-      const distancePips = (minEntry - currentPrice) / pipValue;
-      if (distancePips < minDistancePips) {
-        const messages = [
-          { role: "system", content: `FIX: Short Limit too close. Current: ${currentPrice}, Entry: ${entryStr}, Distance: ${distancePips.toFixed(1)} pips. Need minimum ${minDistancePips} pips. Current price might already hit your entry on next tick. Find structure at least ${minDistancePips} pips ABOVE current, or use market order. Keep other analysis unchanged.` },
-          { role: "user", content: `${instrument}\n\n${text}\n\nFIX: Entry only ${distancePips.toFixed(1)} pips away. Need ${minDistancePips}+ pips distance.` }
-        ];
-        return callOpenAI(model, messages);
-      }
+    if (direction === "short" && maxEntry <= currentPrice) {
+      const messages = [
+        { role: "system", content: "FIX CRITICAL ERROR: Short Limit orders MUST be ABOVE current price. Current price is already at or below your suggested entry. Either: (1) Market order for immediate entry, OR (2) Limit order further ABOVE current price. Keep all other analysis unchanged." },
+        { role: "user", content: `Current ${instrument} price: ${currentPrice}\n\n${text}\n\nFIX: Short Limit at ${entryStr} is impossible. Price already there or below.` }
+      ];
+      return callOpenAI(model, messages);
     }
   }
   
   return text;
 }
 
+// ---------- Entry Format Enforcer ----------
 async function enforceEntryFormat(model: string, instrument: string, text: string): Promise<string> {
   const limitSingleMatch = text.match(/Order Type:\s*Limit[\s\S]{0,300}Entry[^:]*:\s*(\d+\.\d+)\s*\([^)]*\)/i);
   if (limitSingleMatch && !/-/.test(limitSingleMatch[1])) {
@@ -2103,10 +1815,18 @@ async function enforceEntryFormat(model: string, instrument: string, text: strin
   return text;
 }
 
+// ---------- Consistency + visibility guards ----------
+// Quick Plan removed - calendar visibility now in Option 1 and Full Breakdown only
+
 function stampM5Used(text: string, used: boolean) {
   if (!used) return text;
   const stamp = "• Used Chart: 5M execution";
   let out = text;
+  if (/Quick\s*Plan\s*\(Actionable\)/i.test(out) && !/Used\s*Chart:\s*5M/i.test(out)) {
+    out = out.replace(/(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(\n\s*Option\s*1)/i, (m, a, b) => {
+      return /•\s*Used\s*Chart:\s*5M/i.test(a) ? m : `${a}\n${stamp}\n${b}`;
+    });
+  }
   if (/Option\s*1\s*\(?(Primary)?\)?/i.test(out) && !/Used\s*Chart:\s*5M/i.test(out)) {
     out = out.replace(/(Option\s*1[\s\S]*?)(\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i, (m, a, b) => {
       return /•\s*Used\s*Chart:\s*5M/i.test(a) ? m : `${a}\n${stamp}\n${b}`;
@@ -2119,6 +1839,11 @@ function stampM1Used(text: string, used: boolean) {
   if (!used) return text;
   const stamp = "• Used Chart: 1M timing";
   let out = text;
+  if (/Quick\s*Plan\s*\(Actionable\)/i.test(out) && !/Used\s*Chart:\s*1M/i.test(out)) {
+    out = out.replace(/(Quick\s*Plan\s*\(Actionable\)[\s\S]*?)(\n\s*Option\s*1)/i, (m, a, b) => {
+      return /•\s*Used\s*Chart:\s*1M/i.test(a) ? m : `${a}\n${stamp}\n${b}`;
+    });
+  }
   if (/Option\s*1\s*\(?(Primary)?\)?/i.test(out) && !/Used\s*Chart:\s*1M/i.test(out)) {
     out = out.replace(/(Option\s*1[\s\S]*?)(\n\s*Option\s*2|\n\s*Full\s*Breakdown|$)/i, (m, a, b) => {
       return /•\s*Used\s*Chart:\s*1M/i.test(a) ? m : `${a}\n${stamp}\n${b}`;
@@ -2133,14 +1858,17 @@ function applyConsistencyGuards(text: string, args: { instrument: string; headli
   const hasPos = signs.some((s) => s > 0);
   const hasNeg = signs.some((s) => s < 0);
   
+  // Enhanced conflict detection
   const strongConflict = hasPos && hasNeg && signs.length >= 2;
   const aligned = signs.length > 0 && ((hasPos && !hasNeg) || (hasNeg && !hasPos));
   
+  // Detect technical bias from trade direction
   const techBullish = /Direction:\s*Long/i.test(out);
   const techBearish = /Direction:\s*Short/i.test(out);
   const fundyBullish = hasPos && !hasNeg;
   const fundyBearish = hasNeg && !hasPos;
   
+  // Check for fundamental-technical conflict
   const fundamentalTechnicalConflict = 
     (techBullish && fundyBearish) || 
     (techBearish && fundyBullish);
@@ -2152,6 +1880,7 @@ function applyConsistencyGuards(text: string, args: { instrument: string; headli
     let alignment;
     if (fundamentalTechnicalConflict) {
       alignment = "Mismatch";
+      // Reduce conviction for conflicting trades
       out = out.replace(/Conviction:\s*(\d+)%/gi, (match, conv) => {
         const reducedConv = Math.min(Math.floor(Number(conv) * 0.6), 45);
         return `Conviction: ${reducedConv}%`;
@@ -2179,33 +1908,24 @@ interface PriceSource {
 async function fetchLivePriceConsensus(pair: string): Promise<{ consensus: number; sources: PriceSource[]; confidence: number } | null> {
   const sources: Promise<PriceSource | null>[] = [];
   
+  // Parallel fetch from all available sources
   if (TD_KEY) sources.push(fetchTwelveDataPrice(pair));
   if (FH_KEY) sources.push(fetchFinnhubPrice(pair));
   if (POLY_KEY) sources.push(fetchPolygonPrice(pair));
   
-  const timeoutPromise = new Promise<never>((_, reject) => 
-    setTimeout(() => reject(new Error('Price consensus timeout')), 5000)
-  );
-  
-  const results = await Promise.race([
-    Promise.allSettled(sources),
-    timeoutPromise
-  ]).catch(() => []);
-  
-  if (!Array.isArray(results)) return null;
-  
-  const validSources: PriceSource[] = [];
-  for (const result of results) {
-    if (result.status === 'fulfilled' && result.value !== null) {
-      validSources.push(result.value);
-    }
-  }
+  const startTime = Date.now();
+  const results = await Promise.allSettled(sources);
+  const validSources: PriceSource[] = results
+    .filter((r): r is PromiseFulfilledResult<PriceSource> => r.status === 'fulfilled' && r.value !== null)
+    .map(r => r.value);
     
   if (validSources.length === 0) return null;
   
+  // Calculate consensus price using weighted average
   const totalWeight = validSources.reduce((sum, s) => sum + s.confidence, 0);
   const consensus = validSources.reduce((sum, s) => sum + (s.price * s.confidence), 0) / totalWeight;
   
+  // Calculate confidence based on source agreement
   const maxDiff = Math.max(...validSources.map(s => Math.abs(s.price - consensus) / consensus));
   const confidence = maxDiff < 0.001 ? 95 : maxDiff < 0.005 ? 85 : maxDiff < 0.01 ? 70 : 50;
   
@@ -2264,10 +1984,17 @@ async function fetchPolygonPrice(pair: string): Promise<PriceSource | null> {
   return null;
 }
 
+// Legacy fetchLivePrice function replaced by fetchLivePriceConsensus - calling consensus directly
 async function fetchLivePrice(pair: string): Promise<number | null> {
   const result = await fetchLivePriceConsensus(pair);
   return result?.consensus || null;
 }
+// Price consistency validation removed - using enhanced pip-based validation in main handler
+
+// Entry price validation removed - using inline validation in main handler
+
+// Risk-reward validation function removed - using more comprehensive inline validation in main handler
+// Risk management calculator removed - using inline validation instead
 
 // ---------- Provenance footer ----------
 function buildServerProvenanceFooter(args: {
@@ -2289,16 +2016,13 @@ function buildServerProvenanceFooter(args: {
   return lines.join("\n");
 }
 
-// Initialize BOS cache on module load
-initializeBOSCache();
-
 // ---------- Handler ----------
 export default async function handler(req: NextApiRequest, res: NextApiResponse<Ok | Err>) {
   try {
     if (req.method !== "POST") return res.status(405).json({ ok: false, reason: "Method not allowed" });
     if (!OPENAI_API_KEY) return res.status(400).json({ ok: false, reason: "Missing OPENAI_API_KEY" });
 
-    const urlMode = String((req.query.mode as string) || "").toLowerCase();
+   const urlMode = String((req.query.mode as string) || "").toLowerCase();
     const debugQuery = String(req.query.debug || "").trim() === "1";
 
     // ---------- expand ----------
@@ -2350,13 +2074,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const { fields, files } = await parseMultipart(req);
 
     const MODEL = pickModelFromFields(req, fields);
-    const rawInstr = String(fields.instrument || fields.code || "").trim();
-    if (!rawInstr) {
-      return res.status(400).json({ ok: false, reason: "Missing 'instrument'. Provide instrument code (e.g., EURUSD)." });
-    }
-    const instrument = sanitizeInstrument(rawInstr);
+    const rawInstr = String(fields.instrument || fields.code || "").trim().toUpperCase().replace(/\s+/g, "");
+if (!rawInstr) {
+  return res.status(400).json({ ok: false, reason: "Missing 'instrument'. Provide instrument code (e.g., EURUSD)." });
+}
+const instrument = rawInstr;
 
-    // Scalping mode detection
+    // All requests use full institutional analysis
+
+  // Scalping mode detection from frontend checkboxes
     const scalpingRaw = String(pickFirst(fields.scalping) || "").trim().toLowerCase();
     const scalpingHardRaw = String(pickFirst(fields.scalping_hard) || "").trim().toLowerCase();
     
@@ -2364,7 +2090,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       (scalpingHardRaw === "1" || scalpingHardRaw === "true" || scalpingHardRaw === "on") ? "hard" :
       (scalpingRaw === "1" || scalpingRaw === "true" || scalpingRaw === "on") ? "soft" :
       "off";
+    const scalping = scalpingMode !== "off";
 
+    // debug toggle
     const debugField = String(pickFirst(fields.debug) || "").trim() === "1";
     const debugOCR = debugQuery || debugField;
 
@@ -2389,7 +2117,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       fileToDataUrl(m15f), fileToDataUrl(h1f), fileToDataUrl(h4f),
       calF ? fileToDataUrl(calF) : Promise.resolve(null),
     ]);
-    
     const [m1FromUrl, m5FromUrl, m15FromUrl, h1FromUrl, h4FromUrl, calFromUrl] = await Promise.all([
       m1FromFile ? Promise.resolve(null) : linkToDataUrl(m1Url),
       m5FromFile ? Promise.resolve(null) : linkToDataUrl(m5Url),
@@ -2406,11 +2133,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const h4 = h4FromFile || h4FromUrl;
     const calUrlOrig = calFromFile || calFromUrl || null;
 
+   // Hard scalping: 15M + 5M mandatory (1M highly recommended, 1H/4H optional)
     if (scalpingMode === "hard") {
       if (!m15 || !m5) {
         return res.status(400).json({ ok: false, reason: "Hard scalping requires: 15M + 5M minimum. 1M highly recommended. 1H/4H optional for bias." });
       }
     } else {
+      // Normal/soft: 15M + 1H + 4H required
       if (!m15 || !h1 || !h4) {
         return res.status(400).json({ ok: false, reason: "Provide all three charts: m15, h1, h4 — either files or TV/Gyazo image links. (5m/1m optional)" });
       }
@@ -2439,81 +2168,81 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
     const hBias = computeHeadlinesBias(headlineItems);
 
-    // ---------- Calendar Handling ----------
-    let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
-    let calendarProvider: string | null = null;
-    let calendarText: string | null = null;
-    let calendarEvidence: string[] = [];
-    let warningMinutes: number | null = null;
-    let biasNote: string | null = null;
-    let advisoryText: string | null = null;
-    let debugRows: any[] | null = null;
-    let preReleaseOnly = false;
-    let calDataUrlForPrompt: string | null = calUrlOrig;
+   // ---------- Calendar Handling (Improved) ----------
+let calendarStatus: "image-ocr" | "api" | "unavailable" = "unavailable";
+let calendarProvider: string | null = null;
+let calendarText: string | null = null;
+let calendarEvidence: string[] = [];
+let warningMinutes: number | null = null;
+let biasNote: string | null = null;
+let advisoryText: string | null = null;
+let debugRows: any[] | null = null;
+let preReleaseOnly = false;
 
-    if (calUrlOrig) {
-      if (process.env.NODE_ENV !== "production") {
-        console.log("[CALENDAR] Processing image via OCR");
-      }
-      const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch((err) => {
-        console.error("[vision-plan] Calendar OCR error:", err?.message || err);
-        return null;
-      });
-      
-      if (ocr && Array.isArray(ocr.items) && ocr.items.length > 0) {
-        if (process.env.NODE_ENV !== "production") {
-          console.log(`[vision-plan] OCR extracted ${ocr.items.length} calendar rows`);
+let calDataUrlForPrompt: string | null = calUrlOrig;
+
+// Calendar Processing - OCR Only (No API Available)
+if (calUrlOrig) {
+  console.log("[CALENDAR] Processing image via OCR");
+  const ocr = await ocrCalendarFromImage(MODEL, calUrlOrig).catch((err) => {
+    console.error("[vision-plan] Calendar OCR error:", err?.message || err);
+    return null;
+  });
+  
+  if (ocr && Array.isArray(ocr.items) && ocr.items.length > 0) {
+    console.log(`[vision-plan] OCR extracted ${ocr.items.length} calendar rows`);
+    const analysis = analyzeCalendarProfessional(ocr.items, instrument);
+    calendarProvider = "image-ocr";
+    calendarStatus = "image-ocr";
+    calendarText = analysis.reasoning[0];
+    calendarEvidence = analysis.evidence;
+    biasNote = analysis.reasoning.join("; ");
+    advisoryText = analysis.details;
+    calDataUrlForPrompt = calUrlOrig;
+    
+    // High-impact warning detection
+    const nowMs = Date.now();
+    for (const it of ocr.items) {
+      if (it?.impact === "High" && it?.timeISO) {
+        const t = Date.parse(it.timeISO);
+        if (isFinite(t) && t >= nowMs) {
+          const mins = Math.floor((t - nowMs) / 60000);
+          if (mins <= 60) warningMinutes = warningMinutes == null ? mins : Math.min(warningMinutes, mins);
         }
-        const analysis = analyzeCalendarProfessional(ocr.items, instrument);
-        calendarProvider = "image-ocr";
-        calendarStatus = "image-ocr";
-        calendarText = analysis.reasoning[0];
-        calendarEvidence = analysis.evidence;
-        biasNote = analysis.reasoning.join("; ");
-        advisoryText = analysis.details;
-        calDataUrlForPrompt = calUrlOrig;
-        
-        const nowMs = Date.now();
-        for (const it of ocr.items) {
-          if (it?.impact === "High" && it?.timeISO) {
-            const t = Date.parse(it.timeISO);
-            if (isFinite(t) && t >= nowMs) {
-              const mins = Math.floor((t - nowMs) / 60000);
-              if (mins <= 60) warningMinutes = warningMinutes == null ? mins : Math.min(warningMinutes, mins);
-            }
-          }
-        }
-        
-        if (debugOCR || debugQuery || debugField) {
-          debugRows = ocr.items.slice(0, 5).map(r => ({
-            timeISO: r.timeISO || null, title: r.title || null, currency: r.currency || null,
-            impact: r.impact || null, actual: r.actual ?? null, forecast: r.forecast ?? null, previous: r.previous ?? null,
-          }));
-        }
-      } else {
-        console.warn("[vision-plan] Calendar OCR failed or returned no data");
-        calendarProvider = "image-ocr-failed";
-        calendarStatus = "unavailable";
-        calendarText = "Calendar: Unable to extract data from image. Please ensure calendar image is clear and contains economic events.";
-        calendarEvidence = [`Calendar image processing failed for ${instrument}`];
-        biasNote = null;
-        advisoryText = "📊 Technical Analysis Focus: Calendar data unavailable. Analysis based on price action and sentiment only.";
-        warningMinutes = null;
-        calDataUrlForPrompt = calUrlOrig;
       }
-    } else {
-      if (process.env.NODE_ENV !== "production") {
-        console.log("[vision-plan] No calendar image provided");
-      }
-      calendarProvider = null;
-      calendarStatus = "unavailable";
-      calendarText = "Calendar: No calendar image provided";
-      calendarEvidence = [`No calendar data for ${instrument} analysis`];
-      biasNote = null;
-      advisoryText = "📊 Upload calendar image for fundamental analysis enhancement";
-      warningMinutes = null;
-      calDataUrlForPrompt = null;
     }
+    
+    if (debugOCR || debugQuery || debugField) {
+      debugRows = ocr.items.slice(0, 5).map(r => ({
+        timeISO: r.timeISO || null, title: r.title || null, currency: r.currency || null,
+        impact: r.impact || null, actual: r.actual ?? null, forecast: r.forecast ?? null, previous: r.previous ?? null,
+      }));
+    }
+  } else {
+    // OCR failed or returned no data - no fallback available
+    console.warn("[vision-plan] Calendar OCR failed or returned no data");
+    calendarProvider = "image-ocr-failed";
+    calendarStatus = "unavailable";
+    calendarText = "Calendar: Unable to extract data from image. Please ensure calendar image is clear and contains economic events.";
+    calendarEvidence = [`Calendar image processing failed for ${instrument}`];
+    biasNote = null;
+    advisoryText = "📊 Technical Analysis Focus: Calendar data unavailable. Analysis based on price action and sentiment only.";
+    warningMinutes = null;
+    calDataUrlForPrompt = calUrlOrig;
+  }
+} else {
+  // No calendar image provided
+  console.log("[vision-plan] No calendar image provided");
+  calendarProvider = null;
+  calendarStatus = "unavailable";
+  calendarText = "Calendar: No calendar image provided";
+  calendarEvidence = [`No calendar data for ${instrument} analysis`];
+  biasNote = null;
+  advisoryText = "📊 Upload calendar image for fundamental analysis enhancement";
+  warningMinutes = null;
+  calDataUrlForPrompt = null;
+}
+
 
     // Sentiment + price
     let csm: CsmSnapshot;
@@ -2524,6 +2253,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const livePrice = await fetchLivePrice(instrument);
     const dateStr = new Date().toISOString().slice(0, 10);
 
+  // Individual signal analysis for conflict detection
     const calendarSign = parseInstrumentBiasFromNote(biasNote);
     const headlinesSign = computeHeadlinesSign(hBias);
     const csmData = computeCSMInstrumentSign(csm, instrument);
@@ -2538,11 +2268,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         cot_cue_present: !!cotCue
       },
       proximity_flag: warningMinutes != null ? 1 : 0,
-      scalping_mode: scalpingMode !== "off"
+      scalping_mode: !!scalping
     };
 
-    // ---------- FULL ANALYSIS ----------
-    const messages = messagesFull({
+   // ---------- Unified Full Analysis (Fast mode removed) ----------
+
+
+    // ---------- FULL ----------
+const messages = messagesFull({
       instrument, dateStr, 
       m15: m15!, 
       h1: h1 || "", 
@@ -2556,291 +2289,79 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       provenance: provForModel,
       scalpingMode,
     });
-    
-    if (livePrice && scalpingMode === "hard") {
-      (messages[0] as any).content = (messages[0] as any).content + `\n\n**HARD SCALPING PRICE LOCK**: ${instrument} is EXACTLY at ${livePrice} RIGHT NOW. For market orders, entry = ${livePrice} (no rounding). For limit orders, max 5 pips away. SL must be 5-8 pips. TP1 = 8-12 pips, TP2 = 12-18 pips. DO NOT round to .7850 or .50 levels.`;
-    } else if (livePrice) {
-      (messages[0] as any).content = (messages[0] as any).content + `\n\n**CRITICAL PRICE CHECK**: Current ${instrument} price is EXACTLY ${livePrice}. You MUST report this exact price in ai_meta.currentPrice. All entry suggestions must be within 15 points (0.4%) of this level for immediate execution.`;
-    }
+      if (livePrice && scalpingMode === "hard") {
+        (messages[0] as any).content = (messages[0] as any).content + `\n\n**HARD SCALPING PRICE LOCK**: ${instrument} is EXACTLY at ${livePrice} RIGHT NOW. For market orders, entry = ${livePrice} (no rounding). For limit orders, max 5 pips away. SL must be 5-8 pips. TP1 = 8-12 pips, TP2 = 12-18 pips. DO NOT round to .7850 or .50 levels.`;
+      } else if (livePrice) {
+        (messages[0] as any).content = (messages[0] as any).content + `\n\n**CRITICAL PRICE CHECK**: Current ${instrument} price is EXACTLY ${livePrice}. You MUST report this exact price in ai_meta.currentPrice. All entry suggestions must be within 15 points (0.4%) of this level for immediate execution.`;
+      }
 
-   let textFull = await callOpenAI(MODEL, messages);
+ let textFull = await callOpenAI(MODEL, messages);
     let aiMetaFull = extractAiMeta(textFull) || {};
-    
-    // FORCE COMPLETE OUTPUT IF SECTIONS ARE MISSING
-    const requiredSections = [
-      "4H BIAS",
-      "1H CONTEXT", 
-      "15M EXECUTION",
-      "Market Context Assessment",
-      "Strategy Tournament Results",
-      "Performance Tracking",
-      "Trade Management",
-      "Full Breakdown",
-      "Trade Summary",
-      "Trade Validation",
-      "Trader's Honest Assessment"
-    ];
 
-    const missingSections = requiredSections.filter(section => !new RegExp(section, 'i').test(textFull));
-
-    if (missingSections.length > 0) {
-      console.error(`[VISION-PLAN] CRITICAL: Missing sections: ${missingSections.join(', ')}`);
-      
-      const template = `
-**4H BIAS DETERMINATION:**
-[INSERT 4H ANALYSIS HERE - trend, swings, levels, BOS status]
-
-**1H CONTEXT ANALYSIS:**
-[INSERT 1H ANALYSIS HERE - independent trend, swings, relationship to 4H]
-
-**15M EXECUTION CONTEXT:**
-[INSERT 15M ANALYSIS HERE - current trend, recent highs/lows, momentum]
-
-**Market Context Assessment:**
-[INSERT CONTEXT GRADE HERE - move maturity, position quality, grade A-D]
-
-**Strategy Tournament Results:**
-[INSERT 5 STRATEGIES SCORED 0-100]
-
-${textFull}
-
-**Performance Tracking**
-[INSERT R:R RATIO AND SETUP QUALITY]
-
-**Trade Management - Essential Metrics**
-[INSERT SL DISTANCE, R:R RATIO, ENTRY LOGIC]
-
-**Full Breakdown**
-[INSERT ALL BREAKDOWN SECTIONS]
-
-**Trade Summary**
-[INSERT SUMMARY]
-
-**Trade Validation**
-[INSERT VALIDATION CHECKS]
-
-**Trader's Honest Assessment**
-[INSERT HONEST ASSESSMENT WITH ALL 5 QUESTIONS]`;
-
-      const fixMessages = [
-        {
-          role: "system",
-          content: "Fill in ALL the [INSERT] sections in this template with proper analysis. Do NOT skip any section. Each section is MANDATORY."
-        },
-        {
-          role: "user", 
-          content: `${instrument}\n\n${template}\n\nFill in ALL missing sections.`
-        }
-      ];
-      
-      textFull = await callOpenAI(MODEL, fixMessages);
-    }
-
-    // Enhanced price validation
+  // Enhanced price validation with pip-based tolerance
     if (livePrice) {
       const modelPrice = Number(aiMetaFull?.currentPrice);
       
+      // If model didn't report price, inject it but warn
       if (!isFinite(modelPrice) || modelPrice <= 0) {
         console.warn(`[VISION-PLAN] Model failed to report currentPrice, injecting live price ${livePrice}`);
         aiMetaFull.currentPrice = livePrice;
       } else {
-        if (instrument.includes("BTC") || instrument.includes("ETH") || instrument.startsWith("CRYPTO")) {
-          const percentDiff = Math.abs((modelPrice - livePrice) / livePrice);
-          if (percentDiff > 0.05) {
-            console.error(`[VISION-PLAN] Crypto price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(percentDiff*100).toFixed(1)}%`);
-            return res.status(400).json({ 
-              ok: false, 
-              reason: `Price reading error: Model read ${modelPrice} but actual is ${livePrice} (${(percentDiff*100).toFixed(1)}% difference).` 
-            });
-          }
-        } else if (instrument.includes("XAU") || instrument.includes("GOLD")) {
-          const dollarDiff = Math.abs(modelPrice - livePrice);
-          if (dollarDiff > 10) {
-            console.error(`[VISION-PLAN] Gold price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=$${dollarDiff.toFixed(2)}`);
-            return res.status(400).json({ 
-              ok: false, 
-              reason: `Price reading error: Model read ${modelPrice} but actual is ${livePrice} ($${dollarDiff.toFixed(2)} difference).` 
-            });
-          }
-        } else if (instrument.includes("NAS") || instrument.includes("SPX") || instrument.includes("GER") || instrument.includes("UK100") || instrument.includes("JPN")) {
-          const pointDiff = Math.abs(modelPrice - livePrice);
-          if (pointDiff > 50) {
-            console.error(`[VISION-PLAN] Index price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${pointDiff.toFixed(1)} points`);
-            return res.status(400).json({ 
-              ok: false, 
-              reason: `Price reading error: Model read ${modelPrice} but actual is ${livePrice} (${pointDiff.toFixed(1)} points difference).` 
-            });
-          }
-        } else {
-          const pipValue = instrument.includes("JPY") ? 0.01 : 0.0001;
-          const pipDiff = Math.abs(modelPrice - livePrice) / pipValue;
-          const maxPipDiff = 5;
-          
-          if (pipDiff > maxPipDiff) {
-            console.error(`[VISION-PLAN] FX price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${pipDiff.toFixed(1)} pips`);
-            return res.status(400).json({ 
-              ok: false, 
-              reason: `Price reading error: Model read ${modelPrice} but actual is ${livePrice} (${pipDiff.toFixed(1)} pips difference).` 
-            });
-          }
-        }
+      // Instrument-specific price validation with proper tolerances
+if (instrument.includes("BTC") || instrument.includes("ETH") || instrument.startsWith("CRYPTO")) {
+  // Crypto: Use percentage-based validation (5% tolerance)
+  const percentDiff = Math.abs((modelPrice - livePrice) / livePrice);
+  if (percentDiff > 0.05) {
+    console.error(`[VISION-PLAN] Crypto price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${(percentDiff*100).toFixed(1)}%`);
+    return res.status(400).json({ 
+      ok: false, 
+      reason: `Price reading error: Model read ${modelPrice} but actual is ${livePrice} (${(percentDiff*100).toFixed(1)}% difference).` 
+    });
+  }
+} else if (instrument.includes("XAU") || instrument.includes("GOLD")) {
+  // Gold: Use dollar-based validation ($10 tolerance)
+  const dollarDiff = Math.abs(modelPrice - livePrice);
+  if (dollarDiff > 10) {
+    console.error(`[VISION-PLAN] Gold price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=$${dollarDiff.toFixed(2)}`);
+    return res.status(400).json({ 
+      ok: false, 
+      reason: `Price reading error: Model read ${modelPrice} but actual is ${livePrice} ($${dollarDiff.toFixed(2)} difference).` 
+    });
+  }
+} else if (instrument.includes("NAS") || instrument.includes("SPX") || instrument.includes("GER") || instrument.includes("UK100") || instrument.includes("JPN")) {
+  // Indices: Use point-based validation (50 points tolerance)
+  const pointDiff = Math.abs(modelPrice - livePrice);
+  if (pointDiff > 50) {
+    console.error(`[VISION-PLAN] Index price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${pointDiff.toFixed(1)} points`);
+    return res.status(400).json({ 
+      ok: false, 
+      reason: `Price reading error: Model read ${modelPrice} but actual is ${livePrice} (${pointDiff.toFixed(1)} points difference).` 
+    });
+  }
+} else {
+  // FX pairs (including JPY): Use pip-based validation
+  const pipValue = instrument.includes("JPY") ? 0.01 : 0.0001;
+  const pipDiff = Math.abs(modelPrice - livePrice) / pipValue;
+  const maxPipDiff = 5;
+  
+  if (pipDiff > maxPipDiff) {
+    console.error(`[VISION-PLAN] FX price mismatch: Reported=${modelPrice}, Actual=${livePrice}, Diff=${pipDiff.toFixed(1)} pips`);
+    return res.status(400).json({ 
+      ok: false, 
+      reason: `Price reading error: Model read ${modelPrice} but actual is ${livePrice} (${pipDiff.toFixed(1)} pips difference).` 
+    });
+  }
+}
       }
     }
 
-if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) {
-      aiMetaFull.currentPrice = livePrice;
-    }
-    
-    // ENSURE JSON BLOCK EXISTS IN OUTPUT
-    if (!textFull.includes("```json") || !textFull.includes("ai_meta")) {
-      const jsonBlock = `
-\`\`\`json
-ai_meta
-{
-  "currentPrice": ${livePrice || '"UNREADABLE"'},
-  "trade_id": "${uuid()}",
-  "strategy_used": "Structure Break & Retest",
-  "setup_quality": 7,
-  "market_regime": "trending",
-  "risk_grade": "B"
-}
-\`\`\``;
-      textFull = textFull + "\n\n" + jsonBlock;
-      aiMetaFull = { currentPrice: livePrice, ...aiMetaFull };
-    }
+    if (livePrice && (aiMetaFull.currentPrice == null || !isFinite(Number(aiMetaFull.currentPrice)))) aiMetaFull.currentPrice = livePrice;
 
   textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
     textFull = await enforceStrategyTournament(MODEL, instrument, textFull);
-    textFull = await enforceAllSections(MODEL, instrument, textFull);
-    
-    // FORCE CHART ANALYSIS IF MISSING
-    if (!textFull.includes("4H BIAS") || !textFull.includes("1H CONTEXT") || !textFull.includes("15M EXECUTION")) {
-      const chartTemplate = `
-**4H BIAS DETERMINATION:**
-- Trend: [ANALYZE THE 4H CHART]
-- Swing Structure: [LIST EXACT PRICES]
-- Key Levels: [LIST SUPPORT/RESISTANCE]
-- BOS Status: [CHECK TRADINGVIEW INDICATOR]
-- 4H BIAS: [BULLISH/BEARISH/NEUTRAL]
 
-**1H CONTEXT ANALYSIS:**
-- Independent Trend: [ANALYZE THE 1H CHART]
-- Swing Highs: [LIST 3-5 EXACT PRICES]
-- Swing Lows: [LIST 3-5 EXACT PRICES]
-- Relationship to 4H: [CONFIRMS/CONFLICTS/CONSOLIDATES]
-- 1H BIAS: [DIRECTION AND REASONING]
-
-**15M EXECUTION CONTEXT:**
-- Current Trend: [ANALYZE THE 15M CHART]
-- Recent High: [EXACT PRICE]
-- Recent Low: [EXACT PRICE]
-- Current Price: ${livePrice || '[READ FROM CHART]'}
-- Momentum: [BULLISH/BEARISH/CONSOLIDATING]
-
-**Market Context Assessment:**
-[CALCULATE MOVE MATURITY AND GRADE]
-
-**Strategy Tournament Results:**
-[SCORE ALL 5 STRATEGIES]
-
-${textFull}`;
-
-      const forceCharts = [
-        { role: "system", content: "CRITICAL: Fill in ALL chart analysis sections with actual chart readings. Look at the 4H, 1H, and 15M charts and provide EXACT prices and analysis." },
-        { role: "user", content: `${instrument}\n\n${chartTemplate}` }
-      ];
-      textFull = await callOpenAI(MODEL, forceCharts);
-    }
-    // Double-check critical sections exist
-if (!textFull.includes("4H BIAS") || !textFull.includes("1H CONTEXT") || 
-    !textFull.includes("15M EXECUTION") || !textFull.includes("Market Context Assessment")) {
-  console.error("[VISION-PLAN] CRITICAL: Chart analysis sections still missing after enforcement!");
-  const forceMsg = [
-    { role: "system", content: "MANDATORY: Add 4H BIAS DETERMINATION, 1H CONTEXT ANALYSIS, 15M EXECUTION CONTEXT, and Market Context Assessment sections at the beginning. These are NOT optional." },
-    { role: "user", content: `${instrument}\n\n${textFull}\n\nADD MISSING CHART ANALYSIS SECTIONS AT THE TOP.` }
-  ];
-  textFull = await callOpenAI(MODEL, forceMsg);
-}
-    // Ensure both options have strategy names
-    const opt1HasStrategy = /Option\s*1[\s\S]{50,300}Strategy[^:]*:\s*\w+/i.test(textFull);
-    const opt2HasStrategy = /Option\s*2[\s\S]{50,300}Strategy[^:]*:\s*\w+/i.test(textFull);
-    
-    if (!opt1HasStrategy || !opt2HasStrategy) {
-      const messages = [
-        { role: "system", content: "Add missing strategy names. Each option MUST start with '• Strategy: [Strategy Name]'. Use tournament winner for Option 1, runner-up for Option 2." },
-        { role: "user", content: `${instrument}\n\n${textFull}\n\nAdd strategy attribution lines.` }
-      ];
-      textFull = await callOpenAI(MODEL, messages);
-    }
-    // Validate tournament was actually used
-    const tournamentMatch = textFull.match(/Strategy Tournament Results:[\s\S]{200,800}/i);
-    const option1Match = textFull.match(/Option 1[\s\S]{100,500}Strategy.*?:\s*(\w+)/i);
-    const option2Match = textFull.match(/Option 2[\s\S]{100,500}Strategy.*?:\s*(\w+)/i);
-    
-    if (tournamentMatch && option1Match && option2Match) {
-      const strategy1 = option1Match[1];
-      const strategy2 = option2Match[1];
-      
-      // Check if strategies are actually different and valid
-     const validStrategies = [
-  "Structure Break & Retest", "BOS Strategy", "Structure",
-  "Order Block Reaction", "OB Strategy", "Order Block",
-  "Reversal at Extremes", "Reversal Strategy", "Reversal",
-  "Liquidity Grab", "Liquidity Strategy", "Liquidity",
-  "Fair Value Gap Fill", "FVG Strategy", "FVG", "Fair Value"
-];
-const isValid1 = validStrategies.some(s => strategy1.toLowerCase().includes(s.toLowerCase()));
-const isValid2 = validStrategies.some(s => strategy2.toLowerCase().includes(s.toLowerCase()));
-      
-      if (!isValid1 || !isValid2) {
-        console.warn(`[VISION-PLAN] Tournament strategies not properly applied: ${strategy1} / ${strategy2}`);
-      }
-    }
-if (tournamentMatch && option1Match && option2Match) {
-      const strategy1 = option1Match[1];
-      const strategy2 = option2Match[1];
-      
-      // Check if strategies are actually different and valid
-      const validStrategies = ["Structure", "Order", "Reversal", "Liquidity", "Fair", "FVG", "BOS", "OB"];
-      const isValid1 = validStrategies.some(s => strategy1.includes(s));
-      const isValid2 = validStrategies.some(s => strategy2.includes(s));
-      
-      if (!isValid1 || !isValid2) {
-        console.warn(`[VISION-PLAN] Tournament strategies not properly applied: ${strategy1} / ${strategy2}`);
-      }
-    }
-
-    // Validate conviction differentiation between options
-    const conv1Match = textFull.match(/Option\s*1[\s\S]{200,600}Conviction:\s*(\d+)%/i);
-    const conv2Match = textFull.match(/Option\s*2[\s\S]{200,600}Conviction:\s*(\d+)%/i);
-    
-    if (conv1Match && conv2Match) {
-      const conv1 = parseInt(conv1Match[1]);
-      const conv2 = parseInt(conv2Match[1]);
-      const diff = Math.abs(conv1 - conv2);
-      
-      if (diff < 5) {
-        console.warn(`[VISION-PLAN] Conviction too similar: Opt1=${conv1}%, Opt2=${conv2}%, Diff=${diff}%`);
-        const messages = [
-          { role: "system", content: "FIX: Option 2 conviction must be 10-25% lower than Option 1 (it's the runner-up). Reduce Option 2 conviction by 15%. Keep all other content unchanged." },
-          { role: "user", content: `${instrument}\n\n${textFull}\n\nFIX: Convictions too close (${conv1}% vs ${conv2}%). Reduce Option 2.` }
-        ];
-        textFull = await callOpenAI(MODEL, messages);
-      }
-      
-      if (conv2 > conv1) {
-        console.error(`[VISION-PLAN] Option 2 conviction higher than Option 1: ${conv2}% > ${conv1}%`);
-        return res.status(400).json({
-          ok: false,
-          reason: `Logic error: Option 2 conviction (${conv2}%) cannot exceed Option 1 (${conv1}%). Runner-up must have lower conviction.`
-        });
-      }
-    }
-
-    if (livePrice) {
-      textFull = await validateOrderTypeLogic(MODEL, instrument, textFull, livePrice);
-    }
+    // NEW: Validate order type logic and entry format
     if (livePrice) {
       textFull = await validateOrderTypeLogic(MODEL, instrument, textFull, livePrice);
     }
@@ -2861,60 +2382,16 @@ if (tournamentMatch && option1Match && option2Match) {
       }
     }
 
-    // Validate Option 2 entry price logic separately
-    const option2Block = textFull.match(/Option\s*2[\s\S]{400,1000}/i)?.[0] || "";
-    if (option2Block && livePrice) {
-      const opt2Entry = option2Block.match(/Entry[^:]*:\s*([\d.]+(?:-[\d.]+)?)/i)?.[1];
-      const opt2Order = option2Block.match(/Order Type:\s*(Limit|Stop|Market)/i)?.[1]?.toLowerCase();
-      const opt2Dir = option2Block.match(/Direction:\s*(Long|Short)/i)?.[1]?.toLowerCase();
-      
-      if (opt2Entry && opt2Order && opt2Dir) {
-        const entryNums = opt2Entry.split('-').map(Number);
-        const avgEntry = entryNums.reduce((a, b) => a + b, 0) / entryNums.length;
-        
-        // Market orders must be at current price
-        if (opt2Order === "market") {
-          const priceDiff = Math.abs(avgEntry - livePrice);
-          const pipValue = instrument.includes("JPY") ? 0.01 : 0.0001;
-          const pipDiff = priceDiff / pipValue;
-          
-          if (pipDiff > 2) {
-            console.error(`[VISION-PLAN] OPTION 2 VALIDATION FAILED - Market order at wrong price: Entry=${avgEntry}, Live=${livePrice}, Diff=${Math.abs(avgEntry-livePrice).toFixed(5)}`);
-            return res.status(400).json({
-              ok: false,
-              reason: `Option 2 error: Market orders execute at current price (${livePrice}), not ${avgEntry}. Entry must match current price within 2 pips.`
-            });
-          }
-        }
-        
-        // Limit order direction check
-        if (opt2Order === "limit") {
-          if (opt2Dir === "long" && avgEntry >= livePrice) {
-            console.error(`[VISION-PLAN] Option 2 impossible long limit: ${avgEntry} >= ${livePrice}`);
-            return res.status(400).json({
-              ok: false,
-              reason: `Option 2 error: Long Limit must be BELOW current price ${livePrice}, not at ${avgEntry}.`
-            });
-          }
-          if (opt2Dir === "short" && avgEntry <= livePrice) {
-            console.error(`[VISION-PLAN] Option 2 impossible short limit: ${avgEntry} <= ${livePrice}`);
-            return res.status(400).json({
-              ok: false,
-              reason: `Option 2 error: Short Limit must be ABOVE current price ${livePrice}, not at ${avgEntry}.`
-            });
-          }
-        }
-      }
-    }
-
-    // Consolidated validation
+// CRITICAL: Consolidated entry and order type validation
     if (livePrice && aiMetaFull) {
+      // Extract all entry prices
       const entries: number[] = [];
       const entryMatch = textFull.match(/Entry.*?:.*?([\d.]+)/i);
       if (entryMatch) entries.push(Number(entryMatch[1]));
       if (aiMetaFull.zone?.min) entries.push(Number(aiMetaFull.zone.min));
       if (aiMetaFull.zone?.max) entries.push(Number(aiMetaFull.zone.max));
       
+      // Extract direction and order type
       const dirMatch = textFull.match(/Direction:\s*(Long|Short)/i);
       const orderMatch = textFull.match(/Order Type:\s*(Limit|Stop|Market)/i);
       
@@ -2923,6 +2400,7 @@ if (tournamentMatch && option1Match && option2Match) {
         const orderType = orderMatch[1].toLowerCase();
         const avgEntry = entries.reduce((a, b) => a + b, 0) / entries.length;
         
+        // Validation 1: Entry price reasonableness (structure-based allowance)
         for (const entry of entries) {
           if (isFinite(entry) && entry > 0) {
             const pctDiff = Math.abs((entry - livePrice) / livePrice);
@@ -2941,6 +2419,7 @@ if (tournamentMatch && option1Match && option2Match) {
           }
         }
         
+        // Validation 2: Limit order direction logic
         if (orderType === "limit") {
           if (direction === "long" && avgEntry >= livePrice) {
             console.error(`[VISION-PLAN] IMPOSSIBLE Long Limit: ${avgEntry} at/above current ${livePrice}`);
@@ -2958,6 +2437,7 @@ if (tournamentMatch && option1Match && option2Match) {
             });
           }
           
+          // Validation 3: Warn if too close to market
           const minDistance = scalpingMode === "hard" ? 0.0005 : 0.0015;
           const priceDistance = Math.abs(avgEntry - livePrice) / livePrice;
           if (priceDistance < minDistance) {
@@ -2967,54 +2447,57 @@ if (tournamentMatch && option1Match && option2Match) {
       }
     }
 
-    // R:R validation
-    const entryMatches = textFull.matchAll(/Entry[^:]*:\s*(\d+\.\d+)/gi);
-    const slMatches = textFull.matchAll(/Stop Loss[^:]*:\s*(\d+\.\d+)/gi);
-    const tpMatches = textFull.matchAll(/TP1[^:]*(\d+\.\d+)/gi);
+// R:R validation is now handled by the inline validation code above
+
+  // Additional mandatory R:R check - prevent trades with poor risk-reward
+  const entryMatches = textFull.matchAll(/Entry[^:]*:\s*(\d+\.\d+)/gi);
+  const slMatches = textFull.matchAll(/Stop Loss[^:]*:\s*(\d+\.\d+)/gi);
+  const tpMatches = textFull.matchAll(/TP1[^:]*(\d+\.\d+)/gi);
+  
+  if (entryMatches && slMatches && tpMatches) {
+    const entries = Array.from(entryMatches).map(m => Number(m[1]));
+    const stops = Array.from(slMatches).map(m => Number(m[1]));
+    const tps = Array.from(tpMatches).map(m => Number(m[1]));
     
-    if (entryMatches && slMatches && tpMatches) {
-      const entries = Array.from(entryMatches).map(m => Number(m[1]));
-      const stops = Array.from(slMatches).map(m => Number(m[1]));
-      const tps = Array.from(tpMatches).map(m => Number(m[1]));
+    for (let i = 0; i < Math.min(entries.length, stops.length, tps.length); i++) {
+      const risk = Math.abs(entries[i] - stops[i]);
+      const reward = Math.abs(tps[i] - entries[i]);
+      const ratio = reward / risk;
       
-      for (let i = 0; i < Math.min(entries.length, stops.length, tps.length); i++) {
-        const risk = Math.abs(entries[i] - stops[i]);
-        const reward = Math.abs(tps[i] - entries[i]);
-        const ratio = reward / risk;
-        
-        if (ratio < 1.5) {
-          console.error(`[VISION-PLAN] Trade ${i+1} R:R too low: ${ratio.toFixed(2)}:1`);
-          return res.status(400).json({
-            ok: false,
-            reason: `Trade option ${i+1} has poor risk-reward ratio: ${ratio.toFixed(2)}:1 (minimum 1.5:1 required). Entry: ${entries[i]}, SL: ${stops[i]}, TP1: ${tps[i]}`
-          });
-        }
+      if (ratio < 1.5) {
+        console.error(`[VISION-PLAN] Trade ${i+1} R:R too low: ${ratio.toFixed(2)}:1`);
+        return res.status(400).json({
+          ok: false,
+          reason: `Trade option ${i+1} has poor risk-reward ratio: ${ratio.toFixed(2)}:1 (minimum 1.5:1 required). Entry: ${entries[i]}, SL: ${stops[i]}, TP1: ${tps[i]}`
+        });
       }
     }
+  }
 
-    const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
-    textFull = stampM5Used(textFull, usedM5Full);
-    const usedM1Full = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(textFull);
-    textFull = stampM1Used(textFull, usedM1Full);
+  // Stamp 5M/1M execution if used
+  const usedM5Full = !!m5 && /(\b5m\b|\b5\-?min|\b5\s*minute)/i.test(textFull);
+  textFull = stampM5Used(textFull, usedM5Full);
+  const usedM1Full = !!m1 && /(\b1m\b|\b1\-?min|\b1\s*minute)/i.test(textFull);
+  textFull = stampM1Used(textFull, usedM1Full);
 
-    textFull = applyConsistencyGuards(textFull, {
-      instrument,
-      headlinesSign: headlinesSign,
-      csmSign: csmData.sign,
-      calendarSign: calendarSign
-    });
+ textFull = applyConsistencyGuards(textFull, {
+    instrument,
+    headlinesSign: headlinesSign,
+    csmSign: csmData.sign,
+    calendarSign: calendarSign
+  });
 
     const footer = buildServerProvenanceFooter({
       headlines_provider: headlinesProvider || "unknown",
       calendar_status: calendarStatus,
       calendar_provider: calendarProvider,
       csm_time: csm.tsISO,
-      extras: { vp_version: VP_VERSION, model: MODEL, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalpingMode },
+    extras: { vp_version: VP_VERSION, model: MODEL, pre_release: preReleaseOnly, debug_ocr: !!debugOCR, scalping_mode: scalping },
     });
     textFull = `${textFull}\n${footer}`;
 
     res.setHeader("Cache-Control", "no-store");
-    return res.status(200).json({
+  return res.status(200).json({
       ok: true,
       text: textFull,
       meta: {
@@ -3033,7 +2516,6 @@ if (tournamentMatch && option1Match && option2Match) {
       },
     });
   } catch (err: any) {
-    console.error("[vision-plan] Handler error:", err);
     return res.status(500).json({ ok: false, reason: err?.message || "vision-plan failed" });
   }
 }
