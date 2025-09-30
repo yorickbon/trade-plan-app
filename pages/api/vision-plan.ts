@@ -1794,7 +1794,7 @@ function messagesFull(args: {
     "",
     "**4H Analysis:**",
     "• Trend: [UPTREND/DOWNTREND/RANGE]",
-    "• Swing highs: [list 3 prices chronologically]",
+    "• Swing highs: [list 3 prices chronologically]", 
     "• Swing lows: [list 3 prices chronologically]",
     "• Key S/R: [list major levels]",
     "• BOS Status: [UP/DOWN/NONE from TradingView]",
@@ -1832,92 +1832,91 @@ function messagesFull(args: {
     "• Fair Value Gap Fill: [score]/100 - [reason]",
     "Winner: [strategy name] | Runner-up: [strategy name]",
     "",
-    "Option 1 (Primary)",
-    "• Strategy: [Name of winner strategy from tournament]",
-    "• Direction: ...",
-    "• Order Type: ...",
-    "• Trigger:", 
-    "• Entry (zone or single):", 
-    "• Stop Loss:", 
-    "• Take Profit(s): TP1 / TP2",
+    "**Option 1 (Primary)**",
+    "• Direction: [Long/Short]",
+    "• Order Type: [Limit/Market/Stop]",
+    "• Trigger: [specific condition]",
+    "• Entry (zone or single): [price or price range]",
+    "• Stop Loss: [price with reasoning]",
+    "• Take Profit(s): TP1 [price] / TP2 [price]",
     "• Spread Adjustment: Entry ±[X] pips, SL +[Y] pips buffer",
-    "• Conviction: <0–100>% (independent calculation for this option)",
-    "• Why this is primary:",
+    "• Conviction: [X]%",
+    "• Why this is primary: [reasoning]",
     "",
-    "Option 2 (Alternative)",
-    "• Strategy: [Name of runner-up strategy from tournament]",
-    "• Direction: ...",
-    "• Order Type: ...",
-    "• Trigger:", 
-    "• Entry (zone or single):", 
-    "• Stop Loss:", 
-    "• Take Profit(s): TP1 / TP2",
+    "**Option 2 (Alternative)**",
+    "• Direction: [Long/Short]",
+    "• Order Type: [Limit/Market/Stop]",
+    "• Trigger: [specific condition]",
+    "• Entry (zone or single): [price or price range]",
+    "• Stop Loss: [price with reasoning]",
+    "• Take Profit(s): TP1 [price] / TP2 [price]",
     "• Spread Adjustment: Entry ±[X] pips, SL +[Y] pips buffer",
-    "• Conviction: <0–100>% (independent calculation - typically 10-20% lower than Option 1)",
-    "• Why this alternative: [Explain why runner-up strategy also has merit here]",
+    "• Conviction: [X]% (must be 10-20% lower than Option 1)",
+    "• Why this alternative: [reasoning]",
     "",
-    "Performance Tracking",
-    "• Expected R:R Ratio: [Calculated from entry/SL/TP levels]",
-    "• Strategy Attribution: [Primary strategy from tournament]",
-    "• Setup Quality: [High/Medium/Low] based on confluence factors",
+    "**Performance Tracking**",
+    "• Expected R:R Ratio: [X:1]",
+    "• Strategy Attribution: [strategy name]",
+    "• Setup Quality: [High/Medium/Low]",
     "",
-    "Trade Management - Essential Metrics",
-    "• Stop Loss Distance: [X] pips from entry to SL",
-    "• Risk-Reward Ratio: [X:1] (minimum 1.5:1 required)",
-    "• Entry Logic: Structure-based with clear invalidation level",
+    "**Trade Management - Essential Metrics**",
+    "• Stop Loss Distance: [X] pips",
+    "• Risk-Reward Ratio: [X:1]",
+    "• Entry Logic: [explanation]",
     "",
-    "Full Breakdown",
-    "• Technical View (HTF + Intraday): 4H/1H/15m structure (include 5m/1m if used)",
-    "• Market Context Grade: [A/B/C/D] - [Brief explanation]",
-    "• Move Maturity: [X] pips from [swing at price level]",
-    "• Position Quality: [At support/resistance/mid-range] = [Good/Poor for trade direction]",
-    "• Fundamental View (Calendar + Sentiment + Headlines) — include explicit Calendar bias for <PAIR> when available; if pre-release, say: 'Pre-release only, no confirmed bias until data is out.'",
-    "• Tech vs Fundy Alignment: Match | Mismatch (+why)",
-    "• Validation Results: [All checks passed/Failed validations listed]",
-    "• Market Regime: [Trending/Ranging/Breakout/News-driven] with implications",
-    "• Conditional Scenarios:",
-    "• Surprise Risk:",
-    "• Invalidation:",
-    "• One-liner Summary:",
+    "**Full Breakdown**",
+    "• Technical View (HTF + Intraday): [4H/1H/15m analysis summary]",
+    "• Market Context Grade: [A/B/C/D] - [explanation]",
+    "• Move Maturity: [X] pips from [price]",
+    "• Position Quality: [assessment]",
+    "• Fundamental View (Calendar + Sentiment + Headlines): [analysis]",
+    "• Tech vs Fundy Alignment: [Match/Mismatch] - [why]",
+    "• Validation Results: [list]",
+    "• Market Regime: [type]",
+    "• Conditional Scenarios: [if X then Y]",
+    "• Surprise Risk: [what could go wrong]",
+    "• Invalidation: [price level]",
+    "• One-liner Summary: [single sentence]",
     "",
-    "Trade Summary",
+    "**Trade Summary**",
     "• Instrument: [PAIR]",
-    "• Primary Strategy: [Strategy from tournament winner]", 
-    "• Setup Quality: [High/Medium/Low] based on confluence",
-    "• Key Invalidation: [Price level where setup becomes wrong]",
+    "• Primary Strategy: [strategy name]",
+    "• Setup Quality: [High/Medium/Low]",
+    "• Key Invalidation: [price]",
     "",
-    "Trade Validation",
-    "• Logic Check: Trade direction aligns with analysis reasoning",
-    "• Price Validation: Entry/SL/TP levels are structure-based and realistic",
-    "• R:R Confirmation: Minimum 1.5:1 ratio achieved",
+    "**Trade Validation**",
+    "• Logic Check: [Pass/Fail - reason]",
+    "• Price Validation: [Pass/Fail - reason]",
+    "• R:R Confirmation: [Pass/Fail - ratio]",
     "",
-    "Trader's Honest Assessment",
+    "**Trader's Honest Assessment**",
+    "• What's the best case? [answer]",
+    "• What's the realistic case? [answer]",
+    "• What's the risk case? [answer]",
+    "• Would I take this? [Yes/No/Maybe - reasoning]",
+    "• Key concern: [main risk]",
     "",
-    "Answer these like you're explaining to a fellow trader:",
-    "",
-    "• What's the best case? [Describe if everything goes right]",
-    "• What's the realistic case? [Most likely outcome]",
-    "• What's the risk case? [What could go wrong]",
-    "• Would I take this? [Yes/No/Maybe with clear reasoning]",
-    "• Key concern: [Main risk or uncertainty about this setup]",
-    "",
-    "If this is a C or D grade setup, you MUST state:",
-    "'⚠️ This is a lower-probability setup. Consider waiting for [specific better condition].'",
-    "",
-  "CRITICAL: End your response with this EXACT format:",
+   "CRITICAL: End with this EXACT JSON block (no placeholders):",
     "```json",
     "ai_meta",
     "{",
-    "  \"currentPrice\": [PUT_CURRENT_PRICE_HERE_OR_UNREADABLE],",
-    "  \"trade_id\": \"[GENERATE_UUID]\",",
-    "  \"strategy_used\": \"[PRIMARY_STRATEGY_NAME]\",",
-    "  \"setup_quality\": [1-10],",
-    "  \"market_regime\": \"[trending/ranging/breakout/news_driven]\",",
-    "  \"risk_grade\": \"[A/B/C/D]\"",
+    "  \"currentPrice\": ACTUAL_NUMBER_OR_UNREADABLE,",
+    "  \"trade_id\": \"uuid-here\",",
+    "  \"strategy_used\": \"actual-strategy-name\",",
+    "  \"setup_quality\": NUMBER_1_TO_10,",
+    "  \"market_regime\": \"trending_or_ranging_or_breakout\",",
+    "  \"risk_grade\": \"A_or_B_or_C_or_D\"",
     "}",
     "```",
-    "MANDATORY: currentPrice MUST be a number like 0.65318 or 109300 or \"UNREADABLE\"",
-    "DO NOT leave placeholder text. Fill in ALL fields.",
+    "",
+    "MANDATORY RULES FOR JSON:",
+    "- currentPrice: Must be the EXACT price from 15M chart (e.g., 0.6580, 109365, 2654.80)",
+    "- If you cannot read the price clearly, use: \"UNREADABLE\"",
+    "- DO NOT use placeholders like [PUT_CURRENT_PRICE_HERE]",
+    "- ALL fields must have actual values, not descriptions",
+    "- strategy_used: Must match the winning strategy from tournament",
+    "- setup_quality: Must be a number 1-10, not text",
+    "- risk_grade: Must be A, B, C, or D based on context grade",
     "",
     "provenance_hint:",
     JSON.stringify(args.provenance || {}, null, 2),
@@ -1937,58 +1936,44 @@ function messagesFull(args: {
 }
 
 async function enforceAllSections(model: string, instrument: string, text: string): Promise<string> {
-  // Check if critical sections are missing
-  const has4H = /4H\s+BIAS/i.test(text);
-  const has1H = /1H\s+CONTEXT/i.test(text);
-  const has15M = /15M\s+EXECUTION/i.test(text);
-  const hasContext = /Market\s+Context\s+Assessment/i.test(text);
-  const hasTournament = /Strategy\s+Tournament\s+Results/i.test(text);
-  const hasPerformance = /Performance\s+Tracking/i.test(text);
-  const hasManagement = /Trade\s+Management/i.test(text);
-  const hasBreakdown = /Full\s+Breakdown/i.test(text);
-  const hasSummary = /Trade\s+Summary/i.test(text);
-  const hasValidation = /Trade\s+Validation/i.test(text);
-  const hasAssessment = /Trader'?s\s+Honest\s+Assessment/i.test(text);
+  const mandatorySections = [
+    "4H Analysis:",
+    "1H Analysis:",
+    "15M Analysis:",
+    "Market Context Assessment:",
+    "Strategy Tournament Results:",
+    "Option 1 (Primary)",
+    "Option 2 (Alternative)",
+    "Performance Tracking",
+    "Trade Management",
+    "Full Breakdown",
+    "Trade Summary",
+    "Trade Validation",
+    "Trader's Honest Assessment"
+  ];
   
-  // If ANY critical section is missing, rebuild the entire response
-  if (!has4H || !has1H || !has15M || !hasContext || !hasTournament || 
-      !hasPerformance || !hasManagement || !hasBreakdown || !hasSummary || 
-      !hasValidation || !hasAssessment) {
-    
-    console.error(`[VISION-PLAN] CRITICAL: Missing major sections. Forcing complete rebuild.`);
-    
-    const messages = [
-      {
-        role: "system",
-        content: `CRITICAL ERROR: Your response is missing mandatory sections. You MUST include ALL of these IN ORDER:
-
-**4H BIAS DETERMINATION:**
-Show trend, exact swing prices, key levels, BOS status, final bias
-
-**1H CONTEXT ANALYSIS:**
-Show independent trend, exact swing highs/lows, relationship to 4H
-
-**15M EXECUTION CONTEXT:**
-Show current trend, recent high/low prices, momentum, structure levels
-
-**Market Context Assessment:**
-Calculate move maturity, position quality, exhaustion signals, assign grade A/B/C/D
-
-**Strategy Tournament Results:**
-Score all 5 strategies (Structure Break, Order Block, Reversal, Liquidity, FVG) from 0-100
-
-Then include Option 1, Option 2, Performance Tracking, Trade Management, Full Breakdown, Trade Summary, Trade Validation, and Trader's Honest Assessment.
-
-REGENERATE THE ENTIRE ANALYSIS WITH ALL SECTIONS.`
-      },
-      {
-        role: "user",
-        content: `${instrument} - INCOMPLETE OUTPUT DETECTED. Include ALL sections:\n\n${text.substring(0, 500)}...\n\nREBUILD with all mandatory sections.`
-      }
-    ];
-    
-    return callOpenAI(model, messages);
+  for (const section of mandatorySections) {
+    if (!text.includes(section)) {
+      console.error(`[VISION-PLAN] MISSING SECTION: ${section}`);
+      const messages = [
+        {
+          role: "system",
+          content: `CRITICAL: Output is missing "${section}". You MUST include ALL these sections:
+          4H Analysis, 1H Analysis, 15M Analysis, Market Context Assessment, Strategy Tournament Results,
+          Option 1, Option 2, Performance Tracking, Trade Management, Full Breakdown,
+          Trade Summary, Trade Validation, Trader's Honest Assessment.
+          REGENERATE with ALL sections included.`
+        },
+        {
+          role: "user",
+          content: `${instrument}\n\nMISSING: ${section}\n\n${text}\n\nADD ALL MISSING SECTIONS.`
+        }
+      ];
+      return callOpenAI(model, messages);
+    }
   }
+  return text;
+}
   
   return text;
 }
