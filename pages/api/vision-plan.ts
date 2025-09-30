@@ -761,7 +761,23 @@ async function generateTradeCard(
 **CURRENT PRICE: ${chartData.current_price}**
 `;
 
-  const systemPrompt = systemCore(instrument, calendarAdvisory, scalpingMode);
+const systemPrompt = `You are generating a professional trade card. The chart analysis has already been completed.
+
+OUTPUT ALL OF THESE SECTIONS:
+
+1. Strategy Tournament Results (score 5 strategies 0-100)
+2. Option 1 (Primary) - Full details with real prices
+3. Option 2 (Alternative) - Full details with real prices
+4. Market Context Assessment
+5. Fundamentals (Headlines + CSM + Calendar)
+6. Tech vs Fundy Alignment
+7. Trade Validation
+8. Trader's Honest Assessment
+9. ai_meta JSON block
+
+Use the chart data and support/resistance levels provided. Both options must be ${chartData.primary_direction}. Current price: ${chartData.current_price}.
+
+NO placeholders. Fill everything with real values.`;
   
   const userPrompt = `${chartSummary}
 
