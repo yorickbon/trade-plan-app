@@ -1771,36 +1771,6 @@ async function enforceFullStructure(model: string, instrument: string, text: str
   return callOpenAI(model, messages);
 }
 
-// ---------- Enforcement helpers ----------
-async function enforceFullStructure(model: string, instrument: string, text: string): Promise<string> {
-  // Check if all required sections are present
-  const hasPerformanceTracking = /Performance Tracking/i.test(text);
-  const hasFullBreakdown = /Full Breakdown/i.test(text);
-  const hasTradeSummary = /Trade Summary/i.test(text);
-  const hasTraderAssessment = /Trader'?s? Honest Assessment/i.test(text);
-  
-  if (hasPerformanceTracking && hasFullBreakdown && hasTradeSummary && hasTraderAssessment) {
-    return text; // All sections present
-  }
-  
-  // Generate missing sections
-  const messages = [
-    { role: "system", content: "You MUST add all missing sections after Option 2. Required sections: Performance Tracking, Trade Management, Full Breakdown (Technical View + Market Context Grade + Fundamental View), Trade Summary, Trade Validation, Trader's Honest Assessment. Keep Options 1 and 2 unchanged." },
-    { role: "user", content: `${instrument}\n\n${text}\n\nCOMPLETE THE ANALYSIS - Add all missing sections as specified in the output format.` }
-  ];
-  
-  return callOpenAI(model, messages);
-}
-
-function hasCompliantOption2(text: string): boolean {
-// ---------- Enforcement helpers ----------
-function hasCompliantOption2(text: string): boolean {
-  if (!/Option\s*2/i.test(text || "")) return false;
-  const block = (text.match(/Option\s*2[\s\S]{0,800}/i)?.[0] || "").toLowerCase();
-  const must = ["direction", "order type", "trigger", "entry", "stop", "tp", "conviction"];
-  return must.every((k) => block.includes(k));
-}
-
 async function enforceOption2(model: string, instrument: string, text: string) {
   if (hasCompliantOption2(text)) return text;
   
