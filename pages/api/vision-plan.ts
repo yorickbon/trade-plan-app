@@ -574,7 +574,154 @@ async function callOpenAI(model: string, messages: any[]) {
       : "");
   return String(out || "");
 }
+// ---------- Two-Stage Analysis: Stage 1 - Chart Reading ----------
+async function analyzeChartsOnly(
+  model: string,
+  instrument: string,
+  m15: string,
+  h1: string,
+  h4: string,
+  m5: string | null,
+  currentPriceHint: number | null
+): Promise<{
+  h4_left: number;
+  h4_right: number;
+  h4_direction: "UP" | "DOWN" | "SIDEWAYS";
+  h4_recent_high: number;
+  h4_recent_low: number;
+  h4_highs: number[];
+  h4_lows: number[];
+  h4_bias: "BULLISH" | "BEARISH" | "NEUTRAL";
+  h1_left: number;
+  h1_right: number;
+  h1_direction: "UP" | "DOWN" | "SIDEWAYS";
+  h1_recent_high: number;
+  h1_recent_low: number;
+  h1_highs: number[];
+  h1_lows: number[];
+  h1_bias: "BULLISH" | "BEARISH" | "NEUTRAL";
+  h1_vs_h4: "CONFIRMS" | "CONFLICTS" | "CONSOLIDATION";
+  m15_left: number;
+  m15_right: number;
+  m15_direction: "UP" | "DOWN" | "SIDEWAYS";
+  m15_recent_high: number;
+  m15_recent_low: number;
+  m15_context: "UPTREND" | "DOWNTREND" | "RANGING";
+  primary_direction: "LONG" | "SHORT";
+  current_price: number;
+}> {
+  const systemPrompt = `You are a chart reading specialist. Your ONLY job is to read price charts and extract exact data.
 
+CRITICAL RULES:
+1. You MUST output ONLY valid JSON, nothing else
+2. Every price field must be a real number you observe on the chart
+3. If you cannot read a price clearly, use the currentPriceHint as reference
+4. Never use placeholders, never use null, never use brackets
+
+OUTPUT FORMAT (JSON only):
+{
+  "h4_left": <number>,
+  "h4_right": <number>,
+  "h4_direction": "UP" | "DOWN" | "SIDEWAYS",
+  "h4_recent_high": <number>,
+  "h4_recent_low": <number>,
+  "h4_highs": [<oldest>, <middle>, <newest>],
+  "h4_lows": [<oldest>, <middle>, <newest>],
+  "h4_bias": "BULLISH" | "BEARISH" | "NEUTRAL",
+  "h1_left": <number>,
+  "h1_right": <number>,
+  "h1_direction": "UP" | "DOWN" | "SIDEWAYS",
+  "h1_recent_high": <number>,
+  "h1_recent_low": <number>,
+  "h1_highs": [<oldest>, <middle>, <newest>],
+  "h1_lows": [<oldest>, <middle>, <newest>],
+  "h1_bias": "BULLISH" | "BEARISH" | "NEUTRAL",
+  "h1_vs_h4": "CONFIRMS" | "CONFLICTS" | "CONSOLIDATION",
+  "m15_left": <number>,
+  "m15_right": <number>,
+  "m15_direction": "UP" | "DOWN" | "SIDEWAYS",
+  "m15_recent_high": <number>,
+  "m15_recent_low": <number>,
+  "m15_context": "UPTREND" | "DOWNTREND" | "RANGING",
+  "primary_direction": "LONG" | "SHORT",
+  "current_price": <number>
+}
+
+HOW TO READ CHARTS:
+1. Look at price scale on RIGHT edge
+2. Trace leftmost candle to price axis = left price
+3. Trace rightmost candle to price axis = right price = current price
+4. Find 3 most recent swing highs (peaks on right side of chart)
+5. Find 3 most recent swing lows (troughs on right side of chart)
+6. If right > left by >100 pips = UP, if left > right by >100 pips = DOWN, else SIDEWAYS
+7. If highs ascending AND lows ascending = BULLISH
+8. If highs descending AND lows descending = BEARISH
+9. Else = NEUTRAL or RANGING
+
+Current price hint: ${currentPriceHint || "unavailable"}
+Instrument: ${instrument}
+
+Reply with ONLY the JSON object, no other text.`;
+
+  const userContent: any[] = [
+    { type: "text", text: "4H Chart:" },
+    { type: "image_url", image_url: { url: h4 } },
+    { type: "text", text: "1H Chart:" },
+    { type: "image_url", image_url: { url: h1 } },
+    { type: "text", text: "15M Chart:" },
+    { type: "image_url", image_url: { url: m15 } },
+  ];
+
+  if (m5) {
+    userContent.push({ type: "text", text: "5M Chart (optional):" });
+    userContent.push({ type: "image_url", image_url: { url: m5 } });
+  }
+
+  userContent.push({
+    type: "text",
+    text: "Extract all data from these charts and return ONLY the JSON object as specified.",
+  });
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userContent },
+  ];
+
+  const responseText = await callOpenAI(model, messages);
+  
+  const parsed = tryParseJsonBlock(responseText);
+  if (!parsed) {
+    throw new Error("Chart analysis failed: Could not parse JSON response");
+  }
+
+  const requiredNumbers = [
+    "h4_left", "h4_right", "h4_recent_high", "h4_recent_low",
+    "h1_left", "h1_right", "h1_recent_high", "h1_recent_low",
+    "m15_left", "m15_right", "m15_recent_high", "m15_recent_low",
+    "current_price"
+  ];
+
+  for (const field of requiredNumbers) {
+    if (typeof parsed[field] !== "number" || !isFinite(parsed[field])) {
+      throw new Error(`Chart analysis failed: ${field} is not a valid number`);
+    }
+  }
+
+  if (!Array.isArray(parsed.h4_highs) || parsed.h4_highs.length !== 3) {
+    throw new Error("Chart analysis failed: h4_highs must be array of 3 numbers");
+  }
+  if (!Array.isArray(parsed.h4_lows) || parsed.h4_lows.length !== 3) {
+    throw new Error("Chart analysis failed: h4_lows must be array of 3 numbers");
+  }
+  if (!Array.isArray(parsed.h1_highs) || parsed.h1_highs.length !== 3) {
+    throw new Error("Chart analysis failed: h1_highs must be array of 3 numbers");
+  }
+  if (!Array.isArray(parsed.h1_lows) || parsed.h1_lows.length !== 3) {
+    throw new Error("Chart analysis failed: h1_lows must be array of 3 numbers");
+  }
+
+  return parsed;
+}
 function tryParseJsonBlock(s: string): any | null {
   if (!s) return null;
   const fence = s.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
