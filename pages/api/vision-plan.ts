@@ -1548,58 +1548,118 @@ function buildUserPartsBase(args: {
 
 MULTI-TIMEFRAME ANALYSIS PROTOCOL - INSTITUTIONAL HIERARCHY:
 
-STEP 1: 4H BIAS DETERMINATION (Market Direction)
-- Identify overall trend: UPTREND/DOWNTREND/RANGE
-- Key structure levels: Major S/R, round numbers, session extremes
-- Current price position: At highs/middle/lows
-- BOS status and market structure state
-- BIAS OUTPUT: "4H BIAS: [BULLISH/BEARISH/NEUTRAL] - Price [location] in [trend] structure"
-
-STEP 2: 1H INDEPENDENT ANALYSIS (Setup Construction)
-CRITICAL: Analyze 1H chart INDEPENDENTLY first, then compare to 4H
-
-2A: INDEPENDENT 1H STRUCTURE READING:
-- Look at 1H swing highs from left to right: State 3-5 exact prices
-- Look at 1H swing lows from left to right: State 3-5 exact prices
-- DETERMINE 1H TREND INDEPENDENTLY:
-  * If both highs AND lows ascending → 1H UPTREND
-  * If both highs AND lows descending → 1H DOWNTREND
-  * If mixed pattern → 1H RANGE
-- Example: "1H highs: 0.6680 → 0.6720 → 0.6750 = ascending"
-- Example: "1H lows: 0.6550 → 0.6580 → 0.6600 = ascending"
-- Independent 1H verdict: UPTREND (both ascending)
-
-2B: COMPARE 1H TO 4H BIAS:
-- 4H bias from Step 1: [state it]
-- 1H independent bias: [state it]
-- Relationship:
-  * If same direction → "CONFIRMS 4H bias"
-  * If opposite direction → "CONFLICTS with 4H - counter-trend move"
-  * If 1H range but 4H trending → "CONSOLIDATION within 4H trend"
-
-2C: PATTERN & SETUP IDENTIFICATION:
-- Current 1H pattern: Continuation / Reversal / Range breakout
-- Key 1H support: [price] | Key 1H resistance: [price]
-- Setup type: [Pullback entry / Breakout confirmation / Reversal at extreme]
-
-1H CONTEXT OUTPUT: "1H BIAS: [INDEPENDENT DIRECTION] - [CONFIRMS/CONFLICTS/CONSOLIDATES] 4H [direction]. Setup type: [pattern]"
-Example: "1H BIAS: UPTREND (ascending structure) - CONFLICTS with 4H downtrend. Counter-trend bounce in progress."
-
-STEP 3: 15M CHART CONTEXT ANALYSIS (Structure & Momentum Reading)
-- DO NOT suggest entries yet - this is chart reading only
-- Identify current 15M trend: UPTREND (higher highs + higher lows) / DOWNTREND (lower highs + lower lows) / RANGING
-- Recent 15M swing high price: [state exact price from chart]
-- Recent 15M swing low price: [state exact price from chart]
-- Current 15M momentum: Bullish/Bearish/Consolidating
-- Key 15M structure levels: Support at [price], Resistance at [price]
-- 15M position relative to 1H setup: [approaching resistance / at support / mid-range / etc]
-- CONTEXT OUTPUT: "15M CONTEXT: [Current trend] with price at [location], approaching [next structure level]"
-
-STEP 4: STRATEGY TOURNAMENT & TRADE EXECUTION PLAN (After analyzing all charts)
-- NOW you can suggest entries based on multi-timeframe analysis
-- Run 5-strategy tournament as specified earlier
-- Build Option 1 (Primary) and Option 2 (Alternative)
-- EXECUTION OUTPUT: Comes in 'Option 1' and 'Option 2' sections below
+"MANDATORY PRE-FLIGHT CHART READING PROTOCOL:",
+"",
+"You must complete this checklist IN ORDER before any bias determination or trade suggestions.",
+"Output each step explicitly in your response. Do not skip to conclusions.",
+"",
+"═══════════════════════════════════════════════════════════════",
+"PRE-FLIGHT CHECKLIST - 4H CHART",
+"═══════════════════════════════════════════════════════════════",
+"",
+"STEP 0: VISUAL SANITY CHECK",
+"• I observe the leftmost visible price on 4H chart: [STATE PRICE]",
+"• I observe the rightmost current price on 4H chart: [STATE PRICE]",
+"• Simple math: RIGHT - LEFT = [CALCULATE] pips",
+"• Therefore, left-to-right movement is: [UP if positive / DOWN if negative / SIDEWAYS if <50 pips]",
+"• ✓ CHECKPOINT: This is my anchor truth. Everything below must align with this.",
+"",
+"STEP 1: RECENT SWING VERIFICATION (4H)",
+"• Most recent swing HIGH I can physically see on the right side:",
+"  - Price: [STATE EXACT PRICE]",
+"  - Visual location: [Describe: 'X candles from current price']",
+"  - Distance from current: [CALCULATE] pips",
+"  - ✓ Is this within 150 pips of current? [YES/NO] - If NO, find a closer one",
+"",
+"• Most recent swing LOW I can physically see on the right side:",
+"  - Price: [STATE EXACT PRICE]",  
+"  - Visual location: [Describe: 'X candles from current price']",
+"  - Distance from current: [CALCULATE] pips",
+"  - ✓ Is this within 150 pips of current? [YES/NO] - If NO, find a closer one",
+"",
+"STEP 2: SWING SEQUENCE ANALYSIS (4H)",
+"• Looking at the 3 most recent swing highs chronologically (oldest → newest):",
+"  - First high: [PRICE]",
+"  - Second high: [PRICE]",
+"  - Third high (most recent): [PRICE]",
+"  - Pattern: [ASCENDING if each > previous / DESCENDING if each < previous / MIXED]",
+"",
+"• Looking at the 3 most recent swing lows chronologically (oldest → newest):",
+"  - First low: [PRICE]",
+"  - Second low: [PRICE]",
+"  - Third low (most recent): [PRICE]",
+"  - Pattern: [ASCENDING if each > previous / DESCENDING if each < previous / MIXED]",
+"",
+"STEP 3: SELF-CORRECTION CHECKPOINT (4H)",
+"• My Step 0 visual direction was: [UP/DOWN/SIDEWAYS]",
+"• My Step 2 swing analysis shows: [ASCENDING/DESCENDING/MIXED]",
+"• ✓ DO THESE MATCH?",
+"  - If visual says DOWN but swings say ASCENDING → I MADE AN ERROR, re-reading chart",
+"  - If visual says UP but swings say DESCENDING → I MADE AN ERROR, re-reading chart",
+"  - If they match → Proceeding with confidence",
+"",
+"**4H BIAS DETERMINATION:** [BULLISH/BEARISH/NEUTRAL] - [Brief reasoning based on above]",
+"",
+"═══════════════════════════════════════════════════════════════",
+"PRE-FLIGHT CHECKLIST - 1H CHART",
+"═══════════════════════════════════════════════════════════════",
+"",
+"STEP 0: VISUAL SANITY CHECK",
+"• Leftmost visible price on 1H: [STATE PRICE]",
+"• Rightmost current price on 1H: [STATE PRICE]",
+"• Calculation: [CALCULATE difference]",
+"• Left-to-right direction: [UP/DOWN/SIDEWAYS]",
+"",
+"STEP 1: RECENT SWING VERIFICATION (1H)",
+"• Most recent 1H swing high within 100 pips of current:",
+"  - Price: [EXACT]",
+"  - Distance from current: [PIPS]",
+"• Most recent 1H swing low within 100 pips of current:",
+"  - Price: [EXACT]",
+"  - Distance from current: [PIPS]",
+"",
+"STEP 2: SWING SEQUENCE (1H) - Last 3 highs and lows chronologically",
+"• Highs: [PRICE] → [PRICE] → [PRICE] = [ASCENDING/DESCENDING/MIXED]",
+"• Lows: [PRICE] → [PRICE] → [PRICE] = [ASCENDING/DESCENDING/MIXED]",
+"",
+"STEP 3: COMPARISON TO 4H",
+"• 4H bias from above: [STATE IT]",
+"• 1H independent read: [STATE IT]",
+"• Relationship: [CONFIRMS / CONFLICTS / CONSOLIDATION WITHIN]",
+"",
+"**1H INDEPENDENT ANALYSIS:** [STATE BIAS] - [CONFIRMS/CONFLICTS] with 4H",
+"",
+"═══════════════════════════════════════════════════════════════",
+"PRE-FLIGHT CHECKLIST - 15M CHART",
+"═══════════════════════════════════════════════════════════════",
+"",
+"STEP 0: VISUAL SANITY CHECK",
+"• Left price: [STATE] | Right price: [STATE] | Direction: [UP/DOWN/SIDEWAYS]",
+"",
+"STEP 1: IMMEDIATE STRUCTURE (15M)",
+"• Recent swing high (within 50 pips): [PRICE]",
+"• Recent swing low (within 50 pips): [PRICE]",
+"• Current price position: [At highs / At lows / Mid-range]",
+"",
+"STEP 2: MOMENTUM ASSESSMENT",
+"• Last 20 candles pattern: [Bullish / Bearish / Choppy]",
+"• Approaching: [Support at X / Resistance at Y / No clear structure]",
+"",
+"**15M CHART CONTEXT:** [UPTREND/DOWNTREND/RANGING] - Price [location] approaching [structure]",
+"",
+"═══════════════════════════════════════════════════════════════",
+"FINAL SYNTHESIS CHECK",
+"═══════════════════════════════════════════════════════════════",
+"",
+"Before proceeding to Strategy Tournament, verify:",
+"• 4H bias: [STATE]",
+"• 1H bias: [STATE]", 
+"• 15M context: [STATE]",
+"• Primary direction for both trade options will be: [LONG/SHORT]",
+"• ✓ This direction is supported by the higher timeframe biases above",
+"",
+"If any conflict exists, explain which timeframe takes priority and why.",
+"Now proceeding to Strategy Tournament and trade construction...",
 
 MANDATORY TIMEFRAME LABELS:
 - Entry: Always specify source (e.g., "0.6545 (15M order block)", "1.2850-1.2860 (1H support zone)")
@@ -1736,21 +1796,43 @@ function messagesFull(args: {
     "• Price Validation: Entry/SL/TP levels are structure-based and realistic",
     "• R:R Confirmation: Minimum 1.5:1 ratio achieved",
     "",
-    "Trader's Honest Assessment",
-    "",
-    "Answer these like you're explaining to a fellow trader:",
-    "",
-    "• What's the best case? [Describe if everything goes right]",
-    "• What's the realistic case? [Most likely outcome]",
-    "• What's the risk case? [What could go wrong]",
-    "• Would I take this? [Yes/No/Maybe with clear reasoning]",
-    "• Key concern: [Main risk or uncertainty about this setup]",
-    "",
-    "If this is a C or D grade setup, you MUST state:",
-    "'⚠️ This is a lower-probability setup. Consider waiting for [specific better condition].'",
-    "",
-    "```json",
-    "ai_meta",
+   "Trader's Honest Assessment",
+"",
+"Answer these like you're explaining to a fellow trader:",
+"",
+"• What's the best case? [Describe if everything goes right]",
+"• What's the realistic case? [Most likely outcome]",
+"• What's the risk case? [What could go wrong]",
+"• Would I take this? [Yes/No/Maybe with clear reasoning]",
+"• Key concern: [Main risk or uncertainty about this setup]",
+"",
+"If this is a C or D grade setup, you MUST state:",
+"'⚠️ This is a lower-probability setup. Consider waiting for [specific better condition].'",
+"",
+"═══════════════════════════════════════════════════════════════",
+"FINAL CROSS-CHECK BEFORE SUBMISSION",
+"═══════════════════════════════════════════════════════════════",
+"",
+"Q1: I said 4H bias is [STATE IT]. Does the 4H chart actually",
+"    move that direction from left to right?",
+"    ✓ [YES/NO - if NO, what is the correction]",
+"",
+"Q2: I said 1H recent high is [PRICE]. Is that price visible",
+"    on the right 20% of the 1H chart?",
+"    ✓ [YES/NO - if NO, what is the actual recent high]",
+"",
+"Q3: Both options are [LONG/SHORT]. Does this match my",
+"    higher timeframe analysis above?",
+"    ✓ [YES/NO - if NO, explain the conflict]",
+"",
+"Q4: My entries are [STATE THEM]. Are these within 100 pips",
+"    of structure I identified?",
+"    ✓ [YES/NO - if NO, where is structure actually]",
+"",
+"═══════════════════════════════════════════════════════════════",
+"",
+"```json",
+"ai_meta"
     "{",
     "  \"currentPrice\": [PUT_CURRENT_PRICE_HERE_OR_UNREADABLE],",
     "  \"trade_id\": \"[GENERATE_UUID]\",",
