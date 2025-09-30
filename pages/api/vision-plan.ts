@@ -1562,8 +1562,36 @@ CRITICAL HIERARCHY RULES:
     { type: "image_url", image_url: { url: args.h4 } },
     { type: "text", text: "1H CONTEXT CHART - Setup construction within 4H bias:" },
     { type: "image_url", image_url: { url: args.h1 } },
-    { type: "text", text: "15M CHART - Structure and momentum context (do NOT suggest trades yet):" },
+  { type: "text", text: "15M CHART - Structure and momentum context (do NOT suggest trades yet):" },
     { type: "image_url", image_url: { url: args.m15 } },
+    { type: "text", text: `
+NOW READ THE CHARTS ABOVE AND COMPLETE THIS CHECKLIST:
+
+**4H CHART - Fill in these blanks with ACTUAL numbers from the chart:**
+Left edge price: _____ | Right edge: _____ | Difference: _____ pips = [UP/DOWN/SIDEWAYS]
+Recent HIGH (right side): _____ at _____ pips from current
+Recent LOW (right side): _____ at _____ pips from current  
+3 highs chronologically: _____ → _____ → _____ = [ASCENDING/DESCENDING]
+3 lows chronologically: _____ → _____ → _____ = [ASCENDING/DESCENDING]
+**4H BIAS: [BULLISH/BEARISH/NEUTRAL]**
+
+**1H CHART - Fill in these blanks with ACTUAL numbers:**
+Left: _____ | Right: _____ | Direction: [UP/DOWN/SIDEWAYS]
+Recent HIGH: _____ | Recent LOW: _____
+3 highs: _____ → _____ → _____ = [ASCENDING/DESCENDING]
+3 lows: _____ → _____ → _____ = [ASCENDING/DESCENDING]
+**1H ANALYSIS: [BIAS] - [CONFIRMS/CONFLICTS] 4H**
+
+**15M CHART - Fill in these blanks:**
+Left: _____ | Right: _____ | Direction: [UP/DOWN/SIDEWAYS]
+Recent HIGH: _____ | Recent LOW: _____
+Position: [AT HIGHS/AT LOWS/MIDDLE]
+**15M CONTEXT: [UPTREND/DOWNTREND/RANGING]**
+
+Both trades will be: [LONG/SHORT]
+
+After completing this checklist, proceed to Strategy Tournament.
+` },
   ];
   
   if (args.m5) { parts.push({ type: "text", text: "Scalp 5M Chart" }); parts.push({ type: "image_url", image_url: { url: args.m5 } }); }
