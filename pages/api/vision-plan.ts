@@ -106,7 +106,7 @@ async function fileToDataUrl(file: any): Promise<string | null> {
   return processImageToDataUrl(raw);
 }
 
-aasync function linkToDataUrl(url: string): Promise<string | null> {
+async function linkToDataUrl(url: string): Promise<string | null> {
   if (!url) return null;
   try {
     // First fetch - might be HTML with og:image
