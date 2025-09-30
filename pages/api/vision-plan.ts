@@ -141,26 +141,25 @@ async function processAdaptiveToDataUrl(buf: Buffer, isTradingView: boolean = fa
     sharpPipeline.sharpen(1.2, 1.5, 2).modulate({ brightness: 1.05, saturation: 1.1 });
   }
   
- let out = await sharpPipeline.jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
-  
-  // Helper for repeated pipeline creation
-  const buildPipeline = (buf: Buffer, width: number, quality: number, enhance: boolean) => {
-    const pipeline = sharp(buf).rotate().resize({ width, withoutEnlargement: true });
-    if (enhance) {
-      pipeline.sharpen(1.2, 1.5, 2).modulate({ brightness: 1.05, saturation: 1.1 });
-    }
-    return pipeline.jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
-  };
+  let out = await sharpPipeline.jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
   
   let guard = 0;
-  while (out.byteLength < targetMin && guard < 4) {
+ const buildPipeline = (buf: Buffer, width: number, quality: number, enhance: boolean) => {
+  const pipeline = sharp(buf).rotate().resize({ width, withoutEnlargement: true });
+  if (enhance) {
+    pipeline.sharpen(1.2, 1.5, 2).modulate({ brightness: 1.05, saturation: 1.1 });
+  }
+  return pipeline.jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
+};
+
+while (out.byteLength < targetMin && guard < 4) {
     quality = Math.min(quality + (isTradingView ? 4 : 6), isTradingView ? 90 : 88);
     if (quality >= (isTradingView ? 85 : 82) && width < maxWidth) {
       width = Math.min(width + 100, maxWidth);
     }
     out = await buildPipeline(buf, width, quality, isTradingView);
     guard++;
-  }
+}
   
   if (out.byteLength < targetMin && (quality < (isTradingView ? 90 : 88) || width < maxWidth)) {
     quality = Math.min(quality + (isTradingView ? 2 : 4), isTradingView ? 90 : 88);
@@ -1750,25 +1749,13 @@ function messagesFull(args: {
     }) },
   ];
 }
+
 // ---------- Enforcement helpers ----------
-async function enforceFullStructure(model: string, instrument: string, text: string): Promise<string> {
-  // Check if all required sections are present
-  const hasPerformanceTracking = /Performance Tracking/i.test(text);
-  const hasFullBreakdown = /Full Breakdown/i.test(text);
-  const hasTradeSummary = /Trade Summary/i.test(text);
-  const hasTraderAssessment = /Trader'?s? Honest Assessment/i.test(text);
-  
-  if (hasPerformanceTracking && hasFullBreakdown && hasTradeSummary && hasTraderAssessment) {
-    return text; // All sections present
-  }
-  
-  // Generate missing sections
-  const messages = [
-    { role: "system", content: "You MUST add all missing sections after Option 2. Required sections: Performance Tracking, Trade Management, Full Breakdown (Technical View + Market Context Grade + Fundamental View), Trade Summary, Trade Validation, Trader's Honest Assessment. Keep Options 1 and 2 unchanged." },
-    { role: "user", content: `${instrument}\n\n${text}\n\nCOMPLETE THE ANALYSIS - Add all missing sections as specified in the output format.` }
-  ];
-  
-  return callOpenAI(model, messages);
+function hasCompliantOption2(text: string): boolean {
+  if (!/Option\s*2/i.test(text || "")) return false;
+  const block = (text.match(/Option\s*2[\s\S]{0,800}/i)?.[0] || "").toLowerCase();
+  const must = ["direction", "order type", "trigger", "entry", "stop", "tp", "conviction"];
+  return must.every((k) => block.includes(k));
 }
 
 async function enforceOption2(model: string, instrument: string, text: string) {
@@ -2398,7 +2385,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
     textFull = await enforceStrategyTournament(MODEL, instrument, textFull);
-    textFull = await enforceFullStructure(MODEL, instrument, textFull); 
     // Ensure both options have strategy names
     const opt1HasStrategy = /Option\s*1[\s\S]{50,300}Strategy[^:]*:\s*\w+/i.test(textFull);
     const opt2HasStrategy = /Option\s*2[\s\S]{50,300}Strategy[^:]*:\s*\w+/i.test(textFull);
@@ -2429,6 +2415,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 ];
 const isValid1 = validStrategies.some(s => strategy1.toLowerCase().includes(s.toLowerCase()));
 const isValid2 = validStrategies.some(s => strategy2.toLowerCase().includes(s.toLowerCase()));
+      
+      if (!isValid1 || !isValid2) {
+        console.warn(`[VISION-PLAN] Tournament strategies not properly applied: ${strategy1} / ${strategy2}`);
+      }
+    }
+if (tournamentMatch && option1Match && option2Match) {
+      const strategy1 = option1Match[1];
+      const strategy2 = option2Match[1];
+      
+      // Check if strategies are actually different and valid
+      const validStrategies = ["Structure", "Order", "Reversal", "Liquidity", "Fair", "FVG", "BOS", "OB"];
+      const isValid1 = validStrategies.some(s => strategy1.includes(s));
+      const isValid2 = validStrategies.some(s => strategy2.includes(s));
       
       if (!isValid1 || !isValid2) {
         console.warn(`[VISION-PLAN] Tournament strategies not properly applied: ${strategy1} / ${strategy2}`);
@@ -2465,7 +2464,9 @@ const isValid2 = validStrategies.some(s => strategy2.toLowerCase().includes(s.to
     if (livePrice) {
       textFull = await validateOrderTypeLogic(MODEL, instrument, textFull, livePrice);
     }
-   
+    if (livePrice) {
+      textFull = await validateOrderTypeLogic(MODEL, instrument, textFull, livePrice);
+    }
     textFull = await enforceEntryFormat(MODEL, instrument, textFull);
 
     // Validate directional consistency
