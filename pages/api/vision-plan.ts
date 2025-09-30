@@ -69,17 +69,29 @@ function tryParseJson(s: string): any | null {
 
 // ---------- Image Processing ----------
 async function processImageToDataUrl(buf: Buffer): Promise<string> {
-  const width = 1280;
-  const quality = 75;
-  
-  const out = await sharp(buf)
-    .rotate()
-    .resize({ width, withoutEnlargement: true })
-    .jpeg({ quality, progressive: true, mozjpeg: true })
-    .toBuffer();
-  
-  if (out.byteLength > IMG_MAX_BYTES) throw new Error("Image too large");
-  return `data:image/jpeg;base64,${out.toString("base64")}`;
+  try {
+    const width = 1280;
+    const quality = 75;
+    
+    // Force input format detection and handle corrupted headers
+    const out = await sharp(buf, { failOnError: false })
+      .rotate()
+      .resize({ width, withoutEnlargement: true })
+      .jpeg({ quality, progressive: true, mozjpeg: true })
+      .toBuffer();
+    
+    if (out.byteLength > IMG_MAX_BYTES) throw new Error("Image too large");
+    return `data:image/jpeg;base64,${out.toString("base64")}`;
+  } catch (err) {
+    // If Sharp fails, try without rotation
+    const out = await sharp(buf, { failOnError: false })
+      .resize({ width: 1280, withoutEnlargement: true })
+      .jpeg({ quality: 75 })
+      .toBuffer();
+    
+    if (out.byteLength > IMG_MAX_BYTES) throw new Error("Image too large");
+    return `data:image/jpeg;base64,${out.toString("base64")}`;
+  }
 }
 
 async function getFormidable() { 
