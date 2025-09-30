@@ -141,25 +141,26 @@ async function processAdaptiveToDataUrl(buf: Buffer, isTradingView: boolean = fa
     sharpPipeline.sharpen(1.2, 1.5, 2).modulate({ brightness: 1.05, saturation: 1.1 });
   }
   
-  let out = await sharpPipeline.jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
+let out = await sharpPipeline.jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
+  
+  // Helper function for rebuilding pipeline with new parameters
+  const buildPipeline = async (buffer: Buffer, w: number, q: number, enhance: boolean) => {
+    const pipeline = sharp(buffer).rotate().resize({ width: w, withoutEnlargement: true });
+    if (enhance) {
+      pipeline.sharpen(1.2, 1.5, 2).modulate({ brightness: 1.05, saturation: 1.1 });
+    }
+    return pipeline.jpeg({ quality: q, progressive: true, mozjpeg: true }).toBuffer();
+  };
   
   let guard = 0;
- const buildPipeline = (buf: Buffer, width: number, quality: number, enhance: boolean) => {
-  const pipeline = sharp(buf).rotate().resize({ width, withoutEnlargement: true });
-  if (enhance) {
-    pipeline.sharpen(1.2, 1.5, 2).modulate({ brightness: 1.05, saturation: 1.1 });
-  }
-  return pipeline.jpeg({ quality, progressive: true, mozjpeg: true }).toBuffer();
-};
-
-while (out.byteLength < targetMin && guard < 4) {
+  while (out.byteLength < targetMin && guard < 4) {
     quality = Math.min(quality + (isTradingView ? 4 : 6), isTradingView ? 90 : 88);
     if (quality >= (isTradingView ? 85 : 82) && width < maxWidth) {
       width = Math.min(width + 100, maxWidth);
     }
     out = await buildPipeline(buf, width, quality, isTradingView);
     guard++;
-}
+  }
   
   if (out.byteLength < targetMin && (quality < (isTradingView ? 90 : 88) || width < maxWidth)) {
     quality = Math.min(quality + (isTradingView ? 2 : 4), isTradingView ? 90 : 88);
@@ -844,24 +845,52 @@ function systemCore(
     "- For breakouts → Use STOP ORDER 5-10 pips beyond structure break for confirmation.",
     "- PATIENCE over chasing: 'Wait for pullback to 1.7820 OB' is BETTER than 'Enter now mid-move at 1.7855'.",
     "",
-    "ENTRY FORMAT ENFORCEMENT - CRITICAL RULES:",
+"ENTRY PLACEMENT LOGIC - PROFESSIONAL REASONING:",
     "",
-    "IF Order Type = LIMIT:",
-    "- MANDATORY: Use range format ONLY",
-    "- Format: 'Entry: 0.6555-0.6565 (15M order block zone)'",
-    "- NEVER write: 'Entry: 0.6560' for limit orders - THIS IS INVALID",
-    "- Range width: 8-15 pips based on structure width",
-    "- You MUST identify structure boundaries for the range",
+    "STEP 1: READ CURRENT PRICE FIRST (MANDATORY)",
+    "- Current price from ai_meta hint or rightmost candle",
+    "- Example: If current = 0.6570, write this down",
     "",
-    "IF Order Type = MARKET:",
-    "- Use single point: 'Entry: 0.6571 (current market price)'",
-    "- Must match currentPrice from ai_meta",
+    "STEP 2: IDENTIFY WHERE STRUCTURE IS RELATIVE TO CURRENT PRICE",
+    "- Is structure AT current price (within 5 pips)? → Use MARKET order",
+    "- Is structure BELOW current price (15+ pips away)? → Use LIMIT order for LONG",
+    "- Is structure ABOVE current price (15+ pips away)? → Use LIMIT order for SHORT",
+    "- Did structure just break? → Use STOP order",
     "",
-    "VALIDATION:",
-    "- Before writing entry, check: Is this limit or market?",
-    "- Limit → must be range | Market → must be single point",
-    "- WRONG: 'Entry (zone or single): 0.6570 (15M structure)' for limit order",
-    "- RIGHT: 'Entry (zone or single): 0.6565-0.6575 (15M structure)' for limit order",
+    "STEP 3: CALCULATE ENTRY DISTANCE (CRITICAL - THINK LIKE A REAL TRADER)",
+    "",
+    "FOR LONG LIMIT ORDERS:",
+    "- Entry MUST be BELOW current price by minimum 15-50 pips",
+    "- Ask yourself: 'Where will price pull back to before continuing up?'",
+    "- Example: Current=0.6570 → Entry=0.6540-0.6550 (30 pips below at support)",
+    "- INVALID: Current=0.6570 → Entry=0.6565-0.6575 (overlaps current price)",
+    "- If structure is only 5-10 pips away, use MARKET order instead",
+    "",
+    "FOR SHORT LIMIT ORDERS:",
+    "- Entry MUST be ABOVE current price by minimum 15-50 pips",
+    "- Ask yourself: 'Where will price rally to before continuing down?'",
+    "- Example: Current=0.6570 → Entry=0.6595-0.6605 (25 pips above at resistance)",
+    "- INVALID: Current=0.6570 → Entry=0.6565-0.6575 (overlaps current price)",
+    "- If structure is only 5-10 pips away, use MARKET order instead",
+    "",
+    "FOR MARKET ORDERS:",
+    "- Entry = Current price exactly (single point, no range)",
+    "- Example: Current=0.6570 → Entry=0.6570",
+    "- Use when: Price is already at the structure level where you want to enter",
+    "",
+    "SELF-CHECK BEFORE WRITING ENTRY (ASK THESE QUESTIONS):",
+    "1. What is current price? [Write the number]",
+    "2. What is my entry? [Write the number]",
+    "3. Distance = |Entry - Current| = ? pips",
+    "4. For LONG limits: Is entry < current? YES/NO",
+    "5. For SHORT limits: Is entry > current? YES/NO",
+    "6. Is distance ≥ 15 pips? YES/NO",
+    "If any answer is wrong, recalculate before proceeding.",
+    "",
+    "ENTRY FORMAT RULES:",
+    "- Limit orders: ALWAYS use range format (0.6540-0.6550)",
+    "- Market orders: Single point only (0.6570)",
+    "- Range width: 10-15 pips for limit orders",
     "",
     "STOP LOSS PLACEMENT - MANDATORY STRUCTURE IDENTIFICATION:",
     "- Step 1: Look at the chart and identify EXACT swing price (e.g., '15M swing low at 0.6535')",
@@ -1649,7 +1678,23 @@ function messagesFull(args: {
     "- Reduce targets by 1-2 pips for realistic profit taking",
     "- Consider order queue depth for large positions",
     "",
-   "OUTPUT format (in this exact order):",
+ "MANDATORY OUTPUT STRUCTURE - ALL SECTIONS REQUIRED:",
+    "",
+    "Your response MUST contain ALL these sections in this exact order:",
+    "1. Strategy Tournament Results (5 strategies scored 0-100)",
+    "2. Option 1 (Primary) - Complete trade with all fields",
+    "3. Option 2 (Alternative) - Complete trade with all fields",
+    "4. Performance Tracking - Expected R:R, Strategy Attribution, Setup Quality",
+    "5. Trade Management - Essential Metrics (SL distance, R:R ratio, Entry logic)",
+    "6. Full Breakdown - Technical View, Market Context Grade, Fundamental View, Tech vs Fundy Alignment",
+    "7. Trade Summary - Instrument, Primary Strategy, Setup Quality, Key Invalidation",
+    "8. Trade Validation - Logic Check, Price Validation, R:R Confirmation",
+    "9. Trader's Honest Assessment - Best case, Realistic case, Risk case, Would I take this, Key concern",
+    "10. ai_meta JSON block - Trade metadata",
+    "",
+    "If ANY section is missing, the output is INVALID and must be regenerated.",
+    "",
+    "OUTPUT format (in this exact order):",
     "Option 1 (Primary)",
     "• Strategy: [Name of winner strategy from tournament]",
     "• Direction: ...",
@@ -1750,6 +1795,38 @@ function messagesFull(args: {
   ];
 }
 
+async function enforceAllSections(model: string, instrument: string, text: string): Promise<string> {
+  const requiredSections = [
+    { name: "Strategy Tournament Results", pattern: /Strategy\s+Tournament\s+Results/i },
+    { name: "Performance Tracking", pattern: /Performance\s+Tracking/i },
+    { name: "Trade Management", pattern: /Trade\s+Management/i },
+    { name: "Full Breakdown", pattern: /Full\s+Breakdown/i },
+    { name: "Trade Summary", pattern: /Trade\s+Summary/i },
+    { name: "Trade Validation", pattern: /Trade\s+Validation/i },
+    { name: "Trader's Honest Assessment", pattern: /Trader'?s\s+Honest\s+Assessment/i }
+  ];
+  
+  const missing = requiredSections.filter(section => !section.pattern.test(text));
+  
+  if (missing.length === 0) return text;
+  
+  const missingNames = missing.map(s => s.name).join(", ");
+  console.warn(`[VISION-PLAN] Missing sections: ${missingNames}`);
+  
+  const messages = [
+    {
+      role: "system",
+      content: `Add these missing sections in order: ${missingNames}. Each section is MANDATORY per the output structure requirements. Append them after existing content, maintaining all current analysis. Follow the exact format specified in the OUTPUT structure.`
+    },
+    {
+      role: "user",
+      content: `Instrument: ${instrument}\n\n${text}\n\nAdd missing sections: ${missingNames}`
+    }
+  ];
+  
+  return callOpenAI(model, messages);
+}
+
 // ---------- Enforcement helpers ----------
 function hasCompliantOption2(text: string): boolean {
   if (!/Option\s*2/i.test(text || "")) return false;
@@ -1831,21 +1908,46 @@ async function validateOrderTypeLogic(model: string, instrument: string, text: s
   const minEntry = Math.min(...entryNums);
   const maxEntry = Math.max(...entryNums);
   
-  if (orderType === "limit") {
-    if (direction === "long" && minEntry >= currentPrice) {
-      const messages = [
-        { role: "system", content: "FIX CRITICAL ERROR: Long Limit orders MUST be BELOW current price. Current price is already at or above your suggested entry. Either: (1) Market order for immediate entry, OR (2) Limit order further BELOW current price. Keep all other analysis unchanged." },
-        { role: "user", content: `Current ${instrument} price: ${currentPrice}\n\n${text}\n\nFIX: Long Limit at ${entryStr} is impossible. Price already there or above.` }
-      ];
-      return callOpenAI(model, messages);
+if (orderType === "limit") {
+    const minDistancePips = 15;
+    const pipValue = instrument.includes("JPY") ? 0.01 : 0.0001;
+    
+    if (direction === "long") {
+      if (minEntry >= currentPrice) {
+        const messages = [
+          { role: "system", content: `FIX CRITICAL ERROR: Long Limit MUST be BELOW current price by at least ${minDistancePips} pips. Current: ${currentPrice}, Your entry: ${entryStr} is AT/ABOVE current. This is impossible - limit orders execute when price REACHES the level. For long, price must FALL to your entry. Find support structure BELOW ${currentPrice} or use market order. Keep other analysis unchanged.` },
+          { role: "user", content: `Current ${instrument}: ${currentPrice}\n\n${text}\n\nFIX: Long Limit at ${entryStr} impossible. Need entry BELOW current price.` }
+        ];
+        return callOpenAI(model, messages);
+      }
+      
+      const distancePips = (currentPrice - maxEntry) / pipValue;
+      if (distancePips < minDistancePips) {
+        const messages = [
+          { role: "system", content: `FIX: Long Limit too close. Current: ${currentPrice}, Entry: ${entryStr}, Distance: ${distancePips.toFixed(1)} pips. Need minimum ${minDistancePips} pips. Current price might already hit your entry on next tick. Find structure at least ${minDistancePips} pips BELOW current, or use market order. Keep other analysis unchanged.` },
+          { role: "user", content: `${instrument}\n\n${text}\n\nFIX: Entry only ${distancePips.toFixed(1)} pips away. Need ${minDistancePips}+ pips distance.` }
+        ];
+        return callOpenAI(model, messages);
+      }
     }
     
-    if (direction === "short" && maxEntry <= currentPrice) {
-      const messages = [
-        { role: "system", content: "FIX CRITICAL ERROR: Short Limit orders MUST be ABOVE current price. Current price is already at or below your suggested entry. Either: (1) Market order for immediate entry, OR (2) Limit order further ABOVE current price. Keep all other analysis unchanged." },
-        { role: "user", content: `Current ${instrument} price: ${currentPrice}\n\n${text}\n\nFIX: Short Limit at ${entryStr} is impossible. Price already there or below.` }
-      ];
-      return callOpenAI(model, messages);
+    if (direction === "short") {
+      if (maxEntry <= currentPrice) {
+        const messages = [
+          { role: "system", content: `FIX CRITICAL ERROR: Short Limit MUST be ABOVE current price by at least ${minDistancePips} pips. Current: ${currentPrice}, Your entry: ${entryStr} is AT/BELOW current. This is impossible - limit orders execute when price REACHES the level. For short, price must RISE to your entry. Find resistance structure ABOVE ${currentPrice} or use market order. Keep other analysis unchanged.` },
+          { role: "user", content: `Current ${instrument}: ${currentPrice}\n\n${text}\n\nFIX: Short Limit at ${entryStr} impossible. Need entry ABOVE current price.` }
+        ];
+        return callOpenAI(model, messages);
+      }
+      
+      const distancePips = (minEntry - currentPrice) / pipValue;
+      if (distancePips < minDistancePips) {
+        const messages = [
+          { role: "system", content: `FIX: Short Limit too close. Current: ${currentPrice}, Entry: ${entryStr}, Distance: ${distancePips.toFixed(1)} pips. Need minimum ${minDistancePips} pips. Current price might already hit your entry on next tick. Find structure at least ${minDistancePips} pips ABOVE current, or use market order. Keep other analysis unchanged.` },
+          { role: "user", content: `${instrument}\n\n${text}\n\nFIX: Entry only ${distancePips.toFixed(1)} pips away. Need ${minDistancePips}+ pips distance.` }
+        ];
+        return callOpenAI(model, messages);
+      }
     }
   }
   
@@ -2382,9 +2484,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       aiMetaFull.currentPrice = livePrice;
     }
 
-    textFull = await enforceOption1(MODEL, instrument, textFull);
+   textFull = await enforceOption1(MODEL, instrument, textFull);
     textFull = await enforceOption2(MODEL, instrument, textFull);
     textFull = await enforceStrategyTournament(MODEL, instrument, textFull);
+    textFull = await enforceAllSections(MODEL, instrument, textFull);
     // Ensure both options have strategy names
     const opt1HasStrategy = /Option\s*1[\s\S]{50,300}Strategy[^:]*:\s*\w+/i.test(textFull);
     const opt2HasStrategy = /Option\s*2[\s\S]{50,300}Strategy[^:]*:\s*\w+/i.test(textFull);
