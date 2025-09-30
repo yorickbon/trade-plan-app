@@ -2574,7 +2574,7 @@ if (calUrlOrig) {
       sentimentText,
       calendarText,
       calendarEvidence,
-      calendarAdvisory,
+      { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
       scalpingMode
     );
     let aiMetaFull = extractAiMeta(textFull) || {};
