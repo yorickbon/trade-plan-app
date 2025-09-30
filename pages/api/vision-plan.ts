@@ -722,6 +722,73 @@ Reply with ONLY the JSON object, no other text.`;
 
   return parsed;
 }
+// ---------- Two-Stage Analysis: Stage 2 - Trade Generation ----------
+async function generateTradeCard(
+  model: string,
+  instrument: string,
+  chartData: Awaited<ReturnType<typeof analyzeChartsOnly>>,
+  headlinesText: string | null,
+  sentimentText: string,
+  calendarText: string | null,
+  calendarEvidence: string[],
+  calendarAdvisory: any,
+  scalpingMode: "soft" | "hard" | "off"
+): Promise<string> {
+  
+  const chartSummary = `
+**CHART ANALYSIS (Pre-Verified):**
+
+**4H Chart:**
+- Left edge: ${chartData.h4_left} | Right edge: ${chartData.h4_right} | Movement: ${Math.abs(chartData.h4_right - chartData.h4_left).toFixed(0)} pips ${chartData.h4_direction}
+- Recent high: ${chartData.h4_recent_high} | Recent low: ${chartData.h4_recent_low}
+- Swing highs: ${chartData.h4_highs.join(" → ")} = ${chartData.h4_highs[2] > chartData.h4_highs[0] ? "ASCENDING" : "DESCENDING"}
+- Swing lows: ${chartData.h4_lows.join(" → ")} = ${chartData.h4_lows[2] > chartData.h4_lows[0] ? "ASCENDING" : "DESCENDING"}
+- **4H BIAS: ${chartData.h4_bias}**
+
+**1H Chart:**
+- Left edge: ${chartData.h1_left} | Right edge: ${chartData.h1_right} | Movement: ${Math.abs(chartData.h1_right - chartData.h1_left).toFixed(0)} pips ${chartData.h1_direction}
+- Recent high: ${chartData.h1_recent_high} | Recent low: ${chartData.h1_recent_low}
+- Swing highs: ${chartData.h1_highs.join(" → ")} = ${chartData.h1_highs[2] > chartData.h1_highs[0] ? "ASCENDING" : "DESCENDING"}
+- Swing lows: ${chartData.h1_lows.join(" → ")} = ${chartData.h1_lows[2] > chartData.h1_lows[0] ? "ASCENDING" : "DESCENDING"}
+- **1H BIAS: ${chartData.h1_bias}** - ${chartData.h1_vs_h4} 4H
+
+**15M Chart:**
+- Left: ${chartData.m15_left} | Right: ${chartData.m15_right} | Direction: ${chartData.m15_direction}
+- Recent high: ${chartData.m15_recent_high} | Recent low: ${chartData.m15_recent_low}
+- **15M CONTEXT: ${chartData.m15_context}**
+
+**DIRECTIONAL DECISION: ${chartData.primary_direction}**
+**CURRENT PRICE: ${chartData.current_price}**
+`;
+
+  const systemPrompt = systemCore(instrument, calendarAdvisory, scalpingMode);
+  
+  const userPrompt = `${chartSummary}
+
+${sentimentText ? `**Sentiment:**\n${sentimentText}\n` : ""}
+${headlinesText ? `**Headlines:**\n${headlinesText}\n` : ""}
+${calendarText ? `**Calendar:**\n${calendarText}\n` : ""}
+${calendarEvidence.length ? `**Calendar Evidence:**\n${calendarEvidence.join("\n")}\n` : ""}
+
+Using the chart analysis above, generate a complete professional trade card following ALL instructions in your system prompt.
+
+CRITICAL REQUIREMENTS:
+- Both trade options MUST be ${chartData.primary_direction}
+- Use current price ${chartData.current_price} for all entry calculations
+- Use the exact support/resistance levels identified: H4 high ${chartData.h4_recent_high}, H4 low ${chartData.h4_recent_low}, H1 high ${chartData.h1_recent_high}, H1 low ${chartData.h1_recent_low}
+- Include ALL sections: Strategy Tournament, Options 1&2, Market Context, Fundamentals, Trade Validation
+- NO placeholders like [LONG/SHORT] or [Enter price] - fill everything with real values
+- Include ai_meta JSON with currentPrice: ${chartData.current_price}
+
+Generate the complete trade card now.`;
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userPrompt },
+  ];
+
+  return await callOpenAI(model, messages);
+}
 function tryParseJsonBlock(s: string): any | null {
   if (!s) return null;
   const fence = s.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
