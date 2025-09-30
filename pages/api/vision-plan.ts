@@ -2536,27 +2536,47 @@ if (calUrlOrig) {
 
 
     // ---------- FULL ----------
-const messages = messagesFull({
-      instrument, dateStr, 
-      m15: m15!, 
-      h1: h1 || "", 
-      h4: h4 || "", 
-      m5, m1,
-      calendarDataUrl: calDataUrlForPrompt || undefined,
-      calendarText: (!calDataUrlForPrompt && calendarText) ? calendarText : undefined,
-      headlinesText: headlinesText || undefined,
-      sentimentText,
-      calendarAdvisory: { warningMinutes, biasNote, advisoryText, evidence: calendarEvidence || [], debugRows: debugOCR ? debugRows || [] : [], preReleaseOnly },
-      provenance: provForModel,
-      scalpingMode,
-    });
-      if (livePrice && scalpingMode === "hard") {
-        (messages[0] as any).content = (messages[0] as any).content + `\n\n**HARD SCALPING PRICE LOCK**: ${instrument} is EXACTLY at ${livePrice} RIGHT NOW. For market orders, entry = ${livePrice} (no rounding). For limit orders, max 5 pips away. SL must be 5-8 pips. TP1 = 8-12 pips, TP2 = 12-18 pips. DO NOT round to .7850 or .50 levels.`;
-      } else if (livePrice) {
-        (messages[0] as any).content = (messages[0] as any).content + `\n\n**CRITICAL PRICE CHECK**: Current ${instrument} price is EXACTLY ${livePrice}. You MUST report this exact price in ai_meta.currentPrice. All entry suggestions must be within 15 points (0.4%) of this level for immediate execution.`;
+// ---------- TWO-STAGE PROCESSING ----------
+    
+    console.log("[VISION-PLAN] Stage 1: Analyzing charts...");
+    const chartData = await analyzeChartsOnly(
+      MODEL,
+      instrument,
+      m15!,
+      h1 || "",
+      h4 || "",
+      m5,
+      livePrice
+    );
+    
+    console.log("[VISION-PLAN] Stage 1 complete. Chart data extracted:");
+    console.log(`- 4H: ${chartData.h4_bias} (${chartData.h4_left} → ${chartData.h4_right})`);
+    console.log(`- 1H: ${chartData.h1_bias} ${chartData.h1_vs_h4} 4H`);
+    console.log(`- Primary direction: ${chartData.primary_direction}`);
+    console.log(`- Current price: ${chartData.current_price}`);
+    
+    if (livePrice) {
+      const priceDiff = Math.abs(chartData.current_price - livePrice);
+      const pipValue = instrument.includes("JPY") ? 0.01 : 0.0001;
+      const pipDiff = priceDiff / pipValue;
+      
+      if (pipDiff > 50) {
+        console.warn(`[VISION-PLAN] Large price discrepancy: Chart=${chartData.current_price}, Live=${livePrice}, Diff=${pipDiff.toFixed(1)} pips`);
       }
-
- let textFull = await callOpenAI(MODEL, messages);
+    }
+    
+    console.log("[VISION-PLAN] Stage 2: Generating trade card...");
+    let textFull = await generateTradeCard(
+      MODEL,
+      instrument,
+      chartData,
+      headlinesText,
+      sentimentText,
+      calendarText,
+      calendarEvidence,
+      calendarAdvisory,
+      scalpingMode
+    );
     let aiMetaFull = extractAiMeta(textFull) || {};
 
   // Enhanced price validation with pip-based tolerance
