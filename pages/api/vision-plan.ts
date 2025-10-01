@@ -351,8 +351,8 @@ async function fetchHeadlines(instrument: string): Promise<{ items: any[]; bias:
     const j = await r.json();
     const items = Array.isArray(j?.items) ? j.items : [];
     
-    const scores = items
-      .map(h => typeof h?.sentiment?.score === "number" ? Number(h.sentiment.score) : null)
+   const scores = items
+      .map((h: any) => typeof h?.sentiment?.score === "number" ? Number(h.sentiment.score) : null)
       .filter(s => s !== null) as number[];
     
     if (scores.length === 0) return { items: [], bias: "unavailable" };
