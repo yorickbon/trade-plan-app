@@ -535,10 +535,10 @@ async function fetchOandaPrice(pair: string): Promise<PriceSource | null> {
     const ask = Number(pricing.closeoutAsk);
     const mid = (bid + ask) / 2;
     
-    const timestamp = pricing.time ? Date.parse(pricing.time) : 0;
-    const ageSeconds = (Date.now() - timestamp) / 1000;
+  const timestamp = pricing.time ? Date.parse(pricing.time) : null;
+    const ageSeconds = timestamp && isFinite(timestamp) ? (Date.now() - timestamp) / 1000 : null;
     
-    if (isFinite(mid) && mid > 0 && ageSeconds < 5) {
+    if (isFinite(mid) && mid > 0 && (ageSeconds === null || ageSeconds < 5)) {
       return {
         provider: "OANDA-Live",
         price: mid,
@@ -568,10 +568,10 @@ async function fetchTwelveDataPrice(pair: string): Promise<PriceSource | null> {
     const j: any = await r.json().catch(() => ({}));
     
     const p = Number(j?.close);
-    const timestamp = j?.timestamp ? Date.parse(j.timestamp) : 0;
-    const ageSeconds = (Date.now() - timestamp) / 1000;
+   const timestamp = j?.timestamp ? Date.parse(j.timestamp) : null;
+    const ageSeconds = timestamp && isFinite(timestamp) ? (Date.now() - timestamp) / 1000 : null;
     
-    if (isFinite(p) && p > 0 && ageSeconds < 60) {
+    if (isFinite(p) && p > 0 && (ageSeconds === null || ageSeconds < 60)) {
       return { 
         provider: "TwelveData-RT", 
         price: p, 
@@ -601,10 +601,10 @@ async function fetchFinnhubPrice(pair: string): Promise<PriceSource | null> {
     const j: any = await r.json().catch(() => ({}));
     
     const p = Number(j?.c);
-    const timestamp = Number(j?.t) * 1000;
-    const ageSeconds = (Date.now() - timestamp) / 1000;
+   const timestamp = j?.t ? Number(j.t) * 1000 : null;
+    const ageSeconds = timestamp && isFinite(timestamp) ? (Date.now() - timestamp) / 1000 : null;
     
-    if (isFinite(p) && p > 0 && ageSeconds < 60) {
+    if (isFinite(p) && p > 0 && (ageSeconds === null || ageSeconds < 60)) {
       return { 
         provider: "Finnhub-RT", 
         price: p, 
