@@ -1950,9 +1950,7 @@ const stage1Text = await callOpenAI(MODEL, stage1Messages);
       }
     }
     
-    // Validate Stage 1
-    if (!/(?:CONTEXT\s+GRADE|Market\s+Context.*Grade)\s*:\s*[ABCD]/i.test(stage1Text)) {
-    
+      
   // Validate Stage 1
     if (!/(?:CONTEXT\s+GRADE|Market\s+Context.*Grade)\s*:\s*[ABCD]/i.test(stage1Text)) {
       console.error("[STAGE1] Missing Market Context Grade");
