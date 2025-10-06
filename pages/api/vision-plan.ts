@@ -535,25 +535,7 @@ async function fetchOandaPrice(pair: string): Promise<PriceSource | null> {
     const ask = Number(pricing.closeoutAsk);
     const mid = (bid + ask) / 2;
     
-  const timestamp = pricing.time ? Date.parse(pricing.time) : null;
-    const ageSeconds = timestamp && isFinite(timestamp) ? (Date.now() - timestamp) / 1000 : null;
-    
-    if (isFinite(mid) && mid > 0 && (ageSeconds === null || ageSeconds < 5)) {
-      return {
-        provider: "OANDA-Live",
-        price: mid,
-        latency: Date.now() - start,
-        confidence: 0.50
-      };
-    }
-    
-    console.warn(`[PRICE] OANDA quote too old: ${ageSeconds.toFixed(0)}s`);
-    return null;
-  } catch (err) {
-    console.error('[PRICE] OANDA error:', err);
-    return null;
-  }
-}
+ // OANDA removed - no API key
 
 async function fetchTwelveDataPrice(pair: string): Promise<PriceSource | null> {
   if (!TD_KEY) return null;
@@ -568,7 +550,7 @@ async function fetchTwelveDataPrice(pair: string): Promise<PriceSource | null> {
     const j: any = await r.json().catch(() => ({}));
     
     const p = Number(j?.close);
-   const timestamp = j?.timestamp ? Date.parse(j.timestamp) : null;
+    const timestamp = j?.timestamp ? Date.parse(j.timestamp) : null;
     const ageSeconds = timestamp && isFinite(timestamp) ? (Date.now() - timestamp) / 1000 : null;
     
     if (isFinite(p) && p > 0 && (ageSeconds === null || ageSeconds < 60)) {
@@ -576,14 +558,47 @@ async function fetchTwelveDataPrice(pair: string): Promise<PriceSource | null> {
         provider: "TwelveData-RT", 
         price: p, 
         latency: Date.now() - start, 
+        confidence: 0.50 
+      };
+    }
+    
+    console.warn(`[PRICE] TwelveData quote too old: ${ageSeconds !== null ? ageSeconds.toFixed(0) : 'N/A'}s`);
+    return null;
+  } catch (err) {
+    console.error('[PRICE] TwelveData error:', err);
+    return null;
+  }
+}
+
+async function fetchFinnhubPrice(pair: string): Promise<PriceSource | null> {
+  if (!FH_KEY) return null;
+  
+  const start = Date.now();
+  try {
+    const sym = `OANDA:${pair.slice(0, 3)}_${pair.slice(3)}`;
+    const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(
+      sym
+    )}&token=${FH_KEY}`;
+    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(2000) });
+    const j: any = await r.json().catch(() => ({}));
+    
+    const p = Number(j?.c);
+    const timestamp = j?.t ? Number(j.t) * 1000 : null;
+    const ageSeconds = timestamp && isFinite(timestamp) ? (Date.now() - timestamp) / 1000 : null;
+    
+    if (isFinite(p) && p > 0 && (ageSeconds === null || ageSeconds < 60)) {
+      return { 
+        provider: "Finnhub-RT", 
+        price: p, 
+        latency: Date.now() - start, 
         confidence: 0.45 
       };
     }
     
-    console.warn(`[PRICE] TwelveData quote too old: ${ageSeconds.toFixed(0)}s`);
+    console.warn(`[PRICE] Finnhub quote too old: ${ageSeconds !== null ? ageSeconds.toFixed(0) : 'N/A'}s`);
     return null;
   } catch (err) {
-    console.error('[PRICE] TwelveData error:', err);
+    console.error('[PRICE] Finnhub error:', err);
     return null;
   }
 }
@@ -686,8 +701,7 @@ async function fetchLivePriceConsensus(
 ): Promise<{ consensus: number; sources: PriceSource[]; confidence: number; maxAge: number } | null> {
   const sources: Promise<PriceSource | null>[] = [];
 
-  sources.push(fetchOandaPrice(pair));
-  if (TD_KEY) sources.push(fetchTwelveDataPrice(pair));
+if (TD_KEY) sources.push(fetchTwelveDataPrice(pair));
   if (FH_KEY) sources.push(fetchFinnhubPrice(pair));
   if (POLY_KEY) sources.push(fetchPolygonPrice(pair));
 
