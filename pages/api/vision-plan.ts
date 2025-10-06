@@ -2566,7 +2566,107 @@ export default async function handler(
         `\n\n**CRITICAL PRICE CHECK**: Current ${instrument} price is EXACTLY ${livePrice}. You MUST report this exact price in ai_meta.currentPrice. Entry suggestions must reference visible structure levels from charts.`;
     }
 
-   let textFull = await callOpenAI(MODEL, messages);
+  // ---------- STAGE 1: Analysis (Tournament + Context + Chart Reading) ----------
+    const stage1Messages = [
+      { 
+        role: "system", 
+        content: `Professional FX trader analyzing charts. Output ONLY these sections:
+
+**Strategy Tournament Results:**
+[Score all 5 strategies with detection checklists]
+
+**Market Context Assessment:**
+- Move Maturity: [pips from swing]
+- Structural Position: [quality]
+- Market Regime: [trending/ranging]
+- CONTEXT GRADE: [A/B/C/D]
+
+**Chart Analysis:**
+- 4H: [5-step protocol results]
+- 1H: [5-step protocol results]  
+- 15M: [5-step protocol results]
+
+**Fundamental Summary:**
+- Calendar: ${fundamentalBias.breakdown.calendar}/100
+- Headlines: ${fundamentalBias.breakdown.headlines}/100
+- CSM: ${fundamentalBias.breakdown.csm}/100
+- Overall: ${fundamentalBias.label} (${fundamentalBias.score})
+
+NO trade options yet. Analysis only.`
+      },
+      {
+        role: "user",
+        content: buildUserPartsBase({
+          instrument, dateStr, m15: m15!, h1: h1 || "", h4: h4 || "",
+          m5, m1, currentPrice: livePrice || null,
+          calendarDataUrl: calDataUrlForPrompt, calendarText, headlinesText, sentimentText,
+          calendarAdvisoryText: advisoryText, calendarEvidence, debugOCRRows: debugOCR ? debugRows || [] : []
+        })
+      }
+    ];
+    
+    const stage1Text = await callOpenAI(MODEL, stage1Messages);
+    
+    // Validate Stage 1
+    if (!/Market\s+Context.*Grade\s*:\s*[ABCD]/i.test(stage1Text)) {
+      console.error("[STAGE1] Missing Market Context Grade");
+      return res.status(500).json({
+        ok: false,
+        reason: "Analysis failed: Could not determine market context grade. Please regenerate."
+      });
+    }
+    
+    // ---------- STAGE 2: Trade Options (Using Stage 1 Analysis) ----------
+    const stage2Messages = [
+      {
+        role: "system",
+        content: `Generate trade options based on analysis provided.
+
+Output format:
+
+**Option 1 (Primary)**
+- Direction: [Long/Short]
+- Order Type: [Limit/Stop/Market]
+- Entry: [price range with structure reference]
+- Stop Loss: [price (buffer pips direction TF swing at price)]
+- TP1: [price (structure)], TP2: [price (structure)]
+- Conviction: [%]
+
+**Option 2 (Alternative)**
+[Same format, 10-25% lower conviction]
+
+**Full Breakdown**
+- Technical: [Summary from analysis]
+- Fundamental: ${fundamentalBias.label} (${fundamentalBias.score})
+- Tech vs Fundy: [Match/Mismatch]
+
+\`\`\`json
+ai_meta
+{
+  "currentPrice": ${livePrice || 'UNREADABLE'},
+  "trade_id": "${uuid()}",
+  "strategy_used": "[from tournament]",
+  "risk_grade": "[from context]"
+}
+\`\`\``
+      },
+      {
+        role: "user",
+        content: `Based on this analysis, generate trade options:
+
+${stage1Text}
+
+Current Price: ${livePrice}
+Fundamental Bias: ${fundamentalBias.label}
+
+Generate Option 1 and Option 2.`
+      }
+    ];
+    
+    const stage2Text = await callOpenAI(MODEL, stage2Messages);
+    
+    // Combine stages
+    let textFull = `${stage1Text}\n\n${stage2Text}`;
     let aiMetaFull = extractAiMeta(textFull) || {};
     
     // CRITICAL: Validate response has all required sections
