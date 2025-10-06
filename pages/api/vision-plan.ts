@@ -1485,7 +1485,9 @@ Headlines: ${fundamentalBias.breakdown.headlines}/100
 CSM: ${fundamentalBias.breakdown.csm}/100
 Overall: ${fundamentalBias.label} (${fundamentalBias.score})
 
-CRITICAL: Response MUST contain "CONTEXT GRADE: A" or B or C or D. This exact phrase is MANDATORY.`;
+CRITICAL: Response MUST contain "CONTEXT GRADE: A" or B or C or D. This exact phrase is MANDATORY.
+
+CHART READING RULE: You are looking at actual chart images. The support/resistance levels you identify MUST be visible on the charts. Do not invent levels based on what timeframe "should" have - look at the ACTUAL chart image and state what you SEE.`;
 }
 
 function buildStage2SystemPrompt(instrument: string, fundamentalBias: FundamentalBias, livePrice: number | null): string {
@@ -1915,10 +1917,10 @@ export default async function handler(
     }
 
     // ---------- STAGE 1: Analysis Only ----------
-    const stage1Messages = [
+ const stage1Messages = [
       { 
         role: "system", 
-        content: buildStage1SystemPrompt(instrument, fundamentalBias)
+        content: buildStage1SystemPrompt(instrument, fundamentalBias) + `\n\nCRITICAL: Current live price for ${instrument} is ${livePrice ? livePrice.toFixed(5) : 'UNKNOWN'}. This is the EXACT price right now. When you see price on charts, it should be within 10 pips of this live price. If you cannot see a price close to ${livePrice ? livePrice.toFixed(5) : 'this'}, the charts may be stale.`
       },
       {
         role: "user",
@@ -1931,7 +1933,25 @@ export default async function handler(
       }
     ];
     
-    const stage1Text = await callOpenAI(MODEL, stage1Messages);
+const stage1Text = await callOpenAI(MODEL, stage1Messages);
+    
+    // Warn if price appears wrong
+    if (livePrice) {
+      const levelsInText = stage1Text.match(/\d+\.\d{4,5}/g);
+      if (levelsInText) {
+        const closestLevel = levelsInText
+          .map(Number)
+          .filter(n => Math.abs(n - livePrice) < 0.05) // within 500 pips
+          .sort((a, b) => Math.abs(a - livePrice) - Math.abs(b - livePrice))[0];
+        
+        if (!closestLevel) {
+          console.warn(`[PRICE WARNING] Live price ${livePrice} not found in analysis levels. Charts may be stale or misread.`);
+        }
+      }
+    }
+    
+    // Validate Stage 1
+    if (!/(?:CONTEXT\s+GRADE|Market\s+Context.*Grade)\s*:\s*[ABCD]/i.test(stage1Text)) {
     
   // Validate Stage 1
     if (!/(?:CONTEXT\s+GRADE|Market\s+Context.*Grade)\s*:\s*[ABCD]/i.test(stage1Text)) {
