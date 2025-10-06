@@ -1703,9 +1703,23 @@ function systemCore(
     "- Crypto/Indices: Match scale on chart. BTC '109.3K' = 109300. Gold '2.65K' = 2650.",
     "- MUST report currentPrice in ai_meta (exact or 'UNREADABLE').",
     "",
-    "OUTPUT (exact order):",
-    "**Strategy Tournament Results:** [5 scores with reasoning]",
-    "**Market Context:** Grade [A/B/C/D], [maturity/position/regime]",
+  "OUTPUT FORMAT (RESPONSE REJECTED IF INCOMPLETE):",
+    "",
+    "**Strategy Tournament Results:**",
+    "1. Structure Break: [SCORE]/100 - [Checklist Y/N/N + reasoning]",
+    "2. Order Block: [SCORE]/100 - [Checklist Y/Y/N + reasoning]",
+    "3. Reversal: [SCORE]/100 - [Checklist results + reasoning]",
+    "4. Liquidity Grab: [SCORE]/100 - [Checklist results + reasoning]",
+    "5. FVG Fill: [SCORE]/100 - [Checklist results + reasoning]",
+    "Winner: [Name] ([SCORE]pts) = Option 1",
+    "Runner-up: [Name] ([SCORE]pts) = Option 2",
+    "",
+    "**Market Context Assessment:**",
+    "- Move Maturity: [X pips from swing at PRICE] = [FRESH/DEVELOPING/EXTENDED/EXHAUSTED]",
+    "- Structural Position: [GOOD/POOR for direction]",
+    "- Market Regime: [TRENDING/RANGING]",
+    "- CONTEXT GRADE: [A/B/C/D]",
+    "- Conviction Adjustment: [if any]",
     "",
     "**Option 1 (Primary)**",
     "• Direction: Long|Short",
@@ -2123,6 +2137,45 @@ function buildServerProvenanceFooter(args: {
   return lines.join("\n");
 }
 
+// ---------- MANDATORY Output Validation ----------
+interface ValidationResult {
+  isValid: boolean;
+  missing: string[];
+}
+
+function validateMandatorySections(text: string): ValidationResult {
+  const missing: string[] = [];
+  
+  if (!/Strategy\s+Tournament\s+Results/i.test(text)) {
+    missing.push("Strategy Tournament Results");
+  }
+  
+  if (!/Market\s+Context.*Grade\s*:\s*[ABCD]/i.test(text)) {
+    missing.push("Market Context Grade");
+  }
+  
+  if (!/Option\s*1\s*\(.*Primary.*\)/i.test(text)) {
+    missing.push("Option 1 (Primary)");
+  }
+  
+  const opt1Block = text.match(/Option\s*1[\s\S]{0,1000}(?=Option\s*2|Full\s+Breakdown|$)/i)?.[0] || "";
+  if (opt1Block && !opt1Block.includes("Direction:")) missing.push("Option 1 Direction");
+  if (opt1Block && !opt1Block.includes("Entry")) missing.push("Option 1 Entry");
+  if (opt1Block && !opt1Block.includes("Stop Loss")) missing.push("Option 1 Stop Loss");
+  if (opt1Block && !opt1Block.includes("Conviction")) missing.push("Option 1 Conviction");
+  
+  if (!/Full\s+Breakdown/i.test(text)) {
+    missing.push("Full Breakdown");
+  }
+  
+  const fundBlock = text.match(/Fundamental[^:]*:([^\n]+)/i)?.[1] || "";
+  if (fundBlock.toLowerCase().includes("unavailable") && text.includes("synthesized_score")) {
+    missing.push("Fundamental synthesis (data exists but showing unavailable)");
+  }
+  
+  return { isValid: missing.length === 0, missing };
+}
+
 // ---------- Main API Handler ----------
 export default async function handler(
   req: NextApiRequest,
@@ -2513,8 +2566,34 @@ export default async function handler(
         `\n\n**CRITICAL PRICE CHECK**: Current ${instrument} price is EXACTLY ${livePrice}. You MUST report this exact price in ai_meta.currentPrice. Entry suggestions must reference visible structure levels from charts.`;
     }
 
-    let textFull = await callOpenAI(MODEL, messages);
+   let textFull = await callOpenAI(MODEL, messages);
     let aiMetaFull = extractAiMeta(textFull) || {};
+    
+    // CRITICAL: Validate response has all required sections
+    let validation = validateMandatorySections(textFull);
+    let retryCount = 0;
+    
+    while (!validation.isValid && retryCount < 2) {
+      retryCount++;
+      console.error(`[VALIDATION] Attempt ${retryCount} missing:`, validation.missing.join(", "));
+      
+      const fixMessages = [
+        { role: "system", content: systemCore(instrument, { warningMinutes, biasNote }, scalpingMode) },
+        { role: "user", content: `CRITICAL ERROR: Your response is missing required sections: ${validation.missing.join(", ")}.\n\nMANDATORY sections:\n1. Strategy Tournament Results (5 strategies scored)\n2. Market Context Assessment (Grade A/B/C/D)\n3. Option 1 (Primary) with Direction, Entry, SL, TP1, TP2, Conviction\n4. Option 2 (Alternative)\n5. Full Breakdown with Fundamental analysis\n\nYour incomplete response:\n${textFull.slice(0, 1000)}...\n\nREGENERATE COMPLETE RESPONSE NOW.` }
+      ];
+      
+      textFull = await callOpenAI(MODEL, fixMessages);
+      aiMetaFull = extractAiMeta(textFull) || {};
+      validation = validateMandatorySections(textFull);
+    }
+    
+    if (!validation.isValid) {
+      console.error(`[VALIDATION] Failed after retries. Missing:`, validation.missing);
+      return res.status(500).json({
+        ok: false,
+        reason: `Analysis incomplete. Missing: ${validation.missing.join(", ")}. Regenerate required.`
+      });
+    }
 
     // ---------- Price Validation ----------
     if (livePrice) {
