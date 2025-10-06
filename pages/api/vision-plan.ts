@@ -2577,9 +2577,43 @@ export default async function handler(
       retryCount++;
       console.error(`[VALIDATION] Attempt ${retryCount} missing:`, validation.missing.join(", "));
       
-      const fixMessages = [
-        { role: "system", content: systemCore(instrument, { warningMinutes, biasNote }, scalpingMode) },
-        { role: "user", content: `CRITICAL ERROR: Your response is missing required sections: ${validation.missing.join(", ")}.\n\nMANDATORY sections:\n1. Strategy Tournament Results (5 strategies scored)\n2. Market Context Assessment (Grade A/B/C/D)\n3. Option 1 (Primary) with Direction, Entry, SL, TP1, TP2, Conviction\n4. Option 2 (Alternative)\n5. Full Breakdown with Fundamental analysis\n\nYour incomplete response:\n${textFull.slice(0, 1000)}...\n\nREGENERATE COMPLETE RESPONSE NOW.` }
+    const fixMessages = [
+        { 
+          role: "system", 
+          content: `You are fixing an incomplete trading analysis. You MUST include these exact section headers:
+
+**Market Context Assessment:**
+- Move Maturity: [state it]
+- CONTEXT GRADE: [A/B/C/D]
+
+**Strategy Tournament Results:**
+[List all 5 strategies with scores]
+
+**Option 1 (Primary)**
+- Direction:
+- Entry:
+- Stop Loss:
+- Conviction:
+
+**Full Breakdown**
+- Fundamental: [Use CSM data provided - never say unavailable]
+
+NO OTHER FORMAT ACCEPTED. Start response with "**Market Context Assessment:**"`
+        },
+        { 
+          role: "user", 
+          content: `Missing sections: ${validation.missing.join(", ")}
+
+Here is the data you need to complete this:
+- Instrument: ${instrument}
+- Current Price: ${livePrice || 'check charts'}
+- Fundamental Bias: ${fundamentalBias.label} (score: ${fundamentalBias.score})
+- CSM: ${csm.ranks.slice(0,3).join('>')}
+
+Previous incomplete attempt had these charts already analyzed. Build the COMPLETE response with ALL required sections.
+
+Start with: **Market Context Assessment:**` 
+        }
       ];
       
       textFull = await callOpenAI(MODEL, fixMessages);
