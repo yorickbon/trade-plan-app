@@ -1457,42 +1457,35 @@ function analyzeCalendarProfessional(
 // ---------- System Prompts (Two-Stage Optimized for GPT-4o) ----------
 
 function buildStage1SystemPrompt(instrument: string, fundamentalBias: FundamentalBias): string {
-  return `You are a professional FX trader analyzing ${instrument} charts. Your ONLY job is analysis - NO trade recommendations yet.
-
-You MUST output these EXACT sections:
+  return `Analyze ${instrument} charts. Output EXACTLY this structure:
 
 **Strategy Tournament Results:**
-Score each strategy 0-100 based on whether the setup EXISTS on the charts:
-1. Structure Break & Retest: [SCORE]/100 - [Can you see a BOS? Has price pulled back? Any rejection?]
-2. Order Block Reaction: [SCORE]/100 - [Can you see a demand/supply zone? Is it untested? Is price near it?]
-3. Reversal at Extreme: [SCORE]/100 - [Calculate range in pips. Is price at 80%+ of range? Any rejection candles?]
-4. Liquidity Grab: [SCORE]/100 - [Identify recent swing. Did price sweep beyond it? Did it reverse immediately?]
-5. FVG Fill: [SCORE]/100 - [Can you see a gap? Is it unfilled? Is price moving toward it?]
-
-Winner: [Strategy with highest score] ([SCORE]pts)
-Runner-up: [Strategy with 2nd highest score] ([SCORE]pts)
+1. Structure Break: [0-100]/100
+2. Order Block: [0-100]/100
+3. Reversal: [0-100]/100
+4. Liquidity Grab: [0-100]/100
+5. FVG Fill: [0-100]/100
+Winner: [name] ([score]pts)
+Runner-up: [name] ([score]pts)
 
 **Market Context Assessment:**
-- Move Maturity: [Count pips from most recent swing high/low to current price] = [FRESH <150 / DEVELOPING 150-250 / EXTENDED 250-400 / EXHAUSTED >400]
-- Structural Position: [Is this a GOOD or POOR location for the direction suggested by winner strategy?]
-- Market Regime: [TRENDING with clean HH/HL or LL/LH, or RANGING with 3+ rejections at same level]
-- CONTEXT GRADE: [A if Fresh+Good position, B if Developing+Good, C if Extended, D if Exhausted]
+- Move Maturity: [pips from swing] = [FRESH/DEVELOPING/EXTENDED/EXHAUSTED]
+- Structural Position: [GOOD/POOR]
+- Market Regime: [TRENDING/RANGING]
+- CONTEXT GRADE: [A or B or C or D]
 
 **Chart Analysis:**
-For EACH timeframe (4H, 1H, 15M), state:
-- Visual check: [Left edge price] → [Right edge price] = [direction]
-- Recent highs (last 3): [oldest] → [middle] → [newest]
-- Recent lows (last 3): [oldest] → [middle] → [newest]
-- Trend: [UPTREND/DOWNTREND/RANGE because ...]
-- Key levels: High=[price], Low=[price]
+4H: [trend + key levels]
+1H: [trend + key levels]
+15M: [trend + key levels]
 
 **Fundamental Summary:**
-- Calendar: ${fundamentalBias.breakdown.calendar}/100 (${fundamentalBias.label === 'bullish' ? 'supports long' : fundamentalBias.label === 'bearish' ? 'supports short' : 'neutral'})
-- Headlines: ${fundamentalBias.breakdown.headlines}/100
-- CSM: ${fundamentalBias.breakdown.csm}/100
-- Overall Bias: ${fundamentalBias.label.toUpperCase()} (${fundamentalBias.score.toFixed(0)})
+Calendar: ${fundamentalBias.breakdown.calendar}/100
+Headlines: ${fundamentalBias.breakdown.headlines}/100
+CSM: ${fundamentalBias.breakdown.csm}/100
+Overall: ${fundamentalBias.label} (${fundamentalBias.score})
 
-OUTPUT THESE SECTIONS ONLY. NO trade options. NO entries. NO stops. ANALYSIS ONLY.`;
+CRITICAL: Response MUST contain "CONTEXT GRADE: A" or B or C or D. This exact phrase is MANDATORY.`;
 }
 
 function buildStage2SystemPrompt(instrument: string, fundamentalBias: FundamentalBias, livePrice: number | null): string {
