@@ -1933,9 +1933,10 @@ export default async function handler(
     
     const stage1Text = await callOpenAI(MODEL, stage1Messages);
     
-    // Validate Stage 1
-    if (!/Market\s+Context.*Grade\s*:\s*[ABCD]/i.test(stage1Text)) {
+  // Validate Stage 1
+    if (!/(?:CONTEXT\s+GRADE|Market\s+Context.*Grade)\s*:\s*[ABCD]/i.test(stage1Text)) {
       console.error("[STAGE1] Missing Market Context Grade");
+      console.error("[STAGE1] Stage 1 output preview:", stage1Text.slice(0, 500));
       return res.status(500).json({
         ok: false,
         reason: "Analysis incomplete: Missing market context grade. Regenerate."
