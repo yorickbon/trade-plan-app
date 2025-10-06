@@ -733,7 +733,7 @@ async function fetchLivePriceConsensus(
 ): Promise<{ consensus: number; sources: PriceSource[]; confidence: number; maxAge: number } | null> {
   const sources: Promise<PriceSource | null>[] = [];
 
-if (TD_KEY) sources.push(fetchTwelveDataPrice(pair));
+  if (TD_KEY) sources.push(fetchTwelveDataPrice(pair));
   if (FH_KEY) sources.push(fetchFinnhubPrice(pair));
   if (POLY_KEY) sources.push(fetchPolygonPrice(pair));
 
